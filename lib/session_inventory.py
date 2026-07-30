@@ -4867,10 +4867,6 @@ def strict_live_inventory(inventory: Mapping[str, Any]) -> bool:
         return False
     exact_provider_uuids: set[tuple[str, str]] = set()
     for item in inventory.get("sessions", ()):
-        if isinstance(item, Mapping) and _missing_shell_generation_is_quarantinable(
-            item
-        ):
-            continue
         identity = item.get("identity")
         shell = item.get("shpool_shell")
         raw_id = item.get("shpool_id_raw")

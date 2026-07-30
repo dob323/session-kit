@@ -1119,6 +1119,7 @@ class TerminalNumberRegistryTests(unittest.TestCase):
         )
         exact, orphan = inventory["sessions"]
         self._orphan(orphan)
+        self.assertFalse(inventory_core.strict_live_inventory(inventory))
         registry = inventory_core.apply_terminal_numbers(
             inventory,
             inventory_core._empty_terminal_registry("boot-a"),
@@ -1135,7 +1136,7 @@ class TerminalNumberRegistryTests(unittest.TestCase):
         self.assertEqual(2, registry["next_number"])
         self.assertEqual({1}, set(registry["bindings"].values()))
         self.assertTrue(inventory_core.guard_live_inventory(inventory))
-        self.assertTrue(inventory_core.strict_live_inventory(inventory))
+        self.assertFalse(inventory_core.strict_live_inventory(inventory))
         unchanged = inventory_core.apply_terminal_numbers(
             inventory,
             registry,
