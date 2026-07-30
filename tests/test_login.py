@@ -311,7 +311,25 @@ def run_pty(
         if input_bytes:
             os.write(descriptor, input_bytes)
         if send_signal is not None:
-            time.sleep(0.25)
+            prompt = "❯ ".encode()
+            signal_deadline = min(deadline, time.monotonic() + 5)
+            while prompt not in output and time.monotonic() < signal_deadline:
+                ready, _, _ = select.select([descriptor], [], [], 0.05)
+                if not ready:
+                    continue
+                try:
+                    chunk = os.read(descriptor, 65536)
+                except OSError as exc:
+                    if exc.errno != errno.EIO:
+                        raise
+                    break
+                if not chunk:
+                    break
+                output.extend(chunk)
+            if prompt not in output:
+                raise AssertionError(
+                    "picker PTY did not render its prompt before the signal"
+                )
             os.kill(pid, send_signal)
         status = None
         while time.monotonic() < deadline:
