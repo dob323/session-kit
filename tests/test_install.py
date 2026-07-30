@@ -86,6 +86,41 @@ class InstallerTests(unittest.TestCase):
         self.assertIn("OK    source: installable", result.stdout)
         self.assertEqual(list(self.home.iterdir()), [])
 
+    def test_check_rejects_partial_inventory_package(self) -> None:
+        source = self.temp / "source"
+        shutil.copytree(
+            REPO,
+            source,
+            ignore=shutil.ignore_patterns(
+                ".git",
+                ".mypy_cache",
+                ".ruff_cache",
+                "__pycache__",
+                "*.pyc",
+            ),
+        )
+        subprocess.run(["git", "init", "-q", source], check=True)
+        for relative in (
+            "lib/sessionkit_inventory/__init__.py",
+            "lib/sessionkit_inventory/common.py",
+        ):
+            with self.subTest(relative=relative):
+                path = source / relative
+                payload = path.read_bytes()
+                path.unlink()
+                result = subprocess.run(
+                    [str(source / "install.sh"), "--check"],
+                    cwd=source,
+                    env=self.env,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"source file missing: {relative}", result.stdout)
+                path.write_bytes(payload)
+
     def test_noninteractive_install_is_local_and_login_opt_in(self) -> None:
         self.run_installer("--non-interactive")
         current = self.home / ".local/lib/session-kit/current"
@@ -101,6 +136,10 @@ class InstallerTests(unittest.TestCase):
         )
         self.assertEqual(receipt["installed_release"], RELEASE_A)
         self.assertTrue((self.home / ".local/bin/sp").is_file())
+        self.assertTrue(
+            (current / "lib/sessionkit_inventory/__init__.py").is_file()
+        )
+        self.assertTrue((current / "lib/sessionkit_inventory/common.py").is_file())
         self.assertTrue((self.temp / "systemd/shpool.socket").is_file())
         service = (self.temp / "systemd/shpool.service").read_text(encoding="utf-8")
         self.assertIn(f"ExecStart={self.fake_bin / 'shpool'} daemon", service)
@@ -149,6 +188,18 @@ class InstallerTests(unittest.TestCase):
         names = {row["name"]: row for row in payload["checks"]}
         self.assertEqual(names["release"]["detail"], RELEASE_A)
         self.assertEqual(names["login"]["status"], "ok")
+
+    def test_doctor_rejects_partial_inventory_package(self) -> None:
+        self.run_installer("--non-interactive")
+        current = self.home / ".local/lib/session-kit/current"
+        (current / "lib/sessionkit_inventory/common.py").unlink()
+        result = self.installed("doctor", "--json", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        payload = json.loads(result.stdout)
+        self.assertFalse(payload["ok"])
+        names = {row["name"]: row for row in payload["checks"]}
+        self.assertEqual(names["release"]["status"], "fail")
+        self.assertIn("lib/sessionkit_inventory/common.py", names["release"]["detail"])
 
 
 if __name__ == "__main__":

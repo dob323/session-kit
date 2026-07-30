@@ -100,7 +100,14 @@ jobs:
           RUFF_CACHE_DIR: ${{ runner.temp }}/ruff-cache
         run: |
           ruff check .
-          format_files=(tests/test_facade.py tests/test_public_scan.py)
+          python -m compileall -q lib
+          format_files=(
+            lib/sessionkit_inventory/__init__.py
+            lib/sessionkit_inventory/common.py
+            tests/test_facade.py
+            tests/test_public_export.py
+            tests/test_public_scan.py
+          )
           if [[ -f public/tests-support.py ]]; then
             format_files+=(public/tests-support.py)
           else
@@ -111,7 +118,9 @@ jobs:
         continue-on-error: true
         env:
           MYPY_CACHE_DIR: ${{ runner.temp }}/mypy-cache
-        run: mypy --ignore-missing-imports lib/session_inventory.py
+        run: |
+          mypy --ignore-missing-imports \
+            lib/session_inventory.py lib/sessionkit_inventory
       - name: Enforce tested Python coverage
         env:
           COVERAGE_FILE: ${{ runner.temp }}/coverage

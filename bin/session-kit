@@ -15,6 +15,11 @@ receipt_path=$state_root/install.json
 login_start="# >>> session-kit managed integration >>>"
 login_end="# <<< session-kit managed integration <<<"
 helpers=(sp shpool_login shpool_status shpool_reaper codex_resume_here)
+inventory_files=(
+  lib/session_inventory.py
+  lib/sessionkit_inventory/__init__.py
+  lib/sessionkit_inventory/common.py
+)
 
 die() {
   printf '%s: %s\n' "$program" "$*" >&2
@@ -115,7 +120,7 @@ check_source() {
   for required in \
     bin/sp bin/shpool_login bin/shpool_status bin/shpool_reaper \
     bin/codex_resume_here bin/session_kit_common bin/session-kit \
-    lib/session_inventory.py bashrc/shpool.bashrc \
+    "${inventory_files[@]}" bashrc/shpool.bashrc \
     deploy/session-kit-launcher config/projects.example.tsv \
     config/session-inventory.example.json config/shpool.example.toml; do
     if [[ ! -f $source/$required ]]; then
@@ -483,7 +488,7 @@ doctor_command() {
   local json=0
   [[ ${1:-} != --json ]] || { json=1; shift; }
   (($# == 0)) || die "unknown doctor option: $1"
-  local current_platform release_id= failed=0 helper row status name detail
+  local current_platform release_id= failed=0 helper required row status name detail
   current_platform=$(platform)
   release_id=$(current_release_id)
   local -a checks=()
@@ -498,7 +503,18 @@ doctor_command() {
   fi
   if [[ $release_id =~ ^[0-9a-f]{40}$ &&
         -d $install_root/releases/$release_id ]]; then
-    add_check ok release "$release_id"
+    local missing_release_file=
+    for required in "${inventory_files[@]}"; do
+      if [[ ! -f $install_root/releases/$release_id/$required ]]; then
+        missing_release_file=$required
+        break
+      fi
+    done
+    if [[ -z $missing_release_file ]]; then
+      add_check ok release "$release_id"
+    else
+      add_check fail release "active release missing $missing_release_file"
+    fi
   else
     add_check fail release "no valid active release"
   fi

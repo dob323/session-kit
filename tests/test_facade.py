@@ -191,6 +191,47 @@ class InventoryFacadeTests(unittest.TestCase):
         )
         self.assertEqual(result.stderr, "")
 
+    def test_direct_script_help_works_outside_repository(self) -> None:
+        result = subprocess.run(
+            [sys.executable, str(CORE), "--help"],
+            cwd=REPO.parent,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "{" + ",".join(EXPECTED_TOP_LEVEL_COMMANDS) + "}",
+            result.stdout,
+        )
+        self.assertEqual(result.stderr, "")
+
+    def test_common_kernel_preserves_facade_identity_and_behavior(self) -> None:
+        facade = load_facade("session_inventory_facade_common")
+        from sessionkit_inventory import common
+
+        self.assertIs(facade.CollectionError, common.CollectionError)
+        self.assertEqual(
+            common.clean_text("  A\x1b[31m  Title\x00  "),
+            "A [31m Title",
+        )
+        uuid = "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE"
+        self.assertEqual(common.valid_uuid(uuid), uuid.lower())
+        self.assertIsNone(common.valid_uuid("not-a-uuid"))
+        self.assertEqual(
+            sorted(("main10", "main", "main2"), key=common.natural_name_key),
+            ["main", "main2", "main10"],
+        )
+        self.assertEqual(common._positive_int("8", 4, 2, 10), 8)
+        self.assertEqual(common._positive_int("20", 4, 2, 10), 4)
+        self.assertEqual(common._positive_float("0.5", 1.0, 0.2, 2.0), 0.5)
+        for disabled in ("0", "false", "NO", " off "):
+            self.assertFalse(
+                common.automatic_naming_enabled({"SESSION_KIT_AUTO_NAME": disabled})
+            )
+        self.assertTrue(common.automatic_naming_enabled({}))
+
     def test_facade_path_remains_the_launcher_entry_point(self) -> None:
         for relative in ("bin/sp", "bin/shpool_status"):
             text = (REPO / relative).read_text(encoding="utf-8")

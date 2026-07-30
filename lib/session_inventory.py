@@ -32,32 +32,39 @@ import time
 from typing import Any, Callable, Iterable, Mapping, Sequence
 import unicodedata
 
+_SESSION_KIT_LIB_DIR = os.fspath(Path(__file__).resolve().parent)
+if _SESSION_KIT_LIB_DIR not in sys.path:
+    sys.path.insert(0, _SESSION_KIT_LIB_DIR)
+
+from sessionkit_inventory.common import (  # noqa: E402, F401
+    GENERATED_OPERATIONAL_ID_RE,
+    LEGACY_OPERATIONAL_ID_RE,
+    MAX_OPERATIONAL_ID_BYTES,
+    PROVIDERS,
+    UUID_RE,
+    CollectionError,
+    _positive_float,
+    _positive_int,
+    automatic_naming_enabled,
+    clean_text,
+    natural_name_key,
+    normalize_automatic_title,
+    shpool_id_mutation_policy,
+    valid_uuid,
+)
+
 
 SCHEMA_VERSION = 1
-UUID_RE = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-    re.IGNORECASE,
-)
-PROVIDERS = ("claude", "codex")
 PROVIDER_ORDER = {"claude": 0, "codex": 1, "shell": 2, "unknown": 3}
 AVAILABILITY_ORDER = {"ready": 0, "attached": 1}
-MAX_OPERATIONAL_ID_BYTES = 128
 MAX_PRIVATE_JSON_BYTES = 1024 * 1024
 MAX_CODEX_SESSION_INDEX_BYTES = 4 * 1024 * 1024
 DEFAULT_MAX_PROC_NODES = 16384
 ABSENT_ALIAS_CONFIG_BACKUP = b"session-kit-alias-config-absent-v1\n"
-LEGACY_OPERATIONAL_ID_RE = re.compile(r"^main(?:[1-9][0-9]*)?$")
-GENERATED_OPERATIONAL_ID_RE = re.compile(
-    r"^s[0-9]{8}-[0-9]{6}-[1-9][0-9]*(?:-[1-9][0-9]*)?$"
-)
 Runner = Callable[[Sequence[str], float], str]
 
 DARWIN_PREVIEW_ENV = "SESSION_KIT_MACOS_PREVIEW"
 DARWIN_PLATFORM = "darwin"
-
-
-class CollectionError(RuntimeError):
-    """The inventory could not obtain a trustworthy shpool snapshot."""
 
 
 def _runtime_platform() -> str:
@@ -134,22 +141,6 @@ def default_start_dir() -> Path:
 def _load_json_file(path: Path) -> Any:
     with path.open("r", encoding="utf-8") as handle:
         return json.load(handle)
-
-
-def _positive_int(value: Any, default: int, low: int, high: int) -> int:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return default
-    return parsed if low <= parsed <= high else default
-
-
-def _positive_float(value: Any, default: float, low: float, high: float) -> float:
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError):
-        return default
-    return parsed if low <= parsed <= high else default
 
 
 def _valid_aliases(raw: Any) -> dict[str, str]:
@@ -241,68 +232,6 @@ def load_config() -> dict[str, Any]:
     }
 
 
-def clean_text(value: Any, limit: int = 120) -> str:
-    if not isinstance(value, str):
-        return ""
-    # Source metadata can contain terminal controls. Replace all Unicode
-    # control/format/surrogate/private-use
-    # characters, including ESC/CSI/OSC introducers, before whitespace folding.
-    safe = "".join(
-        " " if unicodedata.category(character).startswith("C") else character
-        for character in value
-    )
-    text = " ".join(safe.split())
-    return text[:limit]
-
-
-def valid_uuid(value: Any) -> str | None:
-    if isinstance(value, str) and UUID_RE.fullmatch(value):
-        return value.lower()
-    return None
-
-
-def automatic_naming_enabled(environ: Mapping[str, str] | None = None) -> bool:
-    """Return false only for the explicit automatic-name kill switch."""
-    values = environ if environ is not None else os.environ
-    value = values.get("SESSION_KIT_AUTO_NAME")
-    return value is None or value.strip().casefold() not in {"0", "false", "no", "off"}
-
-
-def normalize_automatic_title(value: Any) -> str:
-    """Return a strict, task-focused 2-5 word title without provider prefixes."""
-    if not isinstance(value, str):
-        raise CollectionError("automatic title must be text")
-    safe = "".join(
-        " " if unicodedata.category(character).startswith("C") else character
-        for character in value
-    )
-    title = " ".join(safe.split())
-    if len(title) > 60:
-        raise CollectionError("automatic title must be at most 60 characters")
-    words = title.split()
-    if not 2 <= len(words) <= 5:
-        raise CollectionError("automatic title must contain 2-5 words")
-    if words[0].rstrip(":").casefold() in PROVIDERS:
-        raise CollectionError("automatic title must not start with a provider name")
-    if any(
-        not any(character.isalnum() for character in word)
-        or any(character in "/\\|[]{}<>" for character in word)
-        for word in words
-    ):
-        raise CollectionError("automatic title contains unsupported punctuation")
-    for word in words:
-        first = next((character for character in word if character.isalpha()), None)
-        if first is not None and not first.isupper():
-            raise CollectionError("automatic title must use Title Case")
-    return title
-
-
-def natural_name_key(name: str) -> tuple[Any, ...]:
-    """Natural, deterministic ordering for names such as main, main2, main10."""
-    parts = re.split(r"(\d+)", name.casefold())
-    return tuple(int(part) if part.isdigit() else part for part in parts)
-
-
 def display_shpool_id(raw: str, limit: int = 32) -> str:
     display_source = "".join(
         " " if unicodedata.category(character).startswith("C") else character
@@ -312,25 +241,6 @@ def display_shpool_id(raw: str, limit: int = 32) -> str:
     if not visible:
         visible = "(non-printing ID)"
     return visible if len(visible) <= limit else f"{visible[: limit - 1]}…"
-
-
-def shpool_id_mutation_policy(raw: Any) -> tuple[bool, str | None]:
-    if not isinstance(raw, str) or not raw:
-        return False, "invalid"
-    if any(unicodedata.category(character).startswith("C") for character in raw):
-        return False, "control"
-    try:
-        encoded = raw.encode("utf-8")
-    except UnicodeEncodeError:
-        return False, "invalid"
-    if len(encoded) > MAX_OPERATIONAL_ID_BYTES:
-        return False, "oversize"
-    lowered = raw.casefold()
-    if "template" in lowered or lowered in {"unmanaged", "control"}:
-        return False, "template" if "template" in lowered else "unmanaged"
-    if LEGACY_OPERATIONAL_ID_RE.fullmatch(raw) or GENERATED_OPERATIONAL_ID_RE.fullmatch(raw):
-        return True, None
-    return False, "unmanaged"
 
 
 def _utc_now(now: float | None = None) -> str:
