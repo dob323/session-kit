@@ -179,13 +179,14 @@ class DarwinFailClosedCommandTests(unittest.TestCase):
             "SESSION_KIT_TEST_PLATFORM": "Darwin",
             "SESSION_KIT_STATE_DIR": str(self.base / "state"),
         }
+        self.bash = os.environ.get("SESSION_KIT_TEST_BASH", "bash")
 
     def tearDown(self) -> None:
         self.temp.cleanup()
 
     def run_bash(self, path: Path, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            ["bash", str(path), *args],
+            [self.bash, str(path), *args],
             cwd=REPO,
             env=self.env,
             text=True,
@@ -215,7 +216,7 @@ class DarwinFailClosedCommandTests(unittest.TestCase):
             "sk_lock_release 9; test ! -e " + str(lock) + ".darwin-lock"
         )
         result = subprocess.run(
-            ["bash", "-c", command],
+            [self.bash, "-c", command],
             cwd=REPO,
             env=self.env,
             text=True,

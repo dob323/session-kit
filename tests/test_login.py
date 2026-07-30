@@ -8,7 +8,6 @@ import pty
 import re
 import select
 import signal
-import stat
 import tempfile
 import time
 import unicodedata

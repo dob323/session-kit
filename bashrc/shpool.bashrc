@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # ---- session-kit shpool integration -----------------------------------------
 # Source this block from ~/.bashrc. Installed releases keep this file immutable.
 

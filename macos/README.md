@@ -17,6 +17,12 @@ automatic upgrade path. A dedicated-Mac acceptance operator must assemble an
 isolated release manually; passing that gate is required before installation
 and service automation are designed.
 
+GitHub CI runs `tests.test_macos_preview` on an Apple Silicon `macos-15`
+runner. This proves the focused parser and fail-closed preview tests execute on
+Darwin. It does not exercise real shpool, provider installations, reboot
+identity, journals, Intel hardware, or the full lifecycle below, so it is not
+dedicated-Mac acceptance.
+
 ## Safety boundary
 
 Darwin process identity comes from `PROC_PIDTBSDINFO`. The recorded generation

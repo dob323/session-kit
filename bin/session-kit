@@ -491,19 +491,28 @@ doctor_command() {
     checks+=("$1"$'\t'"$2"$'\t'"$3")
     [[ $1 != fail ]] || failed=1
   }
-  [[ $current_platform != unsupported ]] &&
-    add_check ok platform "$current_platform" ||
+  if [[ $current_platform != unsupported ]]; then
+    add_check ok platform "$current_platform"
+  else
     add_check fail platform "unsupported operating system"
-  [[ $release_id =~ ^[0-9a-f]{40}$ && -d $install_root/releases/$release_id ]] &&
-    add_check ok release "$release_id" ||
+  fi
+  if [[ $release_id =~ ^[0-9a-f]{40}$ &&
+        -d $install_root/releases/$release_id ]]; then
+    add_check ok release "$release_id"
+  else
     add_check fail release "no valid active release"
-  command -v shpool >/dev/null 2>&1 &&
-    add_check ok shpool "$(command -v shpool)" ||
+  fi
+  if command -v shpool >/dev/null 2>&1; then
+    add_check ok shpool "$(command -v shpool)"
+  else
     add_check fail shpool "command unavailable"
+  fi
   for helper in "${helpers[@]}"; do
-    [[ -x $bin_dir/$helper ]] &&
-      add_check ok "$helper" "$bin_dir/$helper" ||
+    if [[ -x $bin_dir/$helper ]]; then
+      add_check ok "$helper" "$bin_dir/$helper"
+    else
       add_check fail "$helper" "launcher unavailable"
+    fi
   done
   if [[ -f $integration_marker && ! -L $integration_marker &&
         $(stat_mode "$integration_marker") == 600 ]]; then

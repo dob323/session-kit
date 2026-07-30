@@ -45,6 +45,8 @@ The first public release is planned as `v0.1.0`.
 | --- | --- |
 | Linux with systemd user services | Supported target |
 | Bash | Supported shell |
+| Python | 3.10 through 3.13 tested in CI |
+| Ubuntu | 22.04 and 24.04 tested in CI |
 | Claude Code and Codex | Supported providers |
 | Ordinary shpool shells | Supported |
 | macOS core commands | Preview, opt-in, and blocked on a real-Mac test |
@@ -54,6 +56,9 @@ The first public release is planned as `v0.1.0`.
 Session Kit is local-only. It does not send usage data. An administrator may
 configure an optional notification command for watchdog reports; notifications
 must remain off unless explicitly configured.
+
+CI also runs the focused macOS preview tests on a GitHub-hosted Apple Silicon
+runner. That smoke test does not replace the dedicated-Mac acceptance gate.
 
 See [installation requirements](docs/install.md) and the
 [security and data guide](docs/security-and-data.md) before using it with

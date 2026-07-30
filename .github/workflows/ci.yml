@@ -2,25 +2,120 @@ name: CI
 
 on:
   push:
+    branches:
+      - main
   pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
-  test:
-    runs-on: ubuntu-24.04
+  linux:
+    name: Linux ${{ matrix.os }} / Python ${{ matrix.python }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-22.04
+          - ubuntu-24.04
+        python:
+          - "3.10"
+          - "3.11"
+          - "3.12"
+          - "3.13"
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          python-version: "3.12"
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: ${{ matrix.python }}
       - name: Check Bash syntax
         run: |
           bash -n install.sh
           bash -n bin/*
+          bash -n bashrc/shpool.bashrc
+          bash -n deploy/session-kit-launcher
           bash -n tests/run
-      - name: Run tests
-        run: tests/run
       - name: Check public tree
         run: tools/public-scan .
+      - name: Run tests
+        run: tests/run
+
+  macos-preview:
+    name: macOS 15 preview / Python 3.13
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.13"
+      - name: Install supported Bash
+        run: brew install bash
+      - name: Check Bash syntax
+        run: |
+          "$(brew --prefix)/bin/bash" -n install.sh
+          "$(brew --prefix)/bin/bash" -n bin/*
+          "$(brew --prefix)/bin/bash" -n bashrc/shpool.bashrc
+          "$(brew --prefix)/bin/bash" -n deploy/session-kit-launcher
+          "$(brew --prefix)/bin/bash" -n tests/run
+      - name: Run native preview tests
+        env:
+          SESSION_KIT_MACOS_PREVIEW: "1"
+          SESSION_KIT_TEST_BASH: /opt/homebrew/bin/bash
+        run: |
+          test "$("$SESSION_KIT_TEST_BASH" -c 'printf "%s" "${BASH_VERSINFO[0]}"')" -ge 4
+          python3 -m unittest -v tests.test_macos_preview
+
+  quality:
+    name: Static analysis and coverage
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.13"
+      - name: Check public tree before tool caches exist
+        run: tools/public-scan .
+      - name: Install quality tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes shellcheck
+          python -m pip install --requirement requirements-dev.txt
+      - name: Run ShellCheck
+        run: |
+          shellcheck install.sh bin/* bashrc/shpool.bashrc \
+            deploy/session-kit-launcher tests/run
+      - name: Run Ruff
+        env:
+          RUFF_CACHE_DIR: ${{ runner.temp }}/ruff-cache
+        run: |
+          ruff check .
+          format_files=(tests/test_facade.py tests/test_public_scan.py)
+          if [[ -f public/tests-support.py ]]; then
+            format_files+=(public/tests-support.py)
+          else
+            format_files+=(tests/support.py)
+          fi
+          ruff format --check "${format_files[@]}"
+      - name: Report legacy type baseline
+        continue-on-error: true
+        env:
+          MYPY_CACHE_DIR: ${{ runner.temp }}/mypy-cache
+        run: mypy --ignore-missing-imports lib/session_inventory.py
+      - name: Enforce tested Python coverage
+        env:
+          COVERAGE_FILE: ${{ runner.temp }}/coverage
+        run: |
+          coverage run --branch --source=lib \
+            -m unittest discover -s tests -t .
+          coverage report --skip-empty --fail-under=70

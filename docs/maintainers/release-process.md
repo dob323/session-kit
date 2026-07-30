@@ -19,20 +19,22 @@ state, or command changes prominently.
    service dependencies remain.
 3. `LICENSE`, `THIRD_PARTY_NOTICES`, `SECURITY.md`, the changelog, and public
    documentation match the release.
-4. Linux, Bash, Python, shpool, Claude Code, and Codex tested versions are
-   recorded.
-5. Fresh install passes under a disposable Linux account.
-6. Update from the prior public release passes with active detached sessions.
-7. Rollback restores the earlier helpers, integration marker, configuration,
+4. The required Ubuntu 22.04/24.04 and Python 3.10-3.13 CI matrix passes.
+5. The hosted macOS 15 preview smoke passes and remains clearly separate from
+   dedicated-Mac acceptance.
+6. Fresh install passes under a disposable Linux account.
+7. Update from the prior public release passes with active detached sessions.
+8. Rollback restores the earlier helpers, integration marker, configuration,
    and state interpretation without restarting shpool.
-8. Uninstall preserves state and journals by default.
-9. Guided journals are enabled by default only after their data warning is
+9. Uninstall preserves state and journals by default.
+10. Guided journals are enabled by default only after their data warning is
    shown.
-10. Watchdog behavior is report-only and notifications are opt-in.
-11. The macOS preview remains off unless the same candidate passes a real-Mac
+11. Watchdog behavior is report-only and notifications are opt-in.
+12. The macOS preview remains off unless the same candidate passes a real-Mac
     core lifecycle test.
-12. The full test suite, Bash syntax checks, ShellCheck, Python syntax checks,
-    link checks, and documentation privacy checks pass.
+13. The full test suite, Bash syntax checks, ShellCheck, Ruff, Python syntax,
+    the branch-coverage floor, link checks, and documentation privacy checks
+    pass.
 
 ## Build and install a candidate
 

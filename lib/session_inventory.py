@@ -3712,7 +3712,6 @@ def _migration_context(
     collector: Callable[[Mapping[str, Any]], dict[str, Any]] | None = None,
     proc_root: Path | None = None,
 ) -> dict[str, Any]:
-    paths = _state_paths(config)
     collect = collector or collect_live
     try:
         legacy = json.loads(legacy_bytes)

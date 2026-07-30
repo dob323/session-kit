@@ -37,12 +37,31 @@ or service manager.
 For shell changes, also run:
 
 ```bash
-bash -n bin/* bashrc/shpool.bashrc deploy/session-kit-launcher
-shellcheck bin/* bashrc/shpool.bashrc deploy/session-kit-launcher
+bash -n install.sh bin/* bashrc/shpool.bashrc \
+  deploy/session-kit-launcher tests/run
+shellcheck install.sh bin/* bashrc/shpool.bashrc \
+  deploy/session-kit-launcher tests/run
 ```
 
 Run `python3 -m compileall -q lib tests deploy/session-kit-release` for Python
 syntax checking. Python bytecode is ignored by Git.
+
+Install the pinned development tools in a virtual environment:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements-dev.txt
+.venv/bin/ruff check .
+.venv/bin/coverage run --branch --source=lib \
+  -m unittest discover -s tests -t .
+.venv/bin/coverage report --fail-under=70
+```
+
+CI tests Python 3.10 through 3.13 on Ubuntu 22.04 and 24.04. It also runs the
+focused preview tests on macOS 15. Ruff, ShellCheck, and the 70 percent branch
+coverage floor are required. Mypy currently reports the typed legacy baseline
+without blocking; it becomes required module by module during the
+[inventory split](docs/maintainers/modularization-roadmap.md).
 
 ## Pull requests
 

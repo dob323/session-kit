@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # sp: safe shpool session manager.
 
+# Expected nonzero statuses are part of interactive control flow, so this
+# command deliberately avoids `set -e`. Every state-changing path checks its
+# result explicitly and is covered by proof-bound failure tests.
 set -u
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
