@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check Bash syntax
+        run: |
+          bash -n install.sh
+          bash -n bin/*
+          bash -n tests/run
+      - name: Run tests
+        run: tests/run
+      - name: Check public tree
+        run: tools/public-scan .

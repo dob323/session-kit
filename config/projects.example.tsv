@@ -1,0 +1,5 @@
+# alias<TAB>provider<TAB>absolute cwd
+# Alias: lowercase letters, digits, `_`, or dash. Provider: shell,
+# claude, or codex. Cwd must be an existing absolute directory when used.
+web	claude	/home/example/projects/web
+api	codex	/home/example/projects/api

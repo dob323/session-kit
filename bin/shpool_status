@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# One renderer and exact inventory source for the login picker and `sp`.
+set -u
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+CORE=${SESSION_KIT_INVENTORY_CORE:-"$SCRIPT_DIR/../lib/session_inventory.py"}
+
+case "${1:-}" in
+  "") exec python3 "$CORE" render ;;
+  --rows) exec python3 "$CORE" render --rows ;;
+  --waiting-count) exec python3 "$CORE" waiting-count ;;
+  --json) exec python3 "$CORE" snapshot ;;
+  --strict-json) exec python3 "$CORE" snapshot --strict-live --no-write ;;
+  --guard-json) exec python3 "$CORE" snapshot --guard-live --no-write ;;
+  --lookup)
+    [[ -n ${2:-} && -z ${3:-} ]] || {
+      echo "usage: shpool_status --lookup <row|shpool-id>" >&2
+      exit 2
+    }
+    exec python3 "$CORE" lookup "$2"
+    ;;
+  --render-file)
+    [[ -n ${2:-} && ( -z ${3:-} || ${3:-} == --rows ) && -z ${4:-} ]] || {
+      echo "usage: shpool_status --render-file <snapshot.json> [--rows]" >&2
+      exit 2
+    }
+    if [[ ${3:-} == --rows ]]; then
+      exec python3 "$CORE" render --input "$2" --rows
+    fi
+    exec python3 "$CORE" render --input "$2"
+    ;;
+  --lookup-file)
+    [[ -n ${2:-} && -n ${3:-} && -z ${4:-} ]] || {
+      echo "usage: shpool_status --lookup-file <snapshot.json> <row|shpool-id>" >&2
+      exit 2
+    }
+    exec python3 "$CORE" lookup --input "$2" "$3"
+    ;;
+  --recovery-pending-list)
+    [[ -z ${2:-} ]] || {
+      echo "usage: shpool_status --recovery-pending-list" >&2
+      exit 2
+    }
+    exec python3 "$CORE" recovery-pending list
+    ;;
+  --recovery-pending-ack)
+    [[ -n ${2:-} && -n ${3:-} && -n ${4:-} && -z ${5:-} ]] || {
+      echo "usage: shpool_status --recovery-pending-ack <source-generation-key> <old-shpool-id> <uuid>" >&2
+      exit 2
+    }
+    exec python3 "$CORE" recovery-pending ack "$2" "$3" "$4"
+    ;;
+  *)
+    echo "usage: shpool_status [--rows|--waiting-count|--json|--strict-json|--guard-json|--lookup <selector>|--render-file <file> [--rows]|--lookup-file <file> <selector>|--recovery-pending-list|--recovery-pending-ack <generation> <id> <uuid>]" >&2
+    exit 2
+    ;;
+esac

@@ -1,0 +1,27 @@
+name: Feature request
+description: Suggest an improvement to Session Kit
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What session-management problem should this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the user-visible result.
+    validations:
+      required: true
+  - type: textarea
+    id: safety
+    attributes:
+      label: Safety and compatibility
+      description: Could this affect active sessions, recovery identity, journals, provider data, or supported platforms?
+    validations:
+      required: true

@@ -1,0 +1,24 @@
+[Unit]
+Description=Recover sessions whose terminal dies inside shpool
+# The watchdog reads the daemon's log and inventory; it must not start before
+# the daemon exists, but it must not fail if the daemon is restarted either.
+Wants=shpool.service
+After=shpool.service
+
+[Service]
+Type=simple
+# Resolved through the `current` release link at exec time, so a restart always
+# picks up the active release. The stable-launcher whitelist covers only the
+# five original helpers; adding a sixth would mean re-bootstrapping, which is a
+# larger change than this service needs. Restart the unit after an activation
+# to pick up new watchdog code.
+ExecStart=%h/.local/lib/session-kit/current/bin/session_kit_watchdog
+Restart=always
+RestartSec=30s
+# The repair path closes and relaunches a session. Never let a stop signal
+# interrupt one mid-flight.
+KillSignal=SIGTERM
+TimeoutStopSec=120s
+
+[Install]
+WantedBy=default.target

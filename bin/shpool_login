@@ -1,0 +1,1674 @@
+#!/usr/bin/env bash
+# Guided SSH login picker. All session actions are delegated to proof-bound `sp` commands.
+
+set -u
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+# shellcheck source=session_kit_common
+source "$SCRIPT_DIR/session_kit_common"
+
+STATUS_CMD=${SESSION_KIT_STATUS_CMD:-"$SCRIPT_DIR/shpool_status"}
+SP_CMD=${SESSION_KIT_SP_CMD:-"$SCRIPT_DIR/sp"}
+
+if [[ ! -t 0 || ! -t 1 || ${SESSION_KIT_NONINTERACTIVE:-0} == 1 ]]; then
+  exit 2
+fi
+[[ -x $STATUS_CMD && -x $SP_CMD ]] || exit 1
+sk_require_shpool || exit 1
+sk_prepare_state || exit 1
+
+SNAPSHOT=""
+VIEW=""
+RECOVERY=""
+QUERY=""
+PAGE=1
+PAGE_SIZE=1
+TEMP_FILES=()
+NEW_TEMP=""
+PICKER_STYLE=0
+PICKER_BOLD=""
+PICKER_GREEN=""
+PICKER_RESET=""
+
+if [[ -t 1 &&
+      -n ${TERM:-} &&
+      ${TERM,,} != dumb &&
+      ! -v NO_COLOR &&
+      ! -v SESSION_KIT_NO_COLOR ]]; then
+  PICKER_STYLE=1
+  PICKER_BOLD=$'\033[1m'
+  PICKER_GREEN=$'\033[32m'
+  PICKER_RESET=$'\033[0m'
+fi
+
+picker_bold() {
+  if (( PICKER_STYLE )); then
+    printf '%s%s%s' "$PICKER_BOLD" "$1" "$PICKER_RESET"
+  else
+    printf '%s' "$1"
+  fi
+}
+
+picker_green() {
+  if (( PICKER_STYLE )); then
+    printf '%s%s%s%s' "$PICKER_BOLD" "$PICKER_GREEN" "$1" "$PICKER_RESET"
+  else
+    printf '%s' "$1"
+  fi
+}
+
+cleanup() {
+  local path
+  for path in "${TEMP_FILES[@]}"; do
+    [[ -z $path || ! -f $path ]] || command rm -- "$path"
+  done
+}
+trap cleanup EXIT
+trap 'exit 2' HUP INT TERM
+
+new_temp() {
+  local label=$1 path
+  path=$(mktemp "$SK_STATE_DIR/${label}.XXXXXX.json") || return 1
+  chmod 600 "$path" || {
+    command rm -- "$path"
+    return 1
+  }
+  TEMP_FILES+=("$path")
+  NEW_TEMP=$path
+}
+
+refresh_snapshot() {
+  local fresh
+  new_temp login-snapshot || return 1
+  fresh=$NEW_TEMP
+  if ! "$STATUS_CMD" --json > "$fresh"; then
+    command rm -- "$fresh"
+    return 1
+  fi
+  SNAPSHOT=$fresh
+  QUERY=""
+  PAGE=1
+  build_view
+}
+
+build_view() {
+  local fresh
+  new_temp login-view || return 1
+  fresh=$NEW_TEMP
+  if ! python3 - "$SNAPSHOT" "$fresh" "$QUERY" <<'PY'
+import json
+import os
+import re
+import sys
+import unicodedata
+
+source, destination, query = sys.argv[1:4]
+with open(source, encoding="utf-8") as handle:
+    data = json.load(handle)
+
+needle = query.casefold()
+provider_order = {"claude": 0, "codex": 1, "shell": 2, "unknown": 3}
+availability_order = {"ready": 0, "attached": 1}
+
+def clean(value, limit=4096):
+    text = str(value or "")
+    text = "".join(
+        " " if unicodedata.category(character).startswith("C") else character
+        for character in text
+    )
+    return " ".join(text.split())[:limit]
+
+def matches(row):
+    identity = row.get("identity") or {}
+    fields = (
+        row.get("shpool_id"),
+        row.get("provider"),
+        row.get("display_provider"),
+        row.get("title"),
+        row.get("display_title"),
+        row.get("native_title"),
+        row.get("cwd"),
+        identity.get("uuid"),
+        row.get("terminal_number"),
+    )
+    return not needle or any(needle in str(value or "").casefold() for value in fields)
+
+def natural_id(value):
+    return tuple(
+        int(part) if part.isdigit() else part.casefold()
+        for part in re.split(r"([0-9]+)", str(value or ""))
+    )
+
+rows = []
+for original in data.get("sessions", []):
+    if not isinstance(original, dict) or not matches(original):
+        continue
+    row = dict(original)
+    number = row.get("terminal_number")
+    if (
+        isinstance(number, bool)
+        or not isinstance(number, int)
+        or number <= 0
+    ):
+        continue
+    rows.append(row)
+
+rows.sort(
+    key=lambda row: (
+        availability_order.get(row.get("availability"), 9),
+        not bool(row.get("needs_you")),
+        provider_order.get(
+            row.get("display_provider") or row.get("provider"), 9
+        ),
+        row.get("recent_output_at_unix_ms") is None,
+        -(row.get("recent_output_at_unix_ms") or 0),
+        natural_id(row.get("shpool_id_raw")),
+    )
+)
+for row in rows:
+    row["title"] = clean(row.get("title"), 120)
+    row["display_title"] = clean(
+        row.get("display_title") or row.get("title"), 120
+    )
+    row["display_shpool_id"] = clean(
+        row.get("display_shpool_id") or row.get("shpool_id"), 96
+    )
+    row["native_title"] = clean(row.get("native_title"), 120)
+
+outside = []
+for original in data.get("outside_agents", []):
+    if not isinstance(original, dict) or not matches(original):
+        continue
+    item = dict(original)
+    item["title"] = clean(item.get("title"), 120)
+    item["display_title"] = clean(
+        item.get("display_title") or item.get("title"), 120
+    )
+    item["cwd"] = clean(item.get("cwd"), 4096)
+    outside.append(item)
+outside.sort(
+    key=lambda item: (
+        provider_order.get(
+            item.get("display_provider") or item.get("provider"), 9
+        ),
+        str(item.get("display_title") or "").casefold(),
+        str((item.get("identity") or {}).get("uuid") or ""),
+    )
+)
+
+projected = dict(data)
+projected["sessions"] = rows
+projected["outside_agents"] = outside
+projected["_picker"] = {
+    "query": query,
+    "source_total": len(data.get("sessions", [])),
+    "source_outside_total": len(data.get("outside_agents", [])),
+}
+with open(destination, "w", encoding="utf-8") as handle:
+    json.dump(projected, handle, sort_keys=True, separators=(",", ":"))
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+os.chmod(destination, 0o600)
+PY
+  then
+    command rm -- "$fresh"
+    return 1
+  fi
+  VIEW=$fresh
+}
+
+terminal_height() {
+  local height=${LINES:-}
+  if [[ ! $height =~ ^[0-9]+$ ]]; then
+    height=$(tput lines 2>/dev/null || true)
+  fi
+  [[ $height =~ ^[0-9]+$ ]] || height=24
+  (( height >= 12 )) || height=12
+  (( height <= 200 )) || height=200
+  printf '%s\n' "$height"
+}
+
+page_size() {
+  local pending=${1:-0} banner=${2:-0} height
+  height=$(terminal_height)
+  python3 - "$VIEW" "$height" "$pending" "$banner" <<'PY'
+import json
+import sys
+
+path, height_text, pending_text, banner_text = sys.argv[1:5]
+height = int(height_text)
+has_recovery = pending_text.isdigit() and int(pending_text) > 0
+banner_lines = int(banner_text) if banner_text.isdigit() else 0
+with open(path, encoding="utf-8") as handle:
+    data = json.load(handle)
+rows = data.get("sessions", [])
+outside = data.get("outside_agents", [])
+picker = data.get("_picker") or {}
+total = len(rows)
+
+def page_lines(first, last, paged):
+    selected = rows[first:min(last, len(rows))]
+
+    # Summary/search, optional other-provider shortcut/stale notices.
+    lines = 2 if picker.get("query") else 1
+    if outside:
+        lines += 1
+    if data.get("stale"):
+        lines += 1
+
+    previous_availability = None
+    previous_attention = None
+    previous_provider = None
+    for row in selected:
+        availability = row.get("availability")
+        attention = bool(row.get("needs_you"))
+        provider = str(
+            row.get("display_provider") or row.get("provider") or "unknown"
+        )
+        if availability != previous_availability:
+            lines += 1  # action heading
+            previous_availability = availability
+            previous_attention = None
+            previous_provider = None
+        if attention != previous_attention:
+            previous_attention = attention
+            previous_provider = None
+        if provider != previous_provider:
+            lines += 1
+            previous_provider = provider
+        lines += 1
+
+    if not selected:
+        lines += 1
+    if paged:
+        lines += 1
+    if has_recovery:
+        lines += 1
+    lines += banner_lines  # watchdog repair notice
+    lines += 3  # spacer and two compact help lines
+    lines += 1  # input prompt
+    return lines
+
+if total == 0:
+    print(1)
+    raise SystemExit
+
+for size in range(total, 0, -1):
+    pages = (total + size - 1) // size
+    if all(
+        page_lines(first, min(first + size, total), pages > 1) <= height
+        for first in range(0, total, size)
+    ):
+        print(size)
+        break
+else:
+    # Very short terminals still get one item and can scroll safely.
+    print(1)
+PY
+}
+
+view_item_count() {
+  python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(len(d.get("sessions",[])))' "$VIEW"
+}
+
+page_count() {
+  local total
+  total=$(view_item_count)
+  printf '%s\n' "$(( total == 0 ? 1 : (total + PAGE_SIZE - 1) / PAGE_SIZE ))"
+}
+
+clamp_page() {
+  local pages
+  pages=$(page_count)
+  (( PAGE >= 1 )) || PAGE=1
+  (( PAGE <= pages )) || PAGE=$pages
+}
+
+number_on_page() {
+  local number=$1
+  [[ $number =~ ^[0-9]+$ ]] || return 1
+  python3 - "$VIEW" "$PAGE" "$PAGE_SIZE" "$number" <<'PY'
+import json
+import sys
+
+path, page_text, size_text, wanted_text = sys.argv[1:5]
+page, page_size = int(page_text), int(size_text)
+wanted = int(wanted_text)
+with open(path, encoding="utf-8") as handle:
+    data = json.load(handle)
+rows = data.get("sessions", [])
+item_count = len(rows)
+pages = max(1, (item_count + page_size - 1) // page_size)
+page = min(max(page, 1), pages)
+first = (page - 1) * page_size
+last = first + page_size
+selected = rows[first:min(last, len(rows))]
+matches = [
+    row
+    for row in selected
+    if row.get("terminal_number") == wanted
+]
+raise SystemExit(0 if len(matches) == 1 else 1)
+PY
+}
+
+render_page() {
+  python3 - "$VIEW" "$PAGE" "$PAGE_SIZE" "$PICKER_STYLE" <<'PY'
+import json
+import os
+import shutil
+import sys
+import unicodedata
+
+path, page_text, size_text, style_text = sys.argv[1:5]
+page, page_size = int(page_text), int(size_text)
+style_enabled = style_text == "1"
+with open(path, encoding="utf-8") as handle:
+    data = json.load(handle)
+rows = data.get("sessions", [])
+picker = data.get("_picker") or {}
+source_total = int(picker.get("source_total") or 0)
+query = str(picker.get("query") or "")
+ready = sum(row.get("availability") == "ready" for row in rows)
+attached = sum(row.get("availability") == "attached" for row in rows)
+item_count = len(rows)
+pages = max(1, (item_count + page_size - 1) // page_size)
+page = min(max(page, 1), pages)
+first = (page - 1) * page_size
+last = first + page_size
+selected = rows[first:min(last, len(rows))]
+terminal_columns = max(
+    1, shutil.get_terminal_size(fallback=(100, 24)).columns
+)
+width = max(1, min(239, terminal_columns - 1))
+# Long enough that no normal pause reaches it. Codex sessions report "running"
+# for their entire life, working or waiting, so a short threshold would label
+# every parked session and the warning would stop meaning anything.
+stall_seconds = 2700
+_raw_stall = os.environ.get("SESSION_KIT_STALL_SECONDS", "")
+if _raw_stall.isdigit() and int(_raw_stall) > 0:
+    stall_seconds = int(_raw_stall)
+provider_labels = {
+    "claude": "Claude",
+    "codex": "Codex",
+    "shell": "Shell",
+    "unknown": "Unknown",
+}
+BOLD = "\033[1m"
+GREEN = "\033[32m"
+CYAN = "\033[36m"
+YELLOW = "\033[33m"
+RESET = "\033[0m"
+
+def style(text, *codes):
+    if not style_enabled or not text:
+        return text
+    return "".join(codes) + text + RESET
+
+def display_width(text):
+    return sum(
+        0 if unicodedata.combining(character)
+        else 2 if unicodedata.east_asian_width(character) in {"W", "F"}
+        else 1
+        for character in text
+    )
+
+def clean_display(text):
+    text = "".join(
+        " " if unicodedata.category(character).startswith("C") else character
+        for character in str(text or "")
+    )
+    return " ".join(text.split())
+
+def shorten(text, room):
+    text = clean_display(text)
+    if display_width(text) <= room:
+        return text
+    kept = []
+    used = 0
+    for character in text:
+        cells = display_width(character)
+        if used + cells > max(0, room - 1):
+            break
+        kept.append(character)
+        used += cells
+    return "".join(kept) + "…"
+
+def provider_label(item):
+    provider = str(
+        item.get("display_provider")
+        or item.get("provider")
+        or "unknown"
+    ).casefold()
+    return provider_labels.get(provider, "Unknown")
+
+def age(seconds):
+    if seconds < 60:
+        return "now"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
+    return f"{seconds // 86400}d {(seconds % 86400) // 3600}h"
+
+if query:
+    match_word = "match" if len(rows) == 1 else "matches"
+    session_word = "session" if source_total == 1 else "sessions"
+    summary = f"{len(rows)} {match_word} of {source_total} {session_word} · {ready} ready here · {attached} open elsewhere"
+    print("  " + style(shorten(summary, max(1, width - 2)), BOLD))
+    search_label = "Search:"
+    search_value = shorten(query, max(1, width - 2 - len(search_label) - 1))
+    print("  " + style(search_label, BOLD) + " " + search_value)
+else:
+    session_word = "session" if len(rows) == 1 else "sessions"
+    summary = f"{len(rows)} {session_word} · {ready} ready here · {attached} open elsewhere"
+    print("  " + style(shorten(summary, max(1, width - 2)), BOLD))
+if data.get("stale"):
+    source = str(data.get("source") or "").casefold()
+    source_label = {
+        "cache": "cached",
+        "cached": "cached",
+        "last-known-good": "last-known-good cached",
+    }.get(source, "cached")
+    warning = f"Warning: showing {source_label} inventory; actions are disabled."
+    print("  " + style(shorten(warning, max(1, width - 2)), BOLD, YELLOW))
+if not selected:
+    print("  No matches.")
+if selected:
+    rendered_rows = []
+    for row in selected:
+        number = row.get("terminal_number")
+        if (
+            isinstance(number, bool)
+            or not isinstance(number, int)
+            or number <= 0
+        ):
+            continue
+        title = row.get("display_title") or row.get("title") or ""
+        details = []
+        needs_attention = bool(row.get("needs_you"))
+        warning_status = False
+        if row.get("setup_incomplete"):
+            primary_status = "! setup incomplete"
+            warning_status = True
+        elif row.get("needs_you"):
+            primary_status = "! needs your reply"
+            warning_status = True
+        elif row.get("reply_optional"):
+            primary_status = "reply optional"
+        else:
+            primary_status = clean_display(
+                row.get("agent_status") or "state unavailable"
+            )
+            if primary_status.casefold() == "state unavailable":
+                primary_status = "status unavailable"
+        recent_age = row.get("recent_output_age_seconds")
+        has_age = isinstance(recent_age, int) and not isinstance(recent_age, bool)
+        age_text = age(max(0, recent_age)) if has_age else ""
+        if not warning_status and primary_status.casefold() != "reply optional":
+            if (
+                primary_status.casefold() in {"running", "working"}
+                and has_age
+                and recent_age >= stall_seconds
+            ):
+                primary_status = f"quiet {age_text}"
+        details.append(primary_status)
+        if (
+            has_age
+            and 60 <= recent_age < stall_seconds
+            and not primary_status.casefold().startswith("quiet ")
+        ):
+            details.append(f"last output {age_text}")
+        automatic_name_state = str(
+            row.get("automatic_name_state") or ""
+        ).casefold()
+        if automatic_name_state in {"pending", "failed"}:
+            name_detail = f"name {automatic_name_state}"
+            if needs_attention or primary_status.casefold().startswith("quiet "):
+                details.append(name_detail)
+            else:
+                details.insert(0, name_detail)
+            if automatic_name_state == "failed":
+                warning_status = True
+        status_details = (
+            [primary_status]
+            if needs_attention
+            else [
+                detail
+                for detail in details
+                if not detail.startswith("last output ")
+            ]
+        )
+        agents = len(row.get("subagents") or [])
+        if agents:
+            details.append(f"{agents} subagent{'s' if agents != 1 else ''}")
+        # Narrow terminals drop the subagent count first and the spelled-out
+        # age second. How long a session has been quiet is the one thing that
+        # is never dropped.
+        compact_details = [
+            detail
+            for detail in details
+            if not detail.endswith("subagent") and not detail.endswith("subagents")
+        ]
+        rendered_rows.append(
+            (
+                row,
+                number,
+                title,
+                " | ".join(details),
+                " | ".join(compact_details),
+                " | ".join(status_details),
+                needs_attention,
+                warning_status,
+            )
+        )
+    number_width = max(3, max(len(str(item[1])) for item in rendered_rows))
+    prefix_width = len("        ") + number_width
+    available_width = max(1, width - prefix_width)
+    ideal_label_width = max(display_width(item[2]) for item in rendered_rows)
+    # Optional subagent counts never take width away from titles or the primary
+    # status. They are included only when the compact row already has room.
+    ideal_detail_width = max(display_width(item[4]) for item in rendered_rows)
+    if ideal_label_width + 3 + ideal_detail_width <= available_width:
+        label_width = ideal_label_width
+    else:
+        detail_reserve = min(ideal_detail_width, max(18, available_width // 3))
+        label_width = max(8, available_width - 3 - detail_reserve)
+
+    previous_availability = None
+    previous_attention = None
+    previous_provider = None
+    for row, number, title, details, compact_details, status_details, needs_attention, warning_status in rendered_rows:
+        availability = row.get("availability")
+        provider = provider_label(row)
+        if availability != previous_availability:
+            heading = (
+                "Ready to open"
+                if availability == "ready"
+                else "Open elsewhere"
+            )
+            print("  " + style(heading, BOLD))
+            previous_availability = availability
+            previous_attention = None
+            previous_provider = None
+        if needs_attention != previous_attention:
+            previous_attention = needs_attention
+            previous_provider = None
+        if provider != previous_provider:
+            if needs_attention:
+                heading = (
+                    style("Needs your reply", BOLD, YELLOW)
+                    + " · "
+                    + style(provider, BOLD, CYAN)
+                )
+            else:
+                heading = style(provider, BOLD, CYAN)
+            print("    " + heading)
+            previous_provider = provider
+        number_text = f"{number:>{number_width}}"
+        prefix = f"      {number_text}  "
+        compact_label = shorten(title, label_width)
+        compact_label += " " * max(0, label_width - display_width(compact_label))
+        detail_room = max(
+            1,
+            width - display_width(prefix) - label_width - 3,
+        )
+        if compact_details and display_width(details) > detail_room:
+            details = compact_details
+        if status_details and display_width(details) > detail_room:
+            details = status_details
+        detail_text = shorten(details, detail_room)
+        if warning_status:
+            detail_text = style(detail_text, BOLD, YELLOW)
+        styled_prefix = "      " + style(number_text, BOLD, GREEN) + "  "
+        print(styled_prefix + compact_label + " | " + detail_text)
+if pages > 1:
+    directions = []
+    if page > 1:
+        directions.append("prev")
+    if page < pages:
+        directions.append("next")
+    page_label = f"Page {page}/{pages}"
+    styled_directions = [style(item, BOLD, CYAN) for item in directions]
+    print("  " + style(page_label, BOLD) + " | " + " | ".join(styled_directions))
+PY
+}
+
+# Sessions the watchdog repaired while nobody was here. Shown once, then
+# marked as seen, so the human always learns what changed even when every
+# notification path was down.
+REPAIR_FILE=${SESSION_KIT_WATCHDOG_REPAIRS:-"$SK_STATE_DIR/watchdog-repairs.json"}
+REPAIR_BANNER=""
+REPAIR_BANNER_LINES=0
+
+# Read once per picker run and mark as seen, so the message survives every
+# redraw of this session but is not repeated at the next login.
+load_repair_banner() {
+  [[ -r $REPAIR_FILE ]] || return 0
+  REPAIR_BANNER=$(read_repair_banner) || REPAIR_BANNER=""
+  if [[ -n $REPAIR_BANNER ]]; then
+    REPAIR_BANNER_LINES=$(printf '%s\n' "$REPAIR_BANNER" | wc -l)
+  fi
+}
+
+show_repair_banner() {
+  [[ -n $REPAIR_BANNER ]] || return 0
+  printf '%s\n' "$REPAIR_BANNER"
+}
+
+read_repair_banner() {
+  python3 - "$REPAIR_FILE" <<'PY' || true
+import json
+import os
+import sys
+
+path = sys.argv[1]
+try:
+    with open(path, encoding="utf-8") as handle:
+        data = json.load(handle)
+    entries = data["repairs"]
+    if not isinstance(entries, list):
+        raise ValueError
+except (OSError, ValueError, KeyError):
+    sys.exit(0)
+
+unseen = [
+    item
+    for item in entries
+    if isinstance(item, dict) and not item.get("acknowledged")
+]
+if not unseen:
+    sys.exit(0)
+
+for item in unseen[-3:]:
+    title = str(item.get("title") or item.get("old_shpool_id") or "a session")
+    if item.get("outcome") == "repaired":
+        print(f'  Recovered while you were away: "{title}" had stopped working; its conversation continues in a new session.')
+    else:
+        print(f'  Needs you: "{title}" stopped working and could not be recovered automatically.')
+extra = len(unseen) - 3
+if extra > 0:
+    print(f"  ({extra} more repair{'s' if extra != 1 else ''} in the log.)")
+
+for item in entries:
+    if isinstance(item, dict):
+        item["acknowledged"] = True
+tmp = f"{path}.tmp.{os.getpid()}"
+try:
+    descriptor = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        json.dump({"schema_version": 1, "repairs": entries}, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    os.replace(tmp, path)
+except OSError:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+PY
+}
+
+render_main() {
+  local pending other_count
+  pending=$(recovery_count 2>/dev/null || printf '0')
+  [[ $pending =~ ^[0-9]+$ ]] || pending=0
+  other_count=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1])).get("outside_agents",[])))' "$VIEW" 2>/dev/null || printf '0')
+  [[ $other_count =~ ^[0-9]+$ ]] || other_count=0
+  PAGE_SIZE=$(page_size "$pending" "$REPAIR_BANNER_LINES")
+  clamp_page
+  render_page
+  if (( other_count > 0 )); then
+    printf '  Other provider sessions: %s | %s: read-only view\n' \
+      "$other_count" "$(picker_green o)"
+  fi
+  if (( pending > 0 )); then
+    printf '  %s: %s conversation%s | %s: review\n' \
+      "$(picker_bold Recovery)" "$pending" \
+      "$([[ $pending == 1 ]] && printf '' || printf 's')" \
+      "$(picker_green u)"
+  fi
+  show_repair_banner
+  echo
+  printf '  Open: %s · New: %s · Close: %s number\n' \
+    "$(picker_green number)" "$(picker_green n)" "$(picker_green x)"
+  printf '  Terminal: %s · Search: %s · Help: %s\n' \
+    "$(picker_green Enter)" "$(picker_green /text)" "$(picker_green '?')"
+}
+
+show_other_provider_sessions() {
+  python3 - "$VIEW" <<'PY'
+import json
+import os
+import re
+import shutil
+import sys
+import unicodedata
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    data = json.load(handle)
+rows = data.get("outside_agents", [])
+width = max(1, min(239, shutil.get_terminal_size(fallback=(100, 24)).columns - 1))
+
+def clean(value):
+    text = "".join(
+        " " if unicodedata.category(character).startswith("C") else character
+        for character in str(value or "")
+    )
+    return " ".join(text.split())
+
+def cells(text):
+    return sum(
+        0 if unicodedata.combining(character)
+        else 2 if unicodedata.east_asian_width(character) in {"W", "F"}
+        else 1
+        for character in text
+    )
+
+def shorten(text, room):
+    text = clean(text)
+    if cells(text) <= room:
+        return text
+    kept = []
+    used = 0
+    for character in text:
+        size = cells(character)
+        if used + size > max(0, room - 1):
+            break
+        kept.append(character)
+        used += size
+    return "".join(kept) + "…"
+
+def project_hint(value):
+    path = clean(value)
+    if not path.startswith("/"):
+        return ""
+    parts = [part for part in path.split("/") if part]
+    account_names = {
+        parts[index + 1].casefold()
+        for index, part in enumerate(parts[:-1])
+        if part.casefold() in {"home", "users"}
+    }
+    account_names.add(os.path.basename(os.path.expanduser("~")).casefold())
+    generic = {
+        "app", "apps", "code", "current", "home", "repo", "repos", "src",
+        "srv", "users", "v2", "var", "workspace", "workspaces",
+    }
+    for part in reversed(parts):
+        folded = part.casefold()
+        if (
+            part
+            and not part.startswith(".")
+            and folded not in generic
+            and folded not in account_names
+        ):
+            return part
+    return ""
+
+def private_names(value):
+    path = clean(value)
+    parts = [part for part in path.split("/") if part] if path.startswith("/") else []
+    names = {
+        parts[index + 1]
+        for index, part in enumerate(parts[:-1])
+        if part.casefold() in {"home", "users"}
+    }
+    home_name = os.path.basename(os.path.expanduser("~"))
+    if home_name:
+        names.add(home_name)
+    return {name for name in names if name}
+
+def safe_title(value, cwd, fallback):
+    title = clean(value)
+    path = clean(cwd)
+    hint = project_hint(cwd)
+    if path:
+        title = title.replace(path, hint or fallback)
+    for name in sorted(private_names(cwd), key=len, reverse=True):
+        title = re.sub(re.escape(name), "account", title, flags=re.IGNORECASE)
+    return clean(title) or fallback
+
+print()
+print("  Other provider sessions")
+if data.get("stale"):
+    print("  Last-known provider roots outside the session manager; they are not confirmed live or attachable here.")
+else:
+    print("  Detected live provider roots outside the session manager; they are not attachable here.")
+if not rows:
+    print("  No matching other provider sessions.")
+else:
+    previous_provider = None
+    labels = {"claude": "Claude", "codex": "Codex"}
+    for row in rows:
+        provider = labels.get(
+            str(row.get("display_provider") or row.get("provider") or "").casefold(),
+            "Unknown",
+        )
+        if provider != previous_provider:
+            print(f"    {provider}")
+            previous_provider = provider
+        hint = project_hint(row.get("cwd"))
+        title = safe_title(
+            row.get("display_title") or row.get("title"),
+            row.get("cwd"),
+            provider,
+        )
+        detail = "not attachable here"
+        if hint:
+            detail = f"project: {hint} | {detail}"
+        prefix = "      -  "
+        title_room = max(1, width - cells(prefix) - cells(detail) - 3)
+        print(prefix + shorten(title, title_room) + " | " + detail)
+print()
+PY
+  local ignored
+  if ! read -r -p "  Enter: Back ❯ " ignored; then
+    exit 2
+  fi
+}
+
+number_metadata() {
+  local number=$1
+  python3 - "$VIEW" "$number" <<'PY'
+import base64
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    data = json.load(handle)
+wanted = int(sys.argv[2])
+matches = [
+    row
+    for row in data.get("sessions", [])
+    if row.get("terminal_number") == wanted
+]
+if len(matches) != 1:
+    raise SystemExit(2)
+row = matches[0]
+values = (
+    row.get("availability"),
+    "true" if row.get("mutation_allowed") is True else "false",
+    row.get("display_shpool_id"),
+    row.get("provider"),
+    row.get("title"),
+    row.get("shpool_id_raw"),
+    (row.get("identity") or {}).get("uuid"),
+    (row.get("identity") or {}).get("confidence"),
+)
+for value in values:
+    print(base64.b64encode(str(value or "").encode()).decode())
+PY
+}
+
+decode64() {
+  printf '%s' "$1" | base64 -d
+}
+
+create_proof() {
+  local number=$1
+  python3 - "$VIEW" "$number" "$SK_STATE_DIR" <<'PY'
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+import tempfile
+
+view_path, number_text, state_dir = sys.argv[1:4]
+with open(view_path, encoding="utf-8") as handle:
+    data = json.load(handle)
+if data.get("stale") or data.get("source") != "live":
+    raise SystemExit(3)
+wanted = int(number_text)
+matches = [
+    row
+    for row in data.get("sessions", [])
+    if row.get("terminal_number") == wanted
+]
+if len(matches) != 1:
+    raise SystemExit(2)
+row = matches[0]
+if row.get("mutation_allowed") is not True:
+    raise SystemExit(3)
+identity = row.get("identity") or {}
+shell = row.get("shpool_shell") or {}
+daemon = data.get("daemon_generation") or {}
+proof = {
+    "daemon_pid": daemon.get("pid"),
+    "daemon_process_start_ticks": daemon.get("process_start_ticks"),
+    "proof_type": "session-kit-picker-session-v1",
+    "provider": row.get("provider"),
+    "provider_pid": identity.get("pid"),
+    "provider_process_start_ticks": identity.get("process_start_ticks"),
+    "schema_version": 1,
+    "shell_pid": shell.get("pid"),
+    "shell_process_start_ticks": shell.get("process_start_ticks"),
+    "shpool_id": row.get("shpool_id_raw"),
+    "started_at_unix_ms": row.get("started_at_unix_ms"),
+    "uuid": identity.get("uuid") or "",
+}
+payload = (json.dumps(proof, sort_keys=True, separators=(",", ":")) + "\n").encode()
+descriptor, name = tempfile.mkstemp(prefix="picker-proof.", suffix=".json", dir=state_dir)
+try:
+    os.fchmod(descriptor, 0o600)
+    with os.fdopen(descriptor, "wb") as handle:
+        descriptor = -1
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+    metadata = os.lstat(name)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_uid != os.geteuid()
+    ):
+        raise OSError("unsafe proof")
+    print(name)
+except BaseException:
+    if descriptor >= 0:
+        os.close(descriptor)
+    try:
+        os.unlink(name)
+    except OSError:
+        pass
+    raise
+PY
+}
+
+run_proof_action() {
+  local command=$1 number=$2
+  shift 2
+  local proof status
+  proof=$(create_proof "$number") || {
+    echo "  The displayed session is stale or unsafe. Nothing changed."
+    return 1
+  }
+  TEMP_FILES+=("$proof")
+  "$SP_CMD" "$command" "$proof" "$@"
+  status=$?
+  command rm -f -- "$proof"
+  if (( status != 0 )); then
+    # The caller explains the failure itself when it has something better to
+    # say than a bare refusal.
+    if [[ ${PROOF_ACTION_QUIET:-0} != 1 ]]; then
+      echo "  The action was refused. Nothing changed."
+    fi
+    return "$status"
+  fi
+}
+
+# A session whose terminal died inside shpool can never be opened again: the
+# shell and its work are unreachable, but the conversation itself is safe on
+# disk. Say that in plain words and offer the one action that fixes it.
+offer_recovery() {
+  local number=$1 metadata
+  metadata=$(number_metadata "$number") || return 0
+  local -a fields=()
+  mapfile -t fields <<<"$metadata"
+  (( ${#fields[@]} == 8 )) || return 0
+  local display_id provider title uuid
+  display_id=$(decode64 "${fields[2]}")
+  provider=$(decode64 "${fields[3]}")
+  title=$(decode64 "${fields[4]}")
+  uuid=$(decode64 "${fields[6]}")
+
+  echo
+  printf '  %s [%s] could not be opened.\n' "$title" "$display_id"
+  echo "  Its terminal died inside the session manager, so this session cannot be reopened."
+  if [[ ( $provider != claude && $provider != codex ) || -z $uuid ]]; then
+    echo "  There is no saved conversation to move, so nothing can be recovered from it."
+    echo "  Close it with x $number when you no longer need it."
+    return 0
+  fi
+  echo "  The conversation itself is saved and can continue in a new session."
+  echo
+  echo "  1  Continue this conversation in a new session (this one is closed)"
+  echo "  2  View its full terminal history"
+  echo "  Enter  Leave it alone"
+  echo
+  local action
+  while true; do
+    if ! read -r -p "  action ❯ " action; then
+      exit 2
+    fi
+    case "$action" in
+      "") return 0 ;;
+      1)
+        echo "  Moving the conversation to a new session…"
+        run_proof_action picker-recover "$number" || true
+        return 0
+        ;;
+      2)
+        run_proof_action picker-history "$number" || true
+        return 0
+        ;;
+      *) echo "  Choose 1, 2, or Enter." ;;
+    esac
+  done
+}
+
+refresh_after_action() {
+  if ! refresh_snapshot; then
+    echo "  Live sessions could not be refreshed. Returning to a regular terminal."
+    exit 2
+  fi
+}
+
+choose_number() {
+  local number=$1 metadata
+  number_on_page "$number" || {
+    echo "  Choose a number shown here. Nothing changed."
+    return
+  }
+  metadata=$(number_metadata "$number") || {
+    echo "  The displayed row changed format. Nothing changed."
+    return
+  }
+  local -a fields=()
+  mapfile -t fields <<<"$metadata"
+  if (( ${#fields[@]} != 8 )); then
+    echo "  The displayed row changed format. Nothing changed."
+    return
+  fi
+  local availability mutation display_id provider title
+  availability=$(decode64 "${fields[0]}")
+  mutation=$(decode64 "${fields[1]}")
+  display_id=$(decode64 "${fields[2]}")
+  provider=$(decode64 "${fields[3]}")
+  title=$(decode64 "${fields[4]}")
+  if [[ $mutation != true ]]; then
+    printf '  %s is display-only. Nothing changed.\n' "$display_id"
+    return
+  fi
+  if [[ $availability == ready ]]; then
+    local open_status=0
+    PROOF_ACTION_QUIET=1 run_proof_action picker-open "$number" || open_status=$?
+    if (( open_status != 0 )); then
+      offer_recovery "$number"
+    fi
+    refresh_after_action
+    return
+  fi
+
+  while true; do
+    echo
+    printf '  %s [%s]\n' "$title" "$display_id"
+    echo "  Already open in another SSH window."
+    echo
+    echo "  1  Move it here (the other window disconnects)"
+    echo "  2  View full terminal history"
+    echo "  3  Close it (the shell and everything inside will end)"
+    echo "  Enter  Back"
+    echo
+    local action
+    if ! read -r -p "  action ❯ " action; then
+      exit 2
+    fi
+    case "$action" in
+      "") return ;;
+      1)
+        run_proof_action picker-takeover "$number" || true
+        refresh_after_action
+        return
+        ;;
+      2)
+        run_proof_action picker-history "$number" || true
+        refresh_after_action
+        return
+        ;;
+      3)
+        run_proof_action picker-close "$number" || true
+        refresh_after_action
+        return
+        ;;
+      *) echo "  Unknown choice. Nothing changed." ;;
+    esac
+  done
+}
+
+direct_close() {
+  local number=$1
+  number_on_page "$number" || {
+    echo "  Choose a number shown here. Nothing changed."
+    return
+  }
+  run_proof_action picker-close "$number" || true
+  refresh_after_action
+}
+
+rename_number() {
+  local number=$1 metadata provider
+  number_on_page "$number" || {
+    echo "  Choose a number shown here. Nothing changed."
+    return
+  }
+  metadata=$(number_metadata "$number") || return
+  local -a fields=()
+  mapfile -t fields <<<"$metadata"
+  if (( ${#fields[@]} != 8 )); then
+    echo "  The displayed row changed format. Nothing changed."
+    return
+  fi
+  provider=$(decode64 "${fields[3]}")
+  if [[ $provider != claude && $provider != codex ]]; then
+    echo "  Only Claude and Codex conversations can have a custom name."
+    return
+  fi
+  local title
+  if ! read -r -p "  New name (Enter: cancel) ❯ " title; then
+    exit 2
+  fi
+  [[ -n ${title//[[:space:]]/} ]] || {
+    echo "  Rename cancelled."
+    return
+  }
+  run_proof_action picker-name "$number" "$title" || true
+  refresh_after_action
+}
+
+reset_name_number() {
+  local number=$1 metadata provider uuid confidence
+  number_on_page "$number" || {
+    echo "  Choose a number shown here. Nothing changed."
+    return
+  }
+  metadata=$(number_metadata "$number") || return
+  local -a fields=()
+  mapfile -t fields <<<"$metadata"
+  if (( ${#fields[@]} != 8 )); then
+    echo "  The displayed row changed format. Nothing changed."
+    return
+  fi
+  provider=$(decode64 "${fields[3]}")
+  uuid=$(decode64 "${fields[6]}")
+  confidence=$(decode64 "${fields[7]}")
+  if [[ ( $provider != claude && $provider != codex ) ||
+        $confidence != exact || -z $uuid ]]; then
+    echo "  Only exact Claude and Codex conversations can reset a custom name."
+    return
+  fi
+  run_proof_action picker-name-reset "$number" || true
+  refresh_after_action
+}
+
+fork_number() {
+  local number=$1 metadata provider uuid confidence
+  number_on_page "$number" || {
+    echo "  Choose a number shown here. Nothing changed."
+    return
+  }
+  metadata=$(number_metadata "$number") || return
+  local -a fields=()
+  mapfile -t fields <<<"$metadata"
+  if (( ${#fields[@]} != 8 )); then
+    echo "  The displayed row changed format. Nothing changed."
+    return
+  fi
+  provider=$(decode64 "${fields[3]}")
+  uuid=$(decode64 "${fields[6]}")
+  confidence=$(decode64 "${fields[7]}")
+  if [[ ( $provider != claude && $provider != codex ) ||
+        $confidence != exact || -z $uuid ]]; then
+    echo "  Only exact Claude and Codex conversations can be forked."
+    return
+  fi
+  run_proof_action picker-fork "$number" || true
+  refresh_after_action
+}
+
+project_file() {
+  local destination=$1
+  python3 - "$SK_PROJECTS_FILE" "$destination" <<'PY'
+import json
+import os
+from pathlib import Path
+import re
+import sys
+import unicodedata
+
+source, destination = map(Path, sys.argv[1:3])
+projects = []
+if source.is_file() and not source.is_symlink():
+    for line in source.read_text(encoding="utf-8").splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        fields = line.split("\t")
+        if len(fields) < 3:
+            continue
+        alias, configured_provider, cwd = fields[:3]
+        if (
+            re.fullmatch(r"[a-z0-9_-]+", alias)
+            and configured_provider in {"claude", "codex", "shell"}
+            and cwd.startswith("/")
+            and not any(
+                unicodedata.category(character).startswith("C")
+                for character in cwd
+            )
+            and os.path.isdir(cwd)
+        ):
+            projects.append({"alias": alias, "cwd": cwd})
+default = next((index for index, row in enumerate(projects, 1) if row["alias"] == "sl"), 1 if projects else None)
+with destination.open("w", encoding="utf-8") as handle:
+    json.dump({"projects": projects, "default": default}, handle, sort_keys=True, separators=(",", ":"))
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+os.chmod(destination, 0o600)
+PY
+}
+
+guided_new() {
+  echo
+  echo "  New session"
+  echo "  1  Claude Code"
+  echo "  2  Codex"
+  echo "  3  Regular managed shell"
+  echo "  Enter  Back"
+  echo
+  local answer provider
+  if ! read -r -p "  provider ❯ " answer; then
+    exit 2
+  fi
+  case "$answer" in
+    "") return ;;
+    1) provider=claude ;;
+    2) provider=codex ;;
+    3) provider=shell ;;
+    *) echo "  Unknown choice. Nothing changed."; return ;;
+  esac
+
+  local projects
+  new_temp login-projects || return
+  projects=$NEW_TEMP
+  project_file "$projects" || {
+    echo "  Project list is unavailable. Nothing started."
+    return
+  }
+  echo
+  python3 - "$projects" <<'PY'
+import json,sys,unicodedata
+d=json.load(open(sys.argv[1]))
+default=d.get("default")
+print("  Project")
+for number,row in enumerate(d.get("projects",[]),1):
+    print(f"  {number:2}  {row['alias']}: {row['cwd']}")
+if default:
+    row=d["projects"][default-1]
+    print(f"  Enter  Use {row['alias']}: {row['cwd']} | b  Back")
+else:
+    print("  Enter  Current directory | b  Back")
+PY
+  echo
+  local project_choice project_alias
+  if ! read -r -p "  project ❯ " project_choice; then
+    exit 2
+  fi
+  [[ $project_choice != b && $project_choice != B ]] || return
+  project_alias=$(python3 - "$projects" "$project_choice" <<'PY'
+import json,sys
+d=json.load(open(sys.argv[1]))
+choice=sys.argv[2].strip()
+if not choice:
+    default=d.get("default")
+    if not default:
+        print("")
+        raise SystemExit(0)
+    choice=str(default)
+if not choice.isdigit():
+    raise SystemExit(2)
+number=int(choice)
+rows=d.get("projects",[])
+if number < 1 or number > len(rows):
+    raise SystemExit(2)
+print(rows[number-1]["alias"])
+PY
+) || {
+    echo "  Unknown project. Nothing started."
+    return
+  }
+  if [[ $provider == claude || $provider == codex ]]; then
+    echo "  After exact startup proof, use name <number> to assign an optional conversation name."
+  fi
+  if [[ -n $project_alias ]]; then
+    "$SP_CMD" new "$provider" "$project_alias" || true
+  else
+    "$SP_CMD" new "$provider" || true
+  fi
+  refresh_after_action
+}
+
+recovery_list() {
+  local fresh
+  new_temp login-recovery || return 1
+  fresh=$NEW_TEMP
+  "$STATUS_CMD" --recovery-pending-list > "$fresh" || {
+    command rm -- "$fresh"
+    return 1
+  }
+  RECOVERY=$fresh
+}
+
+recovery_count() {
+  local payload
+  payload=$("$STATUS_CMD" --recovery-pending-list) || return 1
+  python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("entries",[])))' \
+    <<<"$payload"
+}
+
+active_target_for_uuid() {
+  local provider=$1 uuid=$2
+  python3 - "$SNAPSHOT" "$provider" "$uuid" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    data = json.load(handle)
+wanted_provider = sys.argv[2]
+wanted = sys.argv[3].casefold()
+managed = []
+outside = []
+for row in data.get("sessions", []):
+    identity = row.get("identity") or {}
+    if (
+        row.get("provider") == wanted_provider
+        and str(identity.get("uuid") or "").casefold() == wanted
+        and identity.get("confidence") == "exact"
+    ):
+        number = row.get("terminal_number")
+        if (
+            isinstance(number, int)
+            and not isinstance(number, bool)
+            and number > 0
+        ):
+            managed.append(number)
+for row in data.get("outside_agents", []):
+    identity = row.get("identity") or {}
+    if (
+        row.get("provider") == wanted_provider
+        and str(identity.get("uuid") or "").casefold() == wanted
+        and identity.get("confidence") == "exact"
+    ):
+        outside.append(row)
+if len(managed) == 1 and not outside:
+    print(f"managed:{managed[0]}")
+elif not managed and len(outside) == 1:
+    print("outside")
+elif managed or outside:
+    print("ambiguous")
+else:
+    print("none")
+PY
+}
+
+review_recovery() {
+  recovery_list || {
+    echo "  Recovery records are unavailable. Nothing changed."
+    return
+  }
+  local count
+  count=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1])).get("entries",[])))' "$RECOVERY")
+  if (( count == 0 )); then
+    echo "  No conversations are waiting for recovery."
+    return
+  fi
+  echo
+  echo "  Conversations available for exact recovery"
+  python3 - "$RECOVERY" <<'PY'
+import json,sys,unicodedata
+for number,row in enumerate(json.load(open(sys.argv[1])).get("entries",[]),1):
+    provider=str(row.get("provider") or "unknown").title()
+    clean=lambda value: " ".join(
+        "".join(
+            " " if unicodedata.category(character).startswith("C") else character
+            for character in str(value or "")
+        ).split()
+    )
+    title=clean(row.get("title"))
+    old_id=clean(row.get("display_old_shpool_id"))
+    print(f"  {number:2}  [{provider}] {title} [{old_id}]")
+PY
+  echo
+  echo "  numbers/ranges: restore selected | a: restore all"
+  echo "  Enter: Back"
+  echo
+  local answer selected
+  if ! read -r -p "  recovery ❯ " answer; then
+    exit 2
+  fi
+  [[ -n $answer ]] || return
+  selected=$(python3 - "$RECOVERY" "$answer" <<'PY'
+import json,sys
+entries=json.load(open(sys.argv[1])).get("entries",[])
+answer=sys.argv[2].strip().lower()
+if answer == "a":
+    chosen=list(range(1,len(entries)+1))
+else:
+    values=set()
+    for part in answer.split(","):
+        part=part.strip()
+        if not part:
+            raise SystemExit(2)
+        if "-" in part:
+            first,last=part.split("-",1)
+            if not first.isdigit() or not last.isdigit():
+                raise SystemExit(2)
+            a,b=int(first),int(last)
+            if a > b:
+                raise SystemExit(2)
+            values.update(range(a,b+1))
+        elif part.isdigit():
+            values.add(int(part))
+        else:
+            raise SystemExit(2)
+    chosen=sorted(values)
+if any(number < 1 or number > len(entries) for number in chosen):
+    raise SystemExit(2)
+print("\n".join(map(str,chosen)))
+PY
+) || {
+    echo "  Invalid recovery selection. Nothing restored."
+    return
+  }
+
+  local number encoded generation old_id provider uuid cwd launched attempt acknowledged active_target active_number
+  local -a values=()
+  while IFS= read -r number; do
+    [[ $number =~ ^[0-9]+$ ]] || continue
+    encoded=$(python3 - "$RECOVERY" "$number" <<'PY'
+import base64,json,sys
+row=json.load(open(sys.argv[1])).get("entries",[])[int(sys.argv[2])-1]
+for key in ("source_generation_key","old_shpool_id","provider","uuid","cwd"):
+    print(base64.b64encode(str(row.get(key) or "").encode()).decode())
+PY
+)
+    mapfile -t values <<<"$encoded"
+    if (( ${#values[@]} != 5 )); then
+      printf '  Recovery record %s is incomplete; it was retained.\n' "$number" >&2
+      continue
+    fi
+    generation=$(decode64 "${values[0]}")
+    old_id=$(decode64 "${values[1]}")
+    provider=$(decode64 "${values[2]}")
+    uuid=$(decode64 "${values[3]}")
+    cwd=$(decode64 "${values[4]}")
+    active_target=$(active_target_for_uuid "$provider" "$uuid") || active_target=ambiguous
+    case "$active_target" in
+      managed:*)
+        active_number=${active_target#managed:}
+        if "$STATUS_CMD" --recovery-pending-ack \
+          "$generation" "$old_id" "$uuid" >/dev/null 2>&1; then
+          printf '  Cleared the recovery record for exact active session %s.\n' \
+            "$active_number"
+        else
+          printf '  Exact active session %s was found, but its recovery record could not be cleared; the record was retained.\n' \
+            "$active_number" >&2
+        fi
+        printf '  %s is already active as session %s; opening the existing session instead.\n' \
+          "$old_id" "$active_number"
+        printf '  Use fork %s from the picker to start a separate writable fork.\n' \
+          "$active_number"
+        QUERY=$uuid
+        PAGE=1
+        if build_view; then
+          choose_number "$active_number"
+        else
+          echo "  The existing session could not be shown. Nothing restored."
+        fi
+        continue
+        ;;
+      outside)
+        printf '  %s is already active outside the session manager; no duplicate was started.\n' \
+          "$old_id"
+        continue
+        ;;
+      ambiguous)
+        printf '  Active identity for %s is ambiguous; no duplicate was started.\n' \
+          "$old_id"
+        continue
+        ;;
+    esac
+    if launched=$("$SP_CMD" restore-exact "$provider" "$uuid" "$cwd"); then
+      printf '  Started %s as %s\n' "$old_id" "$launched"
+      acknowledged=0
+      for attempt in {1..20}; do
+        if "$STATUS_CMD" --recovery-pending-ack \
+          "$generation" "$old_id" "$uuid" >/dev/null 2>&1; then
+          acknowledged=1
+          break
+        fi
+        sleep 0.25
+      done
+      if (( acknowledged == 0 )); then
+        printf '  Exact live proof is pending for %s; its recovery record was retained.\n' "$old_id" >&2
+      fi
+    else
+      printf '  Could not restore %s; its recovery record was retained.\n' "$old_id" >&2
+    fi
+  done <<<"$selected"
+  refresh_after_action
+}
+
+show_help() {
+  echo
+  echo "  Session picker help"
+  echo
+  echo "  number        Open an available session or show actions for one open elsewhere"
+  echo "  n             Guided Claude, Codex, or managed-shell creation"
+  echo "  x <number>    Close the exact displayed session after exact-ID confirmation"
+  echo "  /text         Search names, providers, projects, IDs, and conversation UUIDs"
+  echo "  r             Refresh live state and clear search"
+  echo "  o             View detectable provider roots outside the session manager (read-only)"
+  echo "  u             Review exact conversation recovery; opening it changes nothing"
+  echo "  name <number> Rename an exact Claude or Codex conversation"
+  echo "  name reset #  Remove the local name and show the provider name"
+  echo "  fork <number> Start a separate fork of an exact Claude or Codex conversation"
+  echo "  next / prev   Move between pages; only visible page numbers accept actions"
+  echo "  Enter / EOF   Return to a regular terminal without a session action"
+  echo "  Ctrl-C        Return to a regular terminal without a session action"
+  echo
+  echo "  Inside a managed session: use bye to close it, or disconnect SSH to leave it running."
+  echo "  Full raw terminal history is available from an open-session action menu."
+}
+
+load_repair_banner
+
+refresh_snapshot || {
+  echo "  Live sessions could not be loaded. Returning to a regular terminal."
+  exit 2
+}
+
+while true; do
+  render_main
+  choice=""
+  if ! read -r -p "  $(picker_green '❯') " choice; then
+    exit 2
+  fi
+  case "$choice" in
+    "") exit 2 ;;
+    q|Q|p|P) exit 2 ;;
+    r|R)
+      refresh_snapshot || {
+        echo "  Live sessions could not be refreshed. Returning to a regular terminal."
+        exit 2
+      }
+      ;;
+    \?)
+      show_help
+      ;;
+    u|U)
+      review_recovery
+      ;;
+    o|O)
+      show_other_provider_sessions
+      ;;
+    n|N)
+      guided_new
+      ;;
+    next|\>)
+      pages=$(page_count)
+      if (( PAGE < pages )); then
+        PAGE=$(( PAGE + 1 ))
+      else
+        echo "  Already on the last page."
+      fi
+      ;;
+    prev|\<)
+      if (( PAGE > 1 )); then
+        PAGE=$(( PAGE - 1 ))
+      else
+        echo "  Already on the first page."
+      fi
+      ;;
+    /*)
+      QUERY=${choice#/}
+      PAGE=1
+      build_view || {
+        echo "  Search failed. Returning to the unfiltered list."
+        QUERY=""
+        build_view || exit 2
+      }
+      ;;
+    x\ *|X\ *)
+      number=${choice#* }
+      if [[ $number =~ ^[0-9]+$ ]]; then
+        direct_close "$number"
+      else
+        echo "  Use x followed by a visible number. Nothing changed."
+      fi
+      ;;
+    name\ reset\ *|NAME\ RESET\ *|Name\ reset\ *)
+      number=${choice##* }
+      if [[ $number =~ ^[0-9]+$ ]]; then
+        reset_name_number "$number"
+      else
+        echo "  Use name reset followed by a visible number. Nothing changed."
+      fi
+      ;;
+    name\ *|NAME\ *|Name\ *)
+      number=${choice#* }
+      if [[ $number =~ ^[0-9]+$ ]]; then
+        rename_number "$number"
+      else
+        echo "  Use name followed by a visible number. Nothing changed."
+      fi
+      ;;
+    fork\ *|FORK\ *|Fork\ *)
+      number=${choice#* }
+      if [[ $number =~ ^[0-9]+$ ]]; then
+        fork_number "$number"
+      else
+        echo "  Use fork followed by a visible number. Nothing changed."
+      fi
+      ;;
+    [0-9]*)
+      if [[ $choice =~ ^[0-9]+$ ]]; then
+        choose_number "$choice"
+      else
+        echo "  Unknown choice. Nothing changed."
+      fi
+      ;;
+    *)
+      echo "  Unknown choice. Nothing changed."
+      ;;
+  esac
+done

@@ -1,0 +1,55 @@
+name: Bug report
+description: Report a reproducible Session Kit problem
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Remove credentials, conversation UUIDs, private paths, and terminal journal content. Use the Security tab for vulnerabilities.
+  - type: input
+    id: version
+    attributes:
+      label: Session Kit version
+      description: Provide a tag or full commit ID.
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      description: Linux distribution and version.
+    validations:
+      required: true
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Relevant versions
+      description: Bash, Python, shpool, Claude Code, and Codex versions as applicable.
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: What happened?
+      description: Describe the observed and expected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction
+      description: Give the smallest safe, sanitized sequence that reproduces the problem.
+    validations:
+      required: true
+  - type: dropdown
+    id: mutation
+    attributes:
+      label: Did the problem modify a session or local state?
+      options:
+        - "No"
+        - "Yes"
+        - "Unknown"
+    validations:
+      required: true

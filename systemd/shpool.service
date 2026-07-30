@@ -1,0 +1,13 @@
+[Unit]
+Description=Shpool - Shell Session Pool
+Requires=shpool.socket
+
+[Service]
+Type=simple
+ExecStart=@SHPOOL@ daemon
+KillMode=mixed
+TimeoutStopSec=2s
+SendSIGHUP=yes
+
+[Install]
+WantedBy=default.target

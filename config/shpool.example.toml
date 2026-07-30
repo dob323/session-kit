@@ -1,0 +1,7 @@
+# Restore useful recent context without streaming the unbounded raw journal.
+session_restore_mode = { lines = 500 }
+output_spool_lines = 1000
+vt100_output_spool_width = 200
+
+# Session-kit provides its own compact shpool-aware prompt marker.
+prompt_prefix = ""

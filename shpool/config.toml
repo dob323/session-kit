@@ -1,0 +1,19 @@
+# shpool config — ~/.config/shpool/config.toml
+# Docs: https://github.com/shell-pool/shpool/blob/master/CONFIG.md
+# The daemon hot-reloads this file — no restart, no session loss.
+
+# On reattach, restore up to 500 recent rendered terminal rows. Complete raw
+# journals remain explicit through `sp history`; reconnect never streams them.
+session_restore_mode = { lines = 500 }
+
+# The spool is what the daemon RETAINS while detached; restore can never replay
+# more than this. Keep it at least as large as session_restore_mode.lines.
+output_spool_lines = 1000
+vt100_output_spool_width = 200
+
+# Where new sessions start. EDIT to your main project (or delete the line to
+# start in $HOME).
+# default_dir = "/home/you/projects/web"
+
+# No name prefix in the prompt — the ▌ marker set in bashrc is the indicator.
+prompt_prefix = ""

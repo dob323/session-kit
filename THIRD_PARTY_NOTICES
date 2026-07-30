@@ -1,0 +1,20 @@
+Third-party notices
+===================
+
+shpool
+------
+
+Session Kit integrates with shpool and includes an optional source patch
+against shpool 0.11.0:
+
+  shpool-patch/0001-heartbeat-ack-timeout-is-not-fatal.patch
+
+Upstream project: https://github.com/shell-pool/shpool
+
+shpool is distributed under the Apache License, Version 2.0. The patch is a
+modification of the corresponding upstream source and remains subject to the
+upstream license and notices. Session Kit does not redistribute the shpool
+source tree or a shpool binary.
+
+The Apache License, Version 2.0 is available at:
+https://www.apache.org/licenses/LICENSE-2.0

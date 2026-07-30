@@ -1,0 +1,6 @@
+[Unit]
+Description=Reap abandoned empty shpool sessions
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/shpool_reaper

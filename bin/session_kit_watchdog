@@ -1,0 +1,473 @@
+#!/usr/bin/env bash
+# Session wedge watchdog.
+#
+# Two faults make a session stop working without anything noticing:
+#
+#   1. shpool loses the thread that serves a session's terminal (the daemon
+#      logs "failed to tell shell->client to disconnect: SendTimeoutError").
+#      The session can never be attached again, nothing drains its terminal,
+#      and whatever runs inside it blocks on its next write, forever.
+#   2. A session stays wired to an SSH window that no longer exists. The
+#      terminal fills, the program blocks, and the session list still says
+#      "running".
+#
+# Both look identical from outside: a session that claims to be running and
+# has produced nothing for hours. This watchdog finds them, proves they are
+# dead rather than merely busy, and moves the conversation to a fresh session.
+#
+# It is read-only until every proof holds, and it never touches a session that
+# is simply quiet for a while.
+
+set -u
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+# shellcheck source=session_kit_common
+source "$SCRIPT_DIR/session_kit_common"
+
+if [[ $(sk_platform) == Darwin ]]; then
+  sk_die "watchdog repair is unavailable in the macOS preview; nothing changed"
+  exit 1
+fi
+
+SP_CMD=${SESSION_KIT_SP_CMD:-"$SCRIPT_DIR/sp"}
+STATUS_CMD=${SESSION_KIT_STATUS_CMD:-"$SCRIPT_DIR/shpool_status"}
+STATE_ROOT=${XDG_STATE_HOME:-"$HOME/.local/state"}
+LOG_FILE=${SESSION_KIT_WATCHDOG_LOG:-"$STATE_ROOT/session-kit/watchdog.log"}
+REPAIR_FILE=${SESSION_KIT_WATCHDOG_REPAIRS:-"$STATE_ROOT/session-kit/watchdog-repairs.json"}
+SENTINEL=${SESSION_KIT_WATCHDOG_SENTINEL:-"$HOME/.no_shpool_watchdog"}
+NOTIFY_CMD=${SESSION_KIT_WATCHDOG_NOTIFY:-}
+ALERT_TYPE=${SESSION_KIT_WATCHDOG_ALERT_TYPE:-session-kit.watchdog}
+WATCHDOG_MODE=${SESSION_KIT_WATCHDOG_MODE:-report}
+JOURNAL_UNIT=${SESSION_KIT_WATCHDOG_UNIT:-shpool}
+POLL_SECONDS=${SESSION_KIT_WATCHDOG_POLL_SECONDS:-60}
+# A flagged session must stay silent this long before it counts as dead. Short,
+# because the daemon marker already proves its terminal is unserviceable.
+FLAGGED_QUIET_SECONDS=${SESSION_KIT_WATCHDOG_FLAGGED_QUIET_SECONDS:-120}
+# Silence with no supporting evidence is only ever reported, never repaired.
+DEAD_QUIET_SECONDS=${SESSION_KIT_WATCHDOG_DEAD_SECONDS:-2700}
+# How long a quiet-but-unproven session stays reported before being mentioned
+# again.
+QUIET_REPORT_COOLDOWN_SECONDS=${SESSION_KIT_WATCHDOG_QUIET_REPORT_COOLDOWN:-21600}
+# Seconds allowed for the read-only "is the manager alive" question.
+MANAGER_PROBE_TIMEOUT=${SESSION_KIT_WATCHDOG_MANAGER_TIMEOUT:-20}
+# sha256 of the session-manager binary this machine is supposed to run. Absent
+# means the check is skipped, so nothing breaks if it was never recorded.
+BINARY_FINGERPRINT=${SESSION_KIT_WATCHDOG_BINARY_FINGERPRINT:-"$STATE_ROOT/session-kit/shpool-binary.sha256"}
+REPORT_STATE=${SESSION_KIT_WATCHDOG_REPORT_STATE:-"$STATE_ROOT/session-kit/watchdog-reported.json"}
+ONCE=0
+
+case "${1:-}" in
+  "") ;;
+  --once) ONCE=1 ;;
+  *)
+    echo "usage: session_kit_watchdog [--once]" >&2
+    exit 2
+    ;;
+esac
+[[ $WATCHDOG_MODE == report || $WATCHDOG_MODE == repair ]] || {
+  echo "session-kit: SESSION_KIT_WATCHDOG_MODE must be report or repair" >&2
+  exit 2
+}
+
+sk_require_shpool || exit 1
+sk_prepare_state || exit 1
+
+umask 077
+: >> "$LOG_FILE" || exit 1
+chmod 600 "$LOG_FILE" 2>/dev/null || true
+
+log() {
+  printf '%s %s\n' "$(date -Is)" "$1" >> "$LOG_FILE"
+}
+
+# Records every repair so the picker can tell the human what happened even if
+# all notification paths are down.
+record_repair() {
+  python3 - "$REPAIR_FILE" "$1" "$2" "$3" "$4" "$5" "$6" <<'PY'
+import json
+import os
+import sys
+import time
+
+path, old_id, new_id, title, provider, outcome, reason = sys.argv[1:8]
+try:
+    with open(path, encoding="utf-8") as handle:
+        data = json.load(handle)
+    entries = data["repairs"] if isinstance(data, dict) else []
+    if not isinstance(entries, list):
+        entries = []
+except (OSError, ValueError, KeyError):
+    entries = []
+entries.append(
+    {
+        "at_unix_ms": int(time.time() * 1000),
+        "old_shpool_id": old_id,
+        "new_shpool_id": new_id,
+        "title": title,
+        "provider": provider,
+        "outcome": outcome,
+        "reason": reason,
+        "acknowledged": False,
+    }
+)
+tmp = f"{path}.tmp.{os.getpid()}"
+descriptor = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+    json.dump({"schema_version": 1, "repairs": entries[-50:]}, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+os.replace(tmp, path)
+PY
+}
+
+# Always "warning": an automatic repair, successful or not, must never fire a
+# critical and wake a phone. The picker banner is the guaranteed record.
+notify() {
+  local subject=$1 body=$2
+  if [[ ! -x $NOTIFY_CMD ]]; then
+    log "notify skipped: $NOTIFY_CMD is not executable"
+    return 0
+  fi
+  "$NOTIFY_CMD" \
+    "--type=$ALERT_TYPE" \
+    "--severity=warning" \
+    "--title=$subject" \
+    "--body=$body" >/dev/null 2>&1 ||
+    log "notify not delivered for $ALERT_TYPE (hub down or non-critical drop)"
+}
+
+# Sessions the daemon has reported a terminal-handoff failure for. Only these
+# lines carry the session name; the accompanying ERROR line does not, so it is
+# deliberately not used as a trigger.
+flagged_sessions() {
+  local since=$1
+  journalctl --user -u "$JOURNAL_UNIT" --since "$since" -o cat --no-pager 2>/dev/null |
+    grep -F 'failed to tell shell->client to disconnect' |
+    grep -oE 's="[^"]+"' |
+    sed 's/^s="//; s/"$//' |
+    sort -u
+}
+
+# Prints one JSON verdict per candidate session that is proven dead.
+# Proofs: still present; claims to be running; silent past its threshold; and
+# either the daemon has fewer terminal-serving threads than sessions, or the
+# session was flagged, or the silence is past the long no-marker threshold.
+dead_sessions() {
+  local flagged=$1 snapshot status=0
+  snapshot=$(mktemp "$SK_STATE_DIR/watchdog-snapshot.XXXXXX.json") || return 3
+  if ! "$STATUS_CMD" --json > "$snapshot" 2>/dev/null; then
+    command rm -f -- "$snapshot"
+    return 3
+  fi
+  python3 - "$snapshot" "$flagged" \
+    "$FLAGGED_QUIET_SECONDS" "$DEAD_QUIET_SECONDS" <<'PY'
+import json
+import os
+import sys
+
+snapshot_path, flagged_raw, flagged_quiet_raw, dead_quiet_raw = sys.argv[1:5]
+flagged = {name for name in flagged_raw.split() if name}
+flagged_quiet = int(flagged_quiet_raw)
+dead_quiet = int(dead_quiet_raw)
+
+try:
+    with open(snapshot_path, encoding="utf-8") as handle:
+        inventory = json.load(handle)
+except (OSError, ValueError):
+    sys.exit(3)
+if inventory.get("source") != "live" or inventory.get("stale") is not False:
+    sys.exit(3)
+
+daemon = inventory.get("daemon_generation") or {}
+daemon_pid = daemon.get("pid")
+if not isinstance(daemon_pid, int) or daemon_pid <= 0:
+    sys.exit(3)
+
+# Count the daemon threads that serve session terminals. One per session is
+# healthy; fewer means at least one session has no thread left to serve it.
+# The override exists so the count can be fixed in tests and inspected by
+# hand; normal runs read it from the live daemon.
+override = os.environ.get("SESSION_KIT_WATCHDOG_SERVING_THREADS", "")
+if override.isdigit():
+    serving = int(override)
+else:
+    serving = 0
+    try:
+        for task in os.listdir(f"/proc/{daemon_pid}/task"):
+            try:
+                with open(f"/proc/{daemon_pid}/task/{task}/comm", encoding="utf-8") as handle:
+                    if handle.read().strip().startswith("shell->client"):
+                        serving += 1
+            except OSError:
+                continue
+    except OSError:
+        sys.exit(3)
+
+sessions = list(inventory.get("sessions", ()))
+missing_thread = serving < len(sessions)
+
+for row in sessions:
+    shpool_id = row.get("shpool_id")
+    provider = row.get("provider")
+    uuid = (row.get("identity") or {}).get("uuid") or ""
+    age = row.get("recent_output_age_seconds")
+    if provider not in {"claude", "codex"} or not uuid:
+        continue
+    if row.get("mutation_allowed") is not True:
+        continue
+    if isinstance(age, bool) or not isinstance(age, int):
+        continue
+    # Only a detached session can be probed safely. A session that shows as
+    # attached may have a live human on it, and forcing it off to run a test
+    # would be exactly the damage this watchdog exists to prevent.
+    if row.get("availability") != "ready":
+        continue
+    was_flagged = shpool_id in flagged
+    # Only the first two are evidence that the terminal is actually dead. The
+    # third is silence, which proves nothing on its own and is reported only.
+    if was_flagged and age >= flagged_quiet:
+        evidence = "daemon-marker"
+        reason = "the daemon logged a terminal handoff failure for this session"
+    elif missing_thread and age >= flagged_quiet:
+        evidence = "missing-thread"
+        reason = "the daemon has no thread left to serve this terminal"
+    elif age >= dead_quiet:
+        evidence = "silence-only"
+        reason = "no output for far longer than any normal pause"
+    else:
+        continue
+    print(
+        json.dumps(
+            {
+                "shpool_id": shpool_id,
+                "title": row.get("display_title") or row.get("title") or "",
+                "provider": provider,
+                "recent_output_age_seconds": age,
+                "serving_threads": serving,
+                "sessions": len(sessions),
+                "flagged": was_flagged,
+                "evidence": evidence,
+                "reason": reason,
+            },
+            sort_keys=True,
+        )
+    )
+PY
+  status=$?
+  command rm -f -- "$snapshot"
+  return "$status"
+}
+
+json_field() {
+  python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get(sys.argv[2],""))' "$1" "$2" 2>/dev/null || printf ''
+}
+
+# NO ACTIVE PROBE. This is deliberate and must stay that way.
+#
+# An earlier version confirmed a candidate by attaching to it with
+# `attach --background`. That looked safe -- a healthy session answers at once
+# and `--background` detaches again -- but on 2026-07-29 at 17:38 that probe
+# was issued against an already-wedged session and shpool 0.11.0 deadlocked its
+# `shells` mutex. Every subsequent list, attach, open, close and create hung,
+# the login picker went blind, and the only way out was restarting the daemon,
+# which ends every managed session. A watchdog must never be able to do that.
+#
+# So confirmation is read-only. Two passive signals are precise enough, and
+# both were present in every wedge observed:
+#
+#   * the daemon logged a terminal handoff failure naming the session, or
+#   * the daemon has fewer terminal-serving threads than it has sessions.
+#
+# Silence alone is never sufficient, because it carries no information: Codex
+# reports "running" for its entire life whether it is working or waiting at its
+# prompt, so a session parked for hours is indistinguishable from a frozen one
+# by silence alone. A candidate with nothing but silence behind it is reported,
+# never repaired.
+passive_evidence_only=1
+
+repair_session() {
+  local verdict=$1 id title provider reason new_id
+  id=$(json_field "$verdict" shpool_id)
+  title=$(json_field "$verdict" title)
+  provider=$(json_field "$verdict" provider)
+  reason=$(json_field "$verdict" reason)
+  [[ -n $id ]] || return 0
+  log "repairing $id ($provider: $title): $reason -- $verdict"
+  new_id=$("$SP_CMD" repair "$id" 2>&1 | tail -n 1)
+  # A loaded daemon can miss the inventory timeout, and the mutation guard then
+  # correctly refuses to act on stale data. That is a blind spot, not a failed
+  # repair: say so in the log and try again next sweep rather than recording a
+  # failure and announcing one.
+  case "$new_id" in
+    *"snapshot unavailable"*|*"stale"*|*"guard live inventory unavailable"*)
+      log "repair deferred for $id: live inventory unavailable ($new_id)"
+      return 0
+      ;;
+  esac
+  if [[ $new_id == s2* ]]; then
+    log "repaired $id -> $new_id"
+    record_repair "$id" "$new_id" "$title" "$provider" repaired "$reason" || true
+    notify "Session recovered: ${title:-$id}" \
+      "The terminal for \"${title:-$id}\" stopped working, so the session could not be opened and its work had stopped ($reason). The conversation was moved to a new session and is running again. Nothing else changed."
+  else
+    log "repair FAILED for $id: $new_id"
+    record_repair "$id" "" "$title" "$provider" failed "$reason" || true
+    notify "Session could not be recovered: ${title:-$id}" \
+      "The terminal for \"${title:-$id}\" stopped working and the automatic repair did not succeed. The conversation is still saved -- open the session list to recover it by hand."
+  fi
+}
+
+# Remembers which sessions have already been reported as quiet, so a session
+# parked for days produces one report rather than one a minute.
+already_reported_quiet() {
+  local id=$1
+  python3 - "$REPORT_STATE" "$id" "$QUIET_REPORT_COOLDOWN_SECONDS" <<'PY'
+import json
+import sys
+import time
+
+path, wanted, cooldown_text = sys.argv[1:4]
+try:
+    with open(path, encoding="utf-8") as handle:
+        seen = json.load(handle)["reported"][wanted]
+except (OSError, ValueError, KeyError, TypeError):
+    raise SystemExit(1)
+if not isinstance(seen, (int, float)):
+    raise SystemExit(1)
+raise SystemExit(0 if time.time() - seen < int(cooldown_text) else 1)
+PY
+}
+
+remember_quiet_report() {
+  local id=$1
+  python3 - "$REPORT_STATE" "$id" <<'PY'
+import json
+import os
+import sys
+import time
+
+path, wanted = sys.argv[1:3]
+try:
+    with open(path, encoding="utf-8") as handle:
+        entries = json.load(handle)["reported"]
+    if not isinstance(entries, dict):
+        entries = {}
+except (OSError, ValueError, KeyError):
+    entries = {}
+entries[wanted] = time.time()
+# Keep the file small; a stale id can never match a live session anyway.
+if len(entries) > 200:
+    entries = dict(sorted(entries.items(), key=lambda item: item[1])[-200:])
+tmp = f"{path}.tmp.{os.getpid()}"
+descriptor = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+    json.dump({"schema_version": 1, "reported": entries}, handle, sort_keys=True)
+    handle.write("\n")
+os.replace(tmp, path)
+PY
+}
+
+sweep() {
+  local since=$1 flagged verdict id
+  if [[ -e $SENTINEL ]]; then
+    return 0
+  fi
+  flagged=$(flagged_sessions "$since" | tr '\n' ' ')
+  while IFS= read -r verdict; do
+    [[ -n $verdict ]] || continue
+    id=$(json_field "$verdict" shpool_id)
+    [[ -n $id ]] || continue
+    if [[ $(json_field "$verdict" evidence) == silence-only ]]; then
+      # Nothing but silence. Report it and let a human decide; closing a
+      # session on this alone would eventually close an idle one.
+      if ! already_reported_quiet "$id"; then
+        log "candidate $id is quiet but there is no evidence its terminal is dead; reporting only"
+        record_repair "$id" "" "$(json_field "$verdict" title)" \
+          "$(json_field "$verdict" provider)" reported \
+          "$(json_field "$verdict" reason)" || true
+        remember_quiet_report "$id" || true
+      fi
+      continue
+    fi
+    log "candidate $id has direct evidence its terminal cannot be served"
+    if [[ $WATCHDOG_MODE == repair ]]; then
+      repair_session "$verdict"
+    elif ! already_reported_quiet "$id"; then
+      record_repair "$id" "" "$(json_field "$verdict" title)" \
+        "$(json_field "$verdict" provider)" reported \
+        "$(json_field "$verdict" reason)" || true
+      remember_quiet_report "$id" || true
+    fi
+  done < <(dead_sessions "$flagged")
+  return 0
+}
+
+# Is the session manager still answering at all?
+#
+# On 2026-07-29 the daemon deadlocked its internal lock and every list, attach,
+# open, close and create hung behind it for 73 minutes. Nothing noticed; it was
+# found by walking into it. `list` is read-only and is what the inventory
+# already calls constantly, so asking is free and cannot disturb a session.
+manager_answers() {
+  timeout "$MANAGER_PROBE_TIMEOUT" "$SK_SHPOOL" list >/dev/null 2>&1
+}
+
+# Is the running daemon still the binary we expect?
+#
+# shpool was installed with cargo, so a routine `cargo install shpool` silently
+# replaces a patched build with the stock one and sessions quietly start
+# breaking again with nothing to explain why. Comparing the running executable
+# against a recorded fingerprint turns that into a message instead of a mystery.
+daemon_binary_matches() {
+  [[ -r $BINARY_FINGERPRINT ]] || return 0
+  local expected actual pid
+  IFS= read -r expected < "$BINARY_FINGERPRINT" || return 0
+  [[ $expected =~ ^[0-9a-f]{64}$ ]] || return 0
+  pid=$(pgrep -f "^${SK_SHPOOL} daemon$" | head -n 1)
+  [[ -n $pid && -r /proc/$pid/exe ]] || return 0
+  actual=$(sha256sum "/proc/$pid/exe" 2>/dev/null | cut -d' ' -f1)
+  [[ -n $actual ]] || return 0
+  [[ $actual == "$expected" ]]
+}
+
+# One message per condition per cooldown, so a long outage does not become a
+# stream of identical alerts.
+report_once() {
+  local key=$1 subject=$2 body=$3
+  already_reported_quiet "health:$key" && return 0
+  log "health: $key"
+  notify "$subject" "$body"
+  remember_quiet_report "health:$key" || true
+}
+
+health_check() {
+  [[ -e $SENTINEL ]] && return 0
+  if ! manager_answers; then
+    # Confirm before speaking: a single slow answer under load is not a jam.
+    sleep 5
+    if ! manager_answers; then
+      report_once manager-stuck "Session manager is not responding" \
+        "The session manager stopped answering, so sessions cannot be opened, closed or created and automatic repair cannot run. Sessions already open in a window keep working normally. Clearing this needs the manager restarted, which ends every session; conversations are saved and are brought back automatically."
+      return 0
+    fi
+  fi
+  if ! daemon_binary_matches; then
+    report_once binary-changed "Session manager is running a different build" \
+      "The running session manager is not the build recorded for this machine. The most likely cause is a routine reinstall replacing it, which silently undoes the fix that stops sessions breaking. See shpool-patch/ in the session-kit repository to rebuild and reinstall it."
+  fi
+}
+
+if (( ONCE )); then
+  health_check
+  sweep "${SESSION_KIT_WATCHDOG_SINCE:--60 min}"
+  exit 0
+fi
+
+log "watchdog started (mode=${WATCHDOG_MODE} poll=${POLL_SECONDS}s flagged_quiet=${FLAGGED_QUIET_SECONDS}s dead_quiet=${DEAD_QUIET_SECONDS}s)"
+trap 'log "watchdog stopping"; exit 0' HUP INT TERM
+while true; do
+  health_check
+  sweep "-$(( (POLL_SECONDS * 3 + 59) / 60 )) min"
+  sleep "$POLL_SECONDS"
+done

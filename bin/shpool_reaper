@@ -1,0 +1,404 @@
+#!/usr/bin/env bash
+# Safe session-kit reaper.
+#
+# Scheduled runs may record verified seven-day empty-shell candidates. They
+# never kill a session, move or delete a journal, or change recovery state.
+# `sp prune` performs the separately confirmed destructive action.
+
+set -u
+
+if [[ ${SESSION_KIT_TESTING:-0} == 1 && -n ${SESSION_KIT_TEST_PLATFORM:-} ]]; then
+  REAPER_PLATFORM=$SESSION_KIT_TEST_PLATFORM
+else
+  REAPER_PLATFORM=$(uname -s 2>/dev/null)
+fi
+if [[ $REAPER_PLATFORM == Darwin ]]; then
+  echo "session-kit: reaper is unavailable in the macOS preview; nothing changed" >&2
+  exit 1
+fi
+unset REAPER_PLATFORM
+
+STATE_DIR=${SESSION_KIT_STATE_DIR:-${XDG_STATE_HOME:-"$HOME/.local/state"}/session-kit}
+PROC_ROOT=${SESSION_KIT_PROC_ROOT:-/proc}
+SENTINEL=${SESSION_KIT_REAPER_SENTINEL:-"$HOME/.no_shpool_reaper"}
+MAX_AGE_DAYS=${SESSION_KIT_PRUNE_DAYS:-7}
+SHPOOL=${SESSION_KIT_SHPOOL_CMD:-}
+DRY_RUN=${SESSION_KIT_REAPER_DRY_RUN:-0}
+
+MODE=report
+VERIFY_FILE=
+case "${1:-}" in
+  ""|--candidates) ;;
+  --verify-candidate)
+    [[ -n ${2:-} && -z ${3:-} ]] || {
+      echo "usage: shpool_reaper [--candidates|--verify-candidate <private-json>]" >&2
+      exit 2
+    }
+    MODE=verify
+    VERIFY_FILE=$2
+    ;;
+  *)
+    echo "usage: shpool_reaper [--candidates|--verify-candidate <private-json>]" >&2
+    exit 2
+    ;;
+esac
+
+if [[ -z $SHPOOL ]]; then SHPOOL=$(command -v shpool 2>/dev/null || true); fi
+if [[ -z $SHPOOL ]]; then
+  for candidate in "$HOME/.cargo/bin/shpool" /opt/homebrew/bin/shpool /usr/local/bin/shpool; do
+    if [[ -x $candidate ]]; then SHPOOL=$candidate; break; fi
+  done
+fi
+
+timestamp() { date -Is 2>/dev/null || date; }
+fail() {
+  printf '%s reaper report failed: %s\n' "$(timestamp)" "$*" >&2
+  exit 1
+}
+
+if [[ -e $SENTINEL ]]; then
+  printf '%s reaper disabled by %s\n' "$(timestamp)" "$SENTINEL" >&2
+  exit 3
+fi
+[[ -n $SHPOOL && -x $SHPOOL ]] || fail "shpool executable unavailable"
+[[ $MAX_AGE_DAYS =~ ^[0-9]+$ && $MAX_AGE_DAYS -ge 1 ]] || fail "invalid prune age"
+
+json=$("$SHPOOL" list --json 2>/dev/null) || fail "shpool list error"
+daemon_pid=${SESSION_KIT_DAEMON_PID:-}
+if [[ -z $daemon_pid && $PROC_ROOT == /proc ]]; then
+  daemon_pid=$(pgrep -f '^.*/shpool daemon$' | head -1)
+fi
+[[ $daemon_pid =~ ^[0-9]+$ ]] || fail "daemon PID unavailable"
+
+if [[ $MODE == verify ]]; then
+  [[ -f $VERIFY_FILE && ! -L $VERIFY_FILE ]] || fail "candidate proof is not a regular file"
+  export SK_REAPER_JSON=$json
+  export SK_REAPER_VERIFY_FILE=$VERIFY_FILE
+  export SK_REAPER_PROC_ROOT=$PROC_ROOT
+  export SK_REAPER_DAEMON_PID=$daemon_pid
+  export SK_REAPER_MAX_AGE_DAYS=$MAX_AGE_DAYS
+  python3 <<'PY' || fail "candidate changed or is no longer empty"
+import json, os, pathlib, re, time
+
+payload = json.loads(os.environ["SK_REAPER_JSON"])
+rows = payload.get("sessions") if isinstance(payload, dict) else payload
+candidate = json.loads(pathlib.Path(os.environ["SK_REAPER_VERIFY_FILE"]).read_text())
+proc_root = pathlib.Path(os.environ["SK_REAPER_PROC_ROOT"])
+daemon_pid = int(os.environ["SK_REAPER_DAEMON_PID"])
+required = (
+    "shpool_id",
+    "started_at_unix_ms",
+    "last_disconnected_at_unix_ms",
+    "shell_pid",
+    "shell_start_ticks",
+)
+if not isinstance(rows, list) or not isinstance(candidate, dict):
+    raise SystemExit(2)
+if any(key not in candidate for key in required):
+    raise SystemExit(2)
+session_id = candidate["shpool_id"]
+if not isinstance(session_id, str) or len(session_id.encode()) > 128:
+    raise SystemExit(2)
+disconnected = candidate["last_disconnected_at_unix_ms"]
+if not isinstance(disconnected, int):
+    raise SystemExit(2)
+minimum_age_ms = int(os.environ["SK_REAPER_MAX_AGE_DAYS"]) * 86400 * 1000
+if int(time.time() * 1000) - disconnected < minimum_age_ms:
+    raise SystemExit(2)
+if not re.fullmatch(r"(?:main(?:[1-9][0-9]*)?|s[0-9]{8}-[0-9]{6}-[1-9][0-9]*(?:-[1-9][0-9]*)?)", session_id):
+    raise SystemExit(2)
+matched = [
+    row for row in rows
+    if isinstance(row, dict)
+    and row.get("name") == session_id
+    and row.get("started_at_unix_ms") == candidate["started_at_unix_ms"]
+    and row.get("last_disconnected_at_unix_ms") == disconnected
+    and str(row.get("status", "")).lower() == "disconnected"
+]
+if len(matched) != 1:
+    raise SystemExit(2)
+
+def stat(pid):
+    try:
+        text = (proc_root / str(pid) / "stat").read_text()
+    except OSError:
+        return None
+    end = text.rfind(")")
+    fields = text[end + 2:].split()
+    if len(fields) < 20:
+        return None
+    return int(fields[1]), int(fields[19])
+
+def read_bytes(pid, name):
+    return (proc_root / str(pid) / name).read_bytes()
+
+processes = {}
+try:
+    pids = sorted(int(entry.name) for entry in proc_root.iterdir() if entry.name.isdigit())
+except OSError:
+    raise SystemExit(2)
+for pid in pids:
+    before = stat(pid)
+    if before is None:
+        continue
+    try:
+        comm = read_bytes(pid, "comm").decode("utf-8", "replace").strip()
+        cmdline = read_bytes(pid, "cmdline").replace(b"\0", b" ").decode("utf-8", "replace")
+        environ = read_bytes(pid, "environ").split(b"\0")
+    except OSError:
+        comm = None
+        cmdline = None
+        environ = None
+    after = stat(pid)
+    if before != after:
+        continue
+    processes[pid] = {
+        "ppid": before[0],
+        "start_ticks": before[1],
+        "comm": comm,
+        "cmdline": cmdline,
+        "environ": environ,
+    }
+
+children = {}
+for pid, row in processes.items():
+    children.setdefault(row["ppid"], []).append(pid)
+shells = []
+for pid in children.get(daemon_pid, []):
+    environ = processes[pid]["environ"]
+    if environ is None:
+        continue
+    for item in environ:
+        if item.startswith(b"SHPOOL_SESSION_NAME="):
+            if item.split(b"=", 1)[1].decode("utf-8", "replace") == session_id:
+                shells.append(pid)
+            break
+if len(shells) != 1:
+    raise SystemExit(2)
+shell = shells[0]
+if shell != candidate["shell_pid"] or processes[shell]["start_ticks"] != candidate["shell_start_ticks"]:
+    raise SystemExit(2)
+direct = children.get(shell, [])
+if direct:
+    if len(direct) != 1:
+        raise SystemExit(2)
+    wrapper = direct[0]
+    row = processes[wrapper]
+    if row["comm"] != "script" or "bash -i" not in row["cmdline"]:
+        raise SystemExit(2)
+    inner = children.get(wrapper, [])
+    if len(inner) != 1 or processes[inner[0]]["comm"] not in {"bash", "sh"}:
+        raise SystemExit(2)
+    if children.get(inner[0], []):
+        raise SystemExit(2)
+if stat(shell) != (processes[shell]["ppid"], processes[shell]["start_ticks"]):
+    raise SystemExit(2)
+PY
+  second=$("$SHPOOL" list --json 2>/dev/null) || fail "second shpool list error"
+  export SK_REAPER_SECOND_JSON=$second
+  python3 - "$VERIFY_FILE" <<'PY' || fail "candidate changed after process proof"
+import json,os,sys
+candidate=json.load(open(sys.argv[1]))
+payload=json.loads(os.environ["SK_REAPER_SECOND_JSON"])
+rows=payload.get("sessions") if isinstance(payload,dict) else payload
+matches=[
+    row for row in rows
+    if isinstance(row,dict)
+    and row.get("name")==candidate["shpool_id"]
+    and row.get("started_at_unix_ms")==candidate["started_at_unix_ms"]
+    and row.get("last_disconnected_at_unix_ms")==candidate["last_disconnected_at_unix_ms"]
+    and str(row.get("status","")).lower()=="disconnected"
+]
+raise SystemExit(0 if len(matches)==1 else 1)
+PY
+  echo "candidate verified exact, disconnected, and empty"
+  exit 0
+fi
+
+if [[ $DRY_RUN != 1 ]]; then
+  umask 077
+  mkdir -p "$STATE_DIR" || fail "state directory creation"
+  chmod 700 "$STATE_DIR" 2>/dev/null || true
+fi
+
+export SK_REAPER_JSON=$json
+export SK_REAPER_STATE_DIR=$STATE_DIR
+export SK_REAPER_PROC_ROOT=$PROC_ROOT
+export SK_REAPER_DAEMON_PID=$daemon_pid
+export SK_REAPER_MAX_AGE_DAYS=$MAX_AGE_DAYS
+export SK_REAPER_DRY_RUN=$DRY_RUN
+
+summary=$(python3 <<'PY'
+import json, os, pathlib, tempfile, time
+
+payload = json.loads(os.environ["SK_REAPER_JSON"])
+rows = payload.get("sessions") if isinstance(payload, dict) else payload
+if not isinstance(rows, list):
+    raise SystemExit(2)
+for row in rows:
+    if not isinstance(row, dict) or not isinstance(row.get("name"), str):
+        raise SystemExit(2)
+
+state_dir = pathlib.Path(os.environ["SK_REAPER_STATE_DIR"])
+proc_root = pathlib.Path(os.environ["SK_REAPER_PROC_ROOT"])
+daemon_pid = int(os.environ["SK_REAPER_DAEMON_PID"])
+age_ms = int(os.environ["SK_REAPER_MAX_AGE_DAYS"]) * 86400 * 1000
+dry = os.environ["SK_REAPER_DRY_RUN"] == "1"
+now_ms = int(time.time() * 1000)
+
+def proc_bytes(pid, name):
+    try:
+        return (proc_root / str(pid) / name).read_bytes()
+    except OSError:
+        return b""
+
+def proc_text(pid, name):
+    return proc_bytes(pid, name).decode("utf-8", "replace")
+
+def proc_stat(pid):
+    text = proc_text(pid, "stat")
+    if not text:
+        return None
+    end = text.rfind(")")
+    fields = text[end + 2:].split()
+    if len(fields) < 20:
+        return None
+    return {"ppid": int(fields[1]), "start_ticks": int(fields[19])}
+
+pids = []
+if proc_root.exists():
+    for entry in proc_root.iterdir():
+        if entry.name.isdigit():
+            pids.append(int(entry.name))
+children = {}
+stats = {}
+processes = {}
+for pid in pids:
+    before = proc_stat(pid)
+    if not before:
+        continue
+    comm_value = proc_text(pid, "comm").strip()
+    cmdline_value = proc_bytes(pid, "cmdline").replace(b"\0", b" ").decode("utf-8", "replace")
+    environ_value = proc_bytes(pid, "environ").split(b"\0")
+    after = proc_stat(pid)
+    if before != after:
+        continue
+    stats[pid] = before
+    processes[pid] = {
+        "comm": comm_value,
+        "cmdline": cmdline_value,
+        "environ": environ_value,
+    }
+    children.setdefault(before["ppid"], []).append(pid)
+
+shells = {}
+for pid in children.get(daemon_pid, []):
+    for item in processes[pid]["environ"]:
+        if item.startswith(b"SHPOOL_SESSION_NAME="):
+            shells[item.split(b"=", 1)[1].decode("utf-8", "replace")] = pid
+            break
+
+def comm(pid):
+    return processes.get(pid, {}).get("comm", "")
+
+def cmdline(pid):
+    return processes.get(pid, {}).get("cmdline", "")
+
+def verified_empty(shell_pid):
+    direct = children.get(shell_pid, [])
+    if not direct:
+        return True
+    if len(direct) != 1:
+        return False
+    wrapper = direct[0]
+    if comm(wrapper) != "script" or "bash -i" not in cmdline(wrapper):
+        return False
+    inner = children.get(wrapper, [])
+    if len(inner) != 1 or comm(inner[0]) not in {"bash", "sh"}:
+        return False
+    return not children.get(inner[0], [])
+
+previous_path = state_dir / "reaper-observations.json"
+try:
+    previous = json.loads(previous_path.read_text()).get("observations", {})
+except (OSError, ValueError, AttributeError):
+    previous = {}
+
+observations = {}
+candidates = []
+for row in rows:
+    name = row["name"]
+    status = str(row.get("status", "")).lower()
+    disconnected = row.get("last_disconnected_at_unix_ms")
+    shell_pid = shells.get(name)
+    stat = stats.get(shell_pid) if shell_pid else None
+    if status != "disconnected" or not isinstance(disconnected, int) or not shell_pid or not stat:
+        continue
+    key = f'{row.get("started_at_unix_ms")}:{disconnected}:{shell_pid}:{stat["start_ticks"]}'
+    empty = verified_empty(shell_pid)
+    observations[name] = {
+        "key": key,
+        "first_verified_at_unix_ms": previous.get(name, {}).get("first_verified_at_unix_ms", now_ms)
+        if previous.get(name, {}).get("key") == key and empty else now_ms,
+        "empty": empty,
+    }
+    prior = previous.get(name, {})
+    old_enough = now_ms - disconnected >= age_ms
+    seen_twice = prior.get("key") == key and prior.get("empty") is True
+    if empty and old_enough and seen_twice:
+        candidates.append({
+            "shpool_id": name,
+            "started_at_unix_ms": row.get("started_at_unix_ms"),
+            "last_disconnected_at_unix_ms": disconnected,
+            "shell_pid": shell_pid,
+            "shell_start_ticks": stat["start_ticks"],
+        })
+
+candidate_doc = {
+    "schema_version": 1,
+    "generated_at_unix_ms": now_ms,
+    "policy": "confirmed-prune-only",
+    "candidates": candidates,
+}
+observation_doc = {
+    "schema_version": 1,
+    "generated_at_unix_ms": now_ms,
+    "observations": observations,
+}
+
+def atomic_json(path, value):
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+if not dry:
+    atomic_json(previous_path, observation_doc)
+    atomic_json(state_dir / "prune-candidates.json", candidate_doc)
+
+print(f"sessions={len(rows)} disconnected={sum(str(r.get('status','')).lower() == 'disconnected' for r in rows)} candidates={len(candidates)} actions=0")
+PY
+) || fail "invalid inventory or process map"
+
+if [[ $DRY_RUN != 1 ]]; then
+  printf '%s %s\n' "$(timestamp)" "$summary" >> "$STATE_DIR/reaper.log"
+  chmod 600 "$STATE_DIR/reaper.log" 2>/dev/null || true
+fi
+
+printf '%s\n' "$summary"

@@ -1,0 +1,906 @@
+#!/usr/bin/env bash
+# Shared helpers for session-kit commands. Source this file; do not execute it.
+
+SESSION_KIT_BIN_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+SESSION_KIT_RELEASE_DIR=$(cd -- "$SESSION_KIT_BIN_DIR/.." && pwd -P)
+
+SK_STATE_DIR=${SESSION_KIT_STATE_DIR:-${XDG_STATE_HOME:-"$HOME/.local/state"}/session-kit}
+SK_JOURNAL_DIR=${SESSION_KIT_JOURNAL_DIR:-${XDG_STATE_HOME:-"$HOME/.local/state"}/shpool-journal}
+SK_ARCHIVE_DIR=${SESSION_KIT_ARCHIVE_DIR:-${XDG_STATE_HOME:-"$HOME/.local/state"}/shpool-archive}
+SK_RECOVERY_DIR=${SESSION_KIT_JOURNAL_RECOVERY_DIR:-${XDG_STATE_HOME:-"$HOME/.local/state"}/shpool-journal-recovery}
+SK_START_DIR=${SESSION_KIT_START_DIR:-${XDG_STATE_HOME:-"$HOME/.local/state"}/shpool-start}
+SK_INTEGRATION_MARKER=${SESSION_KIT_INTEGRATION_MARKER:-"$SK_STATE_DIR/integration-ready-v1"}
+SK_PROJECTS_FILE=${SESSION_KIT_PROJECTS_FILE:-${XDG_CONFIG_HOME:-"$HOME/.config"}/session-kit/projects.tsv}
+SK_CONFIG_FILE=${SESSION_KIT_CONFIG:-${XDG_CONFIG_HOME:-"$HOME/.config"}/session-kit/inventory.json}
+SK_SHPOOL=${SESSION_KIT_SHPOOL_CMD:-}
+SK_INVENTORY_CORE=${SESSION_KIT_INVENTORY_CORE:-"$SESSION_KIT_RELEASE_DIR/lib/session_inventory.py"}
+
+if [[ -z $SK_SHPOOL ]]; then
+  SK_SHPOOL=$(command -v shpool 2>/dev/null || true)
+fi
+if [[ -z $SK_SHPOOL ]]; then
+  for sk_candidate in "$HOME/.cargo/bin/shpool" /opt/homebrew/bin/shpool /usr/local/bin/shpool; do
+    if [[ -x $sk_candidate ]]; then
+      SK_SHPOOL=$sk_candidate
+      break
+    fi
+  done
+fi
+unset sk_candidate
+
+sk_die() {
+  printf 'session-kit: %s\n' "$*" >&2
+  return 1
+}
+
+sk_require_shpool() {
+  [[ -n $SK_SHPOOL && -x $SK_SHPOOL ]] || sk_die "shpool executable unavailable"
+}
+
+sk_platform() {
+  if [[ ${SESSION_KIT_TESTING:-0} == 1 && -n ${SESSION_KIT_TEST_PLATFORM:-} ]]; then
+    printf '%s\n' "$SESSION_KIT_TEST_PLATFORM"
+  else
+    command uname -s 2>/dev/null
+  fi
+}
+
+sk_darwin_preview() {
+  [[ $(sk_platform) == Darwin && ${SESSION_KIT_MACOS_PREVIEW:-0} == 1 ]]
+}
+
+sk_boot_id() {
+  if [[ -n ${SESSION_KIT_BOOT_ID_FILE:-} ]]; then
+    command cat -- "$SESSION_KIT_BOOT_ID_FILE"
+  elif sk_darwin_preview; then
+    python3 "$SK_INVENTORY_CORE" platform boot-id
+  else
+    command cat -- /proc/sys/kernel/random/boot_id
+  fi
+}
+
+sk_now_unix_ms() {
+  if [[ $(sk_platform) == Darwin ]]; then
+    python3 -c 'import time; print(time.time_ns() // 1_000_000)'
+  else
+    date +%s%3N
+  fi
+}
+
+# Linux keeps its established flock semantics. The Darwin preview uses a
+# single atomic directory and never removes a lock it did not acquire. A crash
+# therefore fails closed until the preview operator inspects and removes it.
+sk_lock_acquire() {
+  local fd=$1 path=$2
+  if [[ $(sk_platform) != Darwin ]]; then
+    command -v flock >/dev/null 2>&1 || {
+      sk_die "flock is required"
+      return 1
+    }
+    flock -x "$fd"
+    return
+  fi
+  sk_darwin_preview || {
+    sk_die "macOS preview is disabled"
+    return 1
+  }
+  local directory="${path}.darwin-lock"
+  mkdir "$directory" 2>/dev/null || {
+    sk_die "macOS preview lock is busy: $directory"
+    return 1
+  }
+  printf '%s\n' "$$" > "$directory/owner" || {
+    command rm -- "$directory/owner" 2>/dev/null || true
+    rmdir "$directory" 2>/dev/null || true
+    return 1
+  }
+  SK_DARWIN_LOCK_DIR=$directory
+}
+
+sk_lock_release() {
+  local fd=$1 result=0
+  if [[ -n ${SK_DARWIN_LOCK_DIR:-} ]]; then
+    command rm -- "$SK_DARWIN_LOCK_DIR/owner" 2>/dev/null || result=1
+    rmdir "$SK_DARWIN_LOCK_DIR" 2>/dev/null || result=1
+    if (( result == 0 )); then
+      SK_DARWIN_LOCK_DIR=
+    else
+      sk_die "macOS preview lock release failed; lock retained"
+    fi
+  fi
+  eval "exec ${fd}>&-"
+  return "$result"
+}
+
+sk_require_integration() {
+  local release_id=${SESSION_KIT_RELEASE_ID:-${SESSION_KIT_RELEASE_DIR##*/}}
+  local marker_value=
+  local marker_stat=
+  local marker_size=
+  if [[ -f $SK_INTEGRATION_MARKER && ! -L $SK_INTEGRATION_MARKER ]]; then
+    IFS= read -r marker_value < "$SK_INTEGRATION_MARKER" || true
+    if [[ $(sk_platform) == Darwin ]]; then
+      marker_stat=$(stat -f '%Lp:%u' "$SK_INTEGRATION_MARKER" 2>/dev/null || true)
+      marker_size=$(stat -f '%z' "$SK_INTEGRATION_MARKER" 2>/dev/null || true)
+    else
+      marker_stat=$(stat -c '%a:%u' "$SK_INTEGRATION_MARKER" 2>/dev/null || true)
+      marker_size=$(stat -c '%s' "$SK_INTEGRATION_MARKER" 2>/dev/null || true)
+    fi
+  fi
+  local marker_expected="session-kit-integration-v1 $release_id"
+  [[ $release_id =~ ^[0-9a-f]{40}$ &&
+     $marker_value == "$marker_expected" &&
+     $marker_size == $((${#marker_expected} + 1)) &&
+     $marker_stat == "600:$(id -u)" ]] ||
+    sk_die "new-session launch is disabled until shell integration is validated for this release"
+}
+
+sk_prepare_state() {
+  umask 077
+  mkdir -p "$SK_STATE_DIR" "$SK_JOURNAL_DIR" "$SK_ARCHIVE_DIR"
+  chmod 700 "$SK_STATE_DIR" "$SK_JOURNAL_DIR" "$SK_ARCHIVE_DIR" 2>/dev/null || true
+}
+
+sk_snapshot_file() {
+  local destination=$1
+  "$SESSION_KIT_BIN_DIR/shpool_status" --json > "$destination"
+}
+
+sk_strict_snapshot_file() {
+  local destination=$1
+  "$SESSION_KIT_BIN_DIR/shpool_status" --strict-json > "$destination"
+}
+
+sk_guard_snapshot_file() {
+  local destination=$1
+  "$SESSION_KIT_BIN_DIR/shpool_status" --guard-json > "$destination"
+}
+
+sk_lookup_file() {
+  local inventory=$1 selector=$2
+  python3 - "$inventory" "$selector" <<'PY'
+import json, re, sys
+path, selector = sys.argv[1:3]
+with open(path, encoding="utf-8") as handle:
+    data = json.load(handle)
+rows = data.get("sessions", [])
+matches = []
+if selector.isdigit():
+    wanted = int(selector)
+    has_terminal_numbers = any(
+        isinstance(row, dict) and row.get("terminal_number") is not None
+        for row in rows
+    )
+    selector_field = "terminal_number" if has_terminal_numbers else "row"
+    matches = [row for row in rows if row.get(selector_field) == wanted]
+else:
+    matches = [row for row in rows if row.get("shpool_id") == selector]
+if len(matches) != 1:
+    raise SystemExit(2)
+row = matches[0]
+identity = row.get("identity") or {}
+daemon = data.get("daemon_generation") or {}
+raw_id = row.get("shpool_id_raw")
+if not isinstance(raw_id, str) or raw_id != row.get("shpool_id"):
+    raise SystemExit(2)
+values = [
+    raw_id,
+    str(row.get("started_at_unix_ms") or ""),
+    row.get("shpool_status") or "",
+    row.get("availability") or "",
+    row.get("provider") or "unknown",
+    identity.get("uuid") or "",
+    row.get("title") or "",
+    row.get("cwd") or "",
+    str(identity.get("pid") or ""),
+    str(identity.get("process_start_ticks") or ""),
+    str((row.get("shpool_shell") or {}).get("pid") or ""),
+    str((row.get("shpool_shell") or {}).get("process_start_ticks") or ""),
+    str(daemon.get("pid") or ""),
+    str(daemon.get("process_start_ticks") or ""),
+    "true" if row.get("mutation_allowed") is True else "false",
+    row.get("mutation_rejection_reason") or "",
+]
+for value in values:
+    value = re.sub(r"[\t\r\n]+", " ", str(value))
+    print(value)
+PY
+}
+
+sk_resolve() {
+  local inventory=$1 selector=$2
+  local -a fields=()
+  while IFS= read -r field; do fields+=("$field"); done < <(sk_lookup_file "$inventory" "$selector") || return 2
+  [[ ${#fields[@]} -eq 16 ]] || return 2
+  SK_ID=${fields[0]}
+  SK_STARTED=${fields[1]}
+  SK_STATUS=${fields[2]}
+  SK_AVAILABILITY=${fields[3]}
+  SK_PROVIDER=${fields[4]}
+  SK_UUID=${fields[5]}
+  SK_TITLE=${fields[6]}
+  SK_CWD=${fields[7]}
+  SK_PROVIDER_PID=${fields[8]}
+  SK_PROVIDER_START=${fields[9]}
+  SK_SHELL_PID=${fields[10]}
+  SK_SHELL_START=${fields[11]}
+  SK_DAEMON_PID=${fields[12]}
+  SK_DAEMON_START=${fields[13]}
+  SK_MUTATION_ALLOWED=${fields[14]}
+  SK_MUTATION_REASON=${fields[15]}
+}
+
+sk_require_mutation_target() {
+  [[ ${SK_MUTATION_ALLOWED:-false} == true ]] || {
+    sk_die "session ID is display-only and cannot be mutated (${SK_MUTATION_REASON:-unsafe-id})"
+    return 1
+  }
+}
+
+# True only when the running process is the exact one recorded earlier. The
+# start ticks make a recycled PID impossible to mistake for the original.
+sk_proc_is_exact() {
+  local pid=$1 start_ticks=$2 stat tail
+  local -a fields=()
+  [[ $pid =~ ^[0-9]+$ && $start_ticks =~ ^[0-9]+$ ]] || return 1
+  (( pid > 0 && start_ticks > 0 )) || return 1
+  if [[ $(sk_platform) == Darwin ]]; then
+    sk_darwin_preview || return 1
+    local current
+    current=$(python3 "$SK_INVENTORY_CORE" platform process-info "$pid" 2>/dev/null) || return 1
+    [[ ${current#*$'\t'} == "$start_ticks" ]]
+    return
+  fi
+  [[ -r /proc/$pid/stat ]] || return 1
+  stat=$(<"/proc/$pid/stat") || return 1
+  tail=${stat##*) }
+  read -r -a fields <<<"$tail"
+  [[ ${#fields[@]} -ge 20 ]] || return 1
+  [[ ${fields[19]} == "$start_ticks" ]]
+}
+
+# True when a provider process of the expected kind is running underneath the
+# exact proven shell of this session.
+#
+# This exists because a brand-new Codex session cannot be identified from the
+# inventory. Codex identity is derived from an open rollout file, and Codex does
+# not write one until the human sends a first message -- so a new Codex session
+# reports provider "unknown" until it is used. `sp new codex` used to wait for
+# that identity, time out, and abandon a perfectly good session without ever
+# attaching the human to it. Claude was unaffected because `claude agents
+# --json` lists a new session immediately.
+#
+# The process tree is the correct evidence for "did the provider start": it is
+# exactly what the launch record asked the shell to do.
+sk_provider_process_present() {
+  local shell_pid=$1 shell_start=$2 provider=$3
+  local override=${SESSION_KIT_PROVIDER_PRESENCE_OVERRIDE:-}
+  if [[ -n $override ]]; then
+    # Test and diagnostic hook only; unset in normal operation. Checked before
+    # anything reads /proc, because a fixture's shell PIDs are synthetic.
+    [[ $override == present ]]
+    return
+  fi
+  sk_proc_is_exact "$shell_pid" "$shell_start" || return 1
+  if [[ $(sk_platform) == Darwin ]]; then
+    sk_darwin_preview || return 1
+    python3 "$SK_INVENTORY_CORE" platform provider-present \
+      "$shell_pid" "$shell_start" "$provider" >/dev/null
+    return
+  fi
+  python3 - "$shell_pid" "$provider" <<'PY'
+import os
+import re
+import sys
+
+wanted_pid, provider = int(sys.argv[1]), sys.argv[2]
+patterns = {
+    "codex": re.compile(r"(^|/)codex($|\s|\0)"),
+    "claude": re.compile(r"(^|/)claude($|\s|\0)"),
+}
+pattern = patterns.get(provider)
+if pattern is None:
+    raise SystemExit(1)
+
+parents: dict[int, int] = {}
+commands: dict[int, str] = {}
+for entry in os.listdir("/proc"):
+    if not entry.isdigit():
+        continue
+    pid = int(entry)
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as handle:
+            tail = handle.read().rsplit(") ", 1)[-1].split()
+        parents[pid] = int(tail[1])
+        with open(f"/proc/{pid}/cmdline", "rb") as handle:
+            commands[pid] = handle.read(4096).decode("utf-8", "replace")
+    except (OSError, IndexError, ValueError):
+        continue
+
+for pid, command in commands.items():
+    if not pattern.search(command):
+        continue
+    # Bounded walk to the session shell; a provider is a close descendant.
+    walker, depth = pid, 0
+    while walker > 1 and depth < 8:
+        if walker == wanted_pid:
+            raise SystemExit(0)
+        walker = parents.get(walker, 0)
+        depth += 1
+raise SystemExit(1)
+PY
+}
+
+# `shpool kill` ends the session's own shell, but a provider process wedged on
+# a terminal write can outlive it and keep holding the old pty. Only processes
+# whose PID *and* start ticks still match the recorded generation are signalled.
+sk_reap_session_leftovers() {
+  local pid start_ticks signal reaped=0
+  local -a pairs=("$@")
+  local index
+  for signal in HUP TERM KILL; do
+    for (( index = 0; index + 1 < ${#pairs[@]}; index += 2 )); do
+      pid=${pairs[index]}
+      start_ticks=${pairs[index + 1]}
+      if sk_proc_is_exact "$pid" "$start_ticks"; then
+        kill -"$signal" "$pid" 2>/dev/null || true
+        reaped=1
+      fi
+    done
+    (( reaped )) || return 0
+    sleep 2
+    reaped=0
+    for (( index = 0; index + 1 < ${#pairs[@]}; index += 2 )); do
+      if sk_proc_is_exact "${pairs[index]}" "${pairs[index + 1]}"; then
+        reaped=1
+      fi
+    done
+    (( reaped )) || return 0
+  done
+  return 0
+}
+
+sk_revalidate() {
+  local expected_id=$1 expected_started=$2 expected_provider=$3 expected_uuid=$4
+  local expected_shell_pid=$5 expected_shell_start=$6
+  local expected_provider_pid=$7 expected_provider_start=$8
+  local expected_daemon_pid=$9 expected_daemon_start=${10}
+  local fresh result=0
+  fresh=$(mktemp "$SK_STATE_DIR/revalidate.XXXXXX.json") || return 1
+  if ! sk_guard_snapshot_file "$fresh" || ! sk_resolve "$fresh" "$expected_id"; then
+    result=1
+  elif [[ $SK_ID != "$expected_id" || $SK_STARTED != "$expected_started" ]]; then
+    result=1
+  elif [[ $SK_PROVIDER != "$expected_provider" || $SK_UUID != "$expected_uuid" ]]; then
+    result=1
+  elif [[ $SK_SHELL_PID != "$expected_shell_pid" || $SK_SHELL_START != "$expected_shell_start" ]]; then
+    result=1
+  elif [[ $SK_PROVIDER_PID != "$expected_provider_pid" || $SK_PROVIDER_START != "$expected_provider_start" ]]; then
+    result=1
+  elif [[ $SK_DAEMON_PID != "$expected_daemon_pid" || $SK_DAEMON_START != "$expected_daemon_start" ]]; then
+    result=1
+  elif [[ $SK_MUTATION_ALLOWED != true ]]; then
+    result=1
+  fi
+  command rm -- "$fresh"
+  return "$result"
+}
+
+sk_load_picker_proof() {
+  local proof=$1 output
+  output=$(python3 - "$proof" "$(id -u)" <<'PY'
+import json
+import os
+import re
+import stat
+import sys
+
+path, expected_uid_raw = sys.argv[1:3]
+expected_uid = int(expected_uid_raw)
+expected_keys = {
+    "schema_version",
+    "proof_type",
+    "shpool_id",
+    "started_at_unix_ms",
+    "provider",
+    "uuid",
+    "provider_pid",
+    "provider_process_start_ticks",
+    "shell_pid",
+    "shell_process_start_ticks",
+    "daemon_pid",
+    "daemon_process_start_ticks",
+}
+id_pattern = re.compile(
+    r"(?:main(?:[1-9][0-9]*)?|s[0-9]{8}-[0-9]{6}-[1-9][0-9]*(?:-[1-9][0-9]*)?)"
+)
+uuid_pattern = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+)
+
+def reject_duplicates(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate key")
+        result[key] = value
+    return result
+
+flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+try:
+    descriptor = os.open(path, flags)
+except OSError:
+    raise SystemExit(2)
+try:
+    before = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_uid != expected_uid
+        or stat.S_IMODE(before.st_mode) != 0o600
+        or before.st_nlink != 1
+        or before.st_size <= 0
+        or before.st_size > 4096
+    ):
+        raise SystemExit(2)
+    chunks = []
+    remaining = before.st_size
+    while remaining:
+        block = os.read(descriptor, min(remaining, 4096))
+        if not block:
+            raise SystemExit(2)
+        chunks.append(block)
+        remaining -= len(block)
+    if os.read(descriptor, 1):
+        raise SystemExit(2)
+    after = os.fstat(descriptor)
+    stable_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+    if any(getattr(before, key) != getattr(after, key) for key in stable_fields):
+        raise SystemExit(2)
+finally:
+    os.close(descriptor)
+
+raw = b"".join(chunks)
+try:
+    text = raw.decode("utf-8", "strict")
+    value = json.loads(text, object_pairs_hook=reject_duplicates)
+except (UnicodeDecodeError, ValueError):
+    raise SystemExit(2)
+if not isinstance(value, dict) or set(value) != expected_keys:
+    raise SystemExit(2)
+canonical = (
+    json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+).encode("utf-8")
+if raw != canonical:
+    raise SystemExit(2)
+if value["schema_version"] != 1 or value["proof_type"] != "session-kit-picker-session-v1":
+    raise SystemExit(2)
+if not isinstance(value["shpool_id"], str) or not id_pattern.fullmatch(value["shpool_id"]):
+    raise SystemExit(2)
+if value["provider"] not in {"claude", "codex", "shell", "unknown"}:
+    raise SystemExit(2)
+if not isinstance(value["uuid"], str):
+    raise SystemExit(2)
+if value["provider"] in {"shell", "unknown"}:
+    if value["uuid"] != "":
+        raise SystemExit(2)
+elif not uuid_pattern.fullmatch(value["uuid"]):
+    raise SystemExit(2)
+integer_keys = expected_keys - {
+    "proof_type",
+    "shpool_id",
+    "provider",
+    "uuid",
+}
+for key in integer_keys:
+    item = value[key]
+    if isinstance(item, bool) or not isinstance(item, int) or item <= 0:
+        raise SystemExit(2)
+for key in (
+    "shpool_id",
+    "started_at_unix_ms",
+    "provider",
+    "uuid",
+    "provider_pid",
+    "provider_process_start_ticks",
+    "shell_pid",
+    "shell_process_start_ticks",
+    "daemon_pid",
+    "daemon_process_start_ticks",
+):
+    print(value[key])
+PY
+  ) || {
+    sk_die "invalid private picker proof"
+    return 1
+  }
+  local -a fields=()
+  while IFS= read -r field; do fields+=("$field"); done <<<"$output"
+  [[ ${#fields[@]} -eq 10 ]] || {
+    sk_die "invalid private picker proof"
+    return 1
+  }
+  SK_PROOF_ID=${fields[0]}
+  SK_PROOF_STARTED=${fields[1]}
+  SK_PROOF_PROVIDER=${fields[2]}
+  SK_PROOF_UUID=${fields[3]}
+  SK_PROOF_PROVIDER_PID=${fields[4]}
+  SK_PROOF_PROVIDER_START=${fields[5]}
+  SK_PROOF_SHELL_PID=${fields[6]}
+  SK_PROOF_SHELL_START=${fields[7]}
+  SK_PROOF_DAEMON_PID=${fields[8]}
+  SK_PROOF_DAEMON_START=${fields[9]}
+}
+
+sk_picker_proof_matches() {
+  local inventory=$1
+  sk_resolve "$inventory" "$SK_PROOF_ID" || return 1
+  [[ $SK_MUTATION_ALLOWED == true &&
+     $SK_ID == "$SK_PROOF_ID" &&
+     $SK_STARTED == "$SK_PROOF_STARTED" &&
+     $SK_PROVIDER == "$SK_PROOF_PROVIDER" &&
+     $SK_UUID == "$SK_PROOF_UUID" &&
+     $SK_PROVIDER_PID == "$SK_PROOF_PROVIDER_PID" &&
+     $SK_PROVIDER_START == "$SK_PROOF_PROVIDER_START" &&
+     $SK_SHELL_PID == "$SK_PROOF_SHELL_PID" &&
+     $SK_SHELL_START == "$SK_PROOF_SHELL_START" &&
+     $SK_DAEMON_PID == "$SK_PROOF_DAEMON_PID" &&
+     $SK_DAEMON_START == "$SK_PROOF_DAEMON_START" ]]
+}
+
+sk_project_lookup() {
+  local alias=$1
+  [[ -r $SK_PROJECTS_FILE ]] || return 1
+  awk -F '\t' -v wanted="$alias" '
+    $0 !~ /^[[:space:]]*#/ && NF >= 3 && $1 == wanted {
+      if ($2 !~ /^(claude|codex|shell)$/ || $3 !~ /^\//) exit 2
+      print $1 "\t" $2 "\t" $3
+      found=1
+      exit
+    }
+    END { if (!found) exit 1 }
+  ' "$SK_PROJECTS_FILE"
+}
+
+sk_allocate_id() {
+  local json base candidate counter=0
+  json=$("$SK_SHPOOL" list --json 2>/dev/null) || return 1
+  python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+rows=d.get("sessions") if isinstance(d,dict) else None
+raise SystemExit(0 if isinstance(rows,list) and all(isinstance(r,dict) and isinstance(r.get("name"),str) for r in rows) else 1)
+' <<<"$json" || return 1
+  base="s$(date +%Y%m%d-%H%M%S)-$$"
+  candidate=$base
+  while
+    python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+rows=d.get("sessions", d if isinstance(d,list) else [])
+raise SystemExit(0 if any(r.get("name")==sys.argv[1] for r in rows) else 1)
+' "$candidate" <<<"$json" ||
+    [[ -e $SK_START_DIR/$candidate || -L $SK_START_DIR/$candidate ||
+       -e $SK_START_DIR/$candidate.expected || -L $SK_START_DIR/$candidate.expected ]]
+  do
+    counter=$((counter + 1))
+    candidate="${base}-${counter}"
+  done
+  printf '%s\n' "$candidate"
+}
+
+sk_write_start_record() {
+  local shpool_id=$1 provider=$2 cwd=$3 uuid=${4:-} launch_mode=${5:-}
+  [[ $provider =~ ^(claude|codex|shell)$ && $cwd == /* ]] || return 1
+  [[ $cwd != *$'\t'* && $cwd != *$'\r'* && $cwd != *$'\n'* &&
+     $cwd != *$'\034'* ]] || return 1
+  if [[ -z $launch_mode ]]; then
+    if [[ -n $uuid ]]; then launch_mode=resume; else launch_mode=new; fi
+  fi
+  [[ $launch_mode =~ ^(new|resume|fork)$ ]] || return 1
+  if [[ -n $uuid ]]; then
+    [[ $uuid =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]] || return 1
+  fi
+  if [[ $launch_mode == new ]]; then
+    [[ -z $uuid ]] || return 1
+  else
+    [[ -n $uuid && $provider != shell ]] || return 1
+  fi
+  umask 077
+  mkdir -p "$SK_START_DIR" || return 1
+  chmod 700 "$SK_START_DIR" 2>/dev/null || true
+  [[ ! -e $SK_START_DIR/$shpool_id && ! -L $SK_START_DIR/$shpool_id &&
+     ! -e $SK_START_DIR/$shpool_id.expected && ! -L $SK_START_DIR/$shpool_id.expected ]] || return 1
+  local tmp="$SK_START_DIR/.${shpool_id}.$$"
+  printf '%s\t%s\t%s\t%s\n' "$provider" "$cwd" "$uuid" "$launch_mode" > "$tmp" || return 1
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$SK_START_DIR/$shpool_id"
+}
+
+sk_capture_session_generation() {
+  local shpool_id=$1 creation_floor_ms=$2
+  local attempt fresh
+  for attempt in {1..20}; do
+    fresh=$(mktemp "$SK_STATE_DIR/generation-proof.XXXXXX.json") || return 1
+    if sk_guard_snapshot_file "$fresh" 2>/dev/null &&
+       python3 -c '
+import json,sys
+d=json.load(open(sys.argv[1]))
+g=d.get("daemon_generation") or {}
+ok=(d.get("source")=="live" and d.get("stale") is False and not d.get("warnings")
+    and isinstance(g.get("pid"),int) and isinstance(g.get("process_start_ticks"),int))
+raise SystemExit(0 if ok else 1)
+' "$fresh" &&
+       sk_resolve "$fresh" "$shpool_id" &&
+       [[ $SK_MUTATION_ALLOWED == true &&
+          $SK_STARTED =~ ^[0-9]+$ && $SK_STARTED -ge $creation_floor_ms &&
+          $SK_SHELL_PID =~ ^[0-9]+$ && $SK_SHELL_START =~ ^[0-9]+$ &&
+          $SK_DAEMON_PID =~ ^[0-9]+$ && $SK_DAEMON_START =~ ^[0-9]+$ ]]; then
+      SK_CREATED_STARTED=$SK_STARTED
+      SK_CREATED_SHELL_PID=$SK_SHELL_PID
+      SK_CREATED_SHELL_START=$SK_SHELL_START
+      SK_CREATED_DAEMON_PID=$SK_DAEMON_PID
+      SK_CREATED_DAEMON_START=$SK_DAEMON_START
+      SK_CREATED_BOOT_ID=$(sk_boot_id) || {
+        command rm -- "$fresh"
+        return 1
+      }
+      SK_CREATED_BOOT_ID=${SK_CREATED_BOOT_ID//$'\r'/}
+      SK_CREATED_BOOT_ID=${SK_CREATED_BOOT_ID//$'\n'/}
+      [[ -n $SK_CREATED_BOOT_ID && $SK_CREATED_BOOT_ID != *$'\t'* ]] || {
+        command rm -- "$fresh"
+        return 1
+      }
+      command rm -- "$fresh"
+      return 0
+    fi
+    command rm -- "$fresh"
+    (( attempt == 20 )) || sleep 0.1
+  done
+  return 1
+}
+
+sk_write_generation_record() {
+  local shpool_id=$1 provider=$2 cwd=$3 uuid=$4
+  local boot_id=$5 started=$6 shell_pid=$7 shell_start=$8 daemon_pid=$9 daemon_start=${10}
+  local launch_mode=${11:-}
+  if [[ -z $launch_mode ]]; then
+    if [[ -n $uuid ]]; then launch_mode=resume; else launch_mode=new; fi
+  fi
+  [[ $launch_mode =~ ^(new|resume|fork)$ ]] || return 1
+  if [[ $launch_mode == new ]]; then
+    [[ -z $uuid ]] || return 1
+  else
+    [[ $provider =~ ^(claude|codex)$ && $uuid =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]] || return 1
+  fi
+  local tmp="$SK_START_DIR/.${shpool_id}.expected.$$"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$provider" "$cwd" "$boot_id" "$started" "$shell_pid" "$shell_start" \
+    "$daemon_pid" "$daemon_start" "$uuid" "$launch_mode" > "$tmp" || return 1
+  chmod 600 "$tmp" 2>/dev/null || true
+  if ! mv -f "$tmp" "$SK_START_DIR/$shpool_id.expected"; then
+    [[ ! -e $tmp ]] || command rm -- "$tmp"
+    return 1
+  fi
+}
+
+sk_quarantine_start_record() {
+  local shpool_id=$1 reason=$2
+  local failed_dir="$SK_START_DIR/failed"
+  local stamp destination
+  umask 077
+  mkdir -p "$failed_dir" || return 1
+  chmod 700 "$failed_dir" 2>/dev/null || true
+  stamp=$(date +%Y%m%d-%H%M%S)
+  destination="$failed_dir/$shpool_id.$stamp.$reason"
+  if [[ -f $SK_START_DIR/$shpool_id && ! -L $SK_START_DIR/$shpool_id ]]; then
+    mv "$SK_START_DIR/$shpool_id" "$destination.start" || return 1
+  fi
+  if [[ -f $SK_START_DIR/$shpool_id.expected && ! -L $SK_START_DIR/$shpool_id.expected ]]; then
+    mv "$SK_START_DIR/$shpool_id.expected" "$destination.expected" || return 1
+  fi
+  printf '%s\n' "$destination"
+}
+
+sk_read_start_expectation() {
+  local shpool_id=$1
+  local start="$SK_START_DIR/$shpool_id" expected="$SK_START_DIR/$shpool_id.expected"
+  [[ -f $start && ! -L $start && -f $expected && ! -L $expected ]] || return 1
+  python3 - "$start" "$expected" <<'PY' || return 1
+import sys
+
+for path in sys.argv[1:]:
+    with open(path, "rb") as handle:
+        payload = handle.read(8193)
+    if (
+        not payload
+        or len(payload) > 8192
+        or not payload.endswith(b"\n")
+        or payload.count(b"\n") != 1
+        or b"\r" in payload
+    ):
+        raise SystemExit(1)
+PY
+  local start_line expected_line
+  IFS= read -r start_line < "$start" || return 1
+  IFS= read -r expected_line < "$expected" || return 1
+  [[ $start_line != *$'\r'* && $start_line != *$'\n'* && $start_line != *$'\034'* &&
+     $expected_line != *$'\r'* && $expected_line != *$'\n'* &&
+     $expected_line != *$'\034'* ]] || return 1
+  local start_tabs=${start_line//[^$'\t']/}
+  local expected_tabs=${expected_line//[^$'\t']/}
+  [[ ${#start_tabs} -eq 2 || ${#start_tabs} -eq 3 ]] || return 1
+  [[ ${#expected_tabs} -eq 8 || ${#expected_tabs} -eq 9 ]] || return 1
+  start_line=${start_line//$'\t'/$'\034'}
+  expected_line=${expected_line//$'\t'/$'\034'}
+  IFS=$'\034' read -r SK_EXPECT_PROVIDER SK_EXPECT_CWD SK_EXPECT_UUID SK_EXPECT_LAUNCH_MODE <<<"$start_line"
+  local side_provider side_cwd side_uuid side_launch_mode
+  IFS=$'\034' read -r side_provider side_cwd \
+    SK_EXPECT_BOOT_ID SK_EXPECT_STARTED SK_EXPECT_SHELL_PID SK_EXPECT_SHELL_START \
+    SK_EXPECT_DAEMON_PID SK_EXPECT_DAEMON_START side_uuid side_launch_mode <<<"$expected_line"
+  if [[ -z $SK_EXPECT_LAUNCH_MODE ]]; then
+    if [[ -n $SK_EXPECT_UUID ]]; then SK_EXPECT_LAUNCH_MODE=resume; else SK_EXPECT_LAUNCH_MODE=new; fi
+  fi
+  if [[ -z $side_launch_mode ]]; then
+    if [[ -n $side_uuid ]]; then side_launch_mode=resume; else side_launch_mode=new; fi
+  fi
+  [[ $side_provider == "$SK_EXPECT_PROVIDER" &&
+     $side_cwd == "$SK_EXPECT_CWD" &&
+     $side_uuid == "$SK_EXPECT_UUID" &&
+     $side_launch_mode == "$SK_EXPECT_LAUNCH_MODE" ]] || return 1
+  [[ $SK_EXPECT_LAUNCH_MODE =~ ^(new|resume|fork)$ ]] || return 1
+  if [[ $SK_EXPECT_LAUNCH_MODE == new ]]; then
+    [[ -z $SK_EXPECT_UUID ]] || return 1
+  else
+    [[ $SK_EXPECT_PROVIDER =~ ^(claude|codex)$ &&
+       $SK_EXPECT_UUID =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]] || return 1
+  fi
+  [[ -n $SK_EXPECT_BOOT_ID && $SK_EXPECT_BOOT_ID != *$'\t'* &&
+     $SK_EXPECT_BOOT_ID != *$'\r'* && $SK_EXPECT_BOOT_ID != *$'\n'* &&
+     $SK_EXPECT_STARTED =~ ^[0-9]+$ &&
+     $SK_EXPECT_SHELL_PID =~ ^[0-9]+$ && $SK_EXPECT_SHELL_START =~ ^[0-9]+$ &&
+     $SK_EXPECT_DAEMON_PID =~ ^[0-9]+$ && $SK_EXPECT_DAEMON_START =~ ^[0-9]+$ ]]
+}
+
+sk_clear_start_record() {
+  local shpool_id=$1 expected_provider=$2 expected_cwd=$3 expected_uuid=$4
+  local expected_boot_id=$5 expected_started=$6 expected_shell_pid=$7 expected_shell_start=$8
+  local expected_daemon_pid=$9 expected_daemon_start=${10}
+  local expected_launch_mode=${11:-}
+  if [[ -z $expected_launch_mode ]]; then
+    if [[ -n $expected_uuid ]]; then expected_launch_mode=resume; else expected_launch_mode=new; fi
+  fi
+  local path="$SK_START_DIR/$shpool_id"
+  local expected_path="$path.expected"
+  exec 8>"$SK_STATE_DIR/create.lock" || return 1
+  sk_lock_acquire 8 "$SK_STATE_DIR/create.lock" || { exec 8>&-; return 1; }
+  sk_read_start_expectation "$shpool_id" || { sk_lock_release 8; return 1; }
+  [[ $SK_EXPECT_PROVIDER == "$expected_provider" &&
+     $SK_EXPECT_CWD == "$expected_cwd" && $SK_EXPECT_UUID == "$expected_uuid" &&
+     $SK_EXPECT_LAUNCH_MODE == "$expected_launch_mode" &&
+     $SK_EXPECT_BOOT_ID == "$expected_boot_id" &&
+     $SK_EXPECT_STARTED == "$expected_started" &&
+     $SK_EXPECT_SHELL_PID == "$expected_shell_pid" &&
+     $SK_EXPECT_SHELL_START == "$expected_shell_start" &&
+     $SK_EXPECT_DAEMON_PID == "$expected_daemon_pid" &&
+     $SK_EXPECT_DAEMON_START == "$expected_daemon_start" ]] || {
+       sk_lock_release 8
+       return 1
+     }
+  command rm -- "$path" "$expected_path"
+  sk_lock_release 8
+}
+
+sk_wait_for_provider() {
+  local shpool_id=$1 expected_provider=$2 expected_cwd=$3 expected_uuid=$4
+  local expected_boot_id=$5 expected_started=$6 expected_shell_pid=$7 expected_shell_start=$8
+  local expected_daemon_pid=$9 expected_daemon_start=${10}
+  local expected_launch_mode=${11:-}
+  if [[ -z $expected_launch_mode ]]; then
+    if [[ -n $expected_uuid ]]; then expected_launch_mode=resume; else expected_launch_mode=new; fi
+  fi
+  [[ $expected_launch_mode =~ ^(new|resume|fork)$ ]] || return 1
+  # Resuming a large conversation on a loaded box takes far longer than the
+  # original 15s budget: an 11 MB rollout plus a busy machine regularly needs
+  # a minute or more before the provider publishes its identity. Waiting
+  # costs nothing when the launch succeeds -- the loop returns the moment the
+  # identity matches.
+  local attempts=${SESSION_KIT_PROVIDER_PROOF_ATTEMPTS:-480}
+  [[ $attempts =~ ^[0-9]+$ && $attempts -ge 1 && $attempts -le 2400 ]] || return 1
+  local attempt fresh
+  for (( attempt=1; attempt<=attempts; attempt++ )); do
+    local current_boot_id=
+    current_boot_id=$(sk_boot_id) || return 1
+    current_boot_id=${current_boot_id//$'\r'/}
+    current_boot_id=${current_boot_id//$'\n'/}
+    fresh=$(mktemp "$SK_STATE_DIR/provider-proof.XXXXXX.json") || return 1
+    local identity_matches=false
+    if sk_guard_snapshot_file "$fresh" 2>/dev/null &&
+       sk_resolve "$fresh" "$shpool_id"; then
+      case "$expected_launch_mode" in
+        # A guard-live inventory already requires an exact provider UUID for
+        # Claude/Codex. The fixture guard is intentionally smaller, so new
+        # launches need only prove that no source UUID was requested here.
+        new) [[ -z $expected_uuid ]] && identity_matches=true ;;
+        resume) [[ -n $expected_uuid && $SK_UUID == "$expected_uuid" ]] && identity_matches=true ;;
+        fork)
+          if [[ -n $expected_uuid && -n $SK_UUID && $SK_UUID != "$expected_uuid" ]] &&
+             python3 - "$fresh" "$expected_provider" "$SK_UUID" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    inventory = json.load(handle)
+wanted_provider = sys.argv[2]
+wanted_uuid = sys.argv[3]
+rows = list(inventory.get("sessions", ())) + list(inventory.get("outside_agents", ()))
+matches = [
+    row for row in rows
+    if isinstance(row, dict)
+    and row.get("provider") == wanted_provider
+    and isinstance(row.get("identity"), dict)
+    and row["identity"].get("uuid") == wanted_uuid
+    and row["identity"].get("confidence") == "exact"
+]
+raise SystemExit(0 if len(matches) == 1 else 1)
+PY
+          then
+            identity_matches=true
+          fi
+          ;;
+      esac
+    fi
+    # A new session's provider may not be classifiable yet -- Codex publishes
+    # its identity only once it has a rollout, which needs a first message.
+    # Accept the process tree as proof of startup in that case, and only in
+    # that case: a resume or fork must still match its exact conversation.
+    local provider_matches=false
+    if [[ $SK_PROVIDER == "$expected_provider" ]]; then
+      provider_matches=true
+    elif [[ $expected_launch_mode == new && $SK_PROVIDER == unknown ]] &&
+         sk_provider_process_present "$SK_SHELL_PID" "$SK_SHELL_START" "$expected_provider"; then
+      provider_matches=true
+    fi
+    if [[ $identity_matches == true &&
+          $SK_MUTATION_ALLOWED == true &&
+          $provider_matches == true &&
+          $current_boot_id == "$expected_boot_id" &&
+          $SK_CWD == "$expected_cwd" &&
+          $SK_STARTED == "$expected_started" &&
+          $SK_SHELL_PID == "$expected_shell_pid" &&
+          $SK_SHELL_START == "$expected_shell_start" &&
+          $SK_DAEMON_PID == "$expected_daemon_pid" &&
+          $SK_DAEMON_START == "$expected_daemon_start" ]]; then
+      SK_PROVEN_UUID=$SK_UUID
+      command rm -- "$fresh"
+      sk_clear_start_record "$shpool_id" "$expected_provider" "$expected_cwd" "$expected_uuid" \
+        "$expected_boot_id" "$expected_started" "$expected_shell_pid" "$expected_shell_start" \
+        "$expected_daemon_pid" "$expected_daemon_start" "$expected_launch_mode" || return 1
+      return 0
+    fi
+    command rm -- "$fresh"
+    (( attempt == attempts )) || sleep 0.25
+  done
+  return 1
+}
+
+# One keypress, never a typed session name. The caller has already selected an
+# exact session and the line below names it, so retyping an ID proved nothing
+# except that the human could copy a string.
+sk_confirm_exact() {
+  local action=$1 id=$2 title=$3 provider=$4
+  printf '\n  %s\n  %s  [%s]  %s\n' "$action" "$title" "$id" "$provider"
+  if [[ ${SESSION_KIT_NONINTERACTIVE:-0} == 1 ]]; then
+    [[ ${SESSION_KIT_CONFIRM_ID:-} == "$id" ]]
+    return
+  fi
+  local answer=""
+  read -r -n 1 -p "  Confirm? [y/N] " answer
+  printf '\n'
+  [[ $answer == y || $answer == Y ]]
+}
+
+sk_recovery_journal() {
+  local id=$1 map="$SK_RECOVERY_DIR/current-map.tsv"
+  [[ -r $map ]] || return 1
+  awk -F '\t' -v wanted="$id" '$1 == wanted && $2 ~ /^\// { print $2; exit }' "$map"
+}

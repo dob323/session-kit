@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Resume one exact Codex conversation. Never chooses by cwd or recency.
+set -euo pipefail
+
+print_only=0
+cwd=""
+while (( $# )); do
+  case "$1" in
+    --print) print_only=1; shift ;;
+    --cwd)
+      [[ $# -ge 2 ]] || { echo "codex_resume_here: --cwd requires a path" >&2; exit 2; }
+      cwd=$2
+      shift 2
+      ;;
+    --help|-h)
+      echo "usage: codex_resume_here [--print] [--cwd absolute-path] <exact-uuid>"
+      exit 0
+      ;;
+    --*) echo "codex_resume_here: unknown option $1" >&2; exit 2 ;;
+    *) break ;;
+  esac
+done
+
+[[ $# -eq 1 ]] || {
+  echo "usage: codex_resume_here [--print] [--cwd absolute-path] <exact-uuid>" >&2
+  exit 2
+}
+uuid=${1,,}
+[[ $uuid =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || {
+  echo "codex_resume_here: an exact Codex UUID is required" >&2
+  exit 2
+}
+if [[ -n $cwd && $cwd != /* ]]; then
+  echo "codex_resume_here: --cwd must be an absolute path" >&2
+  exit 2
+fi
+
+if (( print_only )); then
+  if [[ -n $cwd ]]; then
+    printf 'cd -- %q && codex --no-alt-screen resume %q\n' "$cwd" "$uuid"
+  else
+    printf 'codex --no-alt-screen resume %q\n' "$uuid"
+  fi
+  exit 0
+fi
+
+command -v codex >/dev/null 2>&1 || {
+  echo "codex_resume_here: codex is not installed" >&2
+  exit 127
+}
+if [[ -n $cwd ]]; then
+  [[ -d $cwd ]] || { echo "codex_resume_here: cwd does not exist: $cwd" >&2; exit 2; }
+  cd -- "$cwd"
+fi
+exec codex --no-alt-screen resume "$uuid"

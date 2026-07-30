@@ -1,0 +1,59 @@
+#!/usr/bin/env python3
+"""Fail when a public tree contains known private markers or secret formats."""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+import re
+
+
+TEXT_LIMIT = 4 * 1024 * 1024
+SECRETS = {
+    "private key": re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
+    "GitHub token": re.compile(r"\b(?:ghp|github_pat)_[A-Za-z0-9_]{20,}\b"),
+    "AWS access key": re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    "OpenAI key": re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
+    "Slack token": re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{20,}\b"),
+}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("root", nargs="?", default=".", type=Path)
+    args = parser.parse_args()
+    root = args.root.resolve()
+    failures: list[str] = []
+    for path in sorted(root.rglob("*")):
+        if (
+            ".git" in path.parts
+            or "__pycache__" in path.parts
+            or path.suffix in {".pyc", ".pyo"}
+            or path.is_dir()
+        ):
+            continue
+        if path.is_symlink():
+            failures.append(f"{path.relative_to(root)}: symlink is not allowed")
+            continue
+        payload = path.read_bytes()
+        if len(payload) > TEXT_LIMIT:
+            failures.append(f"{path.relative_to(root)}: file exceeds scan limit")
+            continue
+        if b"\0" in payload:
+            failures.append(f"{path.relative_to(root)}: binary file is not allowed")
+            continue
+        text = payload.decode("utf-8", "replace")
+        for label, pattern in SECRETS.items():
+            if pattern.search(text):
+                failures.append(f"{path.relative_to(root)}: {label}")
+    if failures:
+        print("public scan failed:")
+        for failure in failures:
+            print(f"  {failure}")
+        return 1
+    print("public scan passed")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

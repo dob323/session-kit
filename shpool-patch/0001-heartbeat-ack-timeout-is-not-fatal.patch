@@ -1,0 +1,24 @@
+diff --git a/libshpool/src/daemon/shell.rs b/libshpool/src/daemon/shell.rs
+index cc3ab28..af76798 100644
+--- a/libshpool/src/daemon/shell.rs
++++ b/libshpool/src/daemon/shell.rs
+@@ -962,7 +962,18 @@ impl SessionInner {
+                             // the shell->client process exited cleanly. We should not raise a
+                             // ruckus.
+                             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return Ok(()),
+-                            Err(e) => return Err(e).context("waiting for heartbeat ack"),
++                            // A timeout here means the same thing the send
++                            // timeout above means, and is handled the same way:
++                            // the shell->client thread may simply be busy. It
++                            // is NOT evidence that the client is gone. Treating
++                            // it as fatal unwinds the whole thread scope and
++                            // destroys this session's shell->client thread, so
++                            // the session can never be attached again and
++                            // whatever runs inside it blocks forever on its
++                            // next write. A genuinely dead client is still
++                            // detected: the write to client_stream fails and
++                            // takes the "assuming hangup" path.
++                            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                             Ok(client_present) => client_present,
+                         };
+                         if !client_present {

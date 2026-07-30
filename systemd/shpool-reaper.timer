@@ -1,0 +1,10 @@
+[Unit]
+Description=Hourly reap of abandoned empty shpool sessions
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=5m
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Stable top-level entry point. Resolve `current` once, then execute from that
+# exact immutable release so an activation cannot split one invocation across
+# two releases.
+helper=${0##*/}
+case "$helper" in
+  sp|shpool_login|shpool_status|shpool_reaper|codex_resume_here) ;;
+  *) echo "session-kit launcher: unsupported helper: $helper" >&2; exit 64 ;;
+esac
+
+root=${SESSION_KIT_ROOT:-"$HOME/.local/lib/session-kit"}
+current=$root/current
+if [[ ! -L $current ]]; then
+  echo "session-kit launcher: missing release link: $current" >&2
+  exit 69
+fi
+
+release_dir=$(cd -P -- "$current" 2>/dev/null && pwd) || {
+  echo "session-kit launcher: invalid release link: $current" >&2
+  exit 69
+}
+case "$release_dir" in
+  "$root"/releases/*) ;;
+  *) echo "session-kit launcher: release escapes $root/releases" >&2; exit 78 ;;
+esac
+
+target=$release_dir/bin/$helper
+if [[ ! -x $target ]]; then
+  echo "session-kit launcher: helper missing from pinned release: $helper" >&2
+  exit 69
+fi
+
+export SESSION_KIT_RELEASE_DIR=$release_dir
+exec "$target" "$@"
