@@ -105,9 +105,11 @@ jobs:
             lib/sessionkit_inventory/__init__.py
             lib/sessionkit_inventory/common.py
             tests/test_facade.py
-            tests/test_public_export.py
             tests/test_public_scan.py
           )
+          if [[ -f tests/test_public_export.py ]]; then
+            format_files+=(tests/test_public_export.py)
+          fi
           if [[ -f public/tests-support.py ]]; then
             format_files+=(public/tests-support.py)
           else
