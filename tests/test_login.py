@@ -488,9 +488,34 @@ class LoginPickerTests(unittest.TestCase):
             self.assertIn(
                 "0 sessions · 0 ready here · 0 open elsewhere", output
             )
+            self.assertIn(
+                "Unavailable: 1 session record without a live shell | no actions",
+                output,
+            )
             self.assertIn("Choose a number shown here. Nothing changed.", output)
             self.assertNotIn("[no-number]", output)
             self.assertEqual([], fixture.sp_entries())
+        finally:
+            fixture.close()
+
+    def test_mixed_unavailable_row_does_not_block_exact_kill_proof(self) -> None:
+        exact = row("exact", number=9, availability="attached")
+        unavailable = row("no-shell", number=2)
+        unavailable["terminal_number"] = None
+        fixture = LoginFixture(inventory(exact, unavailable))
+        try:
+            code, output = run_pty(fixture, b"k 2\nk 9\n\n")
+            self.assertEqual(2, code)
+            self.assertIn(
+                "Unavailable: 1 session record without a live shell | no actions",
+                output,
+            )
+            self.assertIn("Choose a number shown here. Nothing changed.", output)
+            self.assertNotIn("[no-shell]", output)
+            entries = fixture.sp_entries()
+            self.assertEqual(1, len(entries))
+            self.assertEqual("picker-close", entries[0]["args"][0])
+            self.assertEqual("exact", entries[0]["proof"]["shpool_id"])
         finally:
             fixture.close()
 
@@ -901,7 +926,7 @@ class LoginPickerTests(unittest.TestCase):
             self.assertEqual(2, code)
             self.assertNotIn("\x1b", output)
             self.assertIn(
-                "Open: number · New: n · Close: x number",
+                "Open: number · New: n · Kill: k number",
                 output,
             )
             self.assertIn(
@@ -951,6 +976,60 @@ class LoginPickerTests(unittest.TestCase):
             self.assertTrue(
                 all(entry["proof"]["shpool_id"] == "open1" for entry in entries)
             )
+        finally:
+            fixture.close()
+
+    def test_kill_shortcut_and_close_alias_are_proof_bound(self) -> None:
+        for command in ("k 9", "K 9", "x 9", "X 9"):
+            with self.subTest(command=command):
+                fixture = LoginFixture(
+                    inventory(
+                        row(
+                            "open1",
+                            number=9,
+                            provider="codex",
+                            availability="attached",
+                        )
+                    )
+                )
+                try:
+                    code, output = run_pty(
+                        fixture,
+                        f"{command}\n\n".encode(),
+                    )
+                    self.assertEqual(2, code)
+                    self.assertNotIn("Unknown choice", output)
+                    entries = fixture.sp_entries()
+                    self.assertEqual(1, len(entries))
+                    self.assertEqual("picker-close", entries[0]["args"][0])
+                    self.assertEqual("open1", entries[0]["proof"]["shpool_id"])
+                finally:
+                    fixture.close()
+
+    def test_kill_shortcut_refuses_invalid_or_unshown_numbers(self) -> None:
+        fixture = LoginFixture(inventory(row("open1", number=9)))
+        try:
+            code, output = run_pty(fixture, b"k nope\nk 99\n\n")
+            self.assertEqual(2, code)
+            self.assertIn(
+                "Use k followed by a visible number. Nothing changed.",
+                output,
+            )
+            self.assertIn("Choose a number shown here. Nothing changed.", output)
+            self.assertEqual([], fixture.sp_entries())
+        finally:
+            fixture.close()
+
+    def test_help_presents_kill_shortcut_and_close_alias(self) -> None:
+        fixture = LoginFixture(inventory())
+        try:
+            code, output = run_pty(fixture, b"?\n\n")
+            self.assertEqual(2, code)
+            self.assertIn(
+                "k <number>    Kill the exact displayed session after exact-ID confirmation",
+                output,
+            )
+            self.assertIn("x <number>    Compatibility alias for k", output)
         finally:
             fixture.close()
 

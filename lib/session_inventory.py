@@ -36,6 +36,7 @@ _SESSION_KIT_LIB_DIR = os.fspath(Path(__file__).resolve().parent)
 if _SESSION_KIT_LIB_DIR not in sys.path:
     sys.path.insert(0, _SESSION_KIT_LIB_DIR)
 
+from sessionkit_inventory import common as _common  # noqa: E402
 from sessionkit_inventory.common import (  # noqa: E402, F401
     GENERATED_OPERATIONAL_ID_RE,
     LEGACY_OPERATIONAL_ID_RE,
@@ -92,50 +93,51 @@ def _require_supported_platform() -> str:
 
 
 def _home() -> Path:
-    return Path(os.environ.get("HOME", str(Path.home()))).expanduser()
+    return _common._home(environ=os.environ, home_factory=Path.home)
 
 
 def _xdg_path(env_name: str, fallback: Path) -> Path:
-    value = os.environ.get(env_name)
-    return Path(value).expanduser() if value else fallback
+    return _common._xdg_path(env_name, fallback, environ=os.environ)
 
 
 def config_path() -> Path:
-    explicit = os.environ.get("SESSION_KIT_CONFIG")
-    if explicit:
-        return Path(explicit).expanduser()
-    return _xdg_path("XDG_CONFIG_HOME", _home() / ".config") / "session-kit" / "inventory.json"
+    return _common.config_path(
+        environ=os.environ,
+        home=_home,
+        xdg_path=_xdg_path,
+    )
 
 
 def default_state_dir() -> Path:
-    explicit = os.environ.get("SESSION_KIT_STATE_DIR")
-    if explicit:
-        return Path(explicit).expanduser()
-    return _xdg_path("XDG_STATE_HOME", _home() / ".local" / "state") / "session-kit"
+    return _common.default_state_dir(
+        environ=os.environ,
+        home=_home,
+        xdg_path=_xdg_path,
+    )
 
 
 def default_journal_dir() -> Path:
-    explicit = os.environ.get("SESSION_KIT_JOURNAL_DIR")
-    if explicit:
-        return Path(explicit).expanduser()
-    return _xdg_path("XDG_STATE_HOME", _home() / ".local" / "state") / "shpool-journal"
+    return _common.default_journal_dir(
+        environ=os.environ,
+        home=_home,
+        xdg_path=_xdg_path,
+    )
 
 
 def default_journal_recovery_dir() -> Path:
-    explicit = os.environ.get("SESSION_KIT_JOURNAL_RECOVERY_DIR")
-    if explicit:
-        return Path(explicit).expanduser()
-    return (
-        _xdg_path("XDG_STATE_HOME", _home() / ".local" / "state")
-        / "shpool-journal-recovery"
+    return _common.default_journal_recovery_dir(
+        environ=os.environ,
+        home=_home,
+        xdg_path=_xdg_path,
     )
 
 
 def default_start_dir() -> Path:
-    explicit = os.environ.get("SESSION_KIT_START_DIR")
-    if explicit:
-        return Path(explicit).expanduser()
-    return _xdg_path("XDG_STATE_HOME", _home() / ".local" / "state") / "shpool-start"
+    return _common.default_start_dir(
+        environ=os.environ,
+        home=_home,
+        xdg_path=_xdg_path,
+    )
 
 
 def _load_json_file(path: Path) -> Any:
@@ -197,39 +199,18 @@ def _valid_automatic_title_failures(raw: Any) -> dict[str, int]:
 
 def load_config() -> dict[str, Any]:
     """Load and validate configuration, with safe defaults."""
-    raw: Any = {}
-    path = config_path()
-    if path.is_file():
-        try:
-            raw = _load_json_file(path)
-        except (OSError, ValueError) as exc:
-            raise CollectionError(f"invalid config {path}: {exc}") from exc
-    if not isinstance(raw, Mapping):
-        raise CollectionError(f"invalid config {path}: top level must be an object")
-    if raw.get("schema_version", SCHEMA_VERSION) != SCHEMA_VERSION:
-        raise CollectionError(f"unsupported config schema_version in {path}")
-    configured_state = raw.get("state_dir")
-    state_dir = (
-        Path(configured_state).expanduser()
-        if isinstance(configured_state, str) and configured_state
-        else default_state_dir()
+    return _common.load_config(
+        config_path=config_path,
+        load_json_file=_load_json_file,
+        default_state_dir=default_state_dir,
+        positive_float=_positive_float,
+        positive_int=_positive_int,
+        valid_aliases=_valid_aliases,
+        valid_automatic_titles=_valid_automatic_titles,
+        valid_automatic_title_failures=_valid_automatic_title_failures,
+        schema_version=SCHEMA_VERSION,
+        default_max_proc_nodes=DEFAULT_MAX_PROC_NODES,
     )
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "state_dir": state_dir,
-        "command_timeout_seconds": _positive_float(
-            raw.get("command_timeout_seconds"), 6.0, 0.2, 60.0
-        ),
-        "max_proc_nodes": _positive_int(
-            raw.get("max_proc_nodes"), DEFAULT_MAX_PROC_NODES, 64, 100000
-        ),
-        "max_proc_depth": _positive_int(raw.get("max_proc_depth"), 32, 2, 128),
-        "aliases": _valid_aliases(raw.get("aliases")),
-        "automatic_titles": _valid_automatic_titles(raw.get("automatic_titles")),
-        "automatic_title_failures": _valid_automatic_title_failures(
-            raw.get("automatic_title_failures")
-        ),
-    }
 
 
 def display_shpool_id(raw: str, limit: int = 32) -> str:
@@ -3153,6 +3134,60 @@ def _terminal_ai_key(item: Mapping[str, Any]) -> str | None:
     return None
 
 
+def _missing_shell_generation_is_quarantinable(
+    item: Mapping[str, Any],
+) -> bool:
+    """Recognize only an inert disconnected shpool row with no live shell."""
+    identity = item.get("identity")
+    recovery = item.get("recovery")
+    raw_id = item.get("shpool_id_raw")
+    started = item.get("started_at_unix_ms")
+    diagnostics = item.get("diagnostics")
+    expected_diagnostic = (
+        f"expected one daemon child for {raw_id!r}, found 0"
+        if isinstance(raw_id, str)
+        else ""
+    )
+    return (
+        item.get("provider") == "unknown"
+        and item.get("display_provider") == "unknown"
+        and item.get("availability") == "ready"
+        and clean_text(item.get("shpool_status"), 32).casefold() == "disconnected"
+        and isinstance(raw_id, str)
+        and bool(raw_id)
+        and raw_id == item.get("shpool_id")
+        and shpool_id_mutation_policy(raw_id) == (True, None)
+        and isinstance(started, int)
+        and not isinstance(started, bool)
+        and started > 0
+        and item.get("shpool_shell") is None
+        and isinstance(identity, Mapping)
+        and identity.get("confidence") == "unknown"
+        and identity.get("uuid") is None
+        and identity.get("pid") is None
+        and identity.get("process_start_ticks") is None
+        and identity.get("provenance") == "none"
+        and isinstance(recovery, Mapping)
+        and recovery.get("available") is False
+        and recovery.get("provider") is None
+        and recovery.get("uuid") is None
+        and not isinstance(item.get("_terminal_identity_hint"), Mapping)
+        and isinstance(diagnostics, list)
+        and expected_diagnostic in diagnostics
+    )
+
+
+def _missing_shell_generation_is_quarantined(
+    item: Mapping[str, Any],
+) -> bool:
+    return (
+        _missing_shell_generation_is_quarantinable(item)
+        and item.get("terminal_number") is None
+        and item.get("mutation_allowed") is False
+        and item.get("mutation_rejection_reason") == "missing-shell-generation"
+    )
+
+
 def apply_terminal_numbers(
     inventory: dict[str, Any],
     registry: dict[str, Any],
@@ -3170,6 +3205,17 @@ def apply_terminal_numbers(
             raise CollectionError("cannot number a non-object managed session")
         generation_key = _terminal_generation_key(inventory, item, boot_id)
         ai_key = _terminal_ai_key(item)
+        if generation_key is None:
+            if _missing_shell_generation_is_quarantinable(item):
+                item["terminal_number"] = None
+                item["mutation_allowed"] = False
+                item["mutation_rejection_reason"] = "missing-shell-generation"
+                item.pop("_terminal_identity_hint", None)
+                continue
+            if allocate:
+                raise CollectionError(
+                    "managed session lacks an exact generation for numbering"
+                )
         ai_number = bindings.get(ai_key) if ai_key else None
         generation_number = (
             bindings.get(generation_key) if generation_key else None
@@ -3213,10 +3259,7 @@ def apply_terminal_numbers(
                 )
             active_numbers.add(number)
             if allocate:
-                if generation_key is None:
-                    raise CollectionError(
-                        "managed session lacks an exact generation for numbering"
-                    )
+                assert generation_key is not None
                 for key, value in tuple(bindings.items()):
                     if (
                         key.startswith("generation:")
@@ -4643,6 +4686,13 @@ def render_inventory(inventory: Mapping[str, Any], rows_only: bool = False) -> s
     if inventory.get("stale"):
         lines.append(f"{yellow}  Warning: showing {inventory.get('source')} inventory.{reset}")
     sessions = list(inventory.get("sessions", ()))
+    has_terminal_numbers = any(
+        isinstance(item, Mapping)
+        and isinstance(item.get("terminal_number"), int)
+        and not isinstance(item.get("terminal_number"), bool)
+        and item.get("terminal_number", 0) > 0
+        for item in sessions
+    )
     available_count = sum(
         1 for item in sessions if item.get("availability") == "ready"
     )
@@ -4719,7 +4769,7 @@ def render_inventory(inventory: Mapping[str, Any], rows_only: bool = False) -> s
                     or not isinstance(selector, int)
                     or selector <= 0
                 ):
-                    selector = item.get("row")
+                    selector = "-" if has_terminal_numbers else item.get("row")
                 prefix = f"      {selector:>2}  "
                 display_id = _display_title(
                     display_id, min(32, max(1, width - len(prefix) - 5))
@@ -4817,6 +4867,10 @@ def strict_live_inventory(inventory: Mapping[str, Any]) -> bool:
         return False
     exact_provider_uuids: set[tuple[str, str]] = set()
     for item in inventory.get("sessions", ()):
+        if isinstance(item, Mapping) and _missing_shell_generation_is_quarantinable(
+            item
+        ):
+            continue
         identity = item.get("identity")
         shell = item.get("shpool_shell")
         raw_id = item.get("shpool_id_raw")
@@ -4915,6 +4969,17 @@ def guard_live_inventory(inventory: Mapping[str, Any]) -> bool:
         shell = item.get("shpool_shell")
         provider = item.get("provider")
         terminal_number = item.get("terminal_number")
+        if _missing_shell_generation_is_quarantined(item):
+            if (
+                not positive_int(row)
+                or row in rows
+                or not isinstance(raw_id, str)
+                or raw_id in raw_ids
+            ):
+                return False
+            rows.add(row)
+            raw_ids.add(raw_id)
+            continue
         mutation_allowed, mutation_reason = shpool_id_mutation_policy(raw_id)
         if (
             not positive_int(row)
@@ -5016,7 +5081,10 @@ def load_inventory_input(path: str | Path) -> dict[str, Any]:
     rows: set[int] = set()
     terminal_numbers: set[int] = set()
     has_terminal_numbers = any(
-        isinstance(item, Mapping) and item.get("terminal_number") is not None
+        isinstance(item, Mapping)
+        and isinstance(item.get("terminal_number"), int)
+        and not isinstance(item.get("terminal_number"), bool)
+        and item.get("terminal_number", 0) > 0
         for item in value["sessions"]
     )
     for item in value["sessions"]:
@@ -5036,6 +5104,17 @@ def load_inventory_input(path: str | Path) -> dict[str, Any]:
             or row in rows
             or (
                 has_terminal_numbers
+                and _missing_shell_generation_is_quarantinable(item)
+                and not _missing_shell_generation_is_quarantined(item)
+            )
+            or (
+                has_terminal_numbers
+                and terminal_number is None
+                and not _missing_shell_generation_is_quarantined(item)
+            )
+            or (
+                has_terminal_numbers
+                and terminal_number is not None
                 and (
                     isinstance(terminal_number, bool)
                     or not isinstance(terminal_number, int)
@@ -5047,7 +5126,7 @@ def load_inventory_input(path: str | Path) -> dict[str, Any]:
             raise CollectionError(f"inventory input {source} has invalid or duplicate selectors")
         names.add(name)
         rows.add(row)
-        if has_terminal_numbers:
+        if has_terminal_numbers and terminal_number is not None:
             terminal_numbers.add(terminal_number)
     return dict(value)
 

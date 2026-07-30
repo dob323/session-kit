@@ -1075,6 +1075,229 @@ class TerminalNumberRegistryTests(unittest.TestCase):
             "confidence": "unknown",
         }
 
+    @staticmethod
+    def _orphan(item: dict) -> None:
+        raw_id = item["shpool_id_raw"]
+        item["provider"] = "unknown"
+        item["display_provider"] = "unknown"
+        item["availability"] = "ready"
+        item["shpool_status"] = "Disconnected"
+        item["identity"] = {
+            "uuid": None,
+            "pid": None,
+            "process_start_ticks": None,
+            "provenance": "none",
+            "confidence": "unknown",
+        }
+        item["title"] = "Unresolved provider session"
+        item["display_title"] = "Unresolved provider session"
+        item["native_title"] = "Unresolved provider session"
+        item["title_source"] = "provider"
+        item["shpool_shell"] = None
+        item["recovery"] = {
+            "available": False,
+            "provider": None,
+            "uuid": None,
+            "cwd": None,
+            "argv": [],
+            "command": None,
+        }
+        item["diagnostics"] = [
+            f"expected one daemon child for {raw_id!r}, found 0",
+            "identity candidates: Claude=0, Codex=0",
+        ]
+        item["terminal_number"] = None
+        item["mutation_allowed"] = True
+        item["mutation_rejection_reason"] = None
+        item.pop("_terminal_identity_hint", None)
+
+    def test_shell_less_orphan_is_quarantined_without_blocking_exact_rows(
+        self,
+    ) -> None:
+        inventory = inventory_core.build_inventory(
+            *inventory_fixture(2), now=1_800_000_000
+        )
+        exact, orphan = inventory["sessions"]
+        self._orphan(orphan)
+        registry = inventory_core.apply_terminal_numbers(
+            inventory,
+            inventory_core._empty_terminal_registry("boot-a"),
+            boot_id="boot-a",
+            allocate=True,
+        )
+        self.assertEqual(1, exact["terminal_number"])
+        self.assertIsNone(orphan["terminal_number"])
+        self.assertIs(orphan["mutation_allowed"], False)
+        self.assertEqual(
+            "missing-shell-generation",
+            orphan["mutation_rejection_reason"],
+        )
+        self.assertEqual(2, registry["next_number"])
+        self.assertEqual({1}, set(registry["bindings"].values()))
+        self.assertTrue(inventory_core.guard_live_inventory(inventory))
+        self.assertTrue(inventory_core.strict_live_inventory(inventory))
+        unchanged = inventory_core.apply_terminal_numbers(
+            inventory,
+            registry,
+            boot_id="boot-a",
+            allocate=False,
+        )
+        self.assertEqual(registry, unchanged)
+        self.assertIsNone(orphan["terminal_number"])
+        self.assertIs(orphan["mutation_allowed"], False)
+
+        self.assertIs(inventory_core.lookup(inventory, "1"), exact)
+        self.assertIsNone(inventory_core.lookup(inventory, "2"))
+        self.assertIs(
+            inventory_core.lookup(inventory, orphan["shpool_id_raw"]),
+            orphan,
+        )
+        rendered = inventory_core.render_inventory(inventory)
+        self.assertRegex(rendered, r"(?m)^\s+-\s+Unresolved provider session")
+
+        with tempfile.TemporaryDirectory(prefix=".mixed-input-", dir=REPO) as raw:
+            path = Path(raw) / "inventory.json"
+            path.write_text(json.dumps(inventory), encoding="utf-8")
+            loaded = getattr(inventory_core, "load_inventory_input")(path)
+        self.assertEqual(1, loaded["sessions"][0]["terminal_number"])
+        self.assertIsNone(loaded["sessions"][1]["terminal_number"])
+
+    def test_only_exact_inert_orphan_shape_can_skip_numbering(self) -> None:
+        base = inventory_core.build_inventory(
+            *inventory_fixture(2), now=1_800_000_000
+        )
+        self._orphan(base["sessions"][1])
+
+        def known_provider(item: dict) -> None:
+            item["provider"] = "shell"
+
+        def attached(item: dict) -> None:
+            item["availability"] = "attached"
+            item["shpool_status"] = "Attached"
+
+        def partial_shell(item: dict) -> None:
+            item["shpool_shell"] = {
+                "pid": 123,
+                "process_start_ticks": None,
+            }
+
+        def partial_identity(item: dict) -> None:
+            item["identity"]["pid"] = 123
+
+        def retained_hint(item: dict) -> None:
+            item["_terminal_identity_hint"] = {
+                "provider": "codex",
+                "uuid": uuid_for(99),
+            }
+
+        def invalid_start(item: dict) -> None:
+            item["started_at_unix_ms"] = 0
+
+        def recoverable(item: dict) -> None:
+            item["recovery"] = inventory_core.recovery_spec(
+                "codex",
+                uuid_for(99),
+                "/srv/project",
+            )
+
+        cases = (
+            ("known-provider", known_provider),
+            ("attached", attached),
+            ("partial-shell", partial_shell),
+            ("partial-identity", partial_identity),
+            ("retained-hint", retained_hint),
+            ("invalid-start", invalid_start),
+            ("recoverable", recoverable),
+        )
+        for label, mutate in cases:
+            with self.subTest(case=label):
+                inventory = copy.deepcopy(base)
+                mutate(inventory["sessions"][1])
+                with self.assertRaisesRegex(
+                    inventory_core.CollectionError,
+                    "lacks an exact generation",
+                ):
+                    inventory_core.apply_terminal_numbers(
+                        inventory,
+                        inventory_core._empty_terminal_registry("boot-a"),
+                        boot_id="boot-a",
+                        allocate=True,
+                    )
+
+    def test_orphan_quarantine_marker_is_required_by_guard_and_frozen_input(
+        self,
+    ) -> None:
+        inventory = inventory_core.build_inventory(
+            *inventory_fixture(2), now=1_800_000_000
+        )
+        self._orphan(inventory["sessions"][1])
+        inventory_core.apply_terminal_numbers(
+            inventory,
+            inventory_core._empty_terminal_registry("boot-a"),
+            boot_id="boot-a",
+            allocate=True,
+        )
+        for label, field, value in (
+            ("numbered", "terminal_number", 99),
+            ("mutable", "mutation_allowed", True),
+            ("wrong-reason", "mutation_rejection_reason", "unsafe-id"),
+        ):
+            with self.subTest(case=label):
+                changed = copy.deepcopy(inventory)
+                changed["sessions"][1][field] = value
+                self.assertFalse(inventory_core.guard_live_inventory(changed))
+                with tempfile.TemporaryDirectory(
+                    prefix=".mixed-invalid-",
+                    dir=REPO,
+                ) as raw:
+                    path = Path(raw) / "inventory.json"
+                    path.write_text(json.dumps(changed), encoding="utf-8")
+                    with self.assertRaises(inventory_core.CollectionError):
+                        getattr(inventory_core, "load_inventory_input")(path)
+
+    def test_snapshot_writes_live_exact_rows_alongside_quarantined_orphan(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix=".orphan-snapshot-",
+            dir=REPO,
+        ) as raw:
+            state = Path(raw)
+            state.chmod(0o700)
+            config = {
+                "state_dir": state,
+                "aliases": {},
+                "max_proc_nodes": 8192,
+                "max_proc_depth": 32,
+            }
+            live = inventory_core.build_inventory(
+                *inventory_fixture(2),
+                now=1_800_000_000,
+            )
+            self._orphan(live["sessions"][1])
+            with (
+                mock.patch.object(
+                    inventory_core,
+                    "collect_live",
+                    return_value=live,
+                ),
+                mock.patch.object(
+                    inventory_core,
+                    "_boot_id",
+                    return_value="boot-a",
+                ),
+            ):
+                result = inventory_core.snapshot(config=config)
+            self.assertEqual("live", result["source"])
+            self.assertIs(result["stale"], False)
+            self.assertEqual([], result["warnings"])
+            self.assertEqual(1, result["sessions"][0]["terminal_number"])
+            self.assertIsNone(result["sessions"][1]["terminal_number"])
+            stored = json.loads(
+                (state / "inventory.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(result, stored)
+
     def test_provisional_generation_promotes_without_renumbering(self) -> None:
         inventory = inventory_core.build_inventory(
             *inventory_fixture(1), now=1_800_000_000

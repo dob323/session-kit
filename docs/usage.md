@@ -7,7 +7,8 @@ When enabled, the picker appears in an interactive login shell:
 ```text
 number          open a ready session or inspect one open elsewhere
 n               create a Claude, Codex, or managed shell session
-x <number>      close the exact displayed session after confirmation
+k <number>      kill the exact displayed session after confirmation
+x <number>      compatibility alias for k
 /text           search titles, providers, projects, IDs, and UUIDs
 r               refresh live state and clear search
 o               view provider roots outside shpool; read-only
@@ -97,7 +98,8 @@ sp close <terminal-number|shpool-id>
 sp prune
 ```
 
-Closing requires confirmation and a fresh mutation guard. It ends the managed
+Killing from the picker, or closing with `sp close`, requires confirmation and
+a fresh mutation guard. It ends the managed
 terminal process. It does not delete provider-native conversation history.
 
 The scheduled reaper only records old, disconnected, empty-shell candidates.

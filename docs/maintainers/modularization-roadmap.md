@@ -8,9 +8,9 @@ rendered output.
 Phase 1 is complete. The first bounded Phase 2 extraction moved the shared
 exception, identity constants, numeric coercion, text and UUID normalization,
 automatic-title validation, natural ordering, and operational-ID policy into
-`common.py`. Path resolution and configuration loading remain in the facade
-until the next independently tested extraction so existing patch seams do not
-change.
+`common.py`. The second bounded Phase 2 extraction moved path resolution and
+configuration loading behind compatibility wrappers that preserve the facade's
+signatures and patch seams.
 
 The source module currently has about 5,500 lines and still has several
 responsibilities:

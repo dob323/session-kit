@@ -54,6 +54,11 @@ session-kit doctor
 Confirm the installed `current` link resolves to the exact candidate commit and
 that each stable helper dispatches into that immutable directory.
 
+Release metadata schema 1 describes the pre-package layout. Schema 2 requires
+both files in `lib/sessionkit_inventory/`. New builds always emit schema 2; the
+verifier retains the bounded schema-1 contract so existing immutable releases
+remain valid rollback targets.
+
 ## Activation
 
 The installer must not start or restart services. Review the copied systemd

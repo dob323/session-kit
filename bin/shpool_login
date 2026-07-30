@@ -140,17 +140,21 @@ def natural_id(value):
     )
 
 rows = []
+unavailable_total = 0
 for original in data.get("sessions", []):
-    if not isinstance(original, dict) or not matches(original):
+    if not isinstance(original, dict):
         continue
-    row = dict(original)
-    number = row.get("terminal_number")
+    number = original.get("terminal_number")
     if (
         isinstance(number, bool)
         or not isinstance(number, int)
         or number <= 0
     ):
+        unavailable_total += 1
         continue
+    if not matches(original):
+        continue
+    row = dict(original)
     rows.append(row)
 
 rows.sort(
@@ -203,6 +207,7 @@ projected["_picker"] = {
     "query": query,
     "source_total": len(data.get("sessions", [])),
     "source_outside_total": len(data.get("outside_agents", [])),
+    "unavailable_total": unavailable_total,
 }
 with open(destination, "w", encoding="utf-8") as handle:
     json.dump(projected, handle, sort_keys=True, separators=(",", ":"))
@@ -253,6 +258,8 @@ def page_lines(first, last, paged):
     # Summary/search, optional other-provider shortcut/stale notices.
     lines = 2 if picker.get("query") else 1
     if outside:
+        lines += 1
+    if picker.get("unavailable_total"):
         lines += 1
     if data.get("stale"):
         lines += 1
@@ -710,11 +717,13 @@ PY
 }
 
 render_main() {
-  local pending other_count
+  local pending other_count unavailable_count
   pending=$(recovery_count 2>/dev/null || printf '0')
   [[ $pending =~ ^[0-9]+$ ]] || pending=0
   other_count=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1])).get("outside_agents",[])))' "$VIEW" 2>/dev/null || printf '0')
   [[ $other_count =~ ^[0-9]+$ ]] || other_count=0
+  unavailable_count=$(python3 -c 'import json,sys; print(int((json.load(open(sys.argv[1])).get("_picker") or {}).get("unavailable_total") or 0))' "$VIEW" 2>/dev/null || printf '0')
+  [[ $unavailable_count =~ ^[0-9]+$ ]] || unavailable_count=0
   PAGE_SIZE=$(page_size "$pending" "$REPAIR_BANNER_LINES")
   clamp_page
   render_page
@@ -728,10 +737,15 @@ render_main() {
       "$([[ $pending == 1 ]] && printf '' || printf 's')" \
       "$(picker_green u)"
   fi
+  if (( unavailable_count > 0 )); then
+    printf '  Unavailable: %s session record%s without a live shell | no actions\n' \
+      "$unavailable_count" \
+      "$([[ $unavailable_count == 1 ]] && printf '' || printf 's')"
+  fi
   show_repair_banner
   echo
-  printf '  Open: %s · New: %s · Close: %s number\n' \
-    "$(picker_green number)" "$(picker_green n)" "$(picker_green x)"
+  printf '  Open: %s · New: %s · Kill: %s number\n' \
+    "$(picker_green number)" "$(picker_green n)" "$(picker_green k)"
   printf '  Terminal: %s · Search: %s · Help: %s\n' \
     "$(picker_green Enter)" "$(picker_green /text)" "$(picker_green '?')"
 }
@@ -1017,7 +1031,7 @@ offer_recovery() {
   echo "  Its terminal died inside the session manager, so this session cannot be reopened."
   if [[ ( $provider != claude && $provider != codex ) || -z $uuid ]]; then
     echo "  There is no saved conversation to move, so nothing can be recovered from it."
-    echo "  Close it with x $number when you no longer need it."
+    echo "  Kill it with k $number when you no longer need it."
     return 0
   fi
   echo "  The conversation itself is saved and can continue in a new session."
@@ -1554,7 +1568,8 @@ show_help() {
   echo
   echo "  number        Open an available session or show actions for one open elsewhere"
   echo "  n             Guided Claude, Codex, or managed-shell creation"
-  echo "  x <number>    Close the exact displayed session after exact-ID confirmation"
+  echo "  k <number>    Kill the exact displayed session after exact-ID confirmation"
+  echo "  x <number>    Compatibility alias for k"
   echo "  /text         Search names, providers, projects, IDs, and conversation UUIDs"
   echo "  r             Refresh live state and clear search"
   echo "  o             View detectable provider roots outside the session manager (read-only)"
@@ -1628,12 +1643,12 @@ while true; do
         build_view || exit 2
       }
       ;;
-    x\ *|X\ *)
+    k\ *|K\ *|x\ *|X\ *)
       number=${choice#* }
       if [[ $number =~ ^[0-9]+$ ]]; then
         direct_close "$number"
       else
-        echo "  Use x followed by a visible number. Nothing changed."
+        echo "  Use k followed by a visible number. Nothing changed."
       fi
       ;;
     name\ reset\ *|NAME\ RESET\ *|Name\ reset\ *)
