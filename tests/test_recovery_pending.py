@@ -558,6 +558,8 @@ class PendingRecoveryTests(unittest.TestCase):
             for row in live["sessions"]
             if row["shpool_id_raw"] not in {"main3", "main4"}
         ]
+        for row_number, row in enumerate(live["sessions"], start=1):
+            row["row"] = row_number
         live["daemon_generation"] = {
             "pid": 20,
             "process_start_ticks": 200,

@@ -2761,6 +2761,13 @@ class InventoryInputAndRecoveryTests(unittest.TestCase):
         changed("cache source", lambda value: value.update(source="cache"))
         changed("stale", lambda value: value.update(stale=True))
         changed("warning", lambda value: value["warnings"].append("partial"))
+        changed("warnings type", lambda value: value.update(warnings=None))
+        changed("schema version", lambda value: value.update(schema_version=999))
+        changed("missing sessions", lambda value: value.pop("sessions"))
+        changed(
+            "daemon boolean pid",
+            lambda value: value["daemon_generation"].update(pid=True),
+        )
         changed(
             "daemon generation",
             lambda value: value["daemon_generation"].update(
@@ -2788,6 +2795,13 @@ class InventoryInputAndRecoveryTests(unittest.TestCase):
             ),
         )
         changed(
+            "duplicate raw id",
+            lambda value: value["sessions"][1].update(
+                shpool_id_raw=value["sessions"][0]["shpool_id_raw"],
+                shpool_id=value["sessions"][0]["shpool_id"],
+            ),
+        )
+        changed(
             "unknown provider",
             lambda value: value["sessions"][0].update(provider="other"),
         )
@@ -2797,6 +2811,9 @@ class InventoryInputAndRecoveryTests(unittest.TestCase):
             with self.subTest(label=label):
                 self.assertFalse(
                     inventory_core.guard_live_inventory(candidate)
+                )
+                self.assertFalse(
+                    inventory_core.strict_live_inventory(candidate)
                 )
 
     def test_malformed_json_and_duplicate_selectors_fail_closed(self) -> None:

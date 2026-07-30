@@ -69,7 +69,11 @@ def config_path(
     explicit = environ.get("SESSION_KIT_CONFIG")
     if explicit:
         return Path(explicit).expanduser()
-    return xdg_path("XDG_CONFIG_HOME", home() / ".config") / "session-kit" / "inventory.json"
+    return (
+        xdg_path("XDG_CONFIG_HOME", home() / ".config")
+        / "session-kit"
+        / "inventory.json"
+    )
 
 
 def default_state_dir(

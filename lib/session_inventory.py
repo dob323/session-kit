@@ -4851,6 +4851,8 @@ def lookup(inventory: Mapping[str, Any], selector: str) -> dict[str, Any] | None
 
 def strict_live_inventory(inventory: Mapping[str, Any]) -> bool:
     """True only for a complete, unambiguous live mutation guard snapshot."""
+    if not guard_live_inventory(inventory):
+        return False
     generation = inventory.get("daemon_generation")
     outside_agents = inventory.get("outside_agents")
     if (
