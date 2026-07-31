@@ -85,6 +85,8 @@ picker_exit() {
 picker_read() {
   local __sk_read_var=$1 __sk_read_prompt=$2
   PICKER_INTERRUPTED=0
+  # The indirection is deliberate: callers pass the DESTINATION variable name.
+  # shellcheck disable=SC2229
   if IFS= read -r -p "$__sk_read_prompt" "$__sk_read_var"; then
     return 0
   fi
@@ -1152,6 +1154,12 @@ choose_number() {
     return
   fi
   if [[ $availability == ready ]]; then
+    # The window's tab carries the thread name for the whole attachment —
+    # the only in-window name surface Codex has (Claude's own title hook
+    # re-asserts the same name in-session). Cleared again on return.
+    if [[ -t 1 && -n $title ]]; then
+      printf '\033]0;%s\007' "$title"
+    fi
     local open_status=0
     PROOF_ACTION_QUIET=1 run_proof_action picker-open "$number" || open_status=$?
     case "$open_status" in
@@ -1167,6 +1175,9 @@ choose_number() {
         echo "  The open command failed without a verified cause. The session was left alone."
         ;;
     esac
+    if [[ -t 1 ]]; then
+      printf '\033]0;%s\007' "session kit"
+    fi
     refresh_after_action
     return
   fi

@@ -18,10 +18,12 @@ from tests.support import REPO, run
 
 LOGIN = REPO / "bin" / "shpool_login"
 SGR = re.compile(r"\x1b\[([0-9;]*)m")
+# Tab-title sequences render zero cells in a real terminal.
+OSC_TITLE = re.compile(r"\x1b\][0-9;]*[^\x07\x1b]*(?:\x07|\x1b\\)")
 
 
 def strip_sgr(text: str) -> str:
-    return SGR.sub("", text)
+    return OSC_TITLE.sub("", SGR.sub("", text))
 
 
 def display_cells(text: str) -> int:
