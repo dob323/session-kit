@@ -389,6 +389,12 @@ if args and args[0] == "snapshot":
         rows=[]
         for index,item in enumerate(state.get("sessions",[]),1):
             name=item["name"]
+            if os.environ.get("STUB_CONSUME_ARMED_LAUNCH") == "1":
+                start=pathlib.Path(os.environ["SESSION_KIT_START_DIR"])/name
+                expected=start.with_name(start.name+".expected")
+                if start.is_file() and expected.is_file():
+                    start.unlink()
+                    expected.unlink()
             uuid_overrides=json.loads(os.environ.get("STUB_DYNAMIC_UUID_OVERRIDES","{}"))
             rows.append({
                 "row":index,
@@ -666,6 +672,30 @@ class CommandTests(unittest.TestCase):
         self.assertFalse((start_dir / shpool_id).exists())
         self.assertFalse((start_dir / f"{shpool_id}.expected").exists())
         self.assertEqual(decoy_content, decoy.read_text())
+        actions = self.fixture.shpool_log.read_text().splitlines()
+        self.assertFalse(any(line.startswith("kill ") for line in actions))
+
+    def test_exact_ai_startup_accepts_launch_records_consumed_by_shell(self) -> None:
+        """The launcher shell removes its armed request before starting Claude.
+
+        Provider proof must accept that normal handoff after independently
+        matching the exact shpool generation and the live provider.
+        """
+        env = self.fixture.env()
+        env.update(
+            {
+                "SESSION_KIT_BACKGROUND": "1",
+                "SESSION_KIT_PROVIDER_PROOF_ATTEMPTS": "2",
+                "STUB_DYNAMIC_PROVIDER": "claude",
+                "STUB_DYNAMIC_CWD": str(self.fixture.project),
+                "STUB_CONSUME_ARMED_LAUNCH": "1",
+            }
+        )
+        proven = run([SP, "new", "claude", "fixture"], env=env)
+        shpool_id = proven.stdout.strip().splitlines()[-1]
+        self.assertRegex(shpool_id, r"^s[0-9]{8}-[0-9]{6}-[0-9]+$")
+        self.assertFalse((self.fixture.start / shpool_id).exists())
+        self.assertFalse((self.fixture.start / f"{shpool_id}.expected").exists())
         actions = self.fixture.shpool_log.read_text().splitlines()
         self.assertFalse(any(line.startswith("kill ") for line in actions))
 

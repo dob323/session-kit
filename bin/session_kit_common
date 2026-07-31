@@ -892,6 +892,16 @@ sk_clear_start_record() {
   local expected_path="$path.expected"
   exec 8>"$SK_STATE_DIR/create.lock" || return 1
   sk_lock_acquire 8 "$SK_STATE_DIR/create.lock" || { exec 8>&-; return 1; }
+  # The managed shell consumes both launch records immediately before it
+  # starts the provider.  That is the normal successful path: leaving them in
+  # place would let a later `exec bash -i` launch the same request again if the
+  # creator died before observing the provider.  Once the exact session
+  # generation and provider have been proven by the caller, an already
+  # consumed pair is therefore equivalent to clearing it here.
+  if [[ ! -e $path && ! -L $path && ! -e $expected_path && ! -L $expected_path ]]; then
+    sk_lock_release 8
+    return 0
+  fi
   sk_read_start_expectation "$shpool_id" || { sk_lock_release 8; return 1; }
   [[ $SK_EXPECT_PROVIDER == "$expected_provider" &&
      $SK_EXPECT_CWD == "$expected_cwd" && $SK_EXPECT_UUID == "$expected_uuid" &&
