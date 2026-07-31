@@ -2077,6 +2077,15 @@ def build_inventory(
     }
 
 
+def _shpool_executable() -> str:
+    """Resolve shpool for contexts (systemd user services) whose PATH omits it."""
+    found = shutil.which("shpool")
+    if found:
+        return found
+    fallback = Path.home() / ".cargo" / "bin" / "shpool"
+    return str(fallback) if fallback.is_file() else "shpool"
+
+
 def collect_live(
     config: Mapping[str, Any],
     *,
@@ -2091,7 +2100,7 @@ def collect_live(
         shpool_payload = _command_json(
             fixture_env="SESSION_KIT_SHPOOL_JSON_FILE",
             command_env="SESSION_KIT_SHPOOL_CMD",
-            default_command=("shpool", "list", "--json"),
+            default_command=(_shpool_executable(), "list", "--json"),
             runner=invoke,
             timeout=timeout,
         )
