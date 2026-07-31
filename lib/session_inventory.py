@@ -201,7 +201,7 @@ def _valid_automatic_title_failures(raw: Any) -> dict[str, int]:
 
 def load_config() -> dict[str, Any]:
     """Load and validate configuration, with safe defaults."""
-    return _common.load_config(
+    config = _common.load_config(
         config_path=config_path,
         load_json_file=_load_json_file,
         default_state_dir=default_state_dir,
@@ -213,6 +213,19 @@ def load_config() -> dict[str, Any]:
         schema_version=SCHEMA_VERSION,
         default_max_proc_nodes=DEFAULT_MAX_PROC_NODES,
     )
+    # Session colors ride the same document; the pinned kernel contract
+    # predates them, so they are validated here at the facade layer.
+    path = config_path()
+    raw: Any = {}
+    if path.is_file():
+        try:
+            raw = _load_json_file(path)
+        except (OSError, ValueError):
+            raw = {}
+    config["colors"] = _valid_colors(
+        raw.get("colors") if isinstance(raw, Mapping) else None
+    )
+    return config
 
 
 def display_shpool_id(raw: str, limit: int = 32) -> str:
