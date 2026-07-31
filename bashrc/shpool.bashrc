@@ -205,12 +205,29 @@ PY
             # conversation never loads. Suppressed explicitly here rather than
             # relying on user config.
             __sk_codex_no_update=(-c check_for_update_on_startup=false)
+            # Codex has no per-thread color; the session's kit color rides in
+            # as a per-launch theme override (status line, thread-title item).
+            # Only resumes/forks know their conversation ID — brand-new
+            # sessions keep the default theme until their first reopen.
+            # Fail-open: unknown color or missing theme file launches plain.
+            __sk_codex_theme=()
+            if [[ -n $__sk_uuid && -f $__sk_inventory_core ]]; then
+              __sk_theme_color=$(python3 "$__sk_inventory_core" color effective codex "$__sk_uuid" 2>/dev/null || true)
+              case "$__sk_theme_color" in
+                red|blue|green|yellow|purple|orange|pink|cyan)
+                  if [[ -r ${CODEX_HOME:-$HOME/.codex}/themes/sk-$__sk_theme_color.tmTheme ]]; then
+                    __sk_codex_theme=(-c "tui.theme=\"sk-$__sk_theme_color\"")
+                  fi
+                  ;;
+              esac
+              unset __sk_theme_color
+            fi
             command rm -- "$__sk_start" "$__sk_expected"
             __sk_provider_launched=1
             case "$__sk_launch_mode" in
               new) codex "${__sk_codex_no_update[@]}" --no-alt-screen; __sk_provider_rc=$? ;;
-              resume) codex "${__sk_codex_no_update[@]}" --no-alt-screen resume "$__sk_uuid"; __sk_provider_rc=$? ;;
-              fork) codex "${__sk_codex_no_update[@]}" --no-alt-screen fork "$__sk_uuid"; __sk_provider_rc=$? ;;
+              resume) codex "${__sk_codex_no_update[@]}" "${__sk_codex_theme[@]}" --no-alt-screen resume "$__sk_uuid"; __sk_provider_rc=$? ;;
+              fork) codex "${__sk_codex_no_update[@]}" "${__sk_codex_theme[@]}" --no-alt-screen fork "$__sk_uuid"; __sk_provider_rc=$? ;;
             esac
           fi
           ;;

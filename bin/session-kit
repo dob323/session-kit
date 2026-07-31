@@ -556,6 +556,16 @@ install_defaults() {
     install -m 0600 "$install_root/releases/$release_id/config/shpool.example.toml" \
       "$shpool_config"
   fi
+  # Session-color Codex themes. Kit-owned sk-*.tmTheme files track the
+  # release; anything else in the themes directory is left alone.
+  if [[ -d $install_root/releases/$release_id/config/codex-themes ]]; then
+    local codex_theme_root=${CODEX_HOME:-"$HOME/.codex"}/themes theme_file
+    mkdir -p "$codex_theme_root"
+    for theme_file in "$install_root/releases/$release_id"/config/codex-themes/sk-*.tmTheme; do
+      [[ -f $theme_file ]] || continue
+      install -m 0600 "$theme_file" "$codex_theme_root/${theme_file##*/}"
+    done
+  fi
 }
 
 install_systemd_units() {
