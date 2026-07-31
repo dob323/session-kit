@@ -83,7 +83,7 @@ state = os.path.abspath(state_raw)
 proc = os.path.abspath(proc_raw)
 uid = os.geteuid()
 pattern = re.compile(
-    r"^(?:login-(?:snapshot|view|projects)|picker-proof)"
+    r"^(?:login-(?:snapshot|view|projects|recovery)|picker-proof|sp-guard)"
     r"\.[A-Za-z0-9_]{6,16}\.json$"
 )
 
@@ -116,6 +116,7 @@ for name in proc_names:
         if part
     ]
     if "shpool_login" in arguments:
+        print("live picker; temp expiry skipped", file=sys.stderr)
         raise SystemExit(0)
 
 flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC

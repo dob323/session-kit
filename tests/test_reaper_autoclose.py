@@ -456,21 +456,25 @@ print(pathlib.Path(__import__("os").environ["FAKE_INVENTORY"]).read_text(),end="
 
     def test_old_picker_temp_files_expire_only_without_a_live_picker(self) -> None:
         old = self.state / "login-snapshot.ABC123.json"
+        old_guard = self.state / "sp-guard.GHI789.json"
+        old_recovery = self.state / "login-recovery.JKL012.json"
         recent = self.state / "login-view.DEF456.json"
         unrelated = self.state / "inventory.json"
-        for path in (old, recent, unrelated):
+        for path in (old, old_guard, old_recovery, recent, unrelated):
             path.write_text("{}\n", encoding="utf-8")
             path.chmod(0o600)
         expired_at = time.time() - 25 * 60 * 60
-        os.utime(old, (expired_at, expired_at))
-        os.utime(unrelated, (expired_at, expired_at))
+        for path in (old, old_guard, old_recovery, unrelated):
+            os.utime(path, (expired_at, expired_at))
 
         expired = self.run_reaper()
         self.assertEqual(0, expired.returncode, expired.stderr)
         self.assertFalse(old.exists())
+        self.assertFalse(old_guard.exists())
+        self.assertFalse(old_recovery.exists())
         self.assertTrue(recent.is_file())
         self.assertTrue(unrelated.is_file())
-        self.assertIn("expired_picker_temp_files=1", expired.stderr)
+        self.assertIn("expired_picker_temp_files=3", expired.stderr)
 
         blocked = self.state / "picker-proof.abcdefgh.json"
         blocked.write_text("{}\n", encoding="utf-8")
