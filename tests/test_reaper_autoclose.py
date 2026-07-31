@@ -7,6 +7,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 from tests.support import REPO
@@ -452,6 +453,34 @@ print(pathlib.Path(__import__("os").environ["FAKE_INVENTORY"]).read_text(),end="
             (self.state / "auto-close-candidates.json").exists()
         )
         self.assertFalse(self.kill_log.exists())
+
+    def test_old_picker_temp_files_expire_only_without_a_live_picker(self) -> None:
+        old = self.state / "login-snapshot.ABC123.json"
+        recent = self.state / "login-view.DEF456.json"
+        unrelated = self.state / "inventory.json"
+        for path in (old, recent, unrelated):
+            path.write_text("{}\n", encoding="utf-8")
+            path.chmod(0o600)
+        expired_at = time.time() - 25 * 60 * 60
+        os.utime(old, (expired_at, expired_at))
+        os.utime(unrelated, (expired_at, expired_at))
+
+        expired = self.run_reaper()
+        self.assertEqual(0, expired.returncode, expired.stderr)
+        self.assertFalse(old.exists())
+        self.assertTrue(recent.is_file())
+        self.assertTrue(unrelated.is_file())
+        self.assertIn("expired_picker_temp_files=1", expired.stderr)
+
+        blocked = self.state / "picker-proof.abcdefgh.json"
+        blocked.write_text("{}\n", encoding="utf-8")
+        blocked.chmod(0o600)
+        os.utime(blocked, (expired_at, expired_at))
+        self._write_process(200, 1, "shpool_login")
+        retained = self.run_reaper()
+        self.assertEqual(0, retained.returncode, retained.stderr)
+        self.assertTrue(blocked.is_file())
+        self.assertNotIn("expired_picker_temp_files", retained.stderr)
 
     def test_second_verification_race_refuses_close(self) -> None:
         first = self.run_reaper()

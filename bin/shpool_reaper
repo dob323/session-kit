@@ -68,6 +68,124 @@ fail() {
   exit 1
 }
 
+expire_picker_temp_files() {
+  [[ $MODE != verify && $DRY_RUN != 1 ]] || return 0
+  local expired
+  expired=$(python3 - "$STATE_DIR" "$PROC_ROOT" <<'PY'
+import os
+import re
+import stat
+import sys
+import time
+
+state_raw, proc_raw = sys.argv[1:]
+state = os.path.abspath(state_raw)
+proc = os.path.abspath(proc_raw)
+uid = os.geteuid()
+pattern = re.compile(
+    r"^(?:login-(?:snapshot|view|projects)|picker-proof)"
+    r"\.[A-Za-z0-9_]{6,16}\.json$"
+)
+
+try:
+    proc_names = os.listdir(proc)
+except OSError:
+    raise SystemExit(0)
+
+# A picker may still refer to one of its private temp files while waiting for
+# input. Leak rather than delete whenever any same-user picker is live or its
+# process identity cannot be read safely.
+for name in proc_names:
+    if not name.isdigit():
+        continue
+    root = os.path.join(proc, name)
+    try:
+        if os.stat(root, follow_symlinks=False).st_uid != uid:
+            continue
+        with open(os.path.join(root, "cmdline"), "rb") as handle:
+            payload = handle.read(65537)
+        if len(payload) > 65536:
+            raise OSError("oversized process command")
+    except FileNotFoundError:
+        continue
+    except OSError:
+        raise SystemExit(0)
+    arguments = [
+        os.path.basename(part.decode("utf-8", "surrogateescape"))
+        for part in payload.split(b"\0")
+        if part
+    ]
+    if "shpool_login" in arguments:
+        raise SystemExit(0)
+
+flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+flags |= getattr(os, "O_NOFOLLOW", 0)
+try:
+    directory = os.open(state, flags)
+except OSError:
+    raise SystemExit(0)
+
+removed = 0
+try:
+    root_info = os.fstat(directory)
+    if (
+        root_info.st_uid != uid
+        or not stat.S_ISDIR(root_info.st_mode)
+        or stat.S_IMODE(root_info.st_mode) != 0o700
+    ):
+        raise SystemExit(0)
+    cutoff_ns = time.time_ns() - 24 * 60 * 60 * 1_000_000_000
+    for name in os.listdir(directory):
+        if not pattern.fullmatch(name):
+            continue
+        try:
+            before = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            raise SystemExit(0)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != uid
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) != 0o600
+            or before.st_mtime_ns > cutoff_ns
+        ):
+            continue
+        try:
+            after = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            raise SystemExit(0)
+        fingerprint = lambda value: (
+            value.st_dev,
+            value.st_ino,
+            value.st_mode,
+            value.st_uid,
+            value.st_nlink,
+            value.st_size,
+            value.st_mtime_ns,
+        )
+        if fingerprint(before) != fingerprint(after):
+            continue
+        try:
+            os.unlink(name, dir_fd=directory)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            raise SystemExit(0)
+        removed += 1
+finally:
+    os.close(directory)
+
+print(removed)
+PY
+  ) || return 0
+  [[ $expired =~ ^[0-9]+$ && $expired -gt 0 ]] || return 0
+  printf '%s expired_picker_temp_files=%s\n' "$(timestamp)" "$expired" >&2
+}
+
 if [[ -e $SENTINEL ]]; then
   printf '%s reaper disabled by %s\n' "$(timestamp)" "$SENTINEL" >&2
   exit 3
@@ -76,6 +194,8 @@ fi
 [[ $MAX_AGE_DAYS =~ ^[0-9]+$ && $MAX_AGE_DAYS -ge 1 ]] || fail "invalid prune age"
 [[ $AUTO_CLOSE_HOURS =~ ^[0-9]+$ && $AUTO_CLOSE_HOURS -ge 1 &&
    $AUTO_CLOSE_HOURS -le 8760 ]] || fail "invalid auto-close age"
+
+expire_picker_temp_files
 
 json=$("$SHPOOL" list --json 2>/dev/null) || fail "shpool list error"
 daemon_pid=${SESSION_KIT_DAEMON_PID:-}
