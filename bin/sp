@@ -417,6 +417,34 @@ repair_target() {
   return 1
 }
 
+# First-window color: boot a hidden throwaway TUI on a minted conversation ID,
+# let it write its own native color record by typing /color into ITSELF (no
+# human terminal is ever touched), then launch the real session as a resume of
+# that conversation so the color is native from the first frame. Fail-open:
+# any problem falls back to the plain new-session flow. Kill switches:
+# SESSION_KIT_NO_PREBAKE=1 or $SK_STATE_DIR/prebake-off.
+sk_prebake_claude() {
+  SK_PREBAKE_UUID=
+  [[ ${SESSION_KIT_NO_PREBAKE:-0} != 1 && ! -e $SK_STATE_DIR/prebake-off ]] ||
+    return 1
+  command -v script >/dev/null 2>&1 || return 1
+  command -v claude >/dev/null 2>&1 || return 1
+  local minted color transcript
+  minted=$(python3 -c 'import uuid; print(uuid.uuid4())' 2>/dev/null) || return 1
+  color=$(python3 "$INVENTORY_CORE" color effective claude "$minted" \
+    2>/dev/null) || return 1
+  ( cd "$cwd" 2>/dev/null &&
+    { sleep 4; printf '/color %s\r' "$color"; sleep 3; } |
+      timeout 14 env -u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_SESSION_ID \
+        script -qec "timeout 11 claude --session-id $minted" /dev/null
+  ) >/dev/null 2>&1 || true
+  transcript=$(compgen -G "$HOME/.claude/projects/*/$minted.jsonl" | head -1) ||
+    return 1
+  [[ -n $transcript && -s $transcript && ! -L $transcript ]] || return 1
+  command grep -q '"agent-color"' "$transcript" 2>/dev/null || return 1
+  SK_PREBAKE_UUID=$minted
+}
+
 start_new() {
   sk_require_integration || return 1
   local requested_provider=${1:-} requested_project=${2:-}
@@ -446,6 +474,13 @@ start_new() {
   }
   cwd=$(cd -- "$cwd" && pwd -P) || return 1
 
+  local launch_uuid= launch_mode=new
+  if [[ $provider == claude ]] && sk_prebake_claude; then
+    # The window opens as a resume of the pre-baked conversation, so the
+    # session color is already native in its very first frame.
+    launch_uuid=$SK_PREBAKE_UUID
+    launch_mode=resume
+  fi
   sk_prepare_state || return 1
   exec 9>"$SK_STATE_DIR/create.lock" || return 1
   sk_lock_acquire 9 "$SK_STATE_DIR/create.lock" || { exec 9>&-; return 1; }
@@ -459,7 +494,7 @@ start_new() {
     sk_die "could not allocate a unique session ID"
     return 1
   }
-  sk_write_start_record "$id" "$provider" "$cwd" "" new || {
+  sk_write_start_record "$id" "$provider" "$cwd" "$launch_uuid" "$launch_mode" || {
     sk_lock_release 9
     return 1
   }
@@ -487,9 +522,9 @@ start_new() {
   local created_boot_id=$SK_CREATED_BOOT_ID
   local created_shell_pid=$SK_CREATED_SHELL_PID created_shell_start=$SK_CREATED_SHELL_START
   local created_daemon_pid=$SK_CREATED_DAEMON_PID created_daemon_start=$SK_CREATED_DAEMON_START
-  sk_write_generation_record "$id" "$provider" "$cwd" "" \
+  sk_write_generation_record "$id" "$provider" "$cwd" "$launch_uuid" \
     "$created_boot_id" "$created_started" "$created_shell_pid" "$created_shell_start" \
-    "$created_daemon_pid" "$created_daemon_start" new || {
+    "$created_daemon_pid" "$created_daemon_start" "$launch_mode" || {
       local quarantine
       quarantine=$(sk_quarantine_start_record "$id" arming-failed 2>/dev/null || true)
       sk_lock_release 9
@@ -497,9 +532,10 @@ start_new() {
       return 1
     }
   sk_lock_release 9
-  if [[ $provider != shell ]] && ! sk_wait_for_provider "$id" "$provider" "$cwd" "" \
+  if [[ $provider != shell ]] && ! sk_wait_for_provider "$id" "$provider" "$cwd" \
+    "$launch_uuid" \
     "$created_boot_id" "$created_started" "$created_shell_pid" "$created_shell_start" \
-    "$created_daemon_pid" "$created_daemon_start" new; then
+    "$created_daemon_pid" "$created_daemon_start" "$launch_mode"; then
     sk_die "session $id remains open, but exact $provider startup was not proven; launch record retained. Attach with 'sp go $id' and run 'exec bash -i' to retry"
     return 1
   fi
