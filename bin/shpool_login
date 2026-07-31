@@ -1666,7 +1666,22 @@ refresh_snapshot || {
   exit 2
 }
 
+# A menu window can sit open across release rollovers, silently running old
+# code against new state — every fix ships and the standing windows never see
+# it. Replace this picker with the current release at the next safe point.
+picker_self_upgrade() {
+  [[ -n ${SESSION_KIT_RELEASE_DIR:-} ]] || return 0
+  local launcher="$HOME/.local/bin/shpool_login" current
+  [[ -x $launcher ]] || return 0
+  current=$(cd -P -- "${SESSION_KIT_ROOT:-$HOME/.local/lib/session-kit}/current" 2>/dev/null && pwd) || return 0
+  [[ -n $current && $current != "$SESSION_KIT_RELEASE_DIR" ]] || return 0
+  sk_log_action picker_exit release_upgrade || true
+  cleanup
+  exec "$launcher"
+}
+
 while true; do
+  picker_self_upgrade
   render_main
   choice=""
   picker_read choice "  $(picker_green '❯') " || continue

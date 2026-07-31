@@ -95,6 +95,13 @@ picker_attach_id() {
   [[ -z $cwd ]] || args+=(--dir "$cwd")
   args+=("$id")
   sk_push_session_color "${SK_PROOF_PROVIDER:-}" "${SK_PROOF_UUID:-}"
+  if "$SK_SHPOOL" "${args[@]}"; then
+    return 0
+  fi
+  # One retry after a beat: takeovers and just-released sessions race the
+  # daemon's teardown of the previous client, and the action log shows those
+  # first attempts failing regularly.
+  sleep 0.7
   "$SK_SHPOOL" "${args[@]}"
 }
 
@@ -172,8 +179,11 @@ if row.get("subagents"):
     raise SystemExit(1)
 if str(row.get("agent_status") or "").casefold() == "working":
     raise SystemExit(1)
+# With journals disabled the output age is unknown for every session; the
+# rollout-derived turn state above is then the idleness signal. A known
+# recent age still blocks a bounce during active use.
 age = row.get("recent_output_age_seconds")
-if not isinstance(age, int) or isinstance(age, bool) or age < 120:
+if isinstance(age, int) and not isinstance(age, bool) and age < 120:
     raise SystemExit(1)
 codex_root = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
 databases = sorted(codex_root.glob("state_*.sqlite"))
