@@ -27,6 +27,7 @@ REQUIRED_SYMBOLS = {
     "_lifecycle_command",
     "_parse_darwin_procargs2",
     "_parser",
+    "_alias_command",
     "_plan_token",
     "_process_age",
     "_prove_lifecycle_caller",
@@ -59,12 +60,14 @@ REQUIRED_SYMBOLS = {
     "load_config",
     "lookup",
     "main",
+    "MAX_CODEX_SESSION_INDEX_BYTES",
     "migrate_runtime_aliases",
     "mutate_canonical_alias",
     "mutate_canonical_automatic_title",
     "normalize_automatic_title",
     "os",
     "plan_legacy_recovery_manifest",
+    "propagate_provider_title",
     "prove_self_name_caller",
     "prune_automatic_titles",
     "publish_legacy_migration_plan",
@@ -153,7 +156,7 @@ def referenced_facade_symbols() -> set[str]:
 
 class InventoryFacadeTests(unittest.TestCase):
     def test_contract_matches_every_current_test_reference(self) -> None:
-        self.assertEqual(len(REQUIRED_SYMBOLS), 68)
+        self.assertEqual(len(REQUIRED_SYMBOLS), 71)
         self.assertEqual(REQUIRED_SYMBOLS, referenced_facade_symbols())
 
     def test_current_tested_symbols_remain_available(self) -> None:

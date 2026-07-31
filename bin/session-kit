@@ -924,7 +924,7 @@ install_release() {
 }
 
 install_command() {
-  local source= login=prompt journal=prompt answer
+  local source= login=prompt journal=prompt answer noninteractive=0
   while (($#)); do
     case "$1" in
       --source) require_arg "$1" "${2:-}"; source=$2; shift 2 ;;
@@ -932,7 +932,7 @@ install_command() {
       --disable-login) login=disable; shift ;;
       --journal) require_arg "$1" "${2:-}"; journal=$2; shift 2 ;;
       --non-interactive)
-        [[ $login != prompt ]] || login=disable
+        noninteractive=1
         [[ $journal != prompt ]] || journal=off
         shift
         ;;
@@ -948,7 +948,13 @@ install_command() {
   previous=$(current_release_id)
   current_platform=$(platform)
   if [[ $login == prompt ]]; then
-    if [[ -t 0 ]]; then
+    if [[ -L $install_root/current && -f $integration_marker &&
+          ! -L $integration_marker ]]; then
+      # A rollover over an existing installation with validated login keeps
+      # it. Disabling (which also invalidates the launch marker) must be an
+      # explicit --disable-login choice, never a silent non-interactive default.
+      login=enable
+    elif [[ -t 0 && $noninteractive == 0 ]]; then
       printf 'Enable the Session Kit picker for interactive SSH logins? [Y/n] '
       read -r answer
       case ${answer:-y} in [Nn]*) login=disable ;; *) login=enable ;; esac

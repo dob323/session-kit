@@ -2622,6 +2622,130 @@ def prune_automatic_titles(
             }
 
 
+MAX_CLAUDE_SESSION_RECORDS = 512
+
+
+def _push_claude_title(home: Path, uuid: str, title: str) -> tuple[list[str], list[str]]:
+    pushed: list[str] = []
+    warnings: list[str] = []
+    sessions = home / ".claude" / "sessions"
+    if not sessions.is_dir():
+        return pushed, ["Claude sessions directory unavailable; title not pushed"]
+    intent = sessions / f"{uuid}.nameintent"
+    try:
+        if intent.is_symlink():
+            raise OSError("refusing symlinked name intent")
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=f".{intent.name}.", dir=sessions
+        )
+        try:
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                descriptor = -1
+                handle.write(title + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, intent)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(temporary)
+        pushed.append("claude-nameintent")
+    except OSError as exc:
+        warnings.append(f"Claude name intent not written: {exc}")
+    # The per-PID session record names the thread in Claude's own session
+    # picker. Records carry the exact sessionId, so match by content.
+    try:
+        records = sorted(sessions.glob("*.json"))[:MAX_CLAUDE_SESSION_RECORDS]
+    except OSError as exc:
+        return pushed, warnings + [f"Claude session records unreadable: {exc}"]
+    for record in records:
+        if record.is_symlink() or not re.fullmatch(r"\d+\.json", record.name):
+            continue
+        try:
+            data = json.loads(record.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict) or data.get("sessionId") != uuid:
+            continue
+        try:
+            data["name"] = title
+            atomic_write_json(record, data)
+            pushed.append("claude-session-record")
+        except OSError as exc:
+            warnings.append(f"Claude session record not updated: {exc}")
+    return pushed, warnings
+
+
+def _push_codex_title(home: Path, uuid: str, title: str) -> tuple[list[str], list[str]]:
+    codex_root = home / ".codex"
+    if not codex_root.is_dir():
+        return [], ["Codex home unavailable; title not pushed"]
+    index = codex_root / "session_index.jsonl"
+    if index.is_symlink():
+        return [], ["Codex session index is a symlink; title not pushed"]
+    entry = json.dumps(
+        {
+            "id": uuid,
+            "thread_name": title,
+            "updated_at": dt.datetime.now(dt.timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z"),
+        },
+        separators=(",", ":"),
+    )
+    try:
+        if index.exists() and index.stat().st_size > MAX_CODEX_SESSION_INDEX_BYTES:
+            return [], ["Codex session index exceeds the bounded size; title not pushed"]
+        descriptor = os.open(
+            index, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600
+        )
+        with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
+            handle.write(entry + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError as exc:
+        return [], [f"Codex session index not appended: {exc}"]
+    return ["codex-session-index"], []
+
+
+def propagate_provider_title(
+    provider: str,
+    uuid: str,
+    title: str,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """One-shot push of an assigned name into the provider's own surfaces.
+
+    Assignment semantics are last-writer-wins: the push happens once at
+    assignment time and later provider-side renames stand until the next
+    assignment. Every failure is fail-open — naming never breaks because a
+    provider surface is unavailable — but each skipped surface is reported.
+    """
+    exact_uuid = valid_uuid(uuid)
+    clean_title = clean_text(title, 100)
+    if provider not in PROVIDERS or not exact_uuid or not clean_title:
+        return {
+            "provider_title_pushes": [],
+            "provider_title_warnings": ["invalid provider title push request"],
+        }
+    env = environ if environ is not None else os.environ
+    home_raw = env.get("HOME") or os.fspath(Path.home())
+    home = Path(home_raw)
+    if provider == "claude":
+        pushed, warnings = _push_claude_title(home, exact_uuid, clean_title)
+    else:
+        pushed, warnings = _push_codex_title(home, exact_uuid, clean_title)
+    for warning in warnings:
+        print(f"session inventory: {warning}", file=sys.stderr)
+    return {
+        "provider_title_pushes": pushed,
+        "provider_title_warnings": warnings,
+    }
+
+
 def _strict_legacy_aliases(path: Path) -> tuple[bytes, dict[str, str]] | None:
     payload = _read_bounded_owner_file(
         path,
@@ -5251,6 +5375,14 @@ def self_name_automatic_title(
     )
     result["caller"] = evidence
     result["automatic_name_state"] = "ready"
+    result.update(
+        propagate_provider_title(
+            str(evidence["provider"]),
+            str(evidence["uuid"]),
+            normalized,
+            environ=caller_environ,
+        )
+    )
     return result
 
 
@@ -5309,7 +5441,12 @@ def _alias_command(args: argparse.Namespace, config: dict[str, Any]) -> int:
         return 0
     title = args.title if args.alias_action == "set" else None
     aliases = mutate_canonical_alias(config, args.provider, args.uuid, title)
-    _json_print({"schema_version": SCHEMA_VERSION, "aliases": aliases})
+    payload: dict[str, Any] = {"schema_version": SCHEMA_VERSION, "aliases": aliases}
+    if args.alias_action == "set":
+        # Explicit assignment pushes once into the provider's own surfaces;
+        # deletion only clears the local alias and leaves provider titles alone.
+        payload.update(propagate_provider_title(args.provider, args.uuid, title))
+    _json_print(payload)
     return 0
 
 

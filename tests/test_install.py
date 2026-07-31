@@ -183,6 +183,28 @@ class InstallerTests(unittest.TestCase):
         self.assertNotIn("session-kit managed integration", bashrc.read_text())
         self.assertFalse(marker.exists())
 
+    def test_rollover_install_preserves_validated_login_state(self) -> None:
+        self.run_installer("--enable-login", "--journal", "off")
+        marker = self.home / ".local/state/session-kit/integration-ready-v1"
+        self.assertTrue(marker.is_file())
+        self.env["SESSION_KIT_RELEASE_ID"] = RELEASE_B
+        self.run_installer("--non-interactive")
+        current = self.home / ".local/lib/session-kit/current"
+        self.assertEqual(current.resolve().name, RELEASE_B)
+        self.assertEqual(
+            marker.read_text(encoding="utf-8"),
+            f"session-kit-integration-v1 {RELEASE_B}\n",
+        )
+        self.assertEqual(marker.stat().st_mode & 0o777, 0o600)
+        bashrc = self.home / ".bashrc"
+        self.assertIn("session-kit managed integration", bashrc.read_text())
+        self.assertEqual(
+            1, bashrc.read_text().count(">>> session-kit managed integration >>>")
+        )
+        self.env["SESSION_KIT_RELEASE_ID"] = RELEASE_A
+        self.run_installer("--non-interactive", "--disable-login")
+        self.assertFalse(marker.exists())
+
     def test_update_and_rollback_switch_exact_releases(self) -> None:
         self.run_installer("--non-interactive")
         self.env["SESSION_KIT_RELEASE_ID"] = RELEASE_B
