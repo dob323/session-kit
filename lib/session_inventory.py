@@ -2809,6 +2809,42 @@ def _push_claude_title(home: Path, uuid: str, title: str) -> tuple[list[str], li
     return pushed, warnings
 
 
+def _push_codex_thread_title(
+    codex_root: Path, uuid: str, title: str
+) -> tuple[list[str], list[str]]:
+    """Set threads.title in Codex's own state database.
+
+    The Codex TUI's thread-title status item and its rename flow read and
+    write this column (the session index alone never reaches the status
+    bar). Update-only — a missing row is reported, never created — and every
+    failure is fail-open.
+    """
+    import sqlite3
+
+    candidates = sorted(
+        codex_root.glob("state_*.sqlite"),
+        key=lambda p: p.name,
+    )
+    if not candidates:
+        # Older Codex builds have no thread store; nothing to report.
+        return [], []
+    database = candidates[-1]
+    try:
+        connection = sqlite3.connect(database, timeout=1.0)
+        try:
+            cursor = connection.execute(
+                "UPDATE threads SET title = ? WHERE id = ?", (title, uuid)
+            )
+            connection.commit()
+            if cursor.rowcount > 0:
+                return ["codex-thread-title"], []
+            return [], ["Codex thread row not found; thread title not set"]
+        finally:
+            connection.close()
+    except sqlite3.Error as exc:
+        return [], [f"Codex thread title not set: {exc}"]
+
+
 def _push_codex_title(home: Path, uuid: str, title: str) -> tuple[list[str], list[str]]:
     codex_root = home / ".codex"
     if not codex_root.is_dir():
@@ -2838,7 +2874,10 @@ def _push_codex_title(home: Path, uuid: str, title: str) -> tuple[list[str], lis
             os.fsync(handle.fileno())
     except OSError as exc:
         return [], [f"Codex session index not appended: {exc}"]
-    return ["codex-session-index"], []
+    thread_pushes, thread_warnings = _push_codex_thread_title(
+        codex_root, uuid, title
+    )
+    return ["codex-session-index", *thread_pushes], thread_warnings
 
 
 SESSION_COLORS = (
@@ -3011,7 +3050,13 @@ def propagate_provider_title(
     """
     exact_uuid = valid_uuid(uuid)
     clean_title = clean_text(title, 100)
-    if provider not in PROVIDERS or not exact_uuid or not clean_title:
+    if (
+        provider not in PROVIDERS
+        or not exact_uuid
+        or not clean_title
+        # A placeholder identity must never be written into provider stores.
+        or set(exact_uuid.replace("-", "")) <= {"0"}
+    ):
         return {
             "provider_title_pushes": [],
             "provider_title_warnings": ["invalid provider title push request"],

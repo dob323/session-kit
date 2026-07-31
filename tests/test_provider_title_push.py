@@ -581,6 +581,59 @@ class AutoTitleFromHookTests(unittest.TestCase):
             )
             self.assertIsNone(result["title"])
 
+    def test_codex_push_sets_thread_title_in_state_database(self) -> None:
+        import sqlite3
+
+        uuid = "00000000-0000-4000-8000-000000000031"
+        with tempfile.TemporaryDirectory() as base:
+            home = Path(base)
+            codex = home / ".codex"
+            codex.mkdir(parents=True)
+            database = codex / "state_5.sqlite"
+            connection = sqlite3.connect(database)
+            connection.execute(
+                "CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT)"
+            )
+            connection.execute("INSERT INTO threads VALUES (?, NULL)", (uuid,))
+            connection.commit()
+            connection.close()
+            result = inventory_core.propagate_provider_title(
+                "codex", uuid, "Named thread", environ={"HOME": str(home)}
+            )
+            self.assertIn("codex-thread-title", result["provider_title_pushes"])
+            connection = sqlite3.connect(database)
+            self.assertEqual(
+                ("Named thread",),
+                connection.execute(
+                    "SELECT title FROM threads WHERE id = ?", (uuid,)
+                ).fetchone(),
+            )
+            connection.close()
+            missing = inventory_core.propagate_provider_title(
+                "codex",
+                "00000000-0000-4000-8000-000000000032",
+                "Other thread",
+                environ={"HOME": str(home)},
+            )
+            self.assertNotIn(
+                "codex-thread-title", missing["provider_title_pushes"]
+            )
+            self.assertTrue(
+                any(
+                    "thread row not found" in warning
+                    for warning in missing["provider_title_warnings"]
+                )
+            )
+
+    def test_placeholder_uuid_is_never_pushed(self) -> None:
+        result = inventory_core.propagate_provider_title(
+            "codex",
+            "00000000-0000-0000-0000-000000000000",
+            "Ghost thread",
+            environ={"HOME": "/nonexistent"},
+        )
+        self.assertEqual([], result["provider_title_pushes"])
+
     def test_stop_event_titles_from_transcript_first_prompt(self) -> None:
         with tempfile.TemporaryDirectory() as base:
             home, transcript = self._prebaked_home(Path(base))
