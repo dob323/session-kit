@@ -53,8 +53,15 @@ class ProviderTitlePushTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix=".title-push-", dir=REPO) as raw:
             home = self._home(Path(raw))
             sessions = home / ".claude" / "sessions"
+            project = home / ".claude" / "projects" / "-srv-project"
+            project.mkdir(parents=True, mode=0o700)
             exact = uuid_for(11)
             other = uuid_for(12)
+            transcript = project / f"{exact}.jsonl"
+            transcript.write_text(
+                json.dumps({"type": "user", "sessionId": exact}) + "\n",
+                encoding="utf-8",
+            )
             matching = sessions / "123.json"
             matching.write_text(
                 json.dumps({"pid": 123, "sessionId": exact, "name": "Old"}),
@@ -68,8 +75,23 @@ class ProviderTitlePushTest(unittest.TestCase):
             result = self._push("claude", exact, "Launch Gate Test", home)
             self.assertEqual([], result["provider_title_warnings"])
             self.assertEqual(
-                ["claude-nameintent", "claude-session-record"],
+                [
+                    "claude-nameintent",
+                    "claude-transcript-name",
+                    "claude-session-record",
+                ],
                 result["provider_title_pushes"],
+            )
+            appended = json.loads(
+                transcript.read_text(encoding="utf-8").splitlines()[-1]
+            )
+            self.assertEqual(
+                {
+                    "type": "agent-name",
+                    "agentName": "Launch Gate Test",
+                    "sessionId": exact,
+                },
+                appended,
             )
             intent = sessions / f"{exact}.nameintent"
             self.assertEqual(

@@ -2762,6 +2762,29 @@ def _push_claude_title(home: Path, uuid: str, title: str) -> tuple[list[str], li
         pushed.append("claude-nameintent")
     except OSError as exc:
         warnings.append(f"Claude name intent not written: {exc}")
+    # The prompt bar's bottom-right name is a transcript agent-name record —
+    # the exact store /rename persists, hydrated at session start/resume,
+    # rendered beside the agent-color. Same append discipline as colors.
+    projects = home / ".claude" / "projects"
+    try:
+        transcripts = sorted(projects.glob(f"*/{uuid}.jsonl"))
+    except OSError:
+        transcripts = []
+    name_entry = json.dumps(
+        {"type": "agent-name", "agentName": title, "sessionId": uuid},
+        separators=(",", ":"),
+    )
+    for transcript in transcripts[:4]:
+        if transcript.is_symlink():
+            continue
+        try:
+            with open(transcript, "a", encoding="utf-8") as handle:
+                handle.write(name_entry + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            pushed.append("claude-transcript-name")
+        except OSError as exc:
+            warnings.append(f"Claude transcript name not appended: {exc}")
     # The per-PID session record names the thread in Claude's own session
     # picker. Records carry the exact sessionId, so match by content.
     try:
