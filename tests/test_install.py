@@ -27,9 +27,12 @@ class InstallerTests(unittest.TestCase):
         self.home.mkdir()
         self.fake_bin = self.temp / "bin"
         self.fake_bin.mkdir()
-        shpool = self.fake_bin / "shpool"
-        shpool.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
-        shpool.chmod(0o755)
+        for command in ("shpool", "codex"):
+            executable = self.fake_bin / command
+            executable.write_text(
+                "#!/usr/bin/env bash\nexit 0\n", encoding="utf-8"
+            )
+            executable.chmod(0o755)
         self.env = os.environ.copy()
         self.env.update(
             {
