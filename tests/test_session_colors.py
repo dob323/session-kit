@@ -189,6 +189,70 @@ class SessionColorTests(unittest.TestCase):
             ),
         )
 
+    def test_launch_color_is_deterministic_and_valid(self) -> None:
+        first = inventory_core.launch_color_for("s20260731-172651-3345413")
+        second = inventory_core.launch_color_for("s20260731-172651-3345413")
+        self.assertEqual(first, second)
+        self.assertIn(first, inventory_core.SESSION_COLORS)
+        self.assertIsNone(inventory_core.record_launch_color({}, "../evil"))
+        self.assertIsNone(inventory_core.record_launch_color({}, ""))
+
+    def test_launch_color_marker_is_adopted_into_override(self) -> None:
+        with tempfile.TemporaryDirectory(prefix=".launch-", dir=REPO) as raw:
+            base = Path(raw)
+            home = base / "home"
+            home.mkdir()
+            state = base / "state"
+            state.mkdir(mode=0o700)
+            config_file = base / "inventory.json"
+            config_file.write_text(
+                json.dumps({"schema_version": 1, "aliases": {}}),
+                encoding="utf-8",
+            )
+            config_file.chmod(0o600)
+            config = {
+                "state_dir": state,
+                "max_proc_nodes": 8192,
+                "max_proc_depth": 32,
+            }
+            shpool_id = "s20260731-170000-1234567"
+            exact = uuid_for(71)
+            environment = {
+                "SESSION_KIT_CONFIG": os.fspath(config_file),
+                "HOME": os.fspath(home),
+            }
+            with mock.patch.dict(os.environ, environment, clear=False):
+                color = inventory_core.record_launch_color(config, shpool_id)
+                self.assertIn(color, inventory_core.SESSION_COLORS)
+                marker = state / "launch-color" / shpool_id
+                self.assertEqual(color, marker.read_text().strip())
+                sessions = [
+                    {
+                        "provider": "codex",
+                        "shpool_id": shpool_id,
+                        "identity": {"uuid": exact},
+                    }
+                ]
+                adopted = inventory_core._adopt_launch_colors(
+                    config, sessions, {}
+                )
+                self.assertEqual(color, adopted.get(f"codex:{exact}"))
+                self.assertFalse(marker.exists())
+                # A second run with the override in place changes nothing.
+                again = inventory_core._adopt_launch_colors(
+                    config, sessions, adopted
+                )
+                self.assertEqual(adopted, again)
+                # An existing explicit override outranks a fresh marker.
+                inventory_core.record_launch_color(config, shpool_id)
+                kept = inventory_core._adopt_launch_colors(
+                    config,
+                    sessions,
+                    {f"codex:{exact}": "purple"},
+                )
+                self.assertEqual("purple", kept[f"codex:{exact}"])
+                self.assertFalse(marker.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -30,6 +30,9 @@ REQUIRED_SYMBOLS = {
     "_alias_command",
     "auto_title_from_hook",
     "derive_prompt_title",
+    "_adopt_launch_colors",
+    "launch_color_for",
+    "record_launch_color",
     "_color_command",
     "_plan_token",
     "_process_age",
@@ -166,7 +169,7 @@ def referenced_facade_symbols() -> set[str]:
 
 class InventoryFacadeTests(unittest.TestCase):
     def test_contract_matches_every_current_test_reference(self) -> None:
-        self.assertEqual(len(REQUIRED_SYMBOLS), 80)
+        self.assertEqual(len(REQUIRED_SYMBOLS), 83)
         self.assertEqual(REQUIRED_SYMBOLS, referenced_facade_symbols())
 
     def test_current_tested_symbols_remain_available(self) -> None:

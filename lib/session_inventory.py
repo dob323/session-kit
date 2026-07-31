@@ -2166,6 +2166,7 @@ def build_inventory(
         )
     )
     color_overrides = _valid_colors(config.get("colors"))
+    color_overrides = _adopt_launch_colors(config, sessions, color_overrides)
     for item in sessions + outside_agents:
         item["display_color"] = session_color(
             item.get("provider"),
@@ -2931,6 +2932,103 @@ def session_color(
         return override
     digest = hashlib.sha256(f"{provider}:{exact_uuid}".encode("utf-8")).digest()
     return SESSION_COLORS[digest[0] % len(SESSION_COLORS)]
+
+
+# A brand-new Codex session has no conversation ID until Codex boots, so its
+# launch theme cannot come from the identity hash. The launch color is picked
+# deterministically from the shpool session name, recorded as a marker, and
+# adopted as that conversation's explicit override the first time the live
+# collector sees the session's real ID — from then on the window theme, the
+# picker row, and every future resume agree.
+LAUNCH_COLOR_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
+
+
+def launch_color_for(shpool_id: str) -> str:
+    digest = hashlib.sha256(f"launch:{shpool_id}".encode("utf-8")).digest()
+    return SESSION_COLORS[digest[0] % len(SESSION_COLORS)]
+
+
+def _launch_color_dir(config: Mapping[str, Any]) -> Path | None:
+    state_dir = config.get("state_dir")
+    if not state_dir:
+        return None
+    return Path(state_dir) / "launch-color"
+
+
+def record_launch_color(
+    config: Mapping[str, Any], shpool_id: str
+) -> str | None:
+    """Pick and persist a launch color for a session with no conversation ID."""
+    if (
+        not shpool_id
+        or "/" in shpool_id
+        or shpool_id.startswith(".")
+        or len(shpool_id) > 128
+    ):
+        return None
+    color = launch_color_for(shpool_id)
+    directory = _launch_color_dir(config)
+    if directory is None:
+        return color
+    try:
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(directory / shpool_id, flags, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(color + "\n")
+    except OSError:
+        # The theme still applies this boot; only later adoption is lost.
+        pass
+    return color
+
+
+def _adopt_launch_colors(
+    config: Mapping[str, Any],
+    sessions: Sequence[Mapping[str, Any]],
+    overrides: Mapping[str, str],
+) -> dict[str, str]:
+    """Turn launch-color markers into explicit overrides once IDs are known."""
+    current = dict(overrides)
+    directory = _launch_color_dir(config)
+    if directory is None or not directory.is_dir():
+        return current
+    now = time.time()
+    by_shpool_id: dict[str, Mapping[str, Any]] = {
+        str(item.get("shpool_id") or ""): item
+        for item in sessions
+        if item.get("provider") == "codex"
+    }
+    try:
+        markers = list(directory.iterdir())
+    except OSError:
+        return current
+    for marker in markers:
+        try:
+            if marker.is_symlink() or not marker.is_file():
+                continue
+            stat_result = marker.stat()
+            if now - stat_result.st_mtime > LAUNCH_COLOR_MAX_AGE_SECONDS:
+                marker.unlink(missing_ok=True)
+                continue
+            item = by_shpool_id.get(marker.name)
+            if item is None:
+                continue
+            uuid = valid_uuid(str((item.get("identity") or {}).get("uuid") or ""))
+            if not uuid:
+                continue
+            color = marker.read_text(encoding="utf-8", errors="strict").strip()
+            if color not in SESSION_COLORS:
+                marker.unlink(missing_ok=True)
+                continue
+            key = f"codex:{uuid}"
+            if key not in current:
+                current = mutate_canonical_color(config, "codex", uuid, color)
+            marker.unlink(missing_ok=True)
+        except (OSError, ValueError, CollectionError):
+            continue
+    return current
 
 
 def mutate_canonical_color(
@@ -5999,6 +6097,12 @@ def _alias_command(args: argparse.Namespace, config: dict[str, Any]) -> int:
 
 
 def _color_command(args: argparse.Namespace, config: dict[str, Any]) -> int:
+    if args.color_action == "launch-pick":
+        color = record_launch_color(config, args.shpool_id)
+        if not color:
+            return 1
+        print(color)
+        return 0
     if args.color_action == "propagate":
         effective = session_color(
             args.provider, args.uuid, canonical_colors(config)
@@ -6141,6 +6245,8 @@ def _parser() -> argparse.ArgumentParser:
     color_propagate = color_subparsers.add_parser("propagate")
     color_propagate.add_argument("provider", choices=PROVIDERS)
     color_propagate.add_argument("uuid")
+    color_launch = color_subparsers.add_parser("launch-pick")
+    color_launch.add_argument("shpool_id")
     automatic_parser = subparsers.add_parser("automatic-title")
     automatic_subparsers = automatic_parser.add_subparsers(
         dest="automatic_title_action", required=True
