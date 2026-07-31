@@ -3,4 +3,25 @@ set -euo pipefail
 
 repo=$(cd -- "$(dirname -- "$0")/.." && pwd)
 export PYTHONDONTWRITEBYTECODE=1
+
+if [[ ${GITHUB_ACTIONS:-} == true ]]; then
+  log=$(mktemp "${RUNNER_TEMP:-/tmp}/session-kit-tests.XXXXXX.log")
+  set +e
+  python3 -m unittest discover -s "$repo/tests" -t "$repo" -v 2>&1 |
+    tee "$log"
+  status=${PIPESTATUS[0]}
+  set -e
+  if (( status != 0 )); then
+    python3 - "$log" <<'PY'
+from pathlib import Path
+import sys
+
+tail = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")[-6000:]
+escaped = tail.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+print(f"::error title=Session Kit test failure::{escaped}")
+PY
+  fi
+  exit "$status"
+fi
+
 exec python3 -m unittest discover -s "$repo/tests" -t "$repo" -v
