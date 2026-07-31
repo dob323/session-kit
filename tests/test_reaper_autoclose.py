@@ -7,7 +7,6 @@ import stat
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 
 from tests.support import REPO
@@ -19,6 +18,7 @@ from sessionkit_inventory import reaper  # noqa: E402
 SESSION_ID = "s20260730-220500-19"
 UUID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
 HOUR_NS = 3600 * 1_000_000_000
+TEST_NOW_NS = 100 * HOUR_NS
 REAPER = REPO / "bin" / "shpool_reaper"
 
 
@@ -361,6 +361,8 @@ print(pathlib.Path(__import__("os").environ["FAKE_INVENTORY"]).read_text(),end="
                 "SESSION_KIT_DAEMON_PID": "10",
                 "SESSION_KIT_REAPER_SENTINEL": str(self.base / "enabled"),
                 "SESSION_KIT_AUTO_CLOSE_HOURS": "1",
+                "SESSION_KIT_TESTING": "1",
+                "SESSION_KIT_TEST_MONOTONIC_NS": str(TEST_NOW_NS),
                 "FAKE_SHPOOL_STATE": str(self.shpool_state),
                 "FAKE_KILL_LOG": str(self.kill_log),
                 "FAKE_INVENTORY": str(self.inventory),
@@ -391,7 +393,7 @@ print(pathlib.Path(__import__("os").environ["FAKE_INVENTORY"]).read_text(),end="
         value = json.loads(observations.read_text(encoding="utf-8"))
         value["observations"][SESSION_ID][
             "first_verified_monotonic_ns"
-        ] = time.monotonic_ns() - 2 * HOUR_NS
+        ] = TEST_NOW_NS - 2 * HOUR_NS
         observations.write_text(
             json.dumps(value) + "\n", encoding="utf-8"
         )
@@ -458,7 +460,7 @@ print(pathlib.Path(__import__("os").environ["FAKE_INVENTORY"]).read_text(),end="
         value = json.loads(observations.read_text(encoding="utf-8"))
         value["observations"][SESSION_ID][
             "first_verified_monotonic_ns"
-        ] = time.monotonic_ns() - 2 * HOUR_NS
+        ] = TEST_NOW_NS - 2 * HOUR_NS
         observations.write_text(
             json.dumps(value) + "\n", encoding="utf-8"
         )

@@ -323,6 +323,18 @@ def plan_from_environment(
         raise CollectionError("auto-close environment is invalid") from exc
     if not 1 <= hours <= MAX_AUTO_CLOSE_HOURS:
         raise CollectionError("auto-close age is invalid")
+    now_monotonic_ns = time.monotonic_ns()
+    if os.environ.get("SESSION_KIT_TESTING") == "1":
+        raw_test_clock = os.environ.get("SESSION_KIT_TEST_MONOTONIC_NS")
+        if raw_test_clock is not None:
+            try:
+                now_monotonic_ns = int(raw_test_clock)
+            except ValueError as exc:
+                raise CollectionError(
+                    "auto-close test clock is invalid"
+                ) from exc
+            if not _positive_int(now_monotonic_ns):
+                raise CollectionError("auto-close test clock is invalid")
     observation_path = state_dir / "auto-close-observations.json"
     previous = read_private_json(
         observation_path,
@@ -334,7 +346,7 @@ def plan_from_environment(
         inventory,
         scan_shell_facts(proc_root, daemon_pid),
         previous,
-        now_monotonic_ns=time.monotonic_ns(),
+        now_monotonic_ns=now_monotonic_ns,
         minimum_age_ns=hours * 3600 * 1_000_000_000,
     )
     if write_state:
