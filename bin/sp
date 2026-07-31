@@ -65,50 +65,15 @@ cleanup_snapshot() {
 }
 trap cleanup_snapshot EXIT HUP INT TERM
 
-# Terminal tint: the one color surface the kit controls for BOTH providers.
-# Emits OSC 11/12 (background/cursor) for the attached terminal only; reset on
-# detach. Never touches the session or provider. Kill: SESSION_KIT_NO_TINT=1
-# or $SK_STATE_DIR/tint-off. Unsupported terminals ignore the sequences.
-sk_tint_codes() {
-  case "$1" in
-    red)    SK_TINT_BG='#1f0a0a'; SK_TINT_CURSOR='#d73c3c' ;;
-    blue)   SK_TINT_BG='#0a0f1f'; SK_TINT_CURSOR='#466edc' ;;
-    green)  SK_TINT_BG='#0a170f'; SK_TINT_CURSOR='#3cb45a' ;;
-    yellow) SK_TINT_BG='#1a170a'; SK_TINT_CURSOR='#cdb937' ;;
-    purple) SK_TINT_BG='#150a1f'; SK_TINT_CURSOR='#a55fcd' ;;
-    orange) SK_TINT_BG='#1f130a'; SK_TINT_CURSOR='#e18c28' ;;
-    pink)   SK_TINT_BG='#1f0a17'; SK_TINT_CURSOR='#e66eb4' ;;
-    cyan)   SK_TINT_BG='#0a171a'; SK_TINT_CURSOR='#3cc3cd' ;;
-    *) return 1 ;;
-  esac
-}
-
 # Fire-and-forget provider color push at attach time. The transcript is
 # guaranteed to exist by now, unlike at creation proof, and the attach itself
-# is never delayed. Codex is a clean no-op inside the propagator.
+# is never delayed. Codex is a clean no-op inside the propagator. The kit
+# never alters the attached terminal itself; the provider applies its own
+# native color from this record at the session's next start or resume.
 sk_push_session_color() {
   [[ -n ${1:-} && -n ${2:-} ]] || return 0
   ( python3 "$INVENTORY_CORE" color propagate "$1" "$2" >/dev/null 2>&1 \
       || true ) &
-}
-
-sk_attach_tint() {
-  local provider=$1 uuid=$2 color
-  SK_TINTED=0
-  [[ ${SESSION_KIT_NO_TINT:-0} != 1 && ! -e $SK_STATE_DIR/tint-off ]] ||
-    return 0
-  [[ -t 1 && -n $provider && -n $uuid ]] || return 0
-  color=$(python3 "$INVENTORY_CORE" color effective "$provider" "$uuid" \
-    2>/dev/null) || return 0
-  sk_tint_codes "$color" || return 0
-  printf '\033]11;%s\007\033]12;%s\007' "$SK_TINT_BG" "$SK_TINT_CURSOR"
-  SK_TINTED=1
-}
-
-sk_attach_untint() {
-  [[ ${SK_TINTED:-0} == 1 ]] || return 0
-  printf '\033]111\007\033]112\007'
-  SK_TINTED=0
 }
 
 attach_id() {
@@ -119,13 +84,6 @@ attach_id() {
   [[ -z $cwd ]] || args+=(--dir "$cwd")
   args+=("$id")
   sk_push_session_color "${SK_PROVIDER:-}" "${SK_UUID:-}"
-  sk_attach_tint "${SK_PROVIDER:-}" "${SK_UUID:-}"
-  if [[ ${SK_TINTED:-0} == 1 ]]; then
-    local status=0
-    "$SK_SHPOOL" "${args[@]}" || status=$?
-    sk_attach_untint
-    exit "$status"
-  fi
   exec "$SK_SHPOOL" "${args[@]}"
 }
 
@@ -137,11 +95,7 @@ picker_attach_id() {
   [[ -z $cwd ]] || args+=(--dir "$cwd")
   args+=("$id")
   sk_push_session_color "${SK_PROOF_PROVIDER:-}" "${SK_PROOF_UUID:-}"
-  sk_attach_tint "${SK_PROOF_PROVIDER:-}" "${SK_PROOF_UUID:-}"
-  local status=0
-  "$SK_SHPOOL" "${args[@]}" || status=$?
-  sk_attach_untint
-  return "$status"
+  "$SK_SHPOOL" "${args[@]}"
 }
 
 picker_action_event() {
