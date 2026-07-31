@@ -632,11 +632,16 @@ PY
 }
 
 validate_mutable_targets() {
-  local target
+  local target resolved
   while IFS= read -r target; do
     [[ ! -e $target && ! -L $target ]] && continue
     if [[ -L $target ]]; then
-      [[ $target == "$install_root/current" ]] ||
+      [[ $target == "$install_root/current" ]] && continue
+      # Pre-receipt layouts linked helpers into the install root itself. A
+      # symlink resolving inside $install_root is the kit's own legacy
+      # launcher; install(1) replaces the link, never its target.
+      resolved=$(readlink -f -- "$target" 2>/dev/null) || resolved=""
+      [[ -n $resolved && $resolved == "$install_root"/* ]] ||
         die "refusing symlinked lifecycle target: $target"
       continue
     fi
