@@ -9,19 +9,19 @@
       <key>foreground</key><string>#DCDFE4</string>
     </dict></dict>
     <dict><key>scope</key><string>string</string>
-      <key>settings</key><dict><key>foreground</key><string>#E06C75</string></dict></dict>
+      <key>settings</key><dict><key>foreground</key><string>#FF5555</string></dict></dict>
+    <dict><key>scope</key><string>variable, support.type</string>
+      <key>settings</key><dict><key>foreground</key><string>#FF9090</string></dict></dict>
+    <dict><key>scope</key><string>constant, support.constant</string>
+      <key>settings</key><dict><key>foreground</key><string>#FFBBBB</string></dict></dict>
     <dict><key>scope</key><string>keyword, storage</string>
       <key>settings</key><dict><key>foreground</key><string>#C678DD</string></dict></dict>
     <dict><key>scope</key><string>entity.name.function, support.function</string>
       <key>settings</key><dict><key>foreground</key><string>#61AFEF</string></dict></dict>
-    <dict><key>scope</key><string>constant, support.constant</string>
-      <key>settings</key><dict><key>foreground</key><string>#D19A66</string></dict></dict>
     <dict><key>scope</key><string>comment</string>
       <key>settings</key><dict><key>foreground</key><string>#7F848E</string></dict></dict>
-    <dict><key>scope</key><string>variable, support.type</string>
-      <key>settings</key><dict><key>foreground</key><string>#E06C75</string></dict></dict>
     <dict><key>scope</key><string>entity.name.type, entity.name.class</string>
-      <key>settings</key><dict><key>foreground</key><string>#E5C07B</string></dict></dict>
+      <key>settings</key><dict><key>foreground</key><string>#FF9090</string></dict></dict>
   </array>
 </dict>
 </plist>

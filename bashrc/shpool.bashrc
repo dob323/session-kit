@@ -119,7 +119,8 @@ PY
     # session start). The env overrides remain for tests and tooling.
     __sk_release_root=${SESSION_KIT_RELEASE_DIR:-}
     if [[ -z $__sk_release_root ]]; then
-      __sk_release_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd -P || true)
+      __sk_release_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd -P) ||
+        __sk_release_root=""
     fi
     __sk_inventory_core=${SESSION_KIT_INVENTORY_CORE:-$__sk_release_root/lib/session_inventory.py}
     unset __sk_release_root

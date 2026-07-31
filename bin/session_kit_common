@@ -1063,6 +1063,7 @@ sk_confirm_exact() {
   if [[ $answer != "" && $answer != $'\n' ]]; then
     local __sk_confirm_rest=""
     IFS= read -r -s -t 0.3 __sk_confirm_rest 2>/dev/null || true
+    : "${__sk_confirm_rest}"
   fi
   printf '\n'
   [[ $answer == y || $answer == Y ]]
