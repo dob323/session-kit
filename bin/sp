@@ -83,6 +83,15 @@ sk_tint_codes() {
   esac
 }
 
+# Fire-and-forget provider color push at attach time. The transcript is
+# guaranteed to exist by now, unlike at creation proof, and the attach itself
+# is never delayed. Codex is a clean no-op inside the propagator.
+sk_push_session_color() {
+  [[ -n ${1:-} && -n ${2:-} ]] || return 0
+  ( python3 "$INVENTORY_CORE" color propagate "$1" "$2" >/dev/null 2>&1 \
+      || true ) &
+}
+
 sk_attach_tint() {
   local provider=$1 uuid=$2 color
   SK_TINTED=0
@@ -109,6 +118,7 @@ attach_id() {
   args+=(--cmd /bin/false)
   [[ -z $cwd ]] || args+=(--dir "$cwd")
   args+=("$id")
+  sk_push_session_color "${SK_PROVIDER:-}" "${SK_UUID:-}"
   sk_attach_tint "${SK_PROVIDER:-}" "${SK_UUID:-}"
   if [[ ${SK_TINTED:-0} == 1 ]]; then
     local status=0
@@ -126,6 +136,7 @@ picker_attach_id() {
   args+=(--cmd /bin/false)
   [[ -z $cwd ]] || args+=(--dir "$cwd")
   args+=("$id")
+  sk_push_session_color "${SK_PROOF_PROVIDER:-}" "${SK_PROOF_UUID:-}"
   sk_attach_tint "${SK_PROOF_PROVIDER:-}" "${SK_PROOF_UUID:-}"
   local status=0
   "$SK_SHPOOL" "${args[@]}" || status=$?
