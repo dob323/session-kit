@@ -560,6 +560,54 @@ class CommandTests(unittest.TestCase):
         matching = run([SP, "new", "shell", "fixture"], env=env)
         self.assertTrue(matching.stdout.strip().splitlines()[-1].startswith("s"))
 
+    def test_marker_self_heal_repairs_only_with_managed_login_block(self) -> None:
+        marker = self.fixture.state / "integration-ready-v1"
+        env = self.fixture.env()
+        env["SESSION_KIT_BACKGROUND"] = "1"
+        env["STUB_DYNAMIC_PROVIDER"] = "shell"
+        env["STUB_DYNAMIC_CWD"] = str(self.fixture.project)
+        bashrc = self.fixture.home / ".bashrc"
+        marker.unlink()
+        refused = run([SP, "new", "shell", "fixture"], env=env, check=False)
+        self.assertNotEqual(0, refused.returncode)
+        self.assertIn("validated for this release", refused.stderr)
+        self.assertFalse(marker.exists())
+        bashrc.write_text(
+            "# >>> session-kit managed integration >>>\n"
+            "# <<< session-kit managed integration <<<\n",
+            encoding="utf-8",
+        )
+        healed = run([SP, "new", "shell", "fixture"], env=env)
+        self.assertTrue(healed.stdout.strip().splitlines()[-1].startswith("s"))
+        self.assertEqual(
+            f"session-kit-integration-v1 {self.fixture.release_id}\n",
+            marker.read_text(encoding="utf-8"),
+        )
+        self.assertEqual(0o600, marker.stat().st_mode & 0o777)
+        log = self.fixture.state / "action-events.jsonl"
+        self.assertIn("marker_self_heal", log.read_text(encoding="utf-8"))
+        marker.write_text(
+            f"session-kit-integration-v1 {'b' * 40}\n", encoding="utf-8"
+        )
+        marker.chmod(0o600)
+        stale = run([SP, "new", "shell", "fixture"], env=env)
+        self.assertTrue(stale.stdout.strip().splitlines()[-1].startswith("s"))
+        self.assertEqual(
+            f"session-kit-integration-v1 {self.fixture.release_id}\n",
+            marker.read_text(encoding="utf-8"),
+        )
+        marker.unlink()
+        (self.fixture.state / "self-heal-off").write_text("", encoding="utf-8")
+        off = run([SP, "new", "shell", "fixture"], env=env, check=False)
+        self.assertNotEqual(0, off.returncode)
+        self.assertIn("validated for this release", off.stderr)
+        self.assertFalse(marker.exists())
+        (self.fixture.state / "self-heal-off").unlink()
+        env["SESSION_KIT_NO_SELF_HEAL"] = "1"
+        disabled = run([SP, "new", "shell", "fixture"], env=env, check=False)
+        self.assertNotEqual(0, disabled.returncode)
+        self.assertFalse(marker.exists())
+
     def test_queued_new_rechecks_release_marker_under_creation_lock(self) -> None:
         env = self.fixture.env()
         env.update(

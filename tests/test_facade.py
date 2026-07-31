@@ -28,11 +28,13 @@ REQUIRED_SYMBOLS = {
     "_parse_darwin_procargs2",
     "_parser",
     "_alias_command",
+    "_color_command",
     "_plan_token",
     "_process_age",
     "_prove_lifecycle_caller",
     "_provider_title_info",
     "_read_terminal_registry",
+    "_valid_colors",
     "_release_sha",
     "_require_supported_platform",
     "_rollout_turn_state",
@@ -67,6 +69,7 @@ REQUIRED_SYMBOLS = {
     "normalize_automatic_title",
     "os",
     "plan_legacy_recovery_manifest",
+    "propagate_provider_color",
     "propagate_provider_title",
     "prove_self_name_caller",
     "prune_automatic_titles",
@@ -80,6 +83,8 @@ REQUIRED_SYMBOLS = {
     "scan_darwin_process_table",
     "scan_process_table",
     "self_name_automatic_title",
+    "session_color",
+    "SESSION_COLORS",
     "shpool_id_mutation_policy",
     "shutil",
     "snapshot",
@@ -124,6 +129,7 @@ EXPECTED_TOP_LEVEL_COMMANDS = (
     "recovery-command",
     "platform",
     "alias",
+    "color",
     "automatic-title",
     "recovery-pending",
     "recovery-manifest",
@@ -156,7 +162,7 @@ def referenced_facade_symbols() -> set[str]:
 
 class InventoryFacadeTests(unittest.TestCase):
     def test_contract_matches_every_current_test_reference(self) -> None:
-        self.assertEqual(len(REQUIRED_SYMBOLS), 71)
+        self.assertEqual(len(REQUIRED_SYMBOLS), 76)
         self.assertEqual(REQUIRED_SYMBOLS, referenced_facade_symbols())
 
     def test_current_tested_symbols_remain_available(self) -> None:

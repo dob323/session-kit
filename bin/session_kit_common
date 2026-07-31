@@ -113,8 +113,8 @@ sk_lock_release() {
   return "$result"
 }
 
-sk_require_integration() {
-  local release_id=${SESSION_KIT_RELEASE_ID:-${SESSION_KIT_RELEASE_DIR##*/}}
+sk_integration_marker_ok() {
+  local release_id=$1
   local marker_value=
   local marker_stat=
   local marker_size=
@@ -132,8 +132,40 @@ sk_require_integration() {
   [[ $release_id =~ ^[0-9a-f]{40}$ &&
      $marker_value == "$marker_expected" &&
      $marker_size == $((${#marker_expected} + 1)) &&
-     $marker_stat == "600:$(id -u)" ]] ||
-    sk_die "new-session launch is disabled until shell integration is validated for this release"
+     $marker_stat == "600:$(id -u)" ]]
+}
+
+# A marker that is missing or names a stale release while the managed login
+# block still exists is an inconsistent state by definition: enabling login
+# writes both and disabling removes both. Healing rewrites only that state and
+# can never override a deliberate disable, whose bashrc block is gone too.
+sk_integration_self_heal() {
+  [[ ${SESSION_KIT_NO_SELF_HEAL:-0} != 1 &&
+     ! -e $SK_STATE_DIR/self-heal-off ]] || return 1
+  local release_id=$1
+  local bashrc=${SESSION_KIT_BASHRC:-"$HOME/.bashrc"}
+  [[ $release_id =~ ^[0-9a-f]{40}$ ]] || return 1
+  [[ -f $bashrc && ! -L $bashrc ]] || return 1
+  command grep -qF '# >>> session-kit managed integration >>>' "$bashrc" \
+    2>/dev/null || return 1
+  [[ ! -L $SK_INTEGRATION_MARKER ]] || return 1
+  umask 077
+  mkdir -p "$SK_STATE_DIR" || return 1
+  printf 'session-kit-integration-v1 %s\n' "$release_id" \
+    > "$SK_INTEGRATION_MARKER" || return 1
+  chmod 600 "$SK_INTEGRATION_MARKER" || return 1
+  sk_log_action marker_self_heal repaired || true
+  return 0
+}
+
+sk_require_integration() {
+  local release_id=${SESSION_KIT_RELEASE_ID:-${SESSION_KIT_RELEASE_DIR##*/}}
+  sk_integration_marker_ok "$release_id" && return 0
+  if sk_integration_self_heal "$release_id" &&
+      sk_integration_marker_ok "$release_id"; then
+    return 0
+  fi
+  sk_die "new-session launch is disabled until shell integration is validated for this release"
 }
 
 sk_prepare_state() {

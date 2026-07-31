@@ -20,6 +20,8 @@ Usage:
   sp new [claude|codex|shell] [project-alias]
   sp name <terminal-number|shpool-id> <title>
   sp name reset <terminal-number|shpool-id>
+  sp color <terminal-number|shpool-id> <red|blue|green|yellow|purple|orange|pink|cyan>
+  sp color reset <terminal-number|shpool-id>
   sp self-name <2-5-word-title>
   sp go <terminal-number|shpool-id>
   sp takeover <terminal-number|shpool-id>
@@ -63,12 +65,58 @@ cleanup_snapshot() {
 }
 trap cleanup_snapshot EXIT HUP INT TERM
 
+# Terminal tint: the one color surface the kit controls for BOTH providers.
+# Emits OSC 11/12 (background/cursor) for the attached terminal only; reset on
+# detach. Never touches the session or provider. Kill: SESSION_KIT_NO_TINT=1
+# or $SK_STATE_DIR/tint-off. Unsupported terminals ignore the sequences.
+sk_tint_codes() {
+  case "$1" in
+    red)    SK_TINT_BG='#1f0a0a'; SK_TINT_CURSOR='#d73c3c' ;;
+    blue)   SK_TINT_BG='#0a0f1f'; SK_TINT_CURSOR='#466edc' ;;
+    green)  SK_TINT_BG='#0a170f'; SK_TINT_CURSOR='#3cb45a' ;;
+    yellow) SK_TINT_BG='#1a170a'; SK_TINT_CURSOR='#cdb937' ;;
+    purple) SK_TINT_BG='#150a1f'; SK_TINT_CURSOR='#a55fcd' ;;
+    orange) SK_TINT_BG='#1f130a'; SK_TINT_CURSOR='#e18c28' ;;
+    pink)   SK_TINT_BG='#1f0a17'; SK_TINT_CURSOR='#e66eb4' ;;
+    cyan)   SK_TINT_BG='#0a171a'; SK_TINT_CURSOR='#3cc3cd' ;;
+    *) return 1 ;;
+  esac
+}
+
+sk_attach_tint() {
+  local provider=$1 uuid=$2 color
+  SK_TINTED=0
+  [[ ${SESSION_KIT_NO_TINT:-0} != 1 && ! -e $SK_STATE_DIR/tint-off ]] ||
+    return 0
+  [[ -t 1 && -n $provider && -n $uuid ]] || return 0
+  color=$(python3 "$INVENTORY_CORE" color effective "$provider" "$uuid" \
+    2>/dev/null) || return 0
+  sk_tint_codes "$color" || return 0
+  printf '\033]11;%s\007\033]12;%s\007' "$SK_TINT_BG" "$SK_TINT_CURSOR"
+  SK_TINTED=1
+}
+
+sk_attach_untint() {
+  [[ ${SK_TINTED:-0} == 1 ]] || return 0
+  printf '\033]111\007\033]112\007'
+  SK_TINTED=0
+}
+
 attach_id() {
-  local id=$1 cwd=${2:-}
-  if [[ -n $cwd ]]; then
-    exec "$SK_SHPOOL" attach --cmd /bin/false --dir "$cwd" "$id"
+  local id=$1 cwd=${2:-} force=${3:-0}
+  local -a args=(attach)
+  [[ $force == 1 ]] && args+=(--force)
+  args+=(--cmd /bin/false)
+  [[ -z $cwd ]] || args+=(--dir "$cwd")
+  args+=("$id")
+  sk_attach_tint "${SK_PROVIDER:-}" "${SK_UUID:-}"
+  if [[ ${SK_TINTED:-0} == 1 ]]; then
+    local status=0
+    "$SK_SHPOOL" "${args[@]}" || status=$?
+    sk_attach_untint
+    exit "$status"
   fi
-  exec "$SK_SHPOOL" attach --cmd /bin/false "$id"
+  exec "$SK_SHPOOL" "${args[@]}"
 }
 
 picker_attach_id() {
@@ -78,7 +126,11 @@ picker_attach_id() {
   args+=(--cmd /bin/false)
   [[ -z $cwd ]] || args+=(--dir "$cwd")
   args+=("$id")
-  "$SK_SHPOOL" "${args[@]}"
+  sk_attach_tint "${SK_PROOF_PROVIDER:-}" "${SK_PROOF_UUID:-}"
+  local status=0
+  "$SK_SHPOOL" "${args[@]}" || status=$?
+  sk_attach_untint
+  return "$status"
 }
 
 picker_action_event() {
@@ -655,10 +707,7 @@ takeover_target() {
     sk_die "target changed while confirming; no action taken"
     return 1
   }
-  if [[ -n $cwd ]]; then
-    exec "$SK_SHPOOL" attach --force --cmd /bin/false --dir "$cwd" "$id"
-  fi
-  exec "$SK_SHPOOL" attach --force --cmd /bin/false "$id"
+  attach_id "$id" "$cwd" 1
 }
 
 close_target() {
@@ -823,6 +872,50 @@ picker_history() {
   local proof=$1
   picker_load_fresh "$proof" || return 1
   show_history_id "$SK_PROOF_ID"
+}
+
+color_target() {
+  local selector=$1 action=$2 chosen=${3:-}
+  resolve_target "$selector" || return 1
+  sk_require_mutation_target || return 1
+  [[ $SK_PROVIDER == claude || $SK_PROVIDER == codex ]] || {
+    sk_die "managed shell rows keep the derived look and cannot be colored"
+    return 1
+  }
+  local id=$SK_ID started=$SK_STARTED provider=$SK_PROVIDER uuid=$SK_UUID
+  local shell_pid=$SK_SHELL_PID shell_start=$SK_SHELL_START
+  local provider_pid=$SK_PROVIDER_PID provider_start=$SK_PROVIDER_START
+  local daemon_pid=$SK_DAEMON_PID daemon_start=$SK_DAEMON_START
+  picker_lock || return 1
+  sk_revalidate "$id" "$started" "$provider" "$uuid" \
+    "$shell_pid" "$shell_start" "$provider_pid" "$provider_start" \
+    "$daemon_pid" "$daemon_start" || {
+      sk_lock_release 9
+      sk_die "target changed before color update; nothing changed"
+      return 1
+    }
+  if [[ $action == delete ]]; then
+    python3 "$INVENTORY_CORE" color delete "$provider" "$uuid" >/dev/null || {
+      sk_lock_release 9
+      sk_die "could not reset the exact session color; nothing changed"
+      return 1
+    }
+  else
+    python3 "$INVENTORY_CORE" color set "$provider" "$uuid" "$chosen" \
+      >/dev/null || {
+      sk_lock_release 9
+      sk_die "could not set the exact session color; nothing changed"
+      return 1
+    }
+  fi
+  sk_lock_release 9
+  if [[ $action == delete ]]; then
+    printf 'Reset color for exact %s session %s (stable hash color applies)\n' \
+      "$provider" "$id"
+  else
+    printf 'Colored exact %s session %s: %s\n' "$provider" "$id" "$chosen"
+  fi
+  printf 'Claude sessions show the color natively from their next start or resume.\n'
 }
 
 update_ai_alias() {
@@ -1093,6 +1186,15 @@ case "$command" in
   self-name)
     [[ $# -eq 2 ]] || { usage >&2; exit 2; }
     exec python3 "$INVENTORY_CORE" automatic-title self-name "$2"
+    ;;
+  color)
+    if [[ ${2:-} == reset ]]; then
+      [[ $# -eq 3 ]] || { usage >&2; exit 2; }
+      color_target "$3" delete
+    else
+      [[ $# -eq 3 ]] || { usage >&2; exit 2; }
+      color_target "$2" set "$3"
+    fi
     ;;
   go|resume|attach)
     [[ $# -eq 2 ]] || { usage >&2; exit 2; }

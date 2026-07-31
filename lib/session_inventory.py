@@ -2065,6 +2065,13 @@ def build_inventory(
             item["identity"].get("uuid") or "",
         )
     )
+    color_overrides = _valid_colors(config.get("colors"))
+    for item in sessions + outside_agents:
+        item["display_color"] = session_color(
+            item.get("provider"),
+            (item.get("identity") or {}).get("uuid"),
+            color_overrides,
+        )
     return {
         "schema_version": SCHEMA_VERSION,
         "generated_at": _utc_now(current_time),
@@ -2708,6 +2715,160 @@ def _push_codex_title(home: Path, uuid: str, title: str) -> tuple[list[str], lis
     except OSError as exc:
         return [], [f"Codex session index not appended: {exc}"]
     return ["codex-session-index"], []
+
+
+SESSION_COLORS = (
+    "red",
+    "blue",
+    "green",
+    "yellow",
+    "purple",
+    "orange",
+    "pink",
+    "cyan",
+)
+
+
+def _valid_colors(raw: Any) -> dict[str, str]:
+    colors: dict[str, str] = {}
+    if not isinstance(raw, Mapping):
+        return colors
+    for key, value in raw.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            continue
+        provider, separator, uuid = key.partition(":")
+        if (
+            separator
+            and provider in PROVIDERS
+            and UUID_RE.fullmatch(uuid)
+            and value in SESSION_COLORS
+        ):
+            colors[f"{provider}:{uuid.lower()}"] = value
+    return colors
+
+
+def canonical_colors(config: Mapping[str, Any]) -> dict[str, str]:
+    document = _private_alias_document(config_path(), allow_missing=True)
+    return _valid_colors(document.get("colors"))
+
+
+def session_color(
+    provider: str,
+    uuid: str | None,
+    overrides: Mapping[str, str] | None = None,
+) -> str | None:
+    """Stable per-conversation color: explicit override, else identity hash."""
+    if provider not in PROVIDERS or not uuid:
+        return None
+    exact_uuid = valid_uuid(uuid)
+    if not exact_uuid:
+        return None
+    override = (overrides or {}).get(f"{provider}:{exact_uuid}")
+    if override in SESSION_COLORS:
+        return override
+    digest = hashlib.sha256(f"{provider}:{exact_uuid}".encode("utf-8")).digest()
+    return SESSION_COLORS[digest[0] % len(SESSION_COLORS)]
+
+
+def mutate_canonical_color(
+    config: Mapping[str, Any],
+    provider: str,
+    uuid: str,
+    color: str | None,
+) -> dict[str, str]:
+    exact_uuid = valid_uuid(uuid)
+    if provider not in PROVIDERS or not exact_uuid:
+        raise CollectionError("color requires provider claude|codex and an exact UUID")
+    if color is not None and color not in SESSION_COLORS:
+        raise CollectionError(
+            "color must be one of: " + ", ".join(SESSION_COLORS)
+        )
+    path = config_path()
+    paths = _state_paths(config)
+    with StateLock(paths["root"], paths["config_lock"]):
+        with StateLock(paths["root"], paths["lock"]):
+            _private_alias_parent(path)
+            document = _private_alias_document(path, allow_missing=True)
+            colors = _valid_colors(document.get("colors"))
+            key = f"{provider}:{exact_uuid}"
+            if color is None:
+                colors.pop(key, None)
+            else:
+                colors[key] = color
+            if colors:
+                document["colors"] = dict(sorted(colors.items()))
+            else:
+                document.pop("colors", None)
+            atomic_write_json(path, document)
+            return dict(colors)
+
+
+def _push_claude_color(
+    home: Path, uuid: str, color: str
+) -> tuple[list[str], list[str]]:
+    """Append the exact agent-color record /color itself writes.
+
+    Claude Code reads it at session start/resume; nothing is ever typed into
+    a live terminal. Missing transcripts fail open.
+    """
+    projects = home / ".claude" / "projects"
+    if not projects.is_dir():
+        return [], ["Claude projects directory unavailable; color not pushed"]
+    try:
+        transcripts = sorted(projects.glob(f"*/{uuid}.jsonl"))
+    except OSError as exc:
+        return [], [f"Claude transcripts unreadable: {exc}"]
+    if not transcripts:
+        return [], ["no Claude transcript for this conversation; color not pushed"]
+    entry = json.dumps(
+        {"type": "agent-color", "agentColor": color, "sessionId": uuid},
+        separators=(",", ":"),
+    )
+    pushed: list[str] = []
+    warnings: list[str] = []
+    for transcript in transcripts[:4]:
+        if transcript.is_symlink():
+            warnings.append(f"refusing symlinked transcript: {transcript.name}")
+            continue
+        try:
+            with open(transcript, "a", encoding="utf-8") as handle:
+                handle.write(entry + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            pushed.append("claude-transcript-color")
+        except OSError as exc:
+            warnings.append(f"Claude transcript not appended: {exc}")
+    return pushed, warnings
+
+
+def propagate_provider_color(
+    provider: str,
+    uuid: str,
+    color: str,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """One-shot push of a session color into provider-native storage.
+
+    Codex has no native color surface; its rows carry the kit-side color only.
+    """
+    exact_uuid = valid_uuid(uuid)
+    if provider not in PROVIDERS or not exact_uuid or color not in SESSION_COLORS:
+        return {
+            "provider_color_pushes": [],
+            "provider_color_warnings": ["invalid provider color push request"],
+        }
+    if provider != "claude":
+        return {"provider_color_pushes": [], "provider_color_warnings": []}
+    env = environ if environ is not None else os.environ
+    home = Path(env.get("HOME") or os.fspath(Path.home()))
+    pushed, warnings = _push_claude_color(home, exact_uuid, color)
+    for warning in warnings:
+        print(f"session inventory: {warning}", file=sys.stderr)
+    return {
+        "provider_color_pushes": pushed,
+        "provider_color_warnings": warnings,
+    }
 
 
 def propagate_provider_title(
@@ -4755,6 +4916,24 @@ def render_inventory(inventory: Mapping[str, Any], rows_only: bool = False) -> s
     green = "\033[32m" if color else ""
     yellow = "\033[33m" if color else ""
     reset = "\033[0m" if color else ""
+    session_palette = (
+        {
+            "red": "\033[31m",
+            "blue": "\033[34m",
+            "green": "\033[32m",
+            "yellow": "\033[33m",
+            "purple": "\033[35m",
+            "orange": "\033[38;5;208m",
+            "pink": "\033[38;5;205m",
+            "cyan": "\033[36m",
+        }
+        if color
+        else {}
+    )
+
+    def tint(item: Mapping[str, Any], text: str) -> str:
+        code = session_palette.get(item.get("display_color") or "")
+        return f"{code}{text}{reset}" if code else text
     terminal_columns = shutil.get_terminal_size(fallback=(101, 24)).columns
     columns = _positive_int(
         os.environ.get("COLUMNS"),
@@ -4851,7 +5030,7 @@ def render_inventory(inventory: Mapping[str, Any], rows_only: bool = False) -> s
                 title_room = max(1, width - _display_width(prefix))
                 title = _display_title(item.get("title"), title_room)
                 lines.append(
-                    f"      {green}{selector:>2}{reset}  {title}"
+                    f"      {green}{selector:>2}{reset}  {tint(item, title)}"
                 )
                 detail_prefix = "          "
                 detail_room = max(1, width - _display_width(detail_prefix))
@@ -4873,7 +5052,7 @@ def render_inventory(inventory: Mapping[str, Any], rows_only: bool = False) -> s
             title = _display_title(
                 item.get("title"), max(1, width - _display_width(prefix))
             )
-            lines.append(f"{prefix}{title}")
+            lines.append(f"{prefix}{tint(item, title)}")
             detail_parts = [clean_text(item.get("agent_status") or "unknown", 64)]
             if uuid:
                 detail_parts.append(uuid[:8])
@@ -5383,6 +5562,20 @@ def self_name_automatic_title(
             environ=caller_environ,
         )
     )
+    effective_color = session_color(
+        str(evidence["provider"]),
+        str(evidence["uuid"]),
+        canonical_colors(config),
+    )
+    if effective_color:
+        result.update(
+            propagate_provider_color(
+                str(evidence["provider"]),
+                str(evidence["uuid"]),
+                effective_color,
+                environ=caller_environ,
+            )
+        )
     return result
 
 
@@ -5446,6 +5639,42 @@ def _alias_command(args: argparse.Namespace, config: dict[str, Any]) -> int:
         # Explicit assignment pushes once into the provider's own surfaces;
         # deletion only clears the local alias and leaves provider titles alone.
         payload.update(propagate_provider_title(args.provider, args.uuid, title))
+        effective_color = session_color(
+            args.provider, args.uuid, canonical_colors(config)
+        )
+        if effective_color:
+            payload.update(
+                propagate_provider_color(args.provider, args.uuid, effective_color)
+            )
+    _json_print(payload)
+    return 0
+
+
+def _color_command(args: argparse.Namespace, config: dict[str, Any]) -> int:
+    if args.color_action == "effective":
+        effective = session_color(
+            args.provider, args.uuid, canonical_colors(config)
+        )
+        if not effective:
+            return 1
+        print(effective)
+        return 0
+    if args.color_action == "list":
+        _json_print(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "colors": canonical_colors(config),
+            }
+        )
+        return 0
+    color = args.color if args.color_action == "set" else None
+    colors = mutate_canonical_color(config, args.provider, args.uuid, color)
+    payload: dict[str, Any] = {"schema_version": SCHEMA_VERSION, "colors": colors}
+    effective_color = session_color(args.provider, args.uuid, colors)
+    if effective_color:
+        payload.update(
+            propagate_provider_color(args.provider, args.uuid, effective_color)
+        )
     _json_print(payload)
     return 0
 
@@ -5529,6 +5758,21 @@ def _parser() -> argparse.ArgumentParser:
     alias_delete = alias_subparsers.add_parser("delete")
     alias_delete.add_argument("provider", choices=PROVIDERS)
     alias_delete.add_argument("uuid")
+    color_parser = subparsers.add_parser("color")
+    color_subparsers = color_parser.add_subparsers(
+        dest="color_action", required=True
+    )
+    color_subparsers.add_parser("list")
+    color_set = color_subparsers.add_parser("set")
+    color_set.add_argument("provider", choices=PROVIDERS)
+    color_set.add_argument("uuid")
+    color_set.add_argument("color", choices=SESSION_COLORS)
+    color_delete = color_subparsers.add_parser("delete")
+    color_delete.add_argument("provider", choices=PROVIDERS)
+    color_delete.add_argument("uuid")
+    color_effective = color_subparsers.add_parser("effective")
+    color_effective.add_argument("provider", choices=PROVIDERS)
+    color_effective.add_argument("uuid")
     automatic_parser = subparsers.add_parser("automatic-title")
     automatic_subparsers = automatic_parser.add_subparsers(
         dest="automatic_title_action", required=True
@@ -5720,6 +5964,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if args.command == "alias":
             return _alias_command(args, config)
+        if args.command == "color":
+            return _color_command(args, config)
         if args.command == "automatic-title":
             return _automatic_title_command(args, config)
         if args.command == "recovery-pending":
