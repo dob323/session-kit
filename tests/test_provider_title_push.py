@@ -270,5 +270,73 @@ class ProviderTitlePushTest(unittest.TestCase):
             )
 
 
+class ClaudeAiTitleTests(unittest.TestCase):
+    def test_reader_returns_last_bounded_ai_title_for_exact_session(self) -> None:
+        with tempfile.TemporaryDirectory(prefix=".ai-title-", dir=REPO) as raw:
+            home = Path(raw)
+            project = home / ".claude" / "projects" / "-srv-project"
+            project.mkdir(parents=True, mode=0o700)
+            exact = uuid_for(71)
+            other = uuid_for(72)
+            transcript = project / f"{exact}.jsonl"
+            lines = [
+                json.dumps(
+                    {
+                        "type": "ai-title",
+                        "aiTitle": "First Title",
+                        "sessionId": exact,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "ai-title",
+                        "aiTitle": "Wrong Session",
+                        "sessionId": other,
+                    }
+                ),
+                json.dumps({"type": "user", "sessionId": exact}),
+                json.dumps(
+                    {
+                        "type": "ai-title",
+                        "aiTitle": "Find leap years this year",
+                        "sessionId": exact,
+                    }
+                ),
+            ]
+            transcript.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            self.assertEqual(
+                "Find leap years this year",
+                inventory_core.read_claude_ai_title(exact, home),
+            )
+            self.assertEqual(
+                "", inventory_core.read_claude_ai_title(uuid_for(73), home)
+            )
+            self.assertEqual(
+                "", inventory_core.read_claude_ai_title("not-a-uuid", home)
+            )
+
+    def test_parser_passes_title_evidence_and_derived_names_yield(self) -> None:
+        exact = uuid_for(74)
+        parsed = inventory_core._parse_claude_payload(
+            [
+                {
+                    "pid": 4001,
+                    "sessionId": exact,
+                    "cwd": "/srv/project",
+                    "kind": "interactive",
+                    "name": "v2-b3",
+                    "nameSource": "derived",
+                    "aiTitle": "Find leap years this year",
+                    "status": "idle",
+                }
+            ]
+        )
+        self.assertEqual("v2-b3", parsed[0]["title"])
+        self.assertEqual(
+            "Find leap years this year", parsed[0]["ai_title"]
+        )
+        self.assertEqual("derived", parsed[0]["name_source"])
+
+
 if __name__ == "__main__":
     unittest.main()

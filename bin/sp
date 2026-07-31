@@ -538,11 +538,19 @@ start_new() {
     sk_die "session $id remains open, but exact $provider startup was not proven; launch record retained. Attach with 'sp go $id' and run 'exec bash -i' to retry"
     return 1
   fi
+  if [[ $provider != shell && -n ${SK_PROVEN_UUID:-} ]]; then
+    # Every proven provider session gets its stable color pushed once at
+    # creation, so Claude shows it natively from the first resume onward.
+    python3 "$INVENTORY_CORE" color propagate "$provider" "$SK_PROVEN_UUID" \
+      >/dev/null 2>&1 || true
+  fi
   if [[ ${SESSION_KIT_BACKGROUND:-0} == 1 ]]; then
     printf '%s\n' "$id"
     return
   fi
-  exec "$SK_SHPOOL" attach --cmd /bin/false "$id"
+  SK_PROVIDER=$provider
+  SK_UUID=${SK_PROVEN_UUID:-}
+  attach_id "$id"
 }
 
 restore_exact() {
@@ -622,6 +630,10 @@ print("yes" if any(
     sk_lock_release 9
     return 1
   }
+  # Push the stable color before the provider starts so this very resume
+  # already reads it from the transcript.
+  python3 "$INVENTORY_CORE" color propagate "$provider" "$uuid" \
+    >/dev/null 2>&1 || true
   if ! "$SK_SHPOOL" attach --background --dir "$cwd" "$id"; then
     local quarantine
     quarantine=$(sk_quarantine_start_record "$id" attach-failed 2>/dev/null || true)

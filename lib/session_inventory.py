@@ -346,11 +346,92 @@ def _parse_claude_payload(payload: Any) -> list[dict[str, Any]]:
                 if isinstance(item.get("startedAt"), int)
                 else None,
                 "title": clean_text(item.get("name"), 120),
+                "ai_title": clean_text(item.get("aiTitle"), 120),
+                "name_source": clean_text(item.get("nameSource"), 20),
                 "status": status or "unknown",
                 "needs_you": needs_you,
             }
         )
     return result
+
+
+MAX_CLAUDE_TITLE_SCAN_BYTES = 64 * 1024
+
+
+def read_claude_ai_title(uuid: str, home: Path | None = None) -> str:
+    """Return Claude's persisted conversation auto-title for one session.
+
+    The TUI stores it as an ``ai-title`` transcript record, not in the session
+    record, so the derived window label and the visible conversation title can
+    disagree. Reads are bounded to the transcript's head and tail; the last
+    record wins. Any problem returns an empty title.
+    """
+    exact_uuid = valid_uuid(uuid)
+    if not exact_uuid:
+        return ""
+    base = home if home is not None else Path(os.environ.get("HOME") or Path.home())
+    projects = base / ".claude" / "projects"
+    try:
+        transcripts = sorted(projects.glob(f"*/{exact_uuid}.jsonl"))
+    except OSError:
+        return ""
+    title = ""
+    for transcript in transcripts[:4]:
+        if transcript.is_symlink():
+            continue
+        try:
+            size = transcript.stat().st_size
+            with open(transcript, "rb") as handle:
+                chunks = [handle.read(MAX_CLAUDE_TITLE_SCAN_BYTES)]
+                if size > 2 * MAX_CLAUDE_TITLE_SCAN_BYTES:
+                    handle.seek(size - MAX_CLAUDE_TITLE_SCAN_BYTES)
+                    chunks.append(handle.read(MAX_CLAUDE_TITLE_SCAN_BYTES))
+                elif size > MAX_CLAUDE_TITLE_SCAN_BYTES:
+                    chunks.append(handle.read())
+        except OSError:
+            continue
+        for chunk in chunks:
+            for line in chunk.split(b"\n"):
+                if b'"ai-title"' not in line:
+                    continue
+                try:
+                    record = json.loads(line.decode("utf-8", "strict"))
+                except (UnicodeDecodeError, ValueError):
+                    continue
+                if (
+                    isinstance(record, Mapping)
+                    and record.get("type") == "ai-title"
+                    and record.get("sessionId") == exact_uuid
+                ):
+                    candidate = clean_text(record.get("aiTitle"), 120)
+                    if candidate:
+                        title = candidate
+    return title
+
+
+def _enrich_claude_payload(payload: Any) -> Any:
+    """Attach per-session nameSource and ai-title evidence for the collector."""
+    if not isinstance(payload, list):
+        return payload
+    home = Path(os.environ.get("HOME") or Path.home())
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        pid = item.get("pid")
+        uuid = valid_uuid(item.get("sessionId"))
+        if not isinstance(pid, int) or pid <= 0 or not uuid:
+            continue
+        record_path = home / ".claude" / "sessions" / f"{pid}.json"
+        if "nameSource" not in item and record_path.is_file():
+            try:
+                record = json.loads(record_path.read_text(encoding="utf-8"))
+                if isinstance(record, Mapping):
+                    item["nameSource"] = record.get("nameSource")
+            except (OSError, ValueError):
+                pass
+        if "aiTitle" not in item:
+            item["aiTitle"] = read_claude_ai_title(uuid, home)
+    return payload
 
 
 def _proc_stat(path: Path) -> tuple[int, int, int]:
@@ -1779,6 +1860,12 @@ def build_inventory(
             agent = claude_by_pid[pid]
             uuid = agent["uuid"]
             native_title = agent["title"]
+            # Claude persists its conversation auto-title as a transcript
+            # ai-title record while the session record keeps a derived window
+            # label. The visible conversation title outranks the derived
+            # label; any explicit rename keeps outranking both.
+            if agent.get("ai_title") and agent.get("name_source") == "derived":
+                native_title = agent["ai_title"]
             provider = "claude"
             cwd = agent["cwd"] or clean_text(process_table.get(pid, {}).get("cwd"), 4096)
             identity = _agent_identity(
@@ -2140,6 +2227,7 @@ def collect_live(
             runner=invoke,
             timeout=timeout,
         )
+        claude_payload = _enrich_claude_payload(claude_payload)
         _parse_claude_payload(claude_payload)
     except (OSError, ValueError, subprocess.SubprocessError, CollectionError) as exc:
         claude_payload = []
@@ -5664,6 +5752,20 @@ def _alias_command(args: argparse.Namespace, config: dict[str, Any]) -> int:
 
 
 def _color_command(args: argparse.Namespace, config: dict[str, Any]) -> int:
+    if args.color_action == "propagate":
+        effective = session_color(
+            args.provider, args.uuid, canonical_colors(config)
+        )
+        if not effective:
+            return 1
+        _json_print(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "color": effective,
+                **propagate_provider_color(args.provider, args.uuid, effective),
+            }
+        )
+        return 0
     if args.color_action == "effective":
         effective = session_color(
             args.provider, args.uuid, canonical_colors(config)
@@ -5786,6 +5888,9 @@ def _parser() -> argparse.ArgumentParser:
     color_effective = color_subparsers.add_parser("effective")
     color_effective.add_argument("provider", choices=PROVIDERS)
     color_effective.add_argument("uuid")
+    color_propagate = color_subparsers.add_parser("propagate")
+    color_propagate.add_argument("provider", choices=PROVIDERS)
+    color_propagate.add_argument("uuid")
     automatic_parser = subparsers.add_parser("automatic-title")
     automatic_subparsers = automatic_parser.add_subparsers(
         dest="automatic_title_action", required=True
