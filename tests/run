@@ -16,7 +16,10 @@ if [[ ${GITHUB_ACTIONS:-} == true ]]; then
 from pathlib import Path
 import sys
 
-tail = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")[-6000:]
+text = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
+separator = "\n" + "=" * 70 + "\n"
+start = text.rfind(separator)
+tail = text[start if start >= 0 else -3500 :][-3500:]
 escaped = tail.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
 print(f"::error title=Session Kit test failure::{escaped}")
 PY

@@ -107,6 +107,14 @@ jobs:
           tools/build-public-tree \
             --commit "$GITHUB_SHA" \
             --destination "$RUNNER_TEMP/session-kit-public"
+          git -C "$RUNNER_TEMP/session-kit-public" init --quiet
+          git -C "$RUNNER_TEMP/session-kit-public" config \
+            user.name "Session Kit CI"
+          git -C "$RUNNER_TEMP/session-kit-public" config \
+            user.email "ci@example.invalid"
+          git -C "$RUNNER_TEMP/session-kit-public" add .
+          git -C "$RUNNER_TEMP/session-kit-public" commit \
+            --quiet --message "Public export under test"
           "$RUNNER_TEMP/session-kit-public/tests/run"
       - name: Build reproducible release preparation files
         run: |
