@@ -272,6 +272,7 @@ def run_pty(
     columns: int = 100,
     sp_exit: int = 0,
     send_signal: int | None = None,
+    post_signal_bytes: bytes = b"",
     env_updates: dict[str, str | None] | None = None,
 ) -> tuple[int, str]:
     environment = fixture.env(
@@ -331,6 +332,9 @@ def run_pty(
                     "picker PTY did not render its prompt before the signal"
                 )
             os.kill(pid, send_signal)
+            if post_signal_bytes:
+                time.sleep(0.3)
+                os.write(descriptor, post_signal_bytes)
         status = None
         while time.monotonic() < deadline:
             ready, _, _ = select.select([descriptor], [], [], 0.05)
@@ -374,23 +378,41 @@ def run_pty(
 
 
 class LoginPickerTests(unittest.TestCase):
-    def test_enter_eof_and_interrupt_return_regular_shell_without_action(self) -> None:
-        for label, payload, sent_signal in (
-            ("enter", b"\n", None),
-            ("eof", b"\x04", None),
-            ("interrupt", b"", signal.SIGINT),
+    def test_enter_and_eof_return_regular_shell_without_action(self) -> None:
+        for label, payload in (
+            ("enter", b"\n"),
+            ("eof", b"\x04"),
         ):
             with self.subTest(label=label):
                 fixture = LoginFixture(inventory(row("ready", number=9)))
                 try:
-                    code, _ = run_pty(
-                        fixture, payload, send_signal=sent_signal
-                    )
+                    code, _ = run_pty(fixture, payload)
                     self.assertEqual(2, code)
                     self.assertEqual([], fixture.sp_entries())
                     self.assertEqual([], fixture.picker_temps())
                 finally:
                     fixture.close()
+
+    def test_interrupt_redraws_menu_instead_of_exiting(self) -> None:
+        # A stray Ctrl-C must never dump the human to a bare terminal: the
+        # picker redraws its menu and only a deliberate Enter/quit ends it.
+        fixture = LoginFixture(inventory(row("ready", number=9)))
+        try:
+            code, output = run_pty(
+                fixture,
+                b"",
+                send_signal=signal.SIGINT,
+                post_signal_bytes=b"\n",
+            )
+            self.assertEqual(2, code)
+            # The exit reason proves the interrupt was absorbed: the picker
+            # ended through the deliberate Enter that followed, not the signal.
+            log = fixture.state / "action-events.jsonl"
+            events = log.read_text() if log.exists() else ""
+            self.assertIn("terminal_requested", events)
+            self.assertEqual([], fixture.sp_entries())
+        finally:
+            fixture.close()
 
     def test_projection_groups_and_search_preserve_stable_terminal_numbers(self) -> None:
         searchable = row("codex10", number=10, provider="codex")
@@ -501,13 +523,14 @@ class LoginPickerTests(unittest.TestCase):
         unsafe["terminal_number"] = None
         fixture = LoginFixture(inventory(unsafe))
         try:
-            code, output = run_pty(fixture, b"1\n\n")
+            code, output = run_pty(fixture, b"1\nm\n\n\n")
             self.assertEqual(2, code)
             self.assertIn(
                 "0 sessions · 0 ready here · 0 open elsewhere", output
             )
+            self.assertIn("More: m (1)", output)
             self.assertIn(
-                "Unavailable: 1 session record without a live shell | no actions",
+                "Unavailable: 1 session record without a live shell (no actions",
                 output,
             )
             self.assertIn("Choose a number shown here. Nothing changed.", output)
@@ -522,10 +545,10 @@ class LoginPickerTests(unittest.TestCase):
         unavailable["terminal_number"] = None
         fixture = LoginFixture(inventory(exact, unavailable))
         try:
-            code, output = run_pty(fixture, b"k 2\nk 9\n\n")
+            code, output = run_pty(fixture, b"k 2\nk 9\nm\n\n\n")
             self.assertEqual(2, code)
             self.assertIn(
-                "Unavailable: 1 session record without a live shell | no actions",
+                "Unavailable: 1 session record without a live shell (no actions",
                 output,
             )
             self.assertIn("Choose a number shown here. Nothing changed.", output)
@@ -948,7 +971,7 @@ class LoginPickerTests(unittest.TestCase):
                 output,
             )
             self.assertIn(
-                "Terminal: Enter · Search: /text · Help: ?",
+                "Terminal: Enter · Search: /text · More: m (1) · Help: ?",
                 output,
             )
             self.assertFalse(
@@ -1289,10 +1312,7 @@ class LoginPickerTests(unittest.TestCase):
             self.assertIn(
                 "0 sessions · 0 ready here · 0 open elsewhere", output
             )
-            self.assertIn(
-                "Other provider sessions: 1 | o: read-only view",
-                output,
-            )
+            self.assertIn("More: m (1)", output)
             self.assertIn("Other provider sessions", output)
             self.assertIn(
                 "Detected live provider roots outside the session manager; they are not attachable here.",
@@ -1332,9 +1352,7 @@ class LoginPickerTests(unittest.TestCase):
             self.assertIn(
                 "0 sessions · 0 ready here · 0 open elsewhere", output
             )
-            self.assertIn(
-                "Other provider sessions: 30 | o: read-only view", output
-            )
+            self.assertIn("More: m (30)", output)
             self.assertNotIn("Page 1/", output)
             self.assertNotIn("Outside provider 1", output)
             self.assertEqual([], fixture.sp_entries())
@@ -1375,7 +1393,7 @@ class LoginPickerTests(unittest.TestCase):
         try:
             code, output = run_pty(fixture, b"u\n\n\n")
             self.assertEqual(2, code)
-            self.assertIn("Recovery: 1 conversation | u: review", output)
+            self.assertIn("More: m (1)", output)
             self.assertIn("[Claude] Recover me [old1]", output)
             self.assertNotIn("Traceback", output)
             self.assertEqual([], fixture.sp_entries())

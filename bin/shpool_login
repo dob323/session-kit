@@ -66,7 +66,35 @@ cleanup() {
   done
 }
 trap cleanup EXIT
-trap 'exit 2' HUP INT TERM
+# A stray Ctrl-C must never dump the human to a bare terminal: interrupts
+# redraw the menu instead of killing the picker. Hangup and terminate still
+# end it, with the reason recorded for later diagnosis.
+PICKER_INTERRUPTED=0
+trap 'PICKER_INTERRUPTED=1' INT
+trap 'sk_log_action picker_exit hangup || true; exit 2' HUP TERM
+
+# Every deliberate or forced picker exit records why, so "it dropped me to a
+# regular terminal" is diagnosable from the action log after the fact.
+picker_exit() {
+  local reason=$1
+  sk_log_action picker_exit "$reason" || true
+  exit 2
+}
+
+# Shared read wrapper: interrupt = redraw (rc 1), end-of-input = picker ends.
+picker_read() {
+  local __sk_read_var=$1 __sk_read_prompt=$2
+  PICKER_INTERRUPTED=0
+  if IFS= read -r -p "$__sk_read_prompt" "$__sk_read_var"; then
+    return 0
+  fi
+  if (( PICKER_INTERRUPTED )); then
+    PICKER_INTERRUPTED=0
+    echo
+    return 1
+  fi
+  picker_exit input_closed
+}
 
 new_temp() {
   local label=$1 path
@@ -432,6 +460,18 @@ GREEN = "\033[32m"
 CYAN = "\033[36m"
 YELLOW = "\033[33m"
 RESET = "\033[0m"
+# One palette across the kit: same codes the inventory renderer uses, so a
+# session's name is the same tint here, in `sp`, and in its own prompt chip.
+SESSION_PALETTE = {
+    "red": "\033[31m",
+    "blue": "\033[34m",
+    "green": "\033[32m",
+    "yellow": "\033[33m",
+    "purple": "\033[35m",
+    "orange": "\033[38;5;208m",
+    "pink": "\033[38;5;205m",
+    "cyan": "\033[36m",
+}
 
 def style(text, *codes):
     if not style_enabled or not text:
@@ -641,7 +681,13 @@ if selected:
         number_text = f"{number:>{number_width}}"
         prefix = f"      {number_text}  "
         compact_label = shorten(title, label_width)
-        compact_label += " " * max(0, label_width - display_width(compact_label))
+        label_padding = " " * max(0, label_width - display_width(compact_label))
+        # The name itself carries the session's color; padding stays unstyled
+        # so column math keeps working.
+        name_code = SESSION_PALETTE.get(str(row.get("display_color") or ""))
+        if name_code:
+            compact_label = style(compact_label, name_code)
+        compact_label += label_padding
         detail_room = max(
             1,
             width - display_width(prefix) - label_width - 3,
@@ -752,27 +798,62 @@ render_main() {
   PAGE_SIZE=$(page_size "$pending" "$REPAIR_BANNER_LINES")
   clamp_page
   render_page
-  if (( other_count > 0 )); then
-    printf '  Other provider sessions: %s | %s: read-only view\n' \
-      "$other_count" "$(picker_green o)"
-  fi
-  if (( pending > 0 )); then
-    printf '  %s: %s conversation%s | %s: review\n' \
-      "$(picker_bold Recovery)" "$pending" \
-      "$([[ $pending == 1 ]] && printf '' || printf 's')" \
-      "$(picker_green u)"
-  fi
-  if (( unavailable_count > 0 )); then
-    printf '  Unavailable: %s session record%s without a live shell | no actions\n' \
-      "$unavailable_count" \
-      "$([[ $unavailable_count == 1 ]] && printf '' || printf 's')"
-  fi
   show_repair_banner
   echo
+  local more_total=$(( other_count + pending + unavailable_count ))
   printf '  Open: %s · New: %s · Kill: %s number\n' \
     "$(picker_green number)" "$(picker_green n)" "$(picker_green k)"
-  printf '  Terminal: %s · Search: %s · Help: %s\n' \
-    "$(picker_green Enter)" "$(picker_green /text)" "$(picker_green '?')"
+  if (( more_total > 0 )); then
+    printf '  Terminal: %s · Search: %s · More: %s (%s) · Help: %s\n' \
+      "$(picker_green Enter)" "$(picker_green /text)" "$(picker_green m)" \
+      "$more_total" "$(picker_green '?')"
+  else
+    printf '  Terminal: %s · Search: %s · Help: %s\n' \
+      "$(picker_green Enter)" "$(picker_green /text)" "$(picker_green '?')"
+  fi
+}
+
+# Everything that used to clutter the main screen (recovery, other-provider,
+# unavailable records) lives here behind one key.
+show_more_menu() {
+  local pending other_count unavailable_count
+  pending=$(recovery_count 2>/dev/null || printf '0')
+  [[ $pending =~ ^[0-9]+$ ]] || pending=0
+  other_count=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1])).get("outside_agents",[])))' "$VIEW" 2>/dev/null || printf '0')
+  [[ $other_count =~ ^[0-9]+$ ]] || other_count=0
+  unavailable_count=$(python3 -c 'import json,sys; print(int((json.load(open(sys.argv[1])).get("_picker") or {}).get("unavailable_total") or 0))' "$VIEW" 2>/dev/null || printf '0')
+  [[ $unavailable_count =~ ^[0-9]+$ ]] || unavailable_count=0
+  while true; do
+    echo
+    echo "  More"
+    if (( other_count > 0 )); then
+      printf '  %s  Other provider sessions: %s (read-only view)\n' \
+        "$(picker_green o)" "$other_count"
+    fi
+    if (( pending > 0 )); then
+      printf '  %s  Recovery: %s conversation%s to review\n' \
+        "$(picker_green u)" "$pending" \
+        "$([[ $pending == 1 ]] && printf '' || printf 's')"
+    fi
+    if (( unavailable_count > 0 )); then
+      printf '     Unavailable: %s session record%s without a live shell (no actions; a reaper clears them)\n' \
+        "$unavailable_count" \
+        "$([[ $unavailable_count == 1 ]] && printf '' || printf 's')"
+    fi
+    if (( other_count == 0 && pending == 0 && unavailable_count == 0 )); then
+      echo "  Nothing extra right now."
+    fi
+    echo "  Enter  Back"
+    echo
+    local answer
+    picker_read answer "  more ❯ " || return 0
+    case "$answer" in
+      "") return 0 ;;
+      o|O) (( other_count > 0 )) && show_other_provider_sessions || echo "  Nothing to show." ;;
+      u|U) (( pending > 0 )) && review_recovery || echo "  Nothing to review." ;;
+      *) echo "  Unknown choice. Use o, u, or Enter." ;;
+    esac
+  done
 }
 
 show_other_provider_sessions() {
@@ -901,9 +982,7 @@ else:
 print()
 PY
   local ignored
-  if ! read -r -p "  Enter: Back ❯ " ignored; then
-    exit 2
-  fi
+  picker_read ignored "  Enter: Back ❯ " || return 0
 }
 
 number_metadata() {
@@ -1037,9 +1116,11 @@ run_proof_action() {
 }
 
 refresh_after_action() {
+  # A failed refresh must never kill the picker: the previous snapshot stays
+  # on screen (marked stale, actions disabled) and the next loop retries.
   if ! refresh_snapshot; then
-    echo "  Live sessions could not be refreshed. Returning to a regular terminal."
-    exit 2
+    sk_log_action picker_refresh failed || true
+    echo "  Live sessions could not be refreshed; showing the previous view."
   fi
 }
 
@@ -1101,9 +1182,7 @@ choose_number() {
     echo "  Enter  Back"
     echo
     local action
-    if ! read -r -p "  action ❯ " action; then
-      exit 2
-    fi
+    picker_read action "  action ❯ " || return 0
     case "$action" in
       "") return ;;
       1)
@@ -1157,9 +1236,7 @@ rename_number() {
     return
   fi
   local title
-  if ! read -r -p "  New name (Enter: cancel) ❯ " title; then
-    exit 2
-  fi
+  picker_read title "  New name (Enter: cancel) ❯ " || return 0
   [[ -n ${title//[[:space:]]/} ]] || {
     echo "  Rename cancelled."
     return
@@ -1271,9 +1348,7 @@ guided_new() {
   echo "  Enter  Back"
   echo
   local answer provider
-  if ! read -r -p "  provider ❯ " answer; then
-    exit 2
-  fi
+  picker_read answer "  provider ❯ " || return 0
   case "$answer" in
     "") return ;;
     1) provider=claude ;;
@@ -1305,9 +1380,7 @@ else:
 PY
   echo
   local project_choice project_alias
-  if ! read -r -p "  project ❯ " project_choice; then
-    exit 2
-  fi
+  picker_read project_choice "  project ❯ " || return 0
   [[ $project_choice != b && $project_choice != B ]] || return
   project_alias=$(python3 - "$projects" "$project_choice" <<'PY'
 import json,sys
@@ -1438,9 +1511,7 @@ PY
   echo "  Enter: Back"
   echo
   local answer selected
-  if ! read -r -p "  recovery ❯ " answer; then
-    exit 2
-  fi
+  picker_read answer "  recovery ❯ " || return 0
   [[ -n $answer ]] || return
   selected=$(python3 - "$RECOVERY" "$answer" <<'PY'
 import json,sys
@@ -1587,17 +1658,18 @@ refresh_snapshot || {
 while true; do
   render_main
   choice=""
-  if ! read -r -p "  $(picker_green '❯') " choice; then
-    exit 2
-  fi
+  picker_read choice "  $(picker_green '❯') " || continue
   case "$choice" in
-    "") exit 2 ;;
-    q|Q|p|P) exit 2 ;;
+    "") picker_exit terminal_requested ;;
+    q|Q|p|P) picker_exit quit ;;
     r|R)
       refresh_snapshot || {
-        echo "  Live sessions could not be refreshed. Returning to a regular terminal."
-        exit 2
+        sk_log_action picker_refresh failed || true
+        echo "  Live sessions could not be refreshed; showing the previous view."
       }
+      ;;
+    m|M)
+      show_more_menu
       ;;
     \?)
       show_help
@@ -1632,7 +1704,10 @@ while true; do
       build_view || {
         echo "  Search failed. Returning to the unfiltered list."
         QUERY=""
-        build_view || exit 2
+        build_view || {
+          sk_log_action picker_refresh failed || true
+          echo "  The list could not be rebuilt; showing the previous view."
+        }
       }
       ;;
     k\ *|K\ *|x\ *|X\ *)
