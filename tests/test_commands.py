@@ -2753,5 +2753,60 @@ class JournalHistoryTests(unittest.TestCase):
         return proc.stdout.split()[0]
 
 
+class ConfirmExactDrainTests(unittest.TestCase):
+    def test_confirm_drains_the_enter_after_the_keypress(self) -> None:
+        """y-then-Enter must not leave a newline for the caller's next read.
+
+        The leftover Enter was consumed by the picker's menu read as an empty
+        choice, which means "go to a regular terminal" — killing a session
+        silently ended the picker every time.
+        """
+        import pty
+        import select
+        import time
+
+        script = (
+            "source bin/session_kit_common\n"
+            'sk_confirm_exact "Close" "id1" "Title" "codex" && echo CONFIRMED\n'
+            "IFS= read -r next\n"
+            'echo "NEXT=[$next]"\n'
+        )
+        pid, descriptor = pty.fork()
+        if pid == 0:
+            os.chdir(REPO)
+            os.execvp("bash", ["bash", "-c", script])
+        os.write(descriptor, b"y\nPROBE\n")
+        output = bytearray()
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select([descriptor], [], [], 0.1)
+            if ready:
+                try:
+                    chunk = os.read(descriptor, 65536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                output.extend(chunk)
+            done, _ = os.waitpid(pid, os.WNOHANG)
+            if done == pid:
+                while True:
+                    ready, _, _ = select.select([descriptor], [], [], 0)
+                    if not ready:
+                        break
+                    try:
+                        chunk = os.read(descriptor, 65536)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    output.extend(chunk)
+                break
+        os.close(descriptor)
+        text = output.decode("utf-8", "replace")
+        self.assertIn("CONFIRMED", text)
+        self.assertIn("NEXT=[PROBE]", text)
+
+
 if __name__ == "__main__":
     unittest.main()

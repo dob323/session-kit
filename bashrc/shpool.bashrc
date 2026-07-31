@@ -113,7 +113,16 @@ PY
     if [[ -z $__sk_side_launch_mode ]]; then
       if [[ -n $__sk_side_uuid ]]; then __sk_side_launch_mode=resume; else __sk_side_launch_mode=new; fi
     fi
-    __sk_inventory_core=${SESSION_KIT_INVENTORY_CORE:-${SESSION_KIT_RELEASE_DIR:-}/lib/session_inventory.py}
+    # Session shells are spawned by the shpool daemon and carry NO kit
+    # environment, so the release must be derived from this file's own
+    # location (resolving the `current` link pins the release active at
+    # session start). The env overrides remain for tests and tooling.
+    __sk_release_root=${SESSION_KIT_RELEASE_DIR:-}
+    if [[ -z $__sk_release_root ]]; then
+      __sk_release_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd -P || true)
+    fi
+    __sk_inventory_core=${SESSION_KIT_INVENTORY_CORE:-$__sk_release_root/lib/session_inventory.py}
+    unset __sk_release_root
     if [[ -n ${SESSION_KIT_BOOT_ID_FILE:-} ]]; then
       __sk_current_boot_id=$(command cat -- "$SESSION_KIT_BOOT_ID_FILE" 2>/dev/null || true)
     elif [[ $(uname -s 2>/dev/null) == Darwin && ${SESSION_KIT_MACOS_PREVIEW:-0} == 1 &&

@@ -1056,6 +1056,14 @@ sk_confirm_exact() {
   fi
   local answer=""
   read -r -n 1 -p "  Confirm? [y/N] " answer
+  # Humans type y-then-Enter. The single-character read leaves that Enter in
+  # the terminal buffer, where the caller's next menu read would consume it
+  # as an empty choice — which means "go to a regular terminal" and silently
+  # ended the picker after every kill. Drain the rest of the line.
+  if [[ $answer != "" && $answer != $'\n' ]]; then
+    local __sk_confirm_rest=""
+    IFS= read -r -s -t 0.3 __sk_confirm_rest 2>/dev/null || true
+  fi
   printf '\n'
   [[ $answer == y || $answer == Y ]]
 }
