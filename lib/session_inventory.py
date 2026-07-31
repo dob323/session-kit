@@ -5222,7 +5222,7 @@ def self_name_automatic_title(
 
     try:
         normalized = normalize_automatic_title(title)
-    except CollectionError:
+    except CollectionError as reason:
         attempts = record_automatic_title_failure(
             config,
             str(evidence["provider"]),
@@ -5230,7 +5230,9 @@ def self_name_automatic_title(
             revalidate=revalidate,
         )
         suffix = "name failed" if attempts >= 2 else "name pending"
-        raise CollectionError(f"automatic title rejected; {suffix}")
+        raise CollectionError(
+            f"automatic title rejected ({reason}); {suffix}"
+        ) from reason
     result = mutate_canonical_automatic_title(
         config,
         str(evidence["provider"]),
