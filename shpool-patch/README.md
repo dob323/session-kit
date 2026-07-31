@@ -1,112 +1,97 @@
-# shpool patch: a busy session handler must not be treated as a dead client
+# Optional shpool 0.11.0 heartbeat patch
 
-## What this fixes
+Session Kit uses official shpool 0.11.0 by default. This directory contains an
+optional one-file source patch for users who have confirmed the matching
+heartbeat failure in their own daemon logs.
 
-A session becomes permanently unopenable, and whatever runs inside it freezes
-for good, while the session list still reports it as running. Observed four
-times in 24 hours on 2026-07-28/29, costing about 8 hours on one Codex run and
-7.5 on another. Two sessions were lost in the same second when a single
-connection stalled.
+The patch is not installed, built, selected, or activated by Session Kit.
 
-The daemon log of a live incident:
+## Problem
 
-```
-17:03:52  heartbeat{s="…"}: close  time.idle=3.24s
-17:03:52  telling shell->client to disconnect
-17:03:52  failed to tell shell->client to disconnect: "SendTimeoutError(..)"
-          ERROR error shuffling bytes: outer thread scope
-          Caused by: 0: joining heartbeat_h
-                     1: waiting for heartbeat ack
-                     2: timed out waiting on receive operation
-17:06:35  initial_attach_lock(shell_to_client_ctl): close time.busy=300ms
-          ERROR error shuffling bytes: attaching new client stream to
-                shell->client thread
+In shpool 0.11.0, the heartbeat sender treats a send timeout as a busy handler
+and continues. The acknowledgement receiver can treat the same timeout as
+fatal. That error can unwind the handler scope, leaving a listed session unable
+to accept another client.
+
+Typical evidence is:
+
+```text
+waiting for heartbeat ack
+timed out waiting on receive operation
+attaching new client stream to shell->client thread
 ```
 
-Once that thread is gone the session has no handler: every later attach fails
-after 300 ms, nothing drains its terminal, and the program inside blocks on its
-next write.
+Sanitize session names, account names, paths, timestamps, and terminal content
+before sharing logs.
 
-## Why it happens
+## Change
 
-`libshpool/src/daemon/shell.rs`, in `spawn_heartbeat`, handles the *send* half
-and the *ack* half of the same 300 ms budget inconsistently:
+The patch changes only the acknowledgement timeout branch:
 
 ```rust
-// send timeout — explicitly harmless:
-Err(SendTimeoutError::Timeout(_)) => {
-    continue;   // "If we get a timeout it doesn't necessarily mean that the
-}               //  shell->client thread is unhealthy. It might just be busy
-                //  doing other stuff. In particular, this comes up when the
-                //  shell->client thread is generating a particularly large
-                //  session restore buffer, which can take a minute."
-
-// ack receive timeout, twelve lines later — fatal:
-Err(e) => return Err(e).context("waiting for heartbeat ack"),
+Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
 ```
 
-That error unwinds the whole thread scope, taking the session's `shell->client`
-thread with it. So the authors' own reasoning — a busy thread must not be judged
-dead — is contradicted one match arm later.
+A disconnected channel still returns normally. A dead client is still detected
+by the existing client-stream write failure.
 
-## The change
+## Limits
 
-Handle the ack timeout the way the send timeout is already handled: `continue`.
-That is the entire behavioural change. The compiler then reports the following
-generic `Err(e)` arm as unreachable, which is the proof that
-`RecvTimeoutError` has only these two variants — so after this change **no path
-remains where an ack timeout can destroy a session's handler**. The dead arm is
-removed.
+The repository does not claim a deterministic reproduction of the narrow race.
+The patch removes one fatal timeout path based on the upstream control flow. It
+does not prove that every unopenable session has this cause.
 
-A genuinely dead client is still detected, unchanged: the write to
-`client_stream` fails and takes the existing "assuming hangup" path.
+Do not apply it for quiet output, a provider pause, a normal provider exit, or a
+generic attach failure without the matching acknowledgement evidence.
 
-## Honest limits
+## Verify and build
 
-This was **not** reproduced synthetically. Two attempts — a SIGSTOPped client,
-and a client killed repeatedly while a large restore buffer was being built —
-left both the patched and the stock binary healthy. When the client is fully
-stopped the *send* times out first and is already handled safely, so the fault
-needs a narrower coincidence: the handler must receive the heartbeat and then be
-too busy to answer within 300 ms. That matches the observed rate of a few times
-a day rather than every stall.
+Use upstream tag `v0.11.0`, commit
+`fe2d11595ff255810523b0868159dec051e303f1`:
 
-The case for the patch is therefore the production logs plus the code being
-provably exhaustive, not a before/after demonstration. It can only remove a
-fatal path; it cannot add one.
-
-## Rebuilding
-
-The host has no C toolchain, so build in a container. `rust:alpine` produces the
-same static musl binary shape as the stock build.
-
-```sh
-git clone https://github.com/shell-pool/shpool.git ~/shpool-src
-cd ~/shpool-src && git checkout v0.11.0
-git apply /path/to/shpool-patch/0001-heartbeat-ack-timeout-is-not-fatal.patch
-docker run --rm --cpus 4 -v ~/shpool-src:/src -w /src \
-  -e CARGO_HOME=/src/.cargo-home rust:alpine \
-  sh -c 'cargo build --release --bin shpool'
-# expect: "Finished `release` profile", no warnings
-sha256sum target/release/shpool   # compare with patched-binary.sha256
+```bash
+git clone --branch v0.11.0 --depth 1 \
+  https://github.com/shell-pool/shpool.git shpool-0.11.0
+cd shpool-0.11.0
+test "$(git rev-parse HEAD)" = fe2d11595ff255810523b0868159dec051e303f1
+git apply --check /path/to/session-kit/shpool-patch/0001-heartbeat-ack-timeout-is-not-fatal.patch
+git apply /path/to/session-kit/shpool-patch/0001-heartbeat-ack-timeout-is-not-fatal.patch
+cargo build --locked --release --bin shpool
+sha256sum target/release/shpool
 ```
 
-Installing it replaces `~/.cargo/bin/shpool` and needs the daemon restarted,
-which ends every session. Conversations survive and are restored; keep the
-previous binary alongside so rolling back is a single copy.
+`patched-binary.sha256` is a reference checksum from one reviewed build. A
+different Rust toolchain, target, or build environment can produce different
+bytes. Record the upstream tag, patch checksum, Rust version, target triple,
+build command, and resulting binary checksum for your own artifact.
 
-After installing, record the new fingerprint so the watchdog can tell if the
-binary is ever replaced:
+The CI patch job checks that the patch applies to the pinned upstream tag and
+that the patched source builds.
 
-```sh
-sha256sum ~/.cargo/bin/shpool | cut -d' ' -f1 \
-  > ~/.local/state/session-kit/shpool-binary.sha256
-```
+## Activation and rollback
 
-## Upstream
+Replacing the shpool binary normally requires restarting the daemon. Restarting
+the daemon ends its managed terminal processes.
 
-Worth reporting: their own comment justifies the fix. The same class of fault
-has been addressed repeatedly — "deadlock when shell->client thread stops"
-(0.8.0), "reduce deadlock potential in shell->client" (0.8.1), "Add timeouts to
-prevent session message deadlocks" (0.6.1) — so a fix in their tree is more
-durable than carrying this patch.
+Before activation:
+
+1. list active terminals and exact provider recovery identities;
+2. keep the prior binary under a different filename;
+3. verify the new binary checksum and build record;
+4. plan recovery for every active provider conversation;
+5. choose a maintenance window.
+
+After replacement, record the running binary checksum in the private Session
+Kit state if you use binary-change monitoring.
+
+Rollback restores the prior binary and also requires a planned daemon restart.
+Session Kit never performs either restart.
+
+## License and upstream
+
+The patch modifies Apache-2.0 licensed shpool source. See
+[Third-party notices](../THIRD_PARTY_NOTICES) and
+[Apache License 2.0](../LICENSES/Apache-2.0.txt).
+
+Prefer an upstream release containing the accepted fix over carrying a local
+patch.

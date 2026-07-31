@@ -1,96 +1,105 @@
 # Session Kit
 
-Session Kit is a local session manager for people who use
-[shpool](https://github.com/shell-pool/shpool) with Claude Code, Codex, and
-ordinary shells over SSH.
+Session Kit gives shpool users one clear view of Claude Code, Codex, and shell
+sessions over SSH. It adds stable terminal numbers, useful names, reply alerts,
+exact recovery, and guarded session actions.
 
-It adds a readable login picker, stable terminal numbers, task-focused names,
-exact conversation recovery, local terminal journals, and guarded actions for
-opening, moving, closing, or repairing a session.
+> [!WARNING]
+> Session Kit is a Linux-only `v0.1.0` beta. Use it first on an account where
+> every provider conversation can be recovered. macOS and non-systemd systems
+> fail closed and are not supported.
 
-> [!IMPORTANT]
-> Session Kit is a **v0.1.0 beta candidate**. Use a dedicated account or a host
-> where you can recover every provider conversation. Run the read-only
-> preflight before installing, and review the local-journal privacy warning.
-
-## Why Session Kit exists
-
-Long-running terminal sessions are useful, but their raw names and attachment
-state can become difficult to follow. Session Kit builds one local view from
-shpool, Claude Code, Codex, and the process tree:
+## What the dashboard shows
 
 ```text
   4 sessions · 1 ready here · 3 open elsewhere
 
   Ready to open
-    Claude
-       4  Review Login Errors     | needs your reply
+    Needs your reply · Codex
+       4  Review Login Errors                    | ! needs your reply
 
   Open elsewhere
+    Claude
+       1  Improve Session Picker                 | working
     Codex
-       1  Improve Session Picker  | working
-       3  Document Release Process | quiet 2h 18m
-    Shell
-       2  Idle shell
+       3  Document Release Process               | quiet 2h 18m
+
+  Open: number · New: n · Kill: k number
+  Terminal: Enter · Search: /text · Help: ?
 ```
 
-Session Kit keeps the provider conversation as the identity. A directory,
-display number, title, or recent timestamp is never used as recovery authority.
+Colors have one meaning throughout the picker: provider headings identify the
+provider, availability headings identify where a session can open, warnings
+mark attention or risk, and muted text carries secondary status. Set
+`NO_COLOR=1` or `SESSION_KIT_NO_COLOR=1` to disable color.
 
-## Project status and support
-
-The first public release is planned as `v0.1.0`.
-
-| Area | Status |
-| --- | --- |
-| Linux with systemd user services | Supported target |
-| Bash | Supported shell |
-| Python | 3.10 through 3.13 tested in CI |
-| Ubuntu | 22.04 and 24.04 tested in CI |
-| Claude Code and Codex | Supported providers |
-| Ordinary shpool shells | Supported |
-| macOS core commands | Preview, opt-in, and blocked on a real-Mac test |
-| Other shells and init systems | Not supported |
-| Telemetry or hosted service | None |
-
-Session Kit is local-only. It does not send usage data. An administrator may
-configure an optional notification command for watchdog reports; notifications
-must remain off unless explicitly configured.
-
-CI also runs the focused macOS preview tests on a GitHub-hosted Apple Silicon
-runner. That smoke test does not replace the dedicated-Mac acceptance gate.
-
-See [installation requirements](docs/install.md) and the
-[security and data guide](docs/security-and-data.md) before using it with
-valuable sessions.
+Normal rows omit internal shpool IDs and provider UUIDs. Use `sp detail`, JSON
+output, or an explicit search when troubleshooting requires an exact identity.
+Display numbers and titles are convenient selectors, not recovery authority.
 
 ## What it provides
 
-- A compact SSH picker grouped by availability and provider.
-- `needs your reply` for unresolved structured Claude Code or Codex questions.
+- A compact SSH login picker grouped by availability and provider.
+- `needs your reply` for unresolved structured Claude Code and Codex questions.
 - Stable terminal numbers for the current host boot.
-- Manual aliases and guarded automatic 2–5 word task titles.
+- Manual names and guarded automatic 2–5 word task names.
 - Exact Claude Code and Codex recovery by conversation UUID.
-- Append-only local terminal journals, enabled by the guided setup by default.
-- Confirmed takeovers, closes, repairs, and pruning.
-- A report-only watchdog for manager and terminal-health evidence.
-- Immutable release directories with atomic selection and rollback support.
+- Confirmed open, move, kill, repair, recovery, and cleanup actions.
+- A persistent managed terminal when Claude Code or Codex exits.
+- Optional local terminal journals, off by default.
+- Local, report-only health checks.
+- Immutable installed releases with rollback.
 
-## Prerequisites
+When a provider exits, the shpool terminal stays alive. The dashboard shows that
+the provider exited and offers a clear path to reopen the exact conversation or
+close the terminal. Session Kit never substitutes the newest conversation or a
+matching directory.
 
-The supported target requires:
+Automatic close begins only after the cleanup timer is enabled and the same
+exact safe state has been observed continuously for 72 hours. Cleanup requires
+the exact terminal generation, provider identity, exited state, no attachment,
+no child work, no pending reply, and no changed evidence. Any missing or
+changed predicate keeps the terminal.
+
+## Supported target
+
+The beta supports:
 
 - Linux with `/proc` and systemd user services;
 - Bash;
-- Python 3.10 or newer;
+- Python 3.10 through 3.13;
+- Ubuntu 22.04 and 24.04 in CI;
 - shpool 0.11.0;
-- the standard Linux tools listed in [docs/install.md](docs/install.md);
-- Claude Code, Codex, or both.
+- Claude Code, Codex, and ordinary shpool shells.
 
-The official shpool 0.11.0 release is the default. Session Kit also carries an
-optional, narrowly scoped shpool patch for a heartbeat acknowledgement timeout.
-Read [shpool-patch/README.md](shpool-patch/README.md) before deciding whether to
-build it. The patch is not required for evaluating Session Kit.
+macOS, other init systems, other shells, containers without the required
+process view, and multi-user hostile-account isolation are not supported.
+Unsupported platforms stop before installation or mutation.
+
+Until `v0.1.0` is tagged, only the current `main` branch receives fixes. The
+first beta will publish the exact provider versions used in release acceptance.
+See [Security policy](SECURITY.md) for reporting and version support.
+
+## Privacy
+
+Session Kit is local software. It has no account, hosted service, analytics,
+update beacon, or telemetry.
+
+The default is privacy-minimal:
+
+- terminal journals are off;
+- notifications are off;
+- the local picker-action log contains only fixed action and outcome labels,
+  time, and schema version, with no session identity or content;
+- normal dashboard rows hide internal IDs;
+- provider transcripts stay in provider-owned storage.
+
+The picker-action log is owner-only, keeps at most 1,000 records and 256 KiB,
+and removes records older than seven days on each append.
+
+Optional journals record terminal bytes and can contain prompts, credentials,
+source code, and command output. Enable them only after choosing a retention
+policy. Read [Security and local data](docs/security-and-data.md).
 
 ## Install
 
@@ -100,31 +109,16 @@ cd session-kit
 ./install.sh --check
 tests/run
 ./install.sh
-```
-
-The preflight is read-only. The installer asks before enabling the SSH picker
-and local terminal journals, does not start or restart services, and keeps each
-installed Git revision as an immutable release. In a non-interactive shell,
-login integration stays disabled and journals default on; pass
-`--enable-login`, `--disable-login`, or `--journal on|off` explicitly when
-needed.
-
-After installation:
-
-```bash
 session-kit doctor
-session-kit enable-login
-session-kit disable-login
-session-kit update --source "$PWD"
-session-kit rollback
-session-kit uninstall
 ```
 
-The installer copies systemd user units on Linux but prints the commands
-instead of starting them. Review [docs/install.md](docs/install.md) before
-enabling any service. The macOS core preview requires
-`SESSION_KIT_MACOS_PREVIEW=1`, Bash 4 or newer, and the separate acceptance
-limits in [macos/README.md](macos/README.md).
+The preflight is read-only. Installation copies files and systemd user-unit
+definitions but does not start, stop, restart, or enable a service. The guided
+installer asks about the SSH picker and optional journals; journals default to
+off. Noninteractive installation also leaves login integration and journals
+off unless explicitly enabled.
+
+Requirements and safe activation steps are in [Install Session Kit](docs/install.md).
 
 ## Everyday commands
 
@@ -145,11 +139,14 @@ sp recover
 sp prune
 ```
 
-`sp go` opens a detached session. `sp takeover`, `sp close`, repair actions,
-and pruning require fresh identity checks and confirmation. See
-[docs/usage.md](docs/usage.md) for the full behavior.
+In the SSH picker, `k <number>` means kill the exact displayed session. It
+always shows the resolved title, provider, and exact internal ID and requires
+confirmation before changing anything. `x <number>` remains a compatibility
+alias. A cached or stale dashboard disables actions.
 
-## Configuration
+See [Use Session Kit](docs/usage.md) for the complete behavior.
+
+## Configuration and local data
 
 Session Kit follows XDG directories:
 
@@ -159,58 +156,52 @@ ${XDG_STATE_HOME:-$HOME/.local/state}/session-kit/
 ${XDG_STATE_HOME:-$HOME/.local/state}/shpool-journal/
 ```
 
+Configuration and state can contain titles, working directories, process
+metadata, UUIDs, and action receipts. Keep private directories mode `0700` and
+private files mode `0600`.
+
 Start with:
 
-- [config/session-inventory.example.json](config/session-inventory.example.json)
-- [config/projects.example.tsv](config/projects.example.tsv)
-- [config/shpool.example.toml](config/shpool.example.toml)
-
-Configuration files and state can contain conversation titles, working
-directories, UUIDs, and terminal output. Keep directories mode `0700` and files
-mode `0600`.
-
-Read [docs/configuration.md](docs/configuration.md) and
-[docs/provider-integration.md](docs/provider-integration.md).
+- [Inventory configuration](config/session-inventory.example.json)
+- [Project aliases](config/projects.example.tsv)
+- [shpool configuration](config/shpool.example.toml)
 
 ## Safety model
 
-Session Kit treats PID start times, shpool generations, provider UUIDs, and
-private proof files as mutation guards. It fails closed when current identity
-cannot be proved.
+Before a mutation, Session Kit rechecks the daemon generation, shpool terminal
+generation, process start times, provider ancestry, and conversation UUID. A
+stale, ambiguous, partial, or unsafe identity is refused.
 
-It is not a boundary against another process running as the same Unix account.
-A same-account process can read terminal state and edit owner-writable
-configuration. Session Kit is designed for a cooperative single-user account.
+These checks protect against stale dashboard state. They are not a security
+boundary against another process running as the same Unix user.
 
-The watchdog reports quiet sessions, manager timeouts, and binary changes. Its
-supported public policy is **report-only**. A user may run an explicit repair
-after reviewing the evidence.
-
-Read [docs/security-and-data.md](docs/security-and-data.md) for the complete
-trust and retention model.
+The installed watchdog defaults to report-only mode. It does not attach, move,
+kill, restart, or repair sessions in that mode. An advanced repair mode remains
+an explicit opt-in and can close and relaunch a proved-broken terminal; review
+[Security and local data](docs/security-and-data.md) before considering it.
 
 ## Documentation
 
 - [Install](docs/install.md)
 - [Configure](docs/configuration.md)
 - [Use Session Kit](docs/usage.md)
-- [Connect Claude Code and Codex](docs/provider-integration.md)
+- [Claude Code and Codex integration](docs/provider-integration.md)
 - [Security and local data](docs/security-and-data.md)
+- [Troubleshoot](docs/troubleshooting.md)
 - [Update and roll back](docs/update-and-rollback.md)
 - [Uninstall](docs/uninstall.md)
-- [Troubleshoot](docs/troubleshooting.md)
 - [Architecture](docs/architecture.md)
 - [Maintainer release process](docs/maintainers/release-process.md)
-- [Legacy installation migration](docs/migrations/legacy-install.md)
 
-## Contributing
+## Contributing and security
 
-Issues and pull requests are welcome. Start with
-[CONTRIBUTING.md](CONTRIBUTING.md). Report security problems using the private
-process in [SECURITY.md](SECURITY.md), not a public issue.
+Issues and pull requests are welcome. Read [Contributing](CONTRIBUTING.md).
+Report vulnerabilities through the private process in
+[Security policy](SECURITY.md), never through a public issue.
 
 ## License
 
 Session Kit is released under the [MIT License](LICENSE). The optional shpool
-patch is derived from Apache-2.0 software; see
-[THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).
+patch modifies Apache-2.0 software; see
+[Third-party notices](THIRD_PARTY_NOTICES) and the included
+[Apache License 2.0](LICENSES/Apache-2.0.txt).

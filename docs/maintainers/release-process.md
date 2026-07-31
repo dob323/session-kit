@@ -1,44 +1,50 @@
 # Maintainer release process
 
-This document describes the public release standard. It is not an end-user
-installation guide.
+This is the public release checklist, not an installation guide.
 
-## Version policy
+## Version and support policy
 
-The first public release is `v0.1.0` and has beta maturity. Do not move or reuse
-an existing tag. Create a new annotated tag only after every release gate
-passes.
+The first release is `v0.1.0` with beta maturity. Follow Semantic Versioning
+and never move or reuse a tag.
 
-Follow Semantic Versioning. Before `1.0.0`, document incompatible configuration,
-state, or command changes prominently.
+Before `1.0.0`, document incompatible command, configuration, or state changes
+in the changelog. Until the first tag, only current `main` receives fixes. Each
+beta minor line is supported for 90 days after its first release or for 30 days
+after the next beta minor release, whichever ends later. Security fixes may
+require upgrading to the latest patch.
 
 ## Release gates
 
-1. The Git tree and reachable history pass credential and private-data scans.
-2. No account names, private paths, real UUIDs, transcripts, or internal
-   service dependencies remain.
-3. `LICENSE`, `THIRD_PARTY_NOTICES`, `SECURITY.md`, the changelog, and public
-   documentation match the release.
-4. The required Ubuntu 22.04/24.04 and Python 3.10-3.13 CI matrix passes.
-5. The hosted macOS 15 preview smoke passes and remains clearly separate from
-   dedicated-Mac acceptance.
-6. Fresh install passes under a disposable Linux account.
-7. Update from the prior public release passes with active detached sessions.
-8. Rollback restores the earlier helpers, integration marker, configuration,
-   and state interpretation without restarting shpool.
-9. Uninstall preserves state and journals by default.
-10. Guided journals are enabled by default only after their data warning is
-   shown.
-11. Watchdog behavior is report-only and notifications are opt-in.
-12. The macOS preview remains off unless the same candidate passes a real-Mac
-    core lifecycle test.
-13. The full test suite, Bash syntax checks, ShellCheck, Ruff, Python syntax,
-    the branch-coverage floor, link checks, and documentation privacy checks
-    pass.
+1. The public tree and reachable Git history pass secret and private-data scans.
+2. No private account names, paths, hostnames, UUIDs, transcripts, incident
+   timestamps, credentials, or internal services remain.
+3. License, notices, security policy, changelog, support policy, and behavior
+   documentation agree.
+4. Ubuntu 22.04 and 24.04 pass on Python 3.10 through 3.13.
+5. Bash syntax, ShellCheck, Ruff, Python syntax, type baseline, and branch
+   coverage pass.
+6. Local documentation links pass.
+7. The optional shpool patch applies to its pinned upstream tag and builds.
+8. A clean disposable Linux account passes preflight, install, doctor, picker,
+   provider exit, exact reopen, kill confirmation, update, rollback, and
+   uninstall checks.
+9. macOS and other unsupported platforms fail closed.
+10. Journals and notifications default off.
+11. Normal logs contain no prompt, response, terminal, credential, or journal
+    content.
+12. Automatic cleanup begins only after its timer is enabled and then requires
+    72 continuous hours with every exact predicate unchanged.
+13. The public export includes every runtime, test, license, and documentation
+    file declared by the reviewed manifest.
+14. The release archive is reproducible and its checksum and provenance record
+    match the candidate commit.
+15. The public repository has no earlier or conflicting tag that changes the
+    declared first-release version. Private-source tags are not copied into the
+    public history.
 
-## Build and install a candidate
+## Build a candidate
 
-Use a fresh clone of the exact candidate:
+Use a fresh clone at one exact commit:
 
 ```bash
 git clone https://github.com/dob323/session-kit.git session-kit-candidate
@@ -47,48 +53,72 @@ git checkout <full-candidate-commit>
 test -z "$(git status --short)"
 ./install.sh --check
 tests/run
-./install.sh
-session-kit doctor
+tools/check-doc-links
+tools/public-scan . --git-history
 ```
 
-Confirm the installed `current` link resolves to the exact candidate commit and
-that each stable helper dispatches into that immutable directory.
+The private source history may contain private operational context, so that
+command scans it for credentials without treating known private project names
+as a release failure. After the exported tree is committed in the public
+repository, run the strict gate there:
 
-Release metadata schema 1 describes the pre-package layout. Schema 2 requires
-both files in `lib/sessionkit_inventory/`. New builds always emit schema 2; the
-verifier retains the bounded schema-1 contract so existing immutable releases
-remain valid rollback targets.
+```bash
+tools/public-scan . --git-history --private-markers
+```
 
-## Activation
+Do not publish a history that fails the strict gate. Rewriting a branch does
+not remove data from existing clones; investigate any credential match and
+rotate the credential before publication.
 
-The installer must not start or restart services. Review the copied systemd
-units, run `session-kit doctor`, and enable only the components required by the
-acceptance scenario. Record the active-session inventory before and after; the
-daemon and existing provider process generations must not change.
+Build the reviewed public tree and release artifact outside the source:
 
-## Release notes
+```bash
+tools/build-public-tree \
+  --commit <full-candidate-commit> \
+  --destination ../session-kit-public
+tools/build-release-artifact \
+  --commit <full-candidate-commit> \
+  --output-dir ../session-kit-artifacts
+```
 
-Release notes should include:
+Rebuild the artifact in another empty directory and compare the archive,
+checksum, and provenance bytes.
 
-- user-visible changes;
-- exact support matrix;
-- configuration or state migration;
-- journal and privacy effect;
-- active-session effect;
-- known limitations;
-- rollback requirements;
-- optional shpool patch status.
+Release metadata schema 1 is the pre-package layout. Schema 2 adds the package
+marker and common helpers. Schema 3 also requires lifecycle, provider, and
+private-state modules. New builds emit schema 3; verification retains the
+bounded older schemas for installed rollback targets.
 
-## Tag and publish
+## Acceptance
 
-After the candidate commit and clean-machine artifacts pass:
+The installer must not start or restart services. Record process and daemon
+generations before and after each acceptance step.
 
-1. update `CHANGELOG.md` with the release date;
-2. confirm `main` points to the tested commit;
-3. create an annotated `v0.1.0` tag;
+Test at least:
+
+- fresh login and normal terminal fallback;
+- Claude Code and Codex reply alerts;
+- semantic color and no-color output;
+- IDs hidden on normal rows and present in detail, JSON, and explicit search;
+- provider exit leaving the managed terminal alive;
+- exact reopen without latest-directory fallback;
+- same-session move between two SSH windows;
+- `k <number>` exact-ID confirmation and cached-state refusal;
+- 72-hour cleanup boundary after timer enablement, reset conditions, and
+  retained provider history;
+- update and rollback with detached sessions;
+- uninstall retaining private data.
+
+## Publish
+
+After every gate passes:
+
+1. add the release date to `CHANGELOG.md`;
+2. confirm `main` points to the accepted commit;
+3. create one annotated tag;
 4. push the branch and tag;
-5. publish matching GitHub release notes;
-6. verify repository links and downloadable artifacts from a logged-out view.
+5. publish matching notes, archive, checksum, and provenance file;
+6. verify links and downloads from a logged-out view.
 
-Changing repository visibility is a separate administrative action. Perform it
-only after the final privacy and history audit.
+Repository visibility and GitHub security settings are separate administrative
+changes. Perform them only after the final repository and history audit.

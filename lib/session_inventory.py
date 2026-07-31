@@ -37,6 +37,8 @@ if _SESSION_KIT_LIB_DIR not in sys.path:
     sys.path.insert(0, _SESSION_KIT_LIB_DIR)
 
 from sessionkit_inventory import common as _common  # noqa: E402
+from sessionkit_inventory import lifecycle as _lifecycle  # noqa: E402
+from sessionkit_inventory import providers as _providers  # noqa: E402
 from sessionkit_inventory.common import (  # noqa: E402, F401
     GENERATED_OPERATIONAL_ID_RE,
     LEGACY_OPERATIONAL_ID_RE,
@@ -768,105 +770,13 @@ def _is_native_codex(process: Mapping[str, Any]) -> bool:
     return executable == "codex" and process.get("comm") != "node"
 
 
-ROLLOUT_TAIL_BYTES = 128 * 1024
+ROLLOUT_TAIL_BYTES = _providers.ROLLOUT_TAIL_BYTES
+ROLLOUT_LIFECYCLE_SEARCH_BYTES = _providers.ROLLOUT_LIFECYCLE_SEARCH_BYTES
 
 
 def _rollout_turn_state(descriptor: int) -> str:
-    """Classify one Codex turn from bounded, structured rollout events.
-
-    The parser never treats assistant or user prose as state. It pairs
-    ``request_user_input`` calls with outputs by exact call ID and otherwise
-    relies only on Codex lifecycle events. Missing, malformed or out-of-window
-    evidence fails closed to ``state unavailable``.
-    """
-    try:
-        size = os.fstat(descriptor).st_size
-        offset = max(0, size - ROLLOUT_TAIL_BYTES)
-        raw = os.pread(descriptor, min(size, ROLLOUT_TAIL_BYTES), offset)
-        preceding = os.pread(descriptor, 1, offset - 1) if offset else b"\n"
-    except OSError:
-        return "state unavailable"
-    if not raw or not raw.endswith(b"\n"):
-        return "state unavailable"
-    if preceding != b"\n":
-        boundary = raw.find(b"\n")
-        if boundary < 0:
-            return "state unavailable"
-        raw = raw[boundary + 1 :]
-
-    lifecycle_state = "state unavailable"
-    pending_questions: dict[str, bool] = {}
-    for line in raw.splitlines():
-        if not line:
-            continue
-        try:
-            event = json.loads(line)
-        except (UnicodeDecodeError, ValueError):
-            return "state unavailable"
-        if not isinstance(event, Mapping):
-            return "state unavailable"
-        payload = event.get("payload")
-        event_type = event.get("type")
-        if event_type == "event_msg":
-            if not isinstance(payload, Mapping):
-                return "state unavailable"
-            lifecycle = payload.get("type")
-            if lifecycle == "task_started":
-                # Codex can satisfy a picker by starting a fresh user turn
-                # without emitting function_call_output for the prior call.
-                # A structured turn boundary therefore retires every question
-                # inherited from the preceding turn.
-                pending_questions.clear()
-                lifecycle_state = "working"
-            elif lifecycle in {"task_complete", "turn_aborted"}:
-                pending_questions.clear()
-                lifecycle_state = "idle"
-            continue
-        if event_type != "response_item":
-            continue
-        if not isinstance(payload, Mapping):
-            return "state unavailable"
-        kind = payload.get("type")
-        if kind == "function_call_output":
-            call_id = payload.get("call_id")
-            if not isinstance(call_id, str) or not call_id:
-                return "state unavailable"
-            if call_id in pending_questions:
-                pending_questions.pop(call_id)
-                # The exact answer resumes the current task even when its
-                # earlier task_started event has moved beyond the bounded tail.
-                lifecycle_state = "working"
-            continue
-        if kind != "function_call" or payload.get("name") != "request_user_input":
-            continue
-        call_id = payload.get("call_id")
-        arguments = payload.get("arguments")
-        if (
-            not isinstance(call_id, str)
-            or not call_id
-            or not isinstance(arguments, str)
-        ):
-            return "state unavailable"
-        try:
-            request = json.loads(arguments)
-        except (TypeError, ValueError):
-            return "state unavailable"
-        if not isinstance(request, Mapping):
-            return "state unavailable"
-        auto_resolution = request.get("autoResolutionMs")
-        if "autoResolutionMs" in request and (
-            isinstance(auto_resolution, bool)
-            or not isinstance(auto_resolution, int)
-            or auto_resolution <= 0
-        ):
-            return "state unavailable"
-        pending_questions[call_id] = "autoResolutionMs" in request
-
-    if pending_questions:
-        if any(not optional for optional in pending_questions.values()):
-            return "needs your reply"
-        return "reply optional"
-    return lifecycle_state
+    """Compatibility facade for the provider-specific structured parser."""
+    return _providers.rollout_turn_state(descriptor)
 
 
 def _rollout_meta_fd(descriptor: int) -> dict[str, Any] | None:
@@ -4540,6 +4450,27 @@ def snapshot(*, write_state: bool = True, config: dict[str, Any] | None = None) 
                 raise CollectionError("current boot identity is unavailable")
             if write_state:
                 with StateLock(paths["root"], paths["lock"]):
+                    locked_cached = _read_state_json(paths["inventory"])
+                    _lifecycle.persist_last_exact(
+                        result,
+                        (
+                            locked_cached
+                            if isinstance(locked_cached, Mapping)
+                            else None
+                        ),
+                        state_dir=paths["root"],
+                        boot_id=boot_id,
+                    )
+                    _lifecycle.apply_provider_exit_states(
+                        result,
+                        (
+                            locked_cached
+                            if isinstance(locked_cached, Mapping)
+                            else None
+                        ),
+                        state_dir=paths["root"],
+                        boot_id=boot_id,
+                    )
                     registry = _read_terminal_registry(
                         paths["terminal_numbers"],
                         boot_id,
@@ -4560,7 +4491,22 @@ def snapshot(*, write_state: bool = True, config: dict[str, Any] | None = None) 
                     )
                     atomic_write_json(paths["inventory"], result)
                     update_recovery_state(paths, result)
+                    _lifecycle.prune_inactive_state(
+                        paths["root"],
+                        [
+                            item["shpool_id_raw"]
+                            for item in result.get("sessions", ())
+                            if isinstance(item, Mapping)
+                            and isinstance(item.get("shpool_id_raw"), str)
+                        ],
+                    )
             else:
+                _lifecycle.apply_provider_exit_states(
+                    result,
+                    cached if isinstance(cached, Mapping) else None,
+                    state_dir=paths["root"],
+                    boot_id=boot_id,
+                )
                 registry = _read_terminal_registry(
                     paths["terminal_numbers"],
                     boot_id,
@@ -4672,6 +4618,8 @@ def render_inventory(inventory: Mapping[str, Any], rows_only: bool = False) -> s
     color = _color_enabled()
     bold = "\033[1m" if color else ""
     dim = "\033[2m" if color else ""
+    cyan = "\033[36m" if color else ""
+    green = "\033[32m" if color else ""
     yellow = "\033[33m" if color else ""
     reset = "\033[0m" if color else ""
     terminal_columns = shutil.get_terminal_size(fallback=(101, 24)).columns
@@ -4727,7 +4675,7 @@ def render_inventory(inventory: Mapping[str, Any], rows_only: bool = False) -> s
             ]
             if not group:
                 continue
-            lines.append(f"    {provider.title()}")
+            lines.append(f"    {cyan}{provider.title()}{reset}")
             for item in group:
                 process_age = _format_age(item.get("process_age_seconds"))
                 recent_output_age = _format_age(
@@ -4759,10 +4707,6 @@ def render_inventory(inventory: Mapping[str, Any], rows_only: bool = False) -> s
                     status_parts.append(
                         f"{agent_count} subagent{'s' if agent_count != 1 else ''}"
                     )
-                display_id = (
-                    item.get("display_shpool_id")
-                    or display_shpool_id(item.get("shpool_id") or "")
-                )
                 selector = item.get("terminal_number")
                 if (
                     isinstance(selector, bool)
@@ -4771,19 +4715,21 @@ def render_inventory(inventory: Mapping[str, Any], rows_only: bool = False) -> s
                 ):
                     selector = "-" if has_terminal_numbers else item.get("row")
                 prefix = f"      {selector:>2}  "
-                display_id = _display_title(
-                    display_id, min(32, max(1, width - len(prefix) - 5))
-                )
-                suffix = f"  [{display_id}]"
-                title_room = max(
-                    1, width - _display_width(prefix) - _display_width(suffix)
-                )
+                title_room = max(1, width - _display_width(prefix))
                 title = _display_title(item.get("title"), title_room)
-                lines.append(f"{prefix}{title}{suffix}")
+                lines.append(
+                    f"      {green}{selector:>2}{reset}  {title}"
+                )
                 detail_prefix = "          "
                 detail_room = max(1, width - _display_width(detail_prefix))
                 details = _display_title(" | ".join(status_parts), detail_room)
-                lines.append(f"{detail_prefix}{dim}{details}{reset}")
+                detail_color = (
+                    yellow
+                    if item.get("needs_you")
+                    or status.casefold() == "provider exited"
+                    else dim
+                )
+                lines.append(f"{detail_prefix}{detail_color}{details}{reset}")
     outside = list(inventory.get("outside_agents", ()))
     if outside:
         lines.append(f"  {bold}Outside shpool{reset}")
@@ -5471,7 +5417,146 @@ def _parser() -> argparse.ArgumentParser:
     manifest_rollback = manifest_subparsers.add_parser("rollback-legacy")
     manifest_rollback.add_argument("--plan", required=True)
     manifest_rollback.add_argument("--release-sha", required=True)
+    lifecycle_parser = subparsers.add_parser("lifecycle")
+    lifecycle_subparsers = lifecycle_parser.add_subparsers(
+        dest="lifecycle_action", required=True
+    )
+    lifecycle_subparsers.add_parser("provider-exited")
+    lifecycle_subparsers.add_parser("user-input")
+    lifecycle_subparsers.add_parser("reopen")
+    lifecycle_keep = lifecycle_subparsers.add_parser("keep")
+    lifecycle_keep.add_argument("choice", choices=("on", "off"))
     return parser
+
+
+def _lifecycle_environment() -> tuple[Path, str, str, int, int]:
+    state_dir = Path(load_config()["state_dir"])
+    session_id = os.environ.get("SESSION_KIT_LIFECYCLE_SESSION_ID", "")
+    boot_id = os.environ.get("SESSION_KIT_LIFECYCLE_BOOT_ID", "")
+    try:
+        shell_pid = int(os.environ.get("SESSION_KIT_LIFECYCLE_SHELL_PID", ""))
+        shell_start = int(
+            os.environ.get("SESSION_KIT_LIFECYCLE_SHELL_START_TICKS", "")
+        )
+    except ValueError as exc:
+        raise CollectionError("lifecycle shell generation is invalid") from exc
+    return state_dir, session_id, boot_id, shell_pid, shell_start
+
+
+def _prove_lifecycle_caller(
+    session_id: str,
+    shell_pid: int,
+    shell_start: int,
+) -> None:
+    if _require_supported_platform() != "linux":
+        raise CollectionError("lifecycle state is supported on Linux only")
+    proc_root = Path("/proc")
+    if (
+        os.environ.get("SESSION_KIT_TESTING") == "1"
+        and os.environ.get("SESSION_KIT_PROC_ROOT")
+    ):
+        proc_root = Path(os.environ["SESSION_KIT_PROC_ROOT"])
+    process_table = scan_process_table(proc_root, DEFAULT_MAX_PROC_NODES)
+    chain = _process_ancestor_chain(process_table, os.getpid())
+    shell = process_table.get(shell_pid)
+    if (
+        shell_pid not in chain
+        or not isinstance(shell, Mapping)
+        or shell.get("start_ticks") != shell_start
+        or shell.get("session_name") != session_id
+    ):
+        raise CollectionError(
+            "lifecycle caller is outside the exact managed shell generation"
+        )
+
+
+def _lifecycle_command(args: argparse.Namespace) -> int:
+    state_dir, session_id, boot_id, shell_pid, shell_start = (
+        _lifecycle_environment()
+    )
+    _prove_lifecycle_caller(session_id, shell_pid, shell_start)
+    common = {
+        "state_dir": state_dir,
+        "session_id": session_id,
+        "boot_id": boot_id,
+        "shell_pid": shell_pid,
+        "shell_start_ticks": shell_start,
+    }
+    if args.lifecycle_action == "provider-exited":
+        provider = os.environ.get("SESSION_KIT_LIFECYCLE_PROVIDER", "")
+        try:
+            exit_code = int(
+                os.environ.get("SESSION_KIT_LIFECYCLE_EXIT_CODE", "")
+            )
+        except ValueError as exc:
+            raise CollectionError("lifecycle provider exit code is invalid") from exc
+        value = _lifecycle.record_provider_exit(
+            **common,
+            provider=provider,
+            exit_code=exit_code,
+            input_tracking=True,
+        )
+    elif args.lifecycle_action == "user-input":
+        value = _lifecycle.update_state(**common, event="user-input")
+    elif args.lifecycle_action == "reopen":
+        state = _lifecycle.load_state(state_dir, session_id)
+        if state is None:
+            raise CollectionError("provider-exit lifecycle state is unavailable")
+        settings = load_config()
+        live = snapshot(write_state=True, config=settings)
+        item = lookup(live, session_id)
+        if (
+            item is None
+            or not guard_live_inventory(live)
+            or item.get("provider") != "shell"
+            or item.get("exited_provider") != state["provider"]
+            or item.get("shpool_shell", {}).get("pid") != shell_pid
+            or item.get("shpool_shell", {}).get("process_start_ticks")
+            != shell_start
+        ):
+            raise CollectionError(
+                "exact provider-exit recovery is unavailable; nothing reopened"
+            )
+        recovery = item.get("recovery")
+        if not isinstance(recovery, Mapping):
+            raise CollectionError(
+                "exact provider recovery is unavailable; nothing reopened"
+            )
+        provider = state["provider"]
+        uuid = valid_uuid(recovery.get("uuid"))
+        if recovery.get("provider") != provider or not uuid:
+            raise CollectionError(
+                "exact provider recovery is unavailable; nothing reopened"
+            )
+        expected = recovery_spec(provider, uuid, recovery.get("cwd"))
+        if recovery.get("argv") != expected["argv"]:
+            raise CollectionError(
+                "provider recovery command changed; nothing reopened"
+            )
+        argv = list(expected["argv"])
+        if provider == "codex":
+            argv[1:1] = ["-c", "check_for_update_on_startup=false"]
+        cwd = expected.get("cwd")
+        if cwd is not None and (not os.path.isabs(cwd) or not os.path.isdir(cwd)):
+            raise CollectionError(
+                "provider recovery directory is unavailable; nothing reopened"
+            )
+        completed = subprocess.run(argv, cwd=cwd, check=False)
+        value = _lifecycle.record_provider_exit(
+            **common,
+            provider=provider,
+            exit_code=completed.returncode % 256,
+            input_tracking=True,
+        )
+        return 0
+    else:
+        value = _lifecycle.update_state(
+            **common,
+            event="keep",
+            keep=args.choice == "on",
+        )
+    _json_print(value)
+    return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -5479,6 +5564,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "platform":
             return _platform_command(args)
+        if args.command == "lifecycle":
+            return _lifecycle_command(args)
         config = load_config()
         if args.command == "recovery-command":
             _json_print(recovery_spec(args.provider, args.uuid, args.cwd))

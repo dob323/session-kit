@@ -268,14 +268,38 @@ with lock.open("a+") as held:
         if os.environ.get("FAKE_ATTACH_FAIL") == "1":
             raise SystemExit(5)
         name=args[-1]
+        target=next(
+            (row for row in data["sessions"] if row.get("name") == name),
+            None,
+        )
+        force="--force" in args
+        if os.environ.get("FAKE_ATTACH_BECOMES_BUSY") == "1" and not force:
+            if target is not None:
+                target["status"]="Attached"
+            action="busy"
+        elif (
+            os.environ.get("FAKE_BUSY_IF_ATTACHED") == "1"
+            and target is not None
+            and target.get("status") == "Attached"
+            and not force
+        ):
+            action="busy"
+        elif os.environ.get("FAKE_BUSY_IF_ATTACHED") == "1" and force:
+            if target is not None:
+                target["status"]="Attached"
+            action="force-attach"
+        else:
+            action="attach"
         if os.environ.get("FAKE_DROP_BEFORE_ATTACH") == "1":
             data["sessions"]=[row for row in data["sessions"] if row.get("name") != name]
         exits_immediately="--cmd" in args and args[args.index("--cmd")+1] == "/bin/false"
         if not exits_immediately and not any(row.get("name") == name for row in data["sessions"]):
             data["sessions"].append({"name":name,"status":"Disconnected","started_at_unix_ms":int(time.time()*1000)})
-        action="attach"
     elif len(args) == 2 and args[0] == "kill":
-        expected_lock=os.environ.get("FAKE_EXPECT_CREATE_LOCK")
+        expected_lock=os.environ.get(
+            "FAKE_EXPECT_KILL_LOCK",
+            os.environ.get("FAKE_EXPECT_CREATE_LOCK"),
+        )
         if expected_lock:
             create_lock=pathlib.Path(os.environ["SESSION_KIT_STATE_DIR"])/"create.lock"
             with create_lock.open("a+") as create_held:
@@ -884,6 +908,7 @@ class CommandTests(unittest.TestCase):
                 "STUB_DYNAMIC_PROVIDER": "codex",
                 "STUB_DYNAMIC_UUID": exact_uuid,
                 "STUB_DYNAMIC_CWD": str(self.fixture.project),
+                "FAKE_EXPECT_KILL_LOCK": "locked",
             }
         )
         repaired = run([SP, "repair", "wedged"], env=env)
@@ -1234,9 +1259,9 @@ bash --noprofile --norc -ic '
                 )
                 self.assertEqual(0, launched.returncode, launched.stderr)
                 self.assertEqual(expected_args[provider], provider_log.read_text())
-                self.assertTrue(record.exists())
-                self.assertTrue(
-                    (self.fixture.start / "fork-session.expected").exists()
+                self.assertEqual(
+                    record.exists(),
+                    (self.fixture.start / "fork-session.expected").exists(),
                 )
 
     def test_unarmed_creation_failures_are_quarantined(self) -> None:
@@ -1831,6 +1856,184 @@ class PickerProofTests(unittest.TestCase):
         self.assertNotIn("Type the exact ID", moved.stdout)
         self.assertEqual("attach main2\n", self.fixture.shpool_log.read_text())
 
+    def test_picker_open_maps_attach_failure_without_calling_session_dead(self) -> None:
+        proof = self._prime(session_row("main2"))
+        env = self.fixture.env()
+        env["FAKE_ATTACH_FAIL"] = "1"
+        refused = run([SP, "picker-open", proof], env=env, check=False)
+        self.assertEqual(75, refused.returncode)
+        self.assertIn("could not connect", refused.stderr)
+        self.assertIn("nothing was called dead", refused.stderr)
+        self.assertNotIn("terminal died", refused.stderr)
+        events = [
+            json.loads(line)
+            for line in (self.fixture.state / "action-events.jsonl")
+            .read_text()
+            .splitlines()
+        ]
+        self.assertEqual(
+            ["requested", "attach_failed"],
+            [event["outcome"] for event in events],
+        )
+
+    def test_other_client_winning_open_race_is_a_busy_return_not_a_kill(self) -> None:
+        proof = self._prime(session_row("main2"))
+        env = self.fixture.env()
+        env["FAKE_ATTACH_BECOMES_BUSY"] = "1"
+        opened = run([SP, "picker-open", proof], env=env)
+        self.assertEqual(0, opened.returncode)
+        self.assertEqual("busy main2\n", self.fixture.shpool_log.read_text())
+        state = json.loads(self.fixture.shpool_state.read_text())
+        self.assertEqual("Attached", state["sessions"][0]["status"])
+        self.assertNotIn("kill", self.fixture.shpool_log.read_text())
+
+    def test_takeover_uses_force_against_one_busy_session(self) -> None:
+        proof = self._prime(session_row("main2", status="Attached"))
+        env = self.fixture.env()
+        env.update(
+            {
+                "SESSION_KIT_CONFIRM_ID": "main2",
+                "FAKE_BUSY_IF_ATTACHED": "1",
+            }
+        )
+        moved = run([SP, "picker-takeover", proof], env=env)
+        self.assertEqual(0, moved.returncode)
+        self.assertEqual(
+            "force-attach main2\n", self.fixture.shpool_log.read_text()
+        )
+        state = json.loads(self.fixture.shpool_state.read_text())
+        self.assertEqual(1, len(state["sessions"]))
+        self.assertEqual("Attached", state["sessions"][0]["status"])
+
+    def test_picker_recovery_refuses_same_generation_now_attached(self) -> None:
+        row = session_row("main2")
+        row["cwd"] = str(self.fixture.project)
+        proof = self._prime(row)
+        attached = dict(row)
+        attached["shpool_status"] = "Attached"
+        attached["availability"] = "attached"
+        changed = self.fixture.base / "attached.json"
+        changed.write_text(
+            json.dumps(inventory_document(attached)), encoding="utf-8"
+        )
+        env = self.fixture.env()
+        env["STUB_SECOND_INVENTORY"] = str(changed)
+        refused = run([SP, "picker-recover", proof], env=env, check=False)
+        self.assertNotEqual(0, refused.returncode)
+        self.assertIn("open in another window", refused.stderr)
+        self.assertFalse(self.fixture.shpool_log.exists())
+
+    def test_repair_refuses_same_generation_now_attached(self) -> None:
+        row = session_row("wedged")
+        row["cwd"] = str(self.fixture.project)
+        self.fixture.inventory.write_text(
+            json.dumps(inventory_document(row)), encoding="utf-8"
+        )
+        attached = dict(row)
+        attached["shpool_status"] = "Attached"
+        attached["availability"] = "attached"
+        changed = self.fixture.base / "repair-attached.json"
+        changed.write_text(
+            json.dumps(inventory_document(attached)), encoding="utf-8"
+        )
+        self.fixture.shpool_state.write_text(
+            json.dumps(
+                {
+                    "sessions": [
+                        {
+                            "name": "wedged",
+                            "status": "Attached",
+                            "started_at_unix_ms": row["started_at_unix_ms"],
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        env = self.fixture.env()
+        env["STUB_SECOND_INVENTORY"] = str(changed)
+        refused = run([SP, "repair", "wedged"], env=env, check=False)
+        self.assertNotEqual(0, refused.returncode)
+        self.assertIn("open in another window", refused.stderr)
+        self.assertFalse(self.fixture.shpool_log.exists())
+
+    def test_action_log_is_private_minimal_capped_and_seven_day_bounded(
+        self,
+    ) -> None:
+        now_ms = time.time_ns() // 1_000_000
+        old_ms = now_ms - 8 * 24 * 60 * 60 * 1000
+        log = self.fixture.state / "action-events.jsonl"
+        records = [
+            {
+                "action": "picker_open",
+                "at_unix_ms": old_ms,
+                "outcome": "returned",
+                "schema_version": 1,
+            },
+            {
+                "action": "/private/project/path",
+                "at_unix_ms": now_ms,
+                "outcome": "00000000-0000-4000-8000-000000000001",
+                "schema_version": 1,
+            }
+        ]
+        records.extend(
+            {
+                "action": "picker_open",
+                "at_unix_ms": now_ms,
+                "outcome": "returned",
+                "schema_version": 1,
+            }
+            for _ in range(1_005)
+        )
+        log.write_text(
+            "".join(
+                json.dumps(item, sort_keys=True, separators=(",", ":")) + "\n"
+                for item in records
+            ),
+            encoding="utf-8",
+        )
+        log.chmod(0o600)
+        run(
+            [
+                "bash",
+                "-c",
+                'source "$1"; sk_prepare_state; sk_log_action picker_close closed',
+                "action-log-test",
+                COMMON,
+            ],
+            env=self.fixture.env(),
+        )
+        kept = [json.loads(line) for line in log.read_text().splitlines()]
+        self.assertLessEqual(len(kept), 1_000)
+        self.assertTrue(all(item["at_unix_ms"] >= now_ms for item in kept))
+        self.assertEqual(0o600, stat.S_IMODE(log.stat().st_mode))
+        self.assertLessEqual(log.stat().st_size, 256 * 1024)
+        self.assertEqual(
+            {
+                "action",
+                "at_unix_ms",
+                "outcome",
+                "schema_version",
+            },
+            set().union(*(item.keys() for item in kept)),
+        )
+        serialized = log.read_text()
+        self.assertNotIn("/private/project/path", serialized)
+        self.assertNotIn(
+            "00000000-0000-4000-8000-000000000001", serialized
+        )
+        for forbidden in (
+            "title",
+            "uuid",
+            "shpool_id",
+            "path",
+            "prompt",
+            "output",
+            "ip",
+        ):
+            self.assertNotIn(f'"{forbidden}"', serialized.casefold())
+
     def test_unknown_uuidless_picker_open_and_history_use_exact_guard_proof(self) -> None:
         row = unknown_session_row("main9")
         proof = self._prime(row)
@@ -1912,6 +2115,17 @@ class PickerProofTests(unittest.TestCase):
         closed = run([SP, "picker-close", proof], env=env)
         self.assertIn("Closed exact session main2", closed.stdout)
         self.assertEqual("kill main2\n", self.fixture.shpool_log.read_text())
+
+    def test_picker_close_without_exact_confirmation_never_kills(self) -> None:
+        proof = self._prime(session_row("main2", status="Attached"))
+        refused = run(
+            [SP, "picker-close", proof],
+            env=self.fixture.env(),
+            check=False,
+        )
+        self.assertNotEqual(0, refused.returncode)
+        self.assertIn("Close cancelled", refused.stdout)
+        self.assertFalse(self.fixture.shpool_log.exists())
 
     def test_proof_file_and_schema_fail_closed(self) -> None:
         valid = self._prime(session_row("main2"))

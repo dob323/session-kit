@@ -14,6 +14,7 @@ SK_PROJECTS_FILE=${SESSION_KIT_PROJECTS_FILE:-${XDG_CONFIG_HOME:-"$HOME/.config"
 SK_CONFIG_FILE=${SESSION_KIT_CONFIG:-${XDG_CONFIG_HOME:-"$HOME/.config"}/session-kit/inventory.json}
 SK_SHPOOL=${SESSION_KIT_SHPOOL_CMD:-}
 SK_INVENTORY_CORE=${SESSION_KIT_INVENTORY_CORE:-"$SESSION_KIT_RELEASE_DIR/lib/session_inventory.py"}
+SK_ACTION_LOG="$SK_STATE_DIR/action-events.jsonl"
 
 if [[ -z $SK_SHPOOL ]]; then
   SK_SHPOOL=$(command -v shpool 2>/dev/null || true)
@@ -139,6 +140,124 @@ sk_prepare_state() {
   umask 077
   mkdir -p "$SK_STATE_DIR" "$SK_JOURNAL_DIR" "$SK_ARCHIVE_DIR"
   chmod 700 "$SK_STATE_DIR" "$SK_JOURNAL_DIR" "$SK_ARCHIVE_DIR" 2>/dev/null || true
+}
+
+# Keep a small local record of picker actions without recording anything that
+# identifies a conversation or its contents. The only variable fields are two
+# source-controlled enums. Every append also removes entries older than seven
+# days and caps the file at 1,000 records / 256 KiB.
+sk_log_action() {
+  local action=$1 outcome=$2
+  [[ $action =~ ^[a-z][a-z_]{0,31}$ &&
+     $outcome =~ ^[a-z][a-z_]{0,31}$ ]] || return 1
+  python3 - "$SK_ACTION_LOG" "$action" "$outcome" <<'PY' 2>/dev/null
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+import tempfile
+import time
+
+path = Path(sys.argv[1])
+action, outcome = sys.argv[2:4]
+now_ms = time.time_ns() // 1_000_000
+cutoff_ms = now_ms - 7 * 24 * 60 * 60 * 1000
+max_records = 1_000
+max_bytes = 256 * 1024
+enum_pattern = re.compile(r"[a-z][a-z_]{0,31}")
+
+path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+os.chmod(path.parent, 0o700)
+lock_path = path.with_suffix(path.suffix + ".lock")
+lock_fd = os.open(
+    lock_path,
+    os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+    0o600,
+)
+try:
+    os.fchmod(lock_fd, 0o600)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    records = []
+    try:
+        metadata = path.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_size > max_bytes
+        ):
+            raise OSError("unsafe action log")
+        payload = path.read_bytes()
+    except FileNotFoundError:
+        payload = b""
+    for raw_line in payload.splitlines():
+        try:
+            item = json.loads(raw_line)
+        except (UnicodeDecodeError, ValueError):
+            continue
+        if (
+            isinstance(item, dict)
+            and set(item) == {
+                "action",
+                "at_unix_ms",
+                "outcome",
+                "schema_version",
+            }
+            and item.get("schema_version") == 1
+            and isinstance(item.get("at_unix_ms"), int)
+            and not isinstance(item["at_unix_ms"], bool)
+            and cutoff_ms <= item["at_unix_ms"] <= now_ms
+            and isinstance(item.get("action"), str)
+            and enum_pattern.fullmatch(item["action"])
+            and isinstance(item.get("outcome"), str)
+            and enum_pattern.fullmatch(item["outcome"])
+        ):
+            records.append(item)
+    records.append(
+        {
+            "action": action,
+            "at_unix_ms": now_ms,
+            "outcome": outcome,
+            "schema_version": 1,
+        }
+    )
+    encoded = [
+        json.dumps(item, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+        for item in records[-max_records:]
+    ]
+    kept = []
+    total = 0
+    for line in reversed(encoded):
+        if total + len(line) > max_bytes:
+            break
+        kept.append(line)
+        total += len(line)
+    output = b"".join(reversed(kept))
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=".action-events.", dir=path.parent
+    )
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            handle.write(output)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+finally:
+    os.close(lock_fd)
+PY
 }
 
 sk_snapshot_file() {

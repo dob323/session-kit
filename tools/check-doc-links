@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+"""Check local links in public Markdown files."""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+import re
+from urllib.parse import unquote, urlsplit
+
+
+LINK = re.compile(r"(?<!!)\[[^\]]+\]\(([^)]+)\)")
+IGNORED_PARTS = {".git", ".mypy_cache", ".ruff_cache", "__pycache__"}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("root", nargs="?", default=".", type=Path)
+    args = parser.parse_args()
+    root = args.root.resolve()
+    if not root.is_dir():
+        parser.error("root must be a directory")
+
+    failures: list[str] = []
+    checked = 0
+    for document in sorted(root.rglob("*.md")):
+        if any(part in IGNORED_PARTS for part in document.parts):
+            continue
+        text = document.read_text(encoding="utf-8")
+        for line_number, line in enumerate(text.splitlines(), 1):
+            for match in LINK.finditer(line):
+                raw = match.group(1).strip().split(maxsplit=1)[0].strip("<>")
+                parsed = urlsplit(raw)
+                if parsed.scheme or raw.startswith(("#", "//")):
+                    continue
+                target_text = unquote(parsed.path)
+                if not target_text:
+                    continue
+                checked += 1
+                if target_text.startswith("/"):
+                    failures.append(
+                        f"{document.relative_to(root)}:{line_number}: "
+                        f"absolute local link: {raw}"
+                    )
+                    continue
+                target = (document.parent / target_text).resolve()
+                try:
+                    target.relative_to(root)
+                except ValueError:
+                    failures.append(
+                        f"{document.relative_to(root)}:{line_number}: "
+                        f"link escapes repository: {raw}"
+                    )
+                    continue
+                if not target.exists():
+                    failures.append(
+                        f"{document.relative_to(root)}:{line_number}: "
+                        f"missing target: {raw}"
+                    )
+    if failures:
+        print("documentation link check failed:")
+        for failure in failures:
+            print(f"  {failure}")
+        return 1
+    print(f"documentation link check passed ({checked} local links)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -24,10 +24,12 @@ REQUIRED_SYMBOLS = {
     "_display_width",
     "_empty_terminal_registry",
     "_json_bytes",
+    "_lifecycle_command",
     "_parse_darwin_procargs2",
     "_parser",
     "_plan_token",
     "_process_age",
+    "_prove_lifecycle_caller",
     "_provider_title_info",
     "_read_terminal_registry",
     "_release_sha",
@@ -80,6 +82,7 @@ REQUIRED_SYMBOLS = {
     "snapshot",
     "source_generation_key",
     "strict_live_inventory",
+    "subprocess",
     "update_recovery_state",
 }
 
@@ -121,6 +124,7 @@ EXPECTED_TOP_LEVEL_COMMANDS = (
     "automatic-title",
     "recovery-pending",
     "recovery-manifest",
+    "lifecycle",
 )
 
 
@@ -149,7 +153,7 @@ def referenced_facade_symbols() -> set[str]:
 
 class InventoryFacadeTests(unittest.TestCase):
     def test_contract_matches_every_current_test_reference(self) -> None:
-        self.assertEqual(len(REQUIRED_SYMBOLS), 65)
+        self.assertEqual(len(REQUIRED_SYMBOLS), 68)
         self.assertEqual(REQUIRED_SYMBOLS, referenced_facade_symbols())
 
     def test_current_tested_symbols_remain_available(self) -> None:

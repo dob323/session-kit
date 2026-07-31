@@ -12,13 +12,30 @@ systemd_root=${SESSION_KIT_SYSTEMD_ROOT:-"${XDG_CONFIG_HOME:-"$HOME/.config"}/sy
 bashrc_path=${SESSION_KIT_BASHRC:-"$HOME/.bashrc"}
 integration_marker=${SESSION_KIT_INTEGRATION_MARKER:-"$state_root/integration-ready-v1"}
 receipt_path=$state_root/install.json
+shpool_config=${XDG_CONFIG_HOME:-"$HOME/.config"}/shpool/config.toml
 login_start="# >>> session-kit managed integration >>>"
 login_end="# <<< session-kit managed integration <<<"
 helpers=(sp shpool_login shpool_status shpool_reaper codex_resume_here)
+units=(
+  shpool.service
+  shpool.socket
+  shpool-reaper.service
+  shpool-reaper.timer
+  session-kit-watchdog.service
+)
+required_commands=(
+  bash python3 git shpool
+  cmp cp find flock install journalctl mkdir mktemp mv pgrep ps rm script
+  sha256sum stat systemctl timeout
+)
 inventory_files=(
   lib/session_inventory.py
   lib/sessionkit_inventory/__init__.py
   lib/sessionkit_inventory/common.py
+  lib/sessionkit_inventory/lifecycle.py
+  lib/sessionkit_inventory/providers.py
+  lib/sessionkit_inventory/reaper.py
+  lib/sessionkit_inventory/state_io.py
 )
 
 die() {
@@ -30,7 +47,7 @@ usage() {
   cat <<'EOF'
 Usage:
   session-kit doctor [--json]
-  session-kit update [--source PATH] [--enable-login|--disable-login]
+  session-kit update [--source PATH] [--enable-login|--disable-login] [--journal on|off]
   session-kit rollback [--to COMMIT]
   session-kit disable-login
   session-kit enable-login
@@ -50,11 +67,63 @@ require_arg() {
 }
 
 platform() {
+  if [[ -n ${SESSION_KIT_TEST_PLATFORM:-} ]]; then
+    [[ ${SESSION_KIT_TESTING:-0} == 1 ]] ||
+      die "SESSION_KIT_TEST_PLATFORM is reserved for isolated tests"
+    printf '%s\n' "$SESSION_KIT_TEST_PLATFORM"
+    return
+  fi
   case "$(uname -s 2>/dev/null || true)" in
     Linux) printf 'linux\n' ;;
     Darwin) printf 'macos\n' ;;
     *) printf 'unsupported\n' ;;
   esac
+}
+
+validate_roots() {
+  python3 - "$HOME" "$install_root" "$bin_dir" "$config_root" "$state_root" \
+    "$systemd_root" "$bashrc_path" "${SESSION_KIT_TESTING:-0}" <<'PY'
+import os
+import pathlib
+import sys
+
+home, *raw, testing = sys.argv[1:]
+home_path = pathlib.Path(home).resolve(strict=False)
+labels = (
+    "install root", "binary directory", "config root", "state root",
+    "systemd root", "shell file",
+)
+paths = [pathlib.Path(value).resolve(strict=False) for value in raw]
+raw_paths = [pathlib.Path(value) for value in raw]
+for label, raw_path, path in zip(labels, raw_paths, paths):
+    if not raw_path.is_absolute():
+        raise SystemExit(f"session-kit: {label} must be absolute: {raw_path}")
+    normalized = pathlib.Path(os.path.abspath(raw_path))
+    if normalized != path:
+        raise SystemExit(f"session-kit: refusing symlinked {label}: {raw_path}")
+    if path == pathlib.Path("/") or path == home_path:
+        raise SystemExit(f"session-kit: refusing broad {label}: {path}")
+    if len(path.parts) < 4 and testing != "1":
+        raise SystemExit(f"session-kit: refusing broad {label}: {path}")
+install, binary, config, state, systemd, shell = paths
+for label, path in (("install root", install), ("config root", config), ("state root", state)):
+    if path in {
+        home_path / ".local",
+        home_path / ".local" / "lib",
+        home_path / ".local" / "state",
+        home_path / ".config",
+    }:
+        raise SystemExit(f"session-kit: refusing broad {label}: {path}")
+if shell.parent == pathlib.Path("/") or shell == home_path:
+    raise SystemExit(f"session-kit: refusing unsafe shell file: {shell}")
+if len({install, binary, config, state, systemd}) != 5:
+    raise SystemExit("session-kit: lifecycle roots must not overlap exactly")
+roots = (install, binary, config, state, systemd)
+for index, left in enumerate(roots):
+    for right in roots[index + 1:]:
+        if left in right.parents or right in left.parents:
+            raise SystemExit(f"session-kit: lifecycle roots must not contain one another: {left}, {right}")
+PY
 }
 
 stat_mode() {
@@ -81,19 +150,15 @@ check_source() {
   case "$current_platform" in
     linux) printf 'OK    operating system: Linux\n' ;;
     macos)
-      if [[ ${SESSION_KIT_MACOS_PREVIEW:-0} == 1 ]]; then
-        printf 'WARN  operating system: experimental macOS core preview\n'
-      else
-        printf 'FAIL  macOS requires explicit SESSION_KIT_MACOS_PREVIEW=1 opt-in\n'
-        failed=1
-      fi
+      printf 'FAIL  macOS lifecycle operations are not supported; install is Linux-only\n'
+      failed=1
       ;;
     *)
       printf 'FAIL  operating system: only Linux and the macOS core preview are supported\n'
       failed=1
       ;;
   esac
-  for command in bash python3 git; do
+  for command in "${required_commands[@]}"; do
     if command -v "$command" >/dev/null 2>&1; then
       printf 'OK    command: %s\n' "$command"
     else
@@ -111,10 +176,27 @@ check_source() {
     printf 'FAIL  Python 3.10 or newer is required\n'
     failed=1
   fi
-  if command -v shpool >/dev/null 2>&1; then
-    printf 'OK    shpool: %s\n' "$(command -v shpool)"
-  else
+  if ! command -v shpool >/dev/null 2>&1; then
     printf 'FAIL  shpool missing: install v0.11.0 with cargo install shpool --version 0.11.0 --locked\n'
+    failed=1
+  fi
+  if [[ ! -d /proc && ${SESSION_KIT_TESTING:-0} != 1 ]]; then
+    printf 'FAIL  Linux /proc is required for process identity checks\n'
+    failed=1
+  else
+    printf 'OK    process filesystem: /proc\n'
+  fi
+  if [[ ${SESSION_KIT_TESTING:-0} == 1 ]] ||
+      systemctl --user show-environment >/dev/null 2>&1; then
+    printf 'OK    user service manager: systemd\n'
+  else
+    printf 'FAIL  systemd user manager is unavailable\n'
+    failed=1
+  fi
+  if command -v claude >/dev/null 2>&1 || command -v codex >/dev/null 2>&1; then
+    printf 'OK    provider CLI: Claude Code or Codex\n'
+  else
+    printf 'FAIL  install Claude Code, Codex, or both\n'
     failed=1
   fi
   for required in \
@@ -137,6 +219,7 @@ check_source() {
     failed=1
   fi
   (( failed == 0 )) || return 1
+  validate_roots
   release_id_from_source "$source" >/dev/null
   printf 'OK    source: installable\n'
 }
@@ -164,6 +247,193 @@ finally:
 PY
 }
 
+transaction_path=$state_root/lifecycle-transaction.json
+
+lifecycle_transaction() {
+  python3 - "$@" <<'PY'
+import base64
+import json
+import os
+import pathlib
+import stat
+import sys
+import tempfile
+import time
+import uuid
+
+operation, journal_raw, *values = sys.argv[1:]
+journal = pathlib.Path(journal_raw)
+
+def atomic_json(path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+def capture(path):
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return {"path": str(path), "kind": "absent"}
+    if stat.S_ISLNK(info.st_mode):
+        return {"path": str(path), "kind": "symlink", "target": os.readlink(path)}
+    if stat.S_ISREG(info.st_mode):
+        return {
+            "path": str(path),
+            "kind": "file",
+            "mode": stat.S_IMODE(info.st_mode),
+            "content": base64.b64encode(path.read_bytes()).decode("ascii"),
+        }
+    raise SystemExit(f"session-kit: transaction target is unsafe: {path}")
+
+def restore(entry):
+    path = pathlib.Path(entry["path"])
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        info = None
+    if info is not None and not (stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)):
+        raise SystemExit(f"session-kit: refusing incompatible transaction state: {path}")
+    if info is not None:
+        path.unlink()
+    kind = entry["kind"]
+    if kind == "absent":
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if kind == "symlink":
+        os.symlink(entry["target"], path)
+    elif kind == "file":
+        data = base64.b64decode(entry["content"], validate=True)
+        fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        try:
+            os.fchmod(fd, int(entry["mode"]))
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        finally:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+    else:
+        raise SystemExit("session-kit: invalid lifecycle transaction entry")
+
+if operation == "begin":
+    if journal.exists() or journal.is_symlink():
+        raise SystemExit(f"session-kit: pending lifecycle transaction: {journal}")
+    entries = [capture(pathlib.Path(value)) for value in values[1:]]
+    payload = {
+        "schema_version": 1,
+        "transaction_id": uuid.uuid4().hex,
+        "action": values[0],
+        "started_at_unix": int(time.time()),
+        "state": "pending",
+        "entries": entries,
+    }
+    atomic_json(journal, payload)
+elif operation == "recover":
+    if not journal.exists() and not journal.is_symlink():
+        raise SystemExit(0)
+    info = journal.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
+        raise SystemExit(f"session-kit: unsafe lifecycle transaction journal: {journal}")
+    try:
+        payload = json.loads(journal.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"session-kit: invalid lifecycle transaction journal: {exc}")
+    if payload.get("schema_version") != 1 or payload.get("state") != "pending":
+        raise SystemExit("session-kit: incompatible lifecycle transaction state")
+    entries = payload.get("entries")
+    if not isinstance(entries, list):
+        raise SystemExit("session-kit: invalid lifecycle transaction entries")
+    if [entry.get("path") for entry in entries if isinstance(entry, dict)] != values:
+        raise SystemExit("session-kit: lifecycle transaction targets do not match this installation")
+    for entry in reversed(entries):
+        if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+            raise SystemExit("session-kit: invalid lifecycle transaction entry")
+        restore(entry)
+    journal.unlink()
+    print(f"Recovered interrupted Session Kit {payload.get('action', 'lifecycle')} transaction.")
+elif operation == "commit":
+    if not journal.is_file() or journal.is_symlink():
+        raise SystemExit(f"session-kit: missing lifecycle transaction journal: {journal}")
+    payload = json.loads(journal.read_text(encoding="utf-8"))
+    if payload.get("schema_version") != 1 or payload.get("state") != "pending":
+        raise SystemExit("session-kit: incompatible lifecycle transaction state")
+    payload["state"] = "committed"
+    payload["committed_at_unix"] = int(time.time())
+    backup_root = journal.parent / "backups"
+    backup_root.mkdir(parents=True, exist_ok=True)
+    os.chmod(backup_root, 0o700)
+    backup = backup_root / (
+        f"lifecycle-{payload['committed_at_unix']}-{payload['transaction_id']}.json"
+    )
+    atomic_json(backup, payload)
+    journal.unlink()
+else:
+    raise SystemExit("session-kit: invalid lifecycle transaction operation")
+PY
+}
+
+recover_pending_transaction() {
+  validate_roots
+  local -a targets=()
+  mapfile -t targets < <(transaction_targets)
+  lifecycle_transaction recover "$transaction_path" "${targets[@]}"
+}
+
+transaction_targets() {
+  local unit helper
+  printf '%s\n' \
+    "$install_root/current" \
+    "$bin_dir/session-kit" \
+    "$bashrc_path" \
+    "$integration_marker" \
+    "$HOME/.no_shpool_journal" \
+    "$receipt_path" \
+    "$install_root/.session-kit-owned.json" \
+    "$config_root/.session-kit-owned.json"
+  printf '%s\n' \
+    "$config_root/projects.tsv" \
+    "$config_root/inventory.json" \
+    "$shpool_config"
+  for helper in "${helpers[@]}"; do printf '%s\n' "$bin_dir/$helper"; done
+  for unit in "${units[@]}"; do printf '%s\n' "$systemd_root/$unit"; done
+}
+
+begin_transaction() {
+  local action=$1
+  shift
+  umask 077
+  mkdir -p "$state_root"
+  chmod 700 "$state_root" 2>/dev/null || true
+  local -a targets=()
+  mapfile -t targets < <(transaction_targets)
+  lifecycle_transaction begin "$transaction_path" "$action" "${targets[@]}" "$@"
+}
+
+commit_transaction() {
+  lifecycle_transaction commit "$transaction_path"
+}
+
+lifecycle_failpoint() {
+  [[ ${SESSION_KIT_TEST_FAILPOINT:-} != "$1" ]] ||
+    die "isolated test failpoint after $1"
+}
+
 write_receipt() {
   local release_id=$1 source=$2 previous=$3 current_platform=$4
   umask 077
@@ -180,12 +450,19 @@ import time
 path, release_id, source, previous, platform = sys.argv[1:6]
 destination = pathlib.Path(path)
 payload = {
-    "schema_version": 1,
+    "schema_version": 2,
     "installed_release": release_id,
     "previous_release": previous or None,
     "source": source,
     "platform": platform,
     "installed_at_unix": int(time.time()),
+    "roots": {
+        "install": os.environ.get("SESSION_KIT_ROOT", str(pathlib.Path.home() / ".local/lib/session-kit")),
+        "config": os.environ.get(
+            "SESSION_KIT_CONFIG_ROOT",
+            str(pathlib.Path(os.environ.get("XDG_CONFIG_HOME", pathlib.Path.home() / ".config")) / "session-kit"),
+        ),
+    },
 }
 fd, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", dir=destination.parent)
 try:
@@ -202,6 +479,46 @@ finally:
     except FileNotFoundError:
         pass
 PY
+}
+
+write_ownership_markers() {
+  local root marker kind
+  for kind in install config; do
+    if [[ $kind == install ]]; then root=$install_root; else root=$config_root; fi
+    marker=$root/.session-kit-owned.json
+    umask 077
+    mkdir -p "$root"
+    chmod 700 "$root" 2>/dev/null || true
+    python3 - "$marker" "$root" "$kind" <<'PY'
+import json
+import os
+import pathlib
+import tempfile
+import sys
+
+marker, root, kind = map(pathlib.Path, sys.argv[1:4])
+payload = {
+    "schema_version": 1,
+    "owner": "session-kit",
+    "kind": str(kind),
+    "root": str(root.resolve(strict=False)),
+}
+fd, temporary = tempfile.mkstemp(prefix=f".{marker.name}.", dir=marker.parent)
+try:
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, marker)
+finally:
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+PY
+  done
 }
 
 current_release_id() {
@@ -234,7 +551,6 @@ install_defaults() {
   [[ -e $config_root/inventory.json ]] ||
     install -m 0600 "$install_root/releases/$release_id/config/session-inventory.example.json" \
       "$config_root/inventory.json"
-  local shpool_config=${XDG_CONFIG_HOME:-"$HOME/.config"}/shpool/config.toml
   if [[ ! -e $shpool_config ]]; then
     mkdir -p "$(dirname -- "$shpool_config")"
     install -m 0600 "$install_root/releases/$release_id/config/shpool.example.toml" \
@@ -247,8 +563,7 @@ install_systemd_units() {
   [[ $(platform) == linux ]] || return 0
   mkdir -p "$systemd_root"
   local unit shpool_path
-  for unit in shpool.service shpool.socket shpool-reaper.service \
-    shpool-reaper.timer session-kit-watchdog.service; do
+  for unit in "${units[@]}"; do
     install -m 0644 "$install_root/releases/$release_id/systemd/$unit" \
       "$systemd_root/$unit"
   done
@@ -281,6 +596,78 @@ finally:
     except FileNotFoundError:
         pass
 PY
+}
+
+validate_purge_ownership() {
+  local kind=$1 root=$2 marker=$3
+  [[ -r $receipt_path && -f $receipt_path && ! -L $receipt_path ]] ||
+    die "purge requires a valid Session Kit install receipt"
+  [[ -r $marker && -f $marker && ! -L $marker ]] ||
+    die "purge requires an ownership marker for $root"
+  python3 - "$receipt_path" "$marker" "$kind" "$root" <<'PY'
+import json
+import pathlib
+import sys
+
+receipt_path, marker_path, kind, root_raw = sys.argv[1:]
+root = pathlib.Path(root_raw).resolve(strict=False)
+try:
+    receipt = json.loads(pathlib.Path(receipt_path).read_text(encoding="utf-8"))
+    marker = json.loads(pathlib.Path(marker_path).read_text(encoding="utf-8"))
+except (OSError, json.JSONDecodeError) as exc:
+    raise SystemExit(f"session-kit: invalid purge ownership evidence: {exc}")
+if receipt.get("schema_version") != 2:
+    raise SystemExit("session-kit: purge requires a current ownership receipt; run update first")
+roots = receipt.get("roots")
+if not isinstance(roots, dict) or pathlib.Path(str(roots.get(kind, ""))).resolve(strict=False) != root:
+    raise SystemExit(f"session-kit: receipt does not own {kind} root: {root}")
+if (
+    marker.get("schema_version") != 1
+    or marker.get("owner") != "session-kit"
+    or marker.get("kind") != kind
+    or pathlib.Path(str(marker.get("root", ""))).resolve(strict=False) != root
+):
+    raise SystemExit(f"session-kit: ownership marker does not match {kind} root: {root}")
+PY
+}
+
+validate_mutable_targets() {
+  local target
+  while IFS= read -r target; do
+    [[ ! -e $target && ! -L $target ]] && continue
+    if [[ -L $target ]]; then
+      [[ $target == "$install_root/current" ]] ||
+        die "refusing symlinked lifecycle target: $target"
+      continue
+    fi
+    [[ -f $target ]] ||
+      die "refusing incompatible lifecycle target: $target"
+  done < <(transaction_targets)
+}
+
+validate_uninstall_launchers() {
+  local release_id helper target expected
+  release_id=$(current_release_id)
+  [[ $release_id =~ ^[0-9a-f]{40}$ ]] ||
+    die "uninstall requires a valid active Session Kit release"
+  verify_release "$install_root/releases/$release_id" "$release_id"
+  for helper in "${helpers[@]}"; do
+    target=$bin_dir/$helper
+    expected=$install_root/releases/$release_id/deploy/session-kit-launcher
+    [[ ! -e $target && ! -L $target ]] && continue
+    [[ -f $target && ! -L $target ]] ||
+      die "refusing to remove unsafe launcher: $target"
+    cmp -s -- "$target" "$expected" ||
+      die "refusing to remove launcher with unowned content: $target"
+  done
+  target=$bin_dir/session-kit
+  expected=$install_root/releases/$release_id/bin/session-kit
+  if [[ -e $target || -L $target ]]; then
+    [[ -f $target && ! -L $target ]] ||
+      die "refusing to remove unsafe command: $target"
+    cmp -s -- "$target" "$expected" ||
+      die "refusing to remove command with unowned content: $target"
+  fi
 }
 
 rewrite_login() {
@@ -401,12 +788,119 @@ disable_login() {
   printf 'SSH picker disabled. Existing sessions and journals were not changed.\n'
 }
 
+verify_release() {
+  python3 - "$1" "${2:-}" <<'PY'
+import hashlib
+import json
+import pathlib
+import re
+import stat
+import sys
+
+root = pathlib.Path(sys.argv[1])
+expected_commit = sys.argv[2]
+if not root.is_dir() or root.is_symlink():
+    raise SystemExit(f"session-kit: release is not a real directory: {root}")
+try:
+    meta = json.loads((root / "RELEASE.json").read_text(encoding="utf-8"))
+except (OSError, json.JSONDecodeError) as exc:
+    raise SystemExit(f"session-kit: invalid release metadata: {exc}")
+if (
+    meta.get("schema_version") != 1
+    or meta.get("lifecycle_schema_version") != 2
+    or not isinstance(meta.get("commit"), str)
+):
+    raise SystemExit("session-kit: incompatible release metadata")
+commit = meta["commit"]
+if not re.fullmatch(r"[0-9a-f]{40}", commit) or root.name != commit:
+    raise SystemExit("session-kit: invalid release identity")
+if expected_commit and commit != expected_commit:
+    raise SystemExit("session-kit: release identity does not match requested commit")
+manifest = root / "MANIFEST.sha256"
+try:
+    lines = manifest.read_text(encoding="utf-8").splitlines()
+except OSError as exc:
+    raise SystemExit(f"session-kit: missing release manifest: {exc}")
+expected = {}
+for number, line in enumerate(lines, 1):
+    match = re.fullmatch(r"([0-9a-f]{64})  ([^\0]+)", line)
+    if not match:
+        raise SystemExit(f"session-kit: malformed release manifest line {number}")
+    rel = pathlib.PurePosixPath(match.group(2))
+    if rel.is_absolute() or ".." in rel.parts or str(rel) in expected:
+        raise SystemExit("session-kit: unsafe release manifest path")
+    expected[str(rel)] = match.group(1)
+actual = {}
+for path in root.rglob("*"):
+    rel = path.relative_to(root).as_posix()
+    if path.is_symlink():
+        raise SystemExit(f"session-kit: release contains symlink: {rel}")
+    if path.is_file() and rel != "MANIFEST.sha256":
+        actual[rel] = hashlib.sha256(path.read_bytes()).hexdigest()
+    if path.is_dir() and stat.S_IMODE(path.stat().st_mode) & 0o222:
+        raise SystemExit(f"session-kit: writable immutable release directory: {rel}")
+if expected != actual:
+    differing = sorted(set(expected) ^ set(actual))
+    if not differing:
+        differing = sorted(name for name in expected if expected[name] != actual[name])
+    raise SystemExit(f"session-kit: release verification failed: {', '.join(differing[:3])}")
+for rel in ("bin/session-kit", "deploy/session-kit-launcher"):
+    path = root / rel
+    if not path.is_file() or path.is_symlink() or not stat.S_IMODE(path.stat().st_mode) & 0o111:
+        raise SystemExit(f"session-kit: release executable is invalid: {rel}")
+PY
+}
+
+write_release_manifest() {
+  python3 - "$1" "$2" <<'PY'
+import hashlib
+import json
+import os
+import pathlib
+import stat
+import sys
+
+root = pathlib.Path(sys.argv[1])
+commit = sys.argv[2]
+meta = root / "RELEASE.json"
+meta.write_text(
+    json.dumps(
+        {
+            "schema_version": 1,
+            "lifecycle_schema_version": 2,
+            "commit": commit,
+        },
+        indent=2,
+        sort_keys=True,
+    ) + "\n",
+    encoding="utf-8",
+)
+for path in sorted(root.rglob("*"), reverse=True):
+    if path.is_symlink():
+        raise SystemExit(f"session-kit: release source contains symlink: {path}")
+    if path.is_file():
+        mode = stat.S_IMODE(path.stat().st_mode)
+        os.chmod(path, 0o555 if mode & 0o111 else 0o444)
+lines = []
+for path in sorted((path for path in root.rglob("*") if path.is_file())):
+    rel = path.relative_to(root).as_posix()
+    lines.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {rel}")
+manifest = root / "MANIFEST.sha256"
+manifest.write_text("\n".join(lines) + "\n", encoding="utf-8")
+os.chmod(manifest, 0o444)
+for path in sorted((path for path in root.rglob("*") if path.is_dir()), reverse=True):
+    os.chmod(path, 0o555)
+os.chmod(root, 0o555)
+PY
+}
+
 install_release() {
   local source=$1 release_id=$2
   local release_dir=$install_root/releases/$release_id
   if [[ -e $release_dir ]]; then
     [[ -d $release_dir && ! -L $release_dir ]] ||
       die "release path is unsafe: $release_dir"
+    verify_release "$release_dir" "$release_id"
     return 0
   fi
   mkdir -p "$install_root/releases"
@@ -418,10 +912,10 @@ install_release() {
     [[ -e $source/$item ]] || continue
     cp -R "$source/$item" "$staging/$item"
   done
-  find "$staging" -type d -exec chmod 0755 {} +
-  find "$staging" -type f -exec chmod a-w {} +
   find "$staging/bin" "$staging/deploy" -type f -exec chmod 0755 {} +
+  write_release_manifest "$staging" "$release_id"
   mv "$staging" "$release_dir"
+  verify_release "$release_dir" "$release_id"
 }
 
 install_command() {
@@ -434,13 +928,14 @@ install_command() {
       --journal) require_arg "$1" "${2:-}"; journal=$2; shift 2 ;;
       --non-interactive)
         [[ $login != prompt ]] || login=disable
-        [[ $journal != prompt ]] || journal=on
+        [[ $journal != prompt ]] || journal=off
         shift
         ;;
       *) die "unknown install option: $1" ;;
     esac
   done
   [[ -n $source ]] || die "install requires --source PATH"
+  recover_pending_transaction
   source=$(cd -- "$source" && pwd -P) || die "source is unavailable"
   check_source "$source"
   local release_id previous current_platform
@@ -458,28 +953,34 @@ install_command() {
   fi
   if [[ $journal == prompt ]]; then
     if [[ -t 0 ]]; then
-      printf 'Keep local terminal journals for recovery? [Y/n] '
+      printf 'Terminal journals can contain raw commands and output in ~/.local/state/shpool-journal. Opt in to keep them? [y/N] '
       read -r answer
-      case ${answer:-y} in [Nn]*) journal=off ;; *) journal=on ;; esac
+      case ${answer:-n} in [Yy]*) journal=on ;; *) journal=off ;; esac
     else
-      journal=on
+      journal=off
     fi
   fi
+  validate_mutable_targets
+  if [[ -e $install_root/releases/$release_id ]]; then
+    verify_release "$install_root/releases/$release_id" "$release_id"
+  fi
+  begin_transaction install
   install_release "$source" "$release_id"
   atomic_symlink "$install_root/releases/$release_id" "$install_root/current"
+  lifecycle_failpoint current
   install_launchers "$release_id"
   install_defaults "$release_id"
   install_systemd_units "$release_id"
   set_journal_choice "$journal"
   if [[ $login == enable ]]; then enable_login; else disable_login; fi
+  write_ownership_markers
   write_receipt "$release_id" "$source" "$previous" "$current_platform"
+  commit_transaction
   printf 'Installed Session Kit release %s.\n' "$release_id"
   if [[ $current_platform == linux ]]; then
     printf 'User services were installed but not started. Review them, then run:\n'
     printf '  systemctl --user daemon-reload\n'
     printf '  systemctl --user enable --now shpool.socket shpool-reaper.timer\n'
-  else
-    printf 'macOS core preview installed. Watchdog repair and pruning remain disabled.\n'
   fi
   printf 'Run session-kit doctor before opening a new managed session.\n'
 }
@@ -503,25 +1004,39 @@ doctor_command() {
   fi
   if [[ $release_id =~ ^[0-9a-f]{40}$ &&
         -d $install_root/releases/$release_id ]]; then
-    local missing_release_file=
-    for required in "${inventory_files[@]}"; do
-      if [[ ! -f $install_root/releases/$release_id/$required ]]; then
-        missing_release_file=$required
-        break
-      fi
-    done
-    if [[ -z $missing_release_file ]]; then
+    local release_error=
+    if release_error=$(verify_release "$install_root/releases/$release_id" "$release_id" 2>&1); then
       add_check ok release "$release_id"
     else
-      add_check fail release "active release missing $missing_release_file"
+      add_check fail release "${release_error#session-kit: }"
     fi
   else
     add_check fail release "no valid active release"
   fi
-  if command -v shpool >/dev/null 2>&1; then
-    add_check ok shpool "$(command -v shpool)"
+  local -a missing_commands=()
+  for required in "${required_commands[@]}"; do
+    command -v "$required" >/dev/null 2>&1 || missing_commands+=("$required")
+  done
+  if ((${#missing_commands[@]} == 0)); then
+    add_check ok prerequisites "all required commands are available"
   else
-    add_check fail shpool "command unavailable"
+    add_check fail prerequisites "commands unavailable: ${missing_commands[*]}"
+  fi
+  if [[ -d /proc || ${SESSION_KIT_TESTING:-0} == 1 ]]; then
+    add_check ok proc "process identity filesystem is available"
+  else
+    add_check fail proc "/proc is unavailable"
+  fi
+  if [[ ${SESSION_KIT_TESTING:-0} == 1 ]] ||
+      systemctl --user show-environment >/dev/null 2>&1; then
+    add_check ok systemd "user service manager is available"
+  else
+    add_check fail systemd "user service manager is unavailable"
+  fi
+  if command -v claude >/dev/null 2>&1 || command -v codex >/dev/null 2>&1; then
+    add_check ok provider "Claude Code or Codex is available"
+  else
+    add_check fail provider "install Claude Code, Codex, or both"
   fi
   for helper in "${helpers[@]}"; do
     if [[ -x $bin_dir/$helper ]]; then
@@ -530,6 +1045,27 @@ doctor_command() {
       add_check fail "$helper" "launcher unavailable"
     fi
   done
+  if [[ -f $config_root/inventory.json && ! -L $config_root/inventory.json ]] &&
+      python3 -m json.tool "$config_root/inventory.json" >/dev/null 2>&1; then
+    add_check ok config "inventory.json is valid JSON"
+  else
+    add_check fail config "inventory.json is missing, unsafe, or invalid"
+  fi
+  if (
+    validate_purge_ownership \
+      install "$install_root" "$install_root/.session-kit-owned.json" &&
+    validate_purge_ownership \
+      config "$config_root" "$config_root/.session-kit-owned.json"
+  ) >/dev/null 2>&1; then
+    add_check ok ownership "receipt and root ownership markers match"
+  else
+    add_check fail ownership "receipt or root ownership marker is missing or incompatible"
+  fi
+  if [[ -e $transaction_path || -L $transaction_path ]]; then
+    add_check fail transaction "interrupted lifecycle transaction requires recovery"
+  else
+    add_check ok transaction "no interrupted lifecycle transaction"
+  fi
   if [[ -f $integration_marker && ! -L $integration_marker &&
         $(stat_mode "$integration_marker") == 600 ]]; then
     add_check ok login "enabled with a private release marker"
@@ -555,15 +1091,17 @@ print(json.dumps({"ok":all(r["status"]!="fail" for r in rows),"checks":rows},ind
 }
 
 update_command() {
-  local source= login= journal=on
+  local source= login= journal=off
   while (($#)); do
     case "$1" in
       --source) require_arg "$1" "${2:-}"; source=$2; shift 2 ;;
       --enable-login) login=enable; shift ;;
       --disable-login) login=disable; shift ;;
+      --journal) require_arg "$1" "${2:-}"; journal=$2; shift 2 ;;
       *) die "unknown update option: $1" ;;
     esac
   done
+  [[ $(platform) == linux ]] || die "update is supported only on Linux"
   if [[ -z $source && -r $receipt_path ]]; then
     source=$(python3 - "$receipt_path" <<'PY'
 import json,sys
@@ -576,7 +1114,13 @@ PY
 )
   fi
   [[ -n $source ]] || die "update needs --source PATH"
-  [[ ! -e $HOME/.no_shpool_journal ]] || journal=off
+  if [[ -z $login ]]; then
+    if [[ -f $integration_marker && ! -L $integration_marker ]]; then
+      login=enable
+    else
+      login=disable
+    fi
+  fi
   local args=(--source "$source" --journal "$journal" --non-interactive)
   case "$login" in enable) args+=(--enable-login) ;; disable) args+=(--disable-login) ;; esac
   install_command "${args[@]}"
@@ -590,6 +1134,8 @@ rollback_command() {
       *) die "unknown rollback option: $1" ;;
     esac
   done
+  [[ $(platform) == linux ]] || die "rollback is supported only on Linux"
+  recover_pending_transaction
   if [[ -z $target && -r $receipt_path ]]; then
     target=$(python3 - "$receipt_path" <<'PY'
 import json,sys
@@ -604,15 +1150,44 @@ PY
   [[ $target =~ ^[0-9a-f]{40}$ ]] || die "rollback requires a full release commit"
   [[ -d $install_root/releases/$target && ! -L $install_root/releases/$target ]] ||
     die "rollback release is not installed: $target"
-  local previous
+  verify_release "$install_root/releases/$target" "$target"
+  local active_tool=$install_root/current/deploy/session-kit-release
+  if [[ -f $active_tool && ! -L $active_tool ]]; then
+    python3 - "$active_tool" "$HOME" <<'PY'
+import pathlib
+import runpy
+import sys
+
+namespace = runpy.run_path(sys.argv[1], run_name="session_kit_release_gate")
+namespace["validate_rollback_launch_records"](pathlib.Path(sys.argv[2]))
+PY
+  fi
+  validate_mutable_targets
+  begin_transaction rollback
+  local previous source=
   previous=$(current_release_id)
+  if [[ -r $receipt_path ]]; then
+    source=$(python3 - "$receipt_path" <<'PY'
+import json,sys
+try:
+    value=json.load(open(sys.argv[1],encoding="utf-8")).get("source","")
+except (OSError,ValueError):
+    value=""
+print(value if isinstance(value,str) else "")
+PY
+)
+  fi
   atomic_symlink "$install_root/releases/$target" "$install_root/current"
+  lifecycle_failpoint current
   install_launchers "$target"
+  install_systemd_units "$target"
   if [[ -f $integration_marker && ! -L $integration_marker ]]; then
     printf 'session-kit-integration-v1 %s\n' "$target" > "$integration_marker"
     chmod 600 "$integration_marker"
   fi
-  write_receipt "$target" "" "$previous" "$(platform)"
+  write_ownership_markers
+  write_receipt "$target" "$source" "$previous" "$(platform)"
+  commit_transaction
   printf 'Rolled back Session Kit to %s. Services were not restarted.\n' "$target"
 }
 
@@ -625,12 +1200,24 @@ uninstall_command() {
       *) die "unknown uninstall option: $1" ;;
     esac
   done
+  recover_pending_transaction
+  validate_roots
+  validate_uninstall_launchers
+  if (( purge_config )); then
+    validate_purge_ownership config "$config_root" "$config_root/.session-kit-owned.json"
+  fi
+  if (( purge_code )); then
+    validate_purge_ownership install "$install_root" "$install_root/.session-kit-owned.json"
+  fi
+  validate_mutable_targets
+  begin_transaction uninstall
   disable_login
   for helper in "${helpers[@]}"; do
     [[ ! -e $bin_dir/$helper || ( -f $bin_dir/$helper && ! -L $bin_dir/$helper ) ]] ||
       die "refusing to remove unsafe launcher: $bin_dir/$helper"
     command rm -f -- "$bin_dir/$helper"
   done
+  command rm -f -- "$bin_dir/session-kit"
   if (( purge_config )); then
     [[ ! -e $config_root || ( -d $config_root && ! -L $config_root ) ]] ||
       die "refusing to remove unsafe config directory"
@@ -639,9 +1226,11 @@ uninstall_command() {
   if (( purge_code )); then
     [[ ! -e $install_root || ( -d $install_root && ! -L $install_root ) ]] ||
       die "refusing to remove unsafe install directory"
+    find "$install_root" -type d -exec chmod u+rwx {} +
     command rm -rf -- "$install_root"
   fi
   command rm -f -- "$receipt_path"
+  commit_transaction
   printf 'Session Kit integration removed. Journals, archives, and session data were retained.\n'
   printf 'No service was stopped or restarted. Review active sessions before removing service files.\n'
 }

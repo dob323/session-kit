@@ -1,0 +1,2161 @@
+#!/usr/bin/env python3
+"""Build, verify, activate, and roll back immutable session-kit releases.
+
+This tool never invokes shpool or a service manager. Activation transactionally
+switches the release pointer, integration marker, and receipt. Initial launcher
+bootstrap is a separate, explicit operation.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import contextlib
+import datetime as dt
+import fcntl
+import hashlib
+import io
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import uuid
+
+SCHEMA_VERSION = 1
+CURRENT_RELEASE_SCHEMA_VERSION = 3
+HELPERS = ("sp", "shpool_login", "shpool_status", "shpool_reaper", "codex_resume_here")
+LEGACY_REQUIRED_RELEASE_PAYLOAD = (
+    "bin/session_kit_common",
+    "lib/session_inventory.py",
+    "bashrc/shpool.bashrc",
+    "config/projects.example.tsv",
+    "config/session-inventory.example.json",
+    "deploy/session-kit-launcher",
+)
+REQUIRED_RELEASE_PAYLOAD_BY_SCHEMA = {
+    1: LEGACY_REQUIRED_RELEASE_PAYLOAD,
+    2: (
+        *LEGACY_REQUIRED_RELEASE_PAYLOAD,
+        "lib/sessionkit_inventory/__init__.py",
+        "lib/sessionkit_inventory/common.py",
+    ),
+    3: (
+        *LEGACY_REQUIRED_RELEASE_PAYLOAD,
+        "lib/sessionkit_inventory/__init__.py",
+        "lib/sessionkit_inventory/common.py",
+        "lib/sessionkit_inventory/lifecycle.py",
+        "lib/sessionkit_inventory/providers.py",
+        "lib/sessionkit_inventory/state_io.py",
+    ),
+}
+REQUIRED_BACKUP_PAYLOAD = {
+    "bundle.sha256",
+    "canonical-head.bundle",
+    "canonical-state.txt",
+    "current-identities.json",
+    "installed-files.tar",
+    "shpool-list.json",
+    "source-files.after.sha256",
+    "source-files.before.sha256",
+    "source-files.stat",
+}
+INSTALLED_TARGET_SUFFIXES = {
+    ".local/bin/shpool_login",
+    ".local/bin/shpool_reaper",
+    ".local/bin/shpool_status",
+    ".local/bin/sp",
+    ".local/bin/codex_resume_here",
+    ".bashrc",
+    ".config/shpool/config.toml",
+    ".config/systemd/user/shpool.service",
+    ".config/systemd/user/shpool.socket",
+    ".config/systemd/user/shpool-reaper.service",
+    ".config/systemd/user/shpool-reaper.timer",
+}
+SHA_RE = re.compile(r"^[0-9a-f]{40,64}$")
+SUM_RE = re.compile(r"^([0-9a-f]{64})  (.+)$")
+SHPOOL_ID_RE = re.compile(
+    r"^(?:main(?:[1-9][0-9]*)?|s[0-9]{8}-[0-9]{6}-[1-9][0-9]*(?:-[1-9][0-9]*)?)$"
+)
+LAUNCH_RECORD_MAX_BYTES = 8192
+
+
+class ReleaseError(RuntimeError):
+    pass
+
+
+def json_out(payload: dict) -> None:
+    print(json.dumps(payload, sort_keys=True, indent=2))
+
+
+def run(argv: list[str], *, cwd: Path | None = None, capture: bool = True) -> str:
+    proc = subprocess.run(
+        argv,
+        cwd=cwd,
+        check=False,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if proc.returncode:
+        detail = proc.stderr.strip() or proc.stdout.strip()
+        raise ReleaseError(f"command failed ({proc.returncode}): {' '.join(argv)}: {detail}")
+    return proc.stdout.strip() if capture else ""
+
+
+def resolve_commit(repo: Path, requested: str) -> str:
+    if not repo.is_dir():
+        raise ReleaseError(f"repository does not exist: {repo}")
+    if not SHA_RE.fullmatch(requested):
+        raise ReleaseError("--sha must be a full lowercase commit ID")
+    commit = run(["git", "rev-parse", "--verify", f"{requested}^{{commit}}"], cwd=repo)
+    if not SHA_RE.fullmatch(commit):
+        raise ReleaseError(f"git returned an invalid commit id: {commit!r}")
+    return commit
+
+
+def safe_relative(raw: str) -> Path:
+    pure = PurePosixPath(raw)
+    if pure.is_absolute() or not pure.parts or any(p in ("", ".", "..") for p in pure.parts):
+        raise ReleaseError(f"unsafe manifest/archive path: {raw!r}")
+    return Path(*pure.parts)
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def atomic_json(path: Path, payload: dict, mode: int = 0o600) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        with tmp.open("x", encoding="utf-8") as handle:
+            json.dump(payload, handle, sort_keys=True, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+        fsync_dir(path.parent)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            tmp.unlink()
+
+
+def fsync_dir(path: Path) -> None:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    fd = os.open(path, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def atomic_bytes(path: Path, content: bytes, mode: int = 0o600) -> None:
+    """Write bytes durably before atomically publishing one regular file."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        with tmp.open("xb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+        fsync_dir(path.parent)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            tmp.unlink()
+
+
+def capture_entry(path: Path) -> dict:
+    """Capture one absent, regular, or symlink entry for exact rollback."""
+    if path.is_symlink():
+        metadata = path.lstat()
+        return {
+            "kind": "symlink",
+            "target": os.readlink(path),
+            "uid": metadata.st_uid,
+            "gid": metadata.st_gid,
+            "atime_ns": metadata.st_atime_ns,
+            "mtime_ns": metadata.st_mtime_ns,
+        }
+    if not path.exists():
+        return {"kind": "absent"}
+    if not path.is_file():
+        raise ReleaseError(f"transaction target is not a regular file or symlink: {path}")
+    metadata = path.stat()
+    return {
+        "kind": "file",
+        "content": path.read_bytes(),
+        "mode": stat.S_IMODE(metadata.st_mode),
+        "uid": metadata.st_uid,
+        "gid": metadata.st_gid,
+        "atime_ns": metadata.st_atime_ns,
+        "mtime_ns": metadata.st_mtime_ns,
+    }
+
+
+def remove_entry(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.exists():
+        raise ReleaseError(f"refusing to replace directory during rollback: {path}")
+
+
+def restore_entry(path: Path, saved: dict) -> None:
+    """Atomically restore a captured entry's type, bytes/target, and metadata."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+    kind = saved["kind"]
+    if kind == "absent":
+        remove_entry(path)
+        fsync_dir(path.parent)
+        return
+    temporary = path.parent / f".{path.name}.restore.{os.getpid()}.{uuid.uuid4().hex}"
+    try:
+        if kind == "symlink":
+            os.symlink(saved["target"], temporary)
+            with contextlib.suppress(PermissionError):
+                os.lchown(temporary, saved["uid"], saved["gid"])
+            with contextlib.suppress(NotImplementedError, PermissionError):
+                os.utime(
+                    temporary,
+                    ns=(saved["atime_ns"], saved["mtime_ns"]),
+                    follow_symlinks=False,
+                )
+        elif kind == "file":
+            with temporary.open("xb") as handle:
+                handle.write(saved["content"])
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temporary, saved["mode"])
+            with contextlib.suppress(PermissionError):
+                os.chown(temporary, saved["uid"], saved["gid"])
+            os.utime(temporary, ns=(saved["atime_ns"], saved["mtime_ns"]))
+        else:
+            raise ReleaseError(f"unsupported rollback entry kind: {kind}")
+        os.replace(temporary, path)
+        fsync_dir(path.parent)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            temporary.unlink()
+
+
+def restore_entries(entries: list[tuple[Path, dict]]) -> None:
+    errors: list[str] = []
+    for path, saved in reversed(entries):
+        try:
+            restore_entry(path, saved)
+        except (OSError, ReleaseError) as exc:
+            errors.append(f"{path}: {exc}")
+    if errors:
+        raise ReleaseError("transaction rollback failed: " + "; ".join(errors))
+
+
+def encode_saved_entry(saved: dict) -> dict:
+    encoded = dict(saved)
+    content = encoded.get("content")
+    if isinstance(content, bytes):
+        encoded["content_base64"] = base64.b64encode(content).decode("ascii")
+        del encoded["content"]
+    return encoded
+
+
+def decode_saved_entry(encoded: object) -> dict:
+    if not isinstance(encoded, dict):
+        raise ReleaseError("bootstrap transaction has an invalid saved entry")
+    kind = encoded.get("kind")
+    expected_keys = {
+        "absent": {"kind"},
+        "file": {
+            "kind",
+            "content_base64",
+            "mode",
+            "uid",
+            "gid",
+            "atime_ns",
+            "mtime_ns",
+        },
+        "symlink": {
+            "kind",
+            "target",
+            "uid",
+            "gid",
+            "atime_ns",
+            "mtime_ns",
+        },
+    }
+    if kind not in expected_keys or set(encoded) != expected_keys[kind]:
+        raise ReleaseError("bootstrap transaction has an invalid saved entry")
+    for name in ("uid", "gid", "atime_ns", "mtime_ns"):
+        if kind != "absent" and (
+            not isinstance(encoded.get(name), int) or encoded[name] < 0
+        ):
+            raise ReleaseError("bootstrap transaction has invalid saved metadata")
+    if kind == "file" and (
+        not isinstance(encoded.get("mode"), int)
+        or encoded["mode"] < 0
+        or encoded["mode"] > 0o7777
+    ):
+        raise ReleaseError("bootstrap transaction has invalid saved mode")
+    if kind == "symlink" and not isinstance(encoded.get("target"), str):
+        raise ReleaseError("bootstrap transaction has invalid saved symlink")
+    saved = dict(encoded)
+    if saved["kind"] == "file":
+        raw = saved.pop("content_base64", None)
+        if not isinstance(raw, str):
+            raise ReleaseError("bootstrap transaction file entry has no content")
+        try:
+            saved["content"] = base64.b64decode(raw, validate=True)
+        except ValueError as exc:
+            raise ReleaseError("bootstrap transaction has invalid base64 content") from exc
+    return saved
+
+
+def entry_matches_saved(path: Path, saved: dict) -> bool:
+    """Compare rollback-relevant bytes, type, ownership, and mode."""
+    kind = saved["kind"]
+    try:
+        if kind == "absent":
+            return not path.exists() and not path.is_symlink()
+        if kind == "symlink":
+            metadata = path.lstat()
+            return (
+                path.is_symlink()
+                and os.readlink(path) == saved["target"]
+                and metadata.st_uid == saved["uid"]
+                and metadata.st_gid == saved["gid"]
+            )
+        if not path.is_file() or path.is_symlink():
+            return False
+        metadata = path.stat()
+        return (
+            path.read_bytes() == saved["content"]
+            and stat.S_IMODE(metadata.st_mode) == saved["mode"]
+            and metadata.st_uid == saved["uid"]
+            and metadata.st_gid == saved["gid"]
+        )
+    except OSError:
+        return False
+
+
+def validate_journal_file(path: Path, expected_uid: int, kind: str) -> dict:
+    if not path.is_file() or path.is_symlink():
+        raise ReleaseError(f"unsafe {kind} transaction journal: {path}")
+    metadata = path.stat()
+    if stat.S_IMODE(metadata.st_mode) != 0o600 or metadata.st_uid != expected_uid:
+        raise ReleaseError(
+            f"unsafe {kind} transaction journal mode or owner: {path}"
+        )
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ReleaseError(f"invalid {kind} transaction journal: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ReleaseError(f"invalid {kind} transaction journal schema")
+    return payload
+
+
+def decode_journal_entries(
+    payload: dict, expected_paths: list[Path], kind: str
+) -> list[tuple[Path, dict]]:
+    encoded_entries = payload.get("entries")
+    if not isinstance(encoded_entries, list) or len(encoded_entries) != len(
+        expected_paths
+    ):
+        raise ReleaseError(f"invalid {kind} transaction journal entries")
+    entries: list[tuple[Path, dict]] = []
+    for encoded, expected_path in zip(encoded_entries, expected_paths, strict=True):
+        if (
+            not isinstance(encoded, dict)
+            or set(encoded) != {"path", "saved"}
+            or encoded.get("path") != str(expected_path)
+        ):
+            raise ReleaseError(
+                f"{kind} transaction targets do not match this invocation"
+            )
+        entries.append((expected_path, decode_saved_entry(encoded["saved"])))
+    return entries
+
+
+def bootstrap_transaction_paths(args: argparse.Namespace) -> list[Path]:
+    return [
+        args.root / "current",
+        args.root / "launcher",
+        *(args.bin_dir / helper for helper in HELPERS),
+        args.state_dir / "last-activation.json",
+    ]
+
+
+def bootstrap_journal_path(state_dir: Path) -> Path:
+    return state_dir / "bootstrap-transaction.json"
+
+
+def activation_journal_path(state_dir: Path) -> Path:
+    return state_dir / "activation-transaction.json"
+
+
+def ensure_no_pending_bootstrap(state_dir: Path) -> None:
+    journal = bootstrap_journal_path(state_dir)
+    if journal.exists() or journal.is_symlink():
+        raise ReleaseError(
+            f"pending bootstrap transaction must be recovered by bootstrap first: {journal}"
+        )
+
+
+def ensure_no_pending_activation(state_dir: Path) -> None:
+    journal = activation_journal_path(state_dir)
+    if journal.exists() or journal.is_symlink():
+        raise ReleaseError(
+            f"pending activation transaction must be recovered by activate or rollback first: {journal}"
+        )
+
+
+def write_bootstrap_journal(path: Path, payload: dict) -> None:
+    atomic_json(path, payload, mode=0o600)
+
+
+def clear_bootstrap_journal(path: Path) -> None:
+    with contextlib.suppress(FileNotFoundError):
+        path.unlink()
+        fsync_dir(path.parent)
+
+
+def write_activation_journal(path: Path, payload: dict) -> None:
+    atomic_json(path, payload, mode=0o600)
+
+
+def clear_activation_journal(path: Path) -> None:
+    with contextlib.suppress(FileNotFoundError):
+        path.unlink()
+        fsync_dir(path.parent)
+
+
+def bootstrap_checkpoint(label: str) -> None:
+    """Failure-injection seam; production execution is intentionally a no-op."""
+    del label
+
+
+def recover_bootstrap_transaction(args: argparse.Namespace) -> str | None:
+    """Finish a committed bootstrap or restore every entry from an incomplete one."""
+    journal_path = bootstrap_journal_path(args.state_dir)
+    if not journal_path.exists() and not journal_path.is_symlink():
+        return None
+    payload = validate_journal_file(
+        journal_path, args.home.stat().st_uid, "bootstrap"
+    )
+    expected_steps = [
+        "current",
+        "launcher",
+        *(f"helper:{helper}" for helper in HELPERS),
+        "receipt",
+    ]
+    completed_steps = payload.get("completed_steps")
+    postimage = payload.get("postimage")
+    if (
+        set(payload)
+        != {
+            "schema_version",
+            "action",
+            "transaction_id",
+            "commit",
+            "phase",
+            "completed_steps",
+            "entries",
+            "postimage",
+        }
+        or payload.get("schema_version") != SCHEMA_VERSION
+        or payload.get("action") != "bootstrap"
+        or not re.fullmatch(r"[0-9a-f]{32}", str(payload.get("transaction_id", "")))
+        or not SHA_RE.fullmatch(str(payload.get("commit", "")))
+        or payload.get("phase") not in {"prepared", "committed"}
+        or not isinstance(completed_steps, list)
+        or completed_steps != expected_steps[: len(completed_steps)]
+        or (payload.get("phase") == "committed" and completed_steps != expected_steps)
+        or not isinstance(postimage, dict)
+        or set(postimage) != {
+            "launcher_content_base64",
+            "helper_target",
+            "receipt",
+        }
+        or not isinstance(postimage.get("launcher_content_base64"), str)
+        or not isinstance(postimage.get("helper_target"), str)
+        or not isinstance(postimage.get("receipt"), dict)
+    ):
+        raise ReleaseError("invalid bootstrap transaction journal schema")
+    entries = decode_journal_entries(
+        payload, bootstrap_transaction_paths(args), "bootstrap"
+    )
+    try:
+        expected_launcher = base64.b64decode(
+            postimage["launcher_content_base64"], validate=True
+        )
+    except ValueError as exc:
+        raise ReleaseError("invalid bootstrap transaction launcher postimage") from exc
+    expected_helper_target = postimage["helper_target"]
+    expected_receipt = postimage["receipt"]
+    if (
+        expected_helper_target
+        != os.path.relpath(args.root / "launcher", args.bin_dir)
+        or set(expected_receipt)
+        != {
+            "schema_version",
+            "action",
+            "activated_commit",
+            "previous_commit",
+            "backup_bundle",
+            "activated_at",
+        }
+        or expected_receipt.get("schema_version") != SCHEMA_VERSION
+        or expected_receipt.get("action") != "bootstrap"
+        or expected_receipt.get("activated_commit") != payload.get("commit")
+        or expected_receipt.get("previous_commit") is not None
+        or not isinstance(expected_receipt.get("backup_bundle"), str)
+        or not isinstance(expected_receipt.get("activated_at"), str)
+    ):
+        raise ReleaseError("invalid bootstrap transaction postimage")
+    if payload.get("phase") == "committed":
+        launcher = args.root / "launcher"
+        receipt_path = args.state_dir / "last-activation.json"
+        expected_uid = args.home.stat().st_uid
+        try:
+            active = release_commit_from_current(args.root)
+            validate_bootstrap(args.root, args.bin_dir)
+            launcher_metadata = launcher.stat()
+            launcher_ok = (
+                launcher.is_file()
+                and not launcher.is_symlink()
+                and launcher.read_bytes() == expected_launcher
+                and stat.S_IMODE(launcher_metadata.st_mode) == 0o555
+                and launcher_metadata.st_uid == expected_uid
+            )
+            helpers_ok = all(
+                (args.bin_dir / helper).is_symlink()
+                and os.readlink(args.bin_dir / helper) == expected_helper_target
+                and (args.bin_dir / helper).lstat().st_uid == expected_uid
+                for helper in HELPERS
+            )
+            receipt_metadata = receipt_path.stat()
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            receipt_ok = (
+                receipt_path.is_file()
+                and not receipt_path.is_symlink()
+                and stat.S_IMODE(receipt_metadata.st_mode) == 0o600
+                and receipt_metadata.st_uid == expected_uid
+            )
+        except (OSError, ValueError, ReleaseError):
+            active = None
+            launcher_ok = False
+            helpers_ok = False
+            receipt = None
+            receipt_ok = False
+        if (
+            active == payload.get("commit")
+            and launcher_ok
+            and helpers_ok
+            and receipt_ok
+            and receipt == expected_receipt
+        ):
+            clear_bootstrap_journal(journal_path)
+            return "finished-committed"
+        raise ReleaseError(
+            "committed bootstrap poststate is inconsistent; journal retained"
+        )
+    if not incomplete_bootstrap_state_is_expected(
+        args,
+        payload,
+        entries,
+        expected_launcher,
+        expected_helper_target,
+        expected_receipt,
+    ):
+        raise ReleaseError(
+            "incomplete bootstrap state diverged from its journal; journal retained"
+        )
+    try:
+        restore_entries(entries)
+    except BaseException:
+        # Keep the fsynced journal for the next recovery attempt.
+        raise
+    clear_bootstrap_journal(journal_path)
+    return "restored-incomplete"
+
+
+def incomplete_bootstrap_state_is_expected(
+    args: argparse.Namespace,
+    payload: dict,
+    entries: list[tuple[Path, dict]],
+    expected_launcher: bytes,
+    expected_helper_target: str,
+    expected_receipt: dict,
+) -> bool:
+    """Accept only the recorded prefix or one atomically completed next step."""
+    paths = bootstrap_transaction_paths(args)
+    saved = {path: entry for path, entry in entries}
+    expected_uid = args.home.stat().st_uid
+
+    def target_current() -> bool:
+        try:
+            return release_commit_from_current(args.root) == payload["commit"]
+        except ReleaseError:
+            return False
+
+    def target_launcher() -> bool:
+        launcher = args.root / "launcher"
+        try:
+            metadata = launcher.stat()
+            return (
+                launcher.is_file()
+                and not launcher.is_symlink()
+                and launcher.read_bytes() == expected_launcher
+                and stat.S_IMODE(metadata.st_mode) == 0o555
+                and metadata.st_uid == expected_uid
+            )
+        except OSError:
+            return False
+
+    def target_helper(helper: str) -> bool:
+        link = args.bin_dir / helper
+        try:
+            metadata = link.lstat()
+            return (
+                link.is_symlink()
+                and os.readlink(link) == expected_helper_target
+                and metadata.st_uid == expected_uid
+            )
+        except OSError:
+            return False
+
+    def target_receipt() -> bool:
+        receipt = args.state_dir / "last-activation.json"
+        try:
+            metadata = receipt.stat()
+            return (
+                receipt.is_file()
+                and not receipt.is_symlink()
+                and json.loads(receipt.read_text(encoding="utf-8"))
+                == expected_receipt
+                and stat.S_IMODE(metadata.st_mode) == 0o600
+                and metadata.st_uid == expected_uid
+            )
+        except (OSError, ValueError):
+            return False
+
+    target_checks = [
+        target_current,
+        target_launcher,
+        *(lambda helper=helper: target_helper(helper) for helper in HELPERS),
+        target_receipt,
+    ]
+    completed = len(payload["completed_steps"])
+    for target_count in range(completed, min(completed + 1, len(paths)) + 1):
+        if all(
+            target_checks[index]()
+            if index < target_count
+            else entry_matches_saved(path, saved[path])
+            for index, path in enumerate(paths)
+        ):
+            return True
+    return False
+
+
+def release_files(root: Path, *, include_manifests: bool = False) -> list[Path]:
+    skip = set() if include_manifests else {"MANIFEST.sha256", "MANIFEST.modes"}
+    files: list[Path] = []
+    for path in root.rglob("*"):
+        rel = path.relative_to(root)
+        if path.is_symlink():
+            raise ReleaseError(f"release contains a symlink: {rel}")
+        if path.is_file() and rel.as_posix() not in skip:
+            files.append(rel)
+    return sorted(files, key=lambda p: p.as_posix().encode())
+
+
+def normalize_release_modes(root: Path) -> None:
+    for path in sorted(root.rglob("*"), reverse=True):
+        if path.is_symlink():
+            raise ReleaseError(f"release contains a symlink: {path.relative_to(root)}")
+        if path.is_dir():
+            os.chmod(path, 0o755)
+        elif path.is_file():
+            current = stat.S_IMODE(path.stat().st_mode)
+            os.chmod(path, 0o555 if current & 0o111 else 0o444)
+
+
+def release_durability_checkpoint(kind: str, path: Path) -> None:
+    """Failure/ordering seam; production execution is intentionally a no-op."""
+    del kind, path
+
+
+def fsync_release_tree(root: Path) -> None:
+    """Durably flush every final file and directory before publication."""
+    files = sorted(
+        (path for path in root.rglob("*") if path.is_file() and not path.is_symlink()),
+        key=lambda path: path.relative_to(root).as_posix().encode(),
+    )
+    for path in files:
+        with path.open("rb") as handle:
+            os.fsync(handle.fileno())
+        release_durability_checkpoint("file", path)
+    directories = sorted(
+        (path for path in root.rglob("*") if path.is_dir() and not path.is_symlink()),
+        key=lambda path: (
+            -len(path.relative_to(root).parts),
+            path.relative_to(root).as_posix().encode(),
+        ),
+    )
+    for path in [*directories, root]:
+        fsync_dir(path)
+        release_durability_checkpoint("directory", path)
+
+
+def write_release_manifests(root: Path) -> None:
+    files = release_files(root)
+    mode_lines = []
+    sum_lines = []
+    for rel in files:
+        path = root / rel
+        mode_lines.append(f"{stat.S_IMODE(path.stat().st_mode):04o}  {rel.as_posix()}")
+        sum_lines.append(f"{sha256_file(path)}  {rel.as_posix()}")
+    (root / "MANIFEST.modes").write_text("\n".join(mode_lines) + "\n", encoding="utf-8")
+    os.chmod(root / "MANIFEST.modes", 0o444)
+    # The checksum manifest covers the modes manifest as well as payload.
+    sum_lines.append(f"{sha256_file(root / 'MANIFEST.modes')}  MANIFEST.modes")
+    (root / "MANIFEST.sha256").write_text("\n".join(sum_lines) + "\n", encoding="utf-8")
+    os.chmod(root / "MANIFEST.sha256", 0o444)
+    for path in sorted(root.rglob("*"), reverse=True):
+        if path.is_dir():
+            os.chmod(path, 0o555)
+    os.chmod(root, 0o555)
+
+
+def remove_failed_release(root: Path) -> None:
+    """Remove only a newly built release after its verification failed."""
+    if not root.exists():
+        return
+    for path in sorted(root.rglob("*"), reverse=True):
+        if path.is_dir() and not path.is_symlink():
+            with contextlib.suppress(OSError):
+                os.chmod(path, 0o755)
+    with contextlib.suppress(OSError):
+        os.chmod(root, 0o755)
+    shutil.rmtree(root, ignore_errors=True)
+
+
+def parse_checksum_manifest(path: Path) -> list[tuple[str, Path]]:
+    if not path.is_file():
+        raise ReleaseError(f"missing checksum manifest: {path}")
+    entries: list[tuple[str, Path]] = []
+    seen: set[Path] = set()
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        match = SUM_RE.fullmatch(line)
+        if not match:
+            raise ReleaseError(f"malformed checksum line {number}: {line!r}")
+        rel = safe_relative(match.group(2))
+        if rel in seen:
+            raise ReleaseError(f"duplicate checksum entry: {rel}")
+        seen.add(rel)
+        entries.append((match.group(1), rel))
+    if not entries:
+        raise ReleaseError("empty checksum manifest")
+    return entries
+
+
+def verify_release(root: Path, expected_commit: str | None = None) -> dict:
+    if not root.is_dir() or root.is_symlink():
+        raise ReleaseError(f"release is not a real directory: {root}")
+    release_meta_path = root / "RELEASE.json"
+    try:
+        meta = json.loads(release_meta_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ReleaseError(f"invalid release metadata: {exc}") from exc
+    commit = meta.get("commit")
+    release_schema = meta.get("schema_version")
+    if (
+        isinstance(release_schema, bool)
+        or not isinstance(release_schema, int)
+        or release_schema not in REQUIRED_RELEASE_PAYLOAD_BY_SCHEMA
+        or not isinstance(commit, str)
+    ):
+        raise ReleaseError("unsupported release metadata")
+    if not SHA_RE.fullmatch(commit):
+        raise ReleaseError("release metadata has invalid commit")
+    if expected_commit and commit != expected_commit:
+        raise ReleaseError(f"release commit {commit} does not match {expected_commit}")
+    if root.name != commit:
+        raise ReleaseError(f"release directory name must equal commit: {root.name} != {commit}")
+
+    expected = parse_checksum_manifest(root / "MANIFEST.sha256")
+    expected_paths = {rel for _, rel in expected}
+    actual_paths = set(release_files(root)) | {Path("MANIFEST.modes")}
+    if expected_paths != actual_paths:
+        missing = sorted(str(p) for p in expected_paths - actual_paths)
+        extra = sorted(str(p) for p in actual_paths - expected_paths)
+        raise ReleaseError(f"release file set mismatch: missing={missing}, extra={extra}")
+    for digest, rel in expected:
+        actual = sha256_file(root / rel)
+        if actual != digest:
+            raise ReleaseError(f"checksum mismatch: {rel}")
+
+    modes_path = root / "MANIFEST.modes"
+    mode_entries: dict[Path, int] = {}
+    for number, line in enumerate(modes_path.read_text(encoding="utf-8").splitlines(), 1):
+        try:
+            mode_text, raw = line.split("  ", 1)
+            rel = safe_relative(raw)
+            mode = int(mode_text, 8)
+        except (ValueError, ReleaseError) as exc:
+            raise ReleaseError(f"malformed mode line {number}: {line!r}") from exc
+        mode_entries[rel] = mode
+    payload_paths = actual_paths - {Path("MANIFEST.modes")}
+    if set(mode_entries) != payload_paths:
+        raise ReleaseError("mode manifest file set mismatch")
+    for rel, expected_mode in mode_entries.items():
+        actual_mode = stat.S_IMODE((root / rel).stat().st_mode)
+        if actual_mode != expected_mode:
+            raise ReleaseError(f"mode mismatch: {rel}: {actual_mode:04o} != {expected_mode:04o}")
+        if actual_mode & 0o222:
+            raise ReleaseError(f"writable immutable release file: {rel}")
+    for path in root.rglob("*"):
+        if path.is_dir() and stat.S_IMODE(path.stat().st_mode) & 0o222:
+            raise ReleaseError(f"writable immutable release directory: {path.relative_to(root)}")
+    for helper in HELPERS:
+        candidate = root / "bin" / helper
+        if not candidate.is_file() or candidate.is_symlink():
+            raise ReleaseError(f"release is missing required helper: {helper}")
+        if not stat.S_IMODE(candidate.stat().st_mode) & 0o111:
+            raise ReleaseError(f"release helper is not executable: {helper}")
+    for relative in REQUIRED_RELEASE_PAYLOAD_BY_SCHEMA[release_schema]:
+        candidate = root / relative
+        if not candidate.is_file() or candidate.is_symlink():
+            raise ReleaseError(f"release is missing required payload: {relative}")
+    return meta
+
+
+def extract_git_archive(repo: Path, commit: str, destination: Path) -> None:
+    proc = subprocess.run(
+        ["git", "archive", "--format=tar", commit],
+        cwd=repo,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if proc.returncode:
+        raise ReleaseError(
+            f"git archive failed ({proc.returncode}): {proc.stderr.decode(errors='replace').strip()}"
+        )
+    with tarfile.open(fileobj=io.BytesIO(proc.stdout), mode="r:") as archive:
+        for member in archive.getmembers():
+            rel = safe_relative(member.name)
+            if member.issym() or member.islnk():
+                raise ReleaseError(f"committed release contains a link: {rel}")
+            if not (member.isdir() or member.isfile()):
+                raise ReleaseError(f"unsupported archive member: {rel}")
+            target = destination / rel
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            source = archive.extractfile(member)
+            if source is None:
+                raise ReleaseError(f"cannot extract archive member: {rel}")
+            with target.open("xb") as output:
+                shutil.copyfileobj(source, output)
+            os.chmod(target, member.mode & 0o777)
+
+
+def build_release(repo: Path, requested: str, release_root: Path, dry_run: bool) -> dict:
+    commit = resolve_commit(repo, requested)
+    destination = release_root / commit
+    plan = {
+        "action": "build",
+        "commit": commit,
+        "destination": str(destination),
+        "dry_run": dry_run,
+    }
+    if dry_run:
+        return plan
+    release_root.mkdir(parents=True, exist_ok=True, mode=0o755)
+    if destination.exists():
+        verify_release(destination, commit)
+        plan["result"] = "already-present-and-verified"
+        return plan
+    temp = Path(tempfile.mkdtemp(prefix=f".{commit}.", dir=release_root))
+    published = False
+    try:
+        extract_git_archive(repo, commit, temp)
+        committed_at = run(["git", "show", "-s", "--format=%cI", commit], cwd=repo)
+        tree = run(["git", "show", "-s", "--format=%T", commit], cwd=repo)
+        (temp / "RELEASE.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": CURRENT_RELEASE_SCHEMA_VERSION,
+                    "commit": commit,
+                    "tree": tree,
+                    "committed_at": committed_at,
+                },
+                sort_keys=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        normalize_release_modes(temp)
+        # Re-open the root to add manifests, then freeze it again.
+        os.chmod(temp, 0o755)
+        write_release_manifests(temp)
+        fsync_release_tree(temp)
+        os.rename(temp, destination)
+        published = True
+        fsync_dir(release_root)
+        verify_release(destination, commit)
+    except Exception:
+        if published:
+            remove_failed_release(destination)
+        else:
+            remove_failed_release(temp)
+        raise
+    plan["result"] = "built-and-verified"
+    return plan
+
+
+def required_installed_targets(names: set[str]) -> set[str]:
+    """Return the exact HOME-neutral rollback set represented by names."""
+    prefixes: set[str] = set()
+    for name in names:
+        matches = [
+            suffix
+            for suffix in INSTALLED_TARGET_SUFFIXES
+            if name.endswith(f"/{suffix}")
+        ]
+        if len(matches) != 1:
+            raise ReleaseError("installed rollback target has an unexpected suffix")
+        suffix = matches[0]
+        prefix = name[: -(len(suffix) + 1)]
+        safe_relative(prefix)
+        prefixes.add(prefix)
+    if len(prefixes) != 1:
+        raise ReleaseError("installed rollback targets must use one exact home")
+    home_prefix = next(iter(prefixes))
+    expected = {
+        f"{home_prefix}/{suffix}" for suffix in INSTALLED_TARGET_SUFFIXES
+    }
+    if names != expected:
+        raise ReleaseError("installed rollback target set is incomplete or unexpected")
+    return expected
+
+
+def installed_source_evidence(bundle: Path) -> tuple[dict[str, str], dict[str, dict]]:
+    checksum_entries = parse_checksum_manifest(bundle / "source-files.before.sha256")
+    checksums = {rel.as_posix(): digest for digest, rel in checksum_entries}
+    expected_targets = required_installed_targets(set(checksums))
+    metadata: dict[str, dict] = {}
+    for number, line in enumerate(
+        (bundle / "source-files.stat").read_text(encoding="utf-8").splitlines(), 1
+    ):
+        fields = line.split("\\t")
+        if len(fields) != 7:
+            raise ReleaseError(f"malformed source-files.stat line {number}")
+        mode_text, uid_text, gid_text, size_text, inode_text, timestamp, raw_name = fields
+        rel = safe_relative(raw_name)
+        name = rel.as_posix()
+        if name in metadata:
+            raise ReleaseError(f"duplicate source-files.stat entry: {name}")
+        if not re.fullmatch(r"[0-7]{3,4}", mode_text):
+            raise ReleaseError(f"invalid source-files.stat mode on line {number}")
+        try:
+            values = {
+                "mode": int(mode_text, 8),
+                "uid": int(uid_text),
+                "gid": int(gid_text),
+                "size": int(size_text),
+                "inode": int(inode_text),
+            }
+        except ValueError as exc:
+            raise ReleaseError(
+                f"invalid numeric source-files.stat field on line {number}"
+            ) from exc
+        if (
+            values["mode"] > 0o7777
+            or values["uid"] < 0
+            or values["gid"] < 0
+            or values["size"] < 0
+            or values["inode"] < 0
+        ):
+            raise ReleaseError(
+                f"out-of-range source-files.stat field on line {number}"
+            )
+        if not timestamp:
+            raise ReleaseError(f"missing source-files.stat timestamp on line {number}")
+        metadata[name] = values
+    if set(metadata) != expected_targets:
+        raise ReleaseError("source-files.stat has the wrong rollback target set")
+    return checksums, metadata
+
+
+def rehearse_installed_restore(
+    archive_path: Path,
+    expected_digests: dict[str, str],
+    expected_metadata: dict[str, dict],
+) -> dict[str, str]:
+    """Safely reconstruct and byte-verify the complete installed rollback tree."""
+    expected_names = required_installed_targets(set(expected_digests))
+    if set(expected_metadata) != expected_names:
+        raise ReleaseError("rollback metadata has the wrong target set")
+    digests: dict[str, str] = {}
+    seen: set[str] = set()
+    try:
+        with tempfile.TemporaryDirectory(prefix=".session-kit-restore-") as raw_temp:
+            destination = Path(raw_temp)
+            with tarfile.open(archive_path, mode="r:") as archive:
+                for member in archive:
+                    try:
+                        rel = safe_relative(member.name)
+                    except ReleaseError as exc:
+                        raise ReleaseError(
+                            f"backup installed-files.tar has unsafe member: {member.name!r}"
+                        ) from exc
+                    name = rel.as_posix()
+                    if name in seen:
+                        raise ReleaseError(
+                            f"backup installed-files.tar has duplicate member: {name}"
+                        )
+                    seen.add(name)
+                    if name not in expected_names:
+                        raise ReleaseError(
+                            f"backup installed-files.tar has unexpected member: {name}"
+                        )
+                    if not member.isfile() or member.issym() or member.islnk():
+                        raise ReleaseError(
+                            f"backup installed-files.tar member is not a regular file: {name}"
+                        )
+                    mode = member.mode & 0o777
+                    source_meta = expected_metadata[name]
+                    if mode != source_meta["mode"]:
+                        raise ReleaseError(
+                            "backup installed-files.tar mode mismatch: "
+                            f"{name}: {mode:04o} != {source_meta['mode']:04o}"
+                        )
+                    if (
+                        member.uid != source_meta["uid"]
+                        or member.gid != source_meta["gid"]
+                        or member.size != source_meta["size"]
+                    ):
+                        raise ReleaseError(
+                            f"backup installed-files.tar metadata mismatch: {name}"
+                        )
+                    source = archive.extractfile(member)
+                    if source is None:
+                        raise ReleaseError(
+                            f"backup installed-files.tar cannot read member: {name}"
+                        )
+                    target = destination / rel
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    digest = hashlib.sha256()
+                    with target.open("xb") as output:
+                        for block in iter(lambda: source.read(1024 * 1024), b""):
+                            digest.update(block)
+                            output.write(block)
+                        output.flush()
+                        os.fsync(output.fileno())
+                    os.chmod(target, mode)
+                    with contextlib.suppress(PermissionError):
+                        os.chown(target, member.uid, member.gid)
+                    digests[name] = digest.hexdigest()
+            missing = sorted(expected_names - seen)
+            if missing:
+                raise ReleaseError(
+                    "backup is missing installed rollback targets: " + ", ".join(missing)
+                )
+            restored = {
+                path.relative_to(destination).as_posix()
+                for path in destination.rglob("*")
+                if path.is_file() and not path.is_symlink()
+            }
+            if restored != expected_names:
+                raise ReleaseError("backup restore rehearsal reconstructed the wrong file set")
+            for name, expected_digest in digests.items():
+                target = destination / safe_relative(name)
+                source_meta = expected_metadata[name]
+                if (
+                    not target.is_file()
+                    or target.is_symlink()
+                    or stat.S_IMODE(target.stat().st_mode) != source_meta["mode"]
+                    or target.stat().st_uid != source_meta["uid"]
+                    or target.stat().st_gid != source_meta["gid"]
+                    or target.stat().st_size != source_meta["size"]
+                    or sha256_file(target) != expected_digest
+                    or expected_digest != expected_digests[name]
+                ):
+                    raise ReleaseError(
+                        f"backup restore rehearsal did not reproduce {name} byte-for-byte"
+                    )
+    except (OSError, tarfile.TarError) as exc:
+        raise ReleaseError(f"backup installed-files.tar is invalid: {exc}") from exc
+    return digests
+
+
+def verify_backup_bundle(bundle: Path) -> dict:
+    if not bundle.is_dir() or bundle.is_symlink():
+        raise ReleaseError(f"backup bundle is not a real directory: {bundle}")
+    marker_path = bundle / "BACKUP_COMPLETE.json"
+    try:
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ReleaseError(f"invalid backup completion marker: {exc}") from exc
+    required = {
+        "schema_version": SCHEMA_VERSION,
+        "complete": True,
+        "source": "session-kit-predeploy",
+    }
+    for key, value in required.items():
+        if marker.get(key) != value:
+            raise ReleaseError(f"backup marker {key!r} must equal {value!r}")
+    manifest_name = marker.get("manifest")
+    manifest_digest = marker.get("manifest_sha256")
+    canonical_head = marker.get("canonical_head")
+    if manifest_name != "MANIFEST.sha256":
+        raise ReleaseError("backup must use MANIFEST.sha256")
+    if not isinstance(manifest_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", manifest_digest):
+        raise ReleaseError("backup marker has invalid manifest_sha256")
+    if not isinstance(canonical_head, str) or not SHA_RE.fullmatch(canonical_head):
+        raise ReleaseError("backup marker has invalid canonical_head")
+    manifest_path = bundle / manifest_name
+    if sha256_file(manifest_path) != manifest_digest:
+        raise ReleaseError("backup checksum manifest digest mismatch")
+    entries = parse_checksum_manifest(manifest_path)
+    manifest_paths = {rel.as_posix() for _, rel in entries}
+    missing_payload = sorted(REQUIRED_BACKUP_PAYLOAD - manifest_paths)
+    if missing_payload:
+        raise ReleaseError(
+            "backup is missing required rollback payload: " + ", ".join(missing_payload)
+        )
+    for digest, rel in entries:
+        candidate = bundle / rel
+        if not candidate.is_file() or candidate.is_symlink():
+            raise ReleaseError(f"backup payload missing or unsafe: {rel}")
+        if sha256_file(candidate) != digest:
+            raise ReleaseError(f"backup payload checksum mismatch: {rel}")
+    actual_payload: set[str] = set()
+    for candidate in bundle.rglob("*"):
+        if candidate.is_symlink():
+            raise ReleaseError(
+                f"backup contains a symlink: {candidate.relative_to(bundle)}"
+            )
+        if candidate.is_file():
+            relative = candidate.relative_to(bundle).as_posix()
+            if relative not in {"MANIFEST.sha256", "BACKUP_COMPLETE.json"}:
+                actual_payload.add(relative)
+    if manifest_paths != actual_payload:
+        missing = sorted(manifest_paths - actual_payload)
+        extra = sorted(actual_payload - manifest_paths)
+        raise ReleaseError(
+            f"backup manifest scope mismatch: missing={missing}, extra={extra}"
+        )
+    try:
+        with tempfile.TemporaryDirectory(prefix=".session-kit-bundle-verify-") as raw_repo:
+            verify_repo = Path(raw_repo) / "verify.git"
+            run(["git", "init", "--bare", "-q", str(verify_repo)])
+            run(
+                ["git", "bundle", "verify", str(bundle / "canonical-head.bundle")],
+                cwd=verify_repo,
+            )
+        bundle_heads = run(
+            ["git", "bundle", "list-heads", str(bundle / "canonical-head.bundle")]
+        ).splitlines()
+    except ReleaseError as exc:
+        raise ReleaseError(f"backup canonical Git bundle is invalid: {exc}") from exc
+    if not any(line.split(maxsplit=1)[0] == canonical_head for line in bundle_heads):
+        raise ReleaseError("backup canonical Git bundle does not contain canonical_head")
+    expected_digests, expected_metadata = installed_source_evidence(bundle)
+    rehearse_installed_restore(
+        bundle / "installed-files.tar", expected_digests, expected_metadata
+    )
+    return marker
+
+
+def ensure_sentinels(home: Path) -> list[str]:
+    missing = []
+    for name in (".no_shpool", ".no_shpool_reaper"):
+        path = home / name
+        if not path.is_file() or path.is_symlink():
+            missing.append(str(path))
+    return missing
+
+
+def _read_private_launch_record(path: Path, expected_uid: int) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise ReleaseError(f"unsafe retained launch record: {path}: {exc}") from exc
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != expected_uid
+            or stat.S_IMODE(before.st_mode) != 0o600
+            or before.st_nlink != 1
+            or before.st_size <= 0
+            or before.st_size > LAUNCH_RECORD_MAX_BYTES
+        ):
+            raise ReleaseError(
+                f"unsafe retained launch record type, owner, mode, link count, or size: {path}"
+            )
+        chunks: list[bytes] = []
+        remaining = before.st_size
+        while remaining:
+            block = os.read(descriptor, min(remaining, 4096))
+            if not block:
+                raise ReleaseError(
+                    f"retained launch record changed while reading: {path}"
+                )
+            chunks.append(block)
+            remaining -= len(block)
+        payload = b"".join(chunks)
+        if os.read(descriptor, 1):
+            raise ReleaseError(f"retained launch record changed while reading: {path}")
+        after = os.fstat(descriptor)
+        stable = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+        if any(getattr(before, field) != getattr(after, field) for field in stable):
+            raise ReleaseError(f"retained launch record changed while reading: {path}")
+    finally:
+        os.close(descriptor)
+    if (
+        not payload.endswith(b"\n")
+        or payload.count(b"\n") != 1
+        or b"\r" in payload
+        or b"\x1c" in payload
+    ):
+        raise ReleaseError(f"malformed retained launch record: {path}")
+    return payload
+
+
+def validate_rollback_launch_records(home: Path) -> int:
+    """Require rollback-compatible, exact legacy launch pairs only."""
+    root = home / ".local/state/shpool-start"
+    if root.is_symlink():
+        raise ReleaseError(f"unsafe retained launch directory symlink: {root}")
+    if not root.exists():
+        return 0
+    metadata = root.lstat()
+    expected_uid = home.stat().st_uid
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != expected_uid
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        raise ReleaseError(
+            f"retained launch directory must be current-owner mode-0700: {root}"
+        )
+
+    records: dict[str, dict[str, Path]] = {}
+    for path in sorted(root.iterdir(), key=lambda item: item.name):
+        if path.name == "failed":
+            failed = path.lstat()
+            if (
+                path.is_symlink()
+                or not stat.S_ISDIR(failed.st_mode)
+                or failed.st_uid != expected_uid
+                or stat.S_IMODE(failed.st_mode) != 0o700
+            ):
+                raise ReleaseError(f"unsafe retained launch quarantine: {path}")
+            continue
+        if path.is_symlink():
+            raise ReleaseError(f"unsafe retained launch record symlink: {path}")
+        name = path.name
+        kind = "expected" if name.endswith(".expected") else "start"
+        shpool_id = name.removesuffix(".expected") if kind == "expected" else name
+        if not SHPOOL_ID_RE.fullmatch(shpool_id):
+            raise ReleaseError(f"unsafe retained launch record name: {path}")
+        if not path.is_file():
+            raise ReleaseError(f"unsafe retained launch record type: {path}")
+        pair = records.setdefault(shpool_id, {})
+        if kind in pair:
+            raise ReleaseError(f"duplicate retained launch record for {shpool_id}")
+        pair[kind] = path
+
+    legacy_pairs = 0
+    for shpool_id, pair in sorted(records.items()):
+        if set(pair) != {"start", "expected"}:
+            raise ReleaseError(
+                f"mismatched retained launch pair blocks rollback: {shpool_id}"
+            )
+        start_payload = _read_private_launch_record(pair["start"], expected_uid)
+        expected_payload = _read_private_launch_record(
+            pair["expected"], expected_uid
+        )
+        start = start_payload[:-1].split(b"\t")
+        expected = expected_payload[:-1].split(b"\t")
+        if len(start) not in {3, 4} or len(expected) not in {9, 10}:
+            raise ReleaseError(
+                f"malformed retained launch pair blocks rollback: {shpool_id}"
+            )
+        if (len(start), len(expected)) not in {(3, 9), (4, 10)}:
+            raise ReleaseError(
+                f"mismatched retained launch formats block rollback: {shpool_id}"
+            )
+        if (
+            start[0] != expected[0]
+            or start[1] != expected[1]
+            or start[2] != expected[8]
+            or (len(start) == 4 and start[3] != expected[9])
+        ):
+            raise ReleaseError(
+                f"mismatched retained launch fields block rollback: {shpool_id}"
+            )
+        if len(start) == 4:
+            raise ReleaseError(
+                f"new-format retained launch pair blocks older-release rollback: {shpool_id}"
+            )
+        uuid_pattern = re.compile(
+            rb"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
+            rb"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
+        )
+        provider, cwd, exact_uuid = start
+        numeric = expected[3:8]
+        if (
+            provider not in {b"claude", b"codex", b"shell"}
+            or not cwd.startswith(b"/")
+            or any(
+                byte < 0x20 or byte == 0x7F
+                for field in start + expected
+                for byte in field
+            )
+            or not expected[2]
+            or any(re.fullmatch(rb"[1-9][0-9]*", field) is None for field in numeric)
+            or (
+                provider == b"shell"
+                and exact_uuid
+            )
+            or (
+                provider in {b"claude", b"codex"}
+                and exact_uuid
+                and uuid_pattern.fullmatch(exact_uuid) is None
+            )
+        ):
+            raise ReleaseError(
+                f"unsafe legacy retained launch fields block rollback: {shpool_id}"
+            )
+        legacy_pairs += 1
+
+    after = root.lstat()
+    stable = ("st_dev", "st_ino", "st_mode", "st_uid", "st_mtime_ns", "st_ctime_ns")
+    if any(getattr(metadata, field) != getattr(after, field) for field in stable):
+        raise ReleaseError(f"retained launch directory changed while reading: {root}")
+    return legacy_pairs
+
+
+def validate_rollback_creation_state(home: Path) -> tuple[Path, os.stat_result | None]:
+    """Read-only validation for the default session creation lock namespace."""
+    expected_uid = home.stat().st_uid
+    state_root = home / ".local/state/session-kit"
+    if state_root.is_symlink() or not state_root.is_dir():
+        raise ReleaseError(f"unsafe session-kit state directory: {state_root}")
+    root = state_root.lstat()
+    if (
+        not stat.S_ISDIR(root.st_mode)
+        or root.st_uid != expected_uid
+        or stat.S_IMODE(root.st_mode) != 0o700
+    ):
+        raise ReleaseError(
+            f"session-kit state directory must be current-owner mode-0700: {state_root}"
+        )
+    lock_path = state_root / "create.lock"
+    if lock_path.is_symlink():
+        raise ReleaseError(f"unsafe session creation lock symlink: {lock_path}")
+    if not lock_path.exists():
+        return lock_path, None
+    lock = lock_path.lstat()
+    if (
+        not stat.S_ISREG(lock.st_mode)
+        or lock.st_uid != expected_uid
+        or stat.S_IMODE(lock.st_mode) != 0o600
+        or lock.st_nlink != 1
+    ):
+        raise ReleaseError(
+            f"session creation lock must be current-owner mode-0600 single-link regular file: {lock_path}"
+        )
+    return lock_path, lock
+
+
+@contextlib.contextmanager
+def rollback_launch_creation_lock(home: Path):
+    """Serialize the final rollback gate with session creation."""
+    lock_path, _ = validate_rollback_creation_state(home)
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(lock_path, flags, 0o600)
+    try:
+        lock = os.fstat(descriptor)
+        _, published = validate_rollback_creation_state(home)
+        if (
+            not stat.S_ISREG(lock.st_mode)
+            or lock.st_uid != home.stat().st_uid
+            or stat.S_IMODE(lock.st_mode) != 0o600
+            or lock.st_nlink != 1
+            or published is None
+            or published.st_dev != lock.st_dev
+            or published.st_ino != lock.st_ino
+        ):
+            raise ReleaseError(f"unsafe session creation lock: {lock_path}")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ReleaseError(
+                f"session creation is active; rollback refused: {lock_path}"
+            ) from exc
+        yield
+    finally:
+        os.close(descriptor)
+
+
+@contextlib.contextmanager
+def deploy_lock(state_dir: Path):
+    state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(state_dir, 0o700)
+    lock_path = state_dir / "deploy.lock"
+    with lock_path.open("a+", encoding="utf-8") as handle:
+        os.chmod(lock_path, 0o600)
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ReleaseError(f"another deployment holds {lock_path}") from exc
+        yield
+
+
+def release_commit_from_current(root: Path) -> str | None:
+    current = root / "current"
+    if not current.is_symlink():
+        return None
+    try:
+        target = current.resolve(strict=True)
+        target.relative_to((root / "releases").resolve(strict=True))
+        meta = verify_release(target)
+        return meta["commit"]
+    except (OSError, ValueError, ReleaseError):
+        raise ReleaseError(f"current release link is invalid: {current}")
+
+
+def atomic_current_switch(root: Path, release: Path) -> None:
+    root.mkdir(parents=True, exist_ok=True, mode=0o755)
+    relative = os.path.relpath(release, root)
+    temp = root / f".current.{os.getpid()}.{uuid.uuid4().hex}"
+    try:
+        os.symlink(relative, temp)
+        os.replace(temp, root / "current")
+        fsync_dir(root)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            temp.unlink()
+
+
+def activation_checkpoint(label: str) -> None:
+    """Failure-injection seam; production execution is intentionally a no-op."""
+    del label
+
+
+def integration_marker_path(args: argparse.Namespace) -> Path:
+    configured = getattr(args, "integration_marker", None)
+    return configured or args.state_dir.parent / "integration-ready-v1"
+
+
+def activation_transaction_paths(args: argparse.Namespace) -> list[Path]:
+    return [
+        args.root / "current",
+        integration_marker_path(args),
+        args.state_dir / "last-activation.json",
+    ]
+
+
+def recover_activation_transaction(args: argparse.Namespace) -> str | None:
+    """Finish a committed activation or restore an incomplete one."""
+    journal_path = activation_journal_path(args.state_dir)
+    if not journal_path.exists() and not journal_path.is_symlink():
+        return None
+    payload = validate_journal_file(
+        journal_path, args.home.stat().st_uid, "activation"
+    )
+    expected_steps = ["marker-invalidated", "current", "marker", "receipt"]
+    completed_steps = payload.get("completed_steps")
+    postimage = payload.get("postimage")
+    if (
+        set(payload)
+        != {
+            "schema_version",
+            "action",
+            "transaction_id",
+            "commit",
+            "require_bootstrap",
+            "phase",
+            "completed_steps",
+            "entries",
+            "postimage",
+        }
+        or payload.get("schema_version") != SCHEMA_VERSION
+        or payload.get("action") not in {"activate", "rollback"}
+        or not re.fullmatch(r"[0-9a-f]{32}", str(payload.get("transaction_id", "")))
+        or not SHA_RE.fullmatch(str(payload.get("commit", "")))
+        or not isinstance(payload.get("require_bootstrap"), bool)
+        or payload.get("phase") not in {"prepared", "committed"}
+        or not isinstance(completed_steps, list)
+        or completed_steps != expected_steps[: len(completed_steps)]
+        or (payload.get("phase") == "committed" and completed_steps != expected_steps)
+        or not isinstance(postimage, dict)
+        or set(postimage) != {"marker_content_base64", "receipt"}
+        or not isinstance(postimage.get("marker_content_base64"), str)
+        or not isinstance(postimage.get("receipt"), dict)
+    ):
+        raise ReleaseError("invalid activation transaction journal schema")
+    entries = decode_journal_entries(
+        payload, activation_transaction_paths(args), "activation"
+    )
+    try:
+        expected_marker = base64.b64decode(
+            postimage["marker_content_base64"], validate=True
+        )
+    except ValueError as exc:
+        raise ReleaseError("invalid activation transaction marker postimage") from exc
+    expected_receipt = postimage["receipt"]
+    if (
+        expected_marker
+        != f"session-kit-integration-v1 {payload['commit']}\n".encode()
+        or set(expected_receipt)
+        != {
+            "schema_version",
+            "action",
+            "activated_commit",
+            "previous_commit",
+            "backup_bundle",
+            "activated_at",
+        }
+        or expected_receipt.get("schema_version") != SCHEMA_VERSION
+        or expected_receipt.get("action") != payload.get("action")
+        or expected_receipt.get("activated_commit") != payload.get("commit")
+        or (
+            expected_receipt.get("previous_commit") is not None
+            and not SHA_RE.fullmatch(str(expected_receipt.get("previous_commit")))
+        )
+        or not isinstance(expected_receipt.get("backup_bundle"), str)
+        or not isinstance(expected_receipt.get("activated_at"), str)
+    ):
+        raise ReleaseError("invalid activation transaction postimage")
+    if payload.get("phase") == "committed":
+        marker_path = integration_marker_path(args)
+        receipt_path = args.state_dir / "last-activation.json"
+        try:
+            active = release_commit_from_current(args.root)
+            if payload["require_bootstrap"]:
+                validate_bootstrap(args.root, args.bin_dir)
+            marker_metadata = marker_path.stat()
+            marker_ok = (
+                marker_path.is_file()
+                and not marker_path.is_symlink()
+                and marker_path.read_bytes() == expected_marker
+                and stat.S_IMODE(marker_metadata.st_mode) == 0o600
+                and marker_metadata.st_uid == args.home.stat().st_uid
+            )
+            receipt_metadata = receipt_path.stat()
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            receipt_ok = (
+                receipt_path.is_file()
+                and not receipt_path.is_symlink()
+                and stat.S_IMODE(receipt_metadata.st_mode) == 0o600
+                and receipt_metadata.st_uid == args.home.stat().st_uid
+            )
+        except (OSError, ValueError, ReleaseError):
+            active = None
+            marker_ok = False
+            receipt = None
+            receipt_ok = False
+        if (
+            active == payload.get("commit")
+            and marker_ok
+            and receipt_ok
+            and receipt == expected_receipt
+        ):
+            clear_activation_journal(journal_path)
+            return "finished-committed"
+        raise ReleaseError(
+            "committed activation poststate is inconsistent; journal retained"
+        )
+    if not incomplete_activation_state_is_expected(
+        args, payload, entries, expected_marker, expected_receipt
+    ):
+        raise ReleaseError(
+            "incomplete activation state diverged from its journal; journal retained"
+        )
+    try:
+        restore_entries(entries)
+    except BaseException:
+        # Keep the fsynced journal for the next recovery attempt.
+        raise
+    clear_activation_journal(journal_path)
+    return "restored-incomplete"
+
+
+def incomplete_activation_state_is_expected(
+    args: argparse.Namespace,
+    payload: dict,
+    entries: list[tuple[Path, dict]],
+    expected_marker: bytes,
+    expected_receipt: dict,
+) -> bool:
+    """Accept only the recorded prefix or one atomically completed next step."""
+    saved = {path: entry for path, entry in entries}
+    current = args.root / "current"
+    marker = integration_marker_path(args)
+    receipt = args.state_dir / "last-activation.json"
+
+    def target_current() -> bool:
+        try:
+            return release_commit_from_current(args.root) == payload["commit"]
+        except ReleaseError:
+            return False
+
+    def target_marker() -> bool:
+        try:
+            metadata = marker.stat()
+            return (
+                marker.is_file()
+                and not marker.is_symlink()
+                and marker.read_bytes() == expected_marker
+                and stat.S_IMODE(metadata.st_mode) == 0o600
+                and metadata.st_uid == args.home.stat().st_uid
+            )
+        except OSError:
+            return False
+
+    def target_receipt() -> bool:
+        try:
+            metadata = receipt.stat()
+            return (
+                receipt.is_file()
+                and not receipt.is_symlink()
+                and json.loads(receipt.read_text(encoding="utf-8"))
+                == expected_receipt
+                and stat.S_IMODE(metadata.st_mode) == 0o600
+                and metadata.st_uid == args.home.stat().st_uid
+            )
+        except (OSError, ValueError):
+            return False
+
+    states = [
+        (
+            entry_matches_saved(current, saved[current]),
+            entry_matches_saved(marker, saved[marker]),
+            entry_matches_saved(receipt, saved[receipt]),
+        ),
+        (
+            entry_matches_saved(current, saved[current]),
+            not marker.exists() and not marker.is_symlink(),
+            entry_matches_saved(receipt, saved[receipt]),
+        ),
+        (
+            target_current(),
+            not marker.exists() and not marker.is_symlink(),
+            entry_matches_saved(receipt, saved[receipt]),
+        ),
+        (
+            target_current(),
+            target_marker(),
+            entry_matches_saved(receipt, saved[receipt]),
+        ),
+        (target_current(), target_marker(), target_receipt()),
+    ]
+    completed = len(payload["completed_steps"])
+    return any(all(state) for state in states[completed : completed + 2])
+
+
+def validated_integration_proof(args: argparse.Namespace, commit: str) -> bytes:
+    proof = getattr(args, "integration_proof", None)
+    if proof is None:
+        raise ReleaseError(
+            "activation requires --integration-proof from the explicit host migration phase"
+        )
+    if not proof.is_file() or proof.is_symlink():
+        raise ReleaseError(f"integration proof is not a regular file: {proof}")
+    metadata = proof.stat()
+    if stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise ReleaseError(f"integration proof must have mode 0600: {proof}")
+    expected_uid = args.home.stat().st_uid
+    if metadata.st_uid != expected_uid:
+        raise ReleaseError(f"integration proof must be owned by uid {expected_uid}: {proof}")
+    expected = f"session-kit-integration-v1 {commit}\n".encode()
+    content = proof.read_bytes()
+    if content != expected:
+        raise ReleaseError(f"integration proof does not match target release {commit}")
+    return content
+
+
+def validate_bootstrap(root: Path, bin_dir: Path) -> None:
+    launcher = root / "launcher"
+    if not launcher.is_file() or launcher.is_symlink() or not os.access(launcher, os.X_OK):
+        raise ReleaseError(f"stable launcher is not bootstrapped: {launcher}")
+    for helper in HELPERS:
+        link = bin_dir / helper
+        if not link.is_symlink():
+            raise ReleaseError(f"helper is not launcher-linked: {link}")
+        resolved = (link.parent / os.readlink(link)).resolve(strict=False)
+        if resolved != launcher.resolve():
+            raise ReleaseError(f"helper points outside launcher: {link}")
+
+
+def activation_preconditions(
+    *,
+    home: Path,
+    backup: Path,
+    release: Path,
+    root: Path,
+    bin_dir: Path,
+    require_bootstrap: bool,
+    dry_run: bool,
+) -> tuple[dict, list[str]]:
+    if not SHA_RE.fullmatch(release.name):
+        raise ReleaseError("--commit must be a full lowercase commit ID")
+    meta = verify_release(release)
+    marker = verify_backup_bundle(backup)
+    missing = ensure_sentinels(home)
+    if require_bootstrap:
+        validate_bootstrap(root, bin_dir)
+    if missing and not dry_run:
+        raise ReleaseError("missing safety sentinels: " + ", ".join(missing))
+    return {"release": meta, "backup": marker}, missing
+
+
+def activate(args: argparse.Namespace, *, action: str = "activate") -> dict:
+    if action not in {"activate", "rollback"}:
+        raise ReleaseError(f"unsupported activation action: {action}")
+    if not SHA_RE.fullmatch(args.commit):
+        raise ReleaseError("--commit must be a full lowercase commit ID")
+    home = args.home
+    root = args.root
+    release = root / "releases" / args.commit
+    if args.dry_run:
+        ensure_no_pending_bootstrap(args.state_dir)
+        ensure_no_pending_activation(args.state_dir)
+        evidence, missing = activation_preconditions(
+            home=home,
+            backup=args.backup_bundle,
+            release=release,
+            root=root,
+            bin_dir=args.bin_dir,
+            require_bootstrap=not args.allow_unbootstrapped,
+            dry_run=True,
+        )
+        validated_integration_proof(args, evidence["release"]["commit"])
+        if action == "rollback":
+            validate_rollback_creation_state(home)
+            validate_rollback_launch_records(home)
+        previous = release_commit_from_current(root)
+        plan = {
+            "action": action,
+            "activate_commit": evidence["release"]["commit"],
+            "previous_commit": previous,
+            "backup_bundle": str(args.backup_bundle),
+            "current_link": str(root / "current"),
+            "integration_marker": str(integration_marker_path(args)),
+            "integration_proof": str(args.integration_proof),
+            "missing_sentinels": missing,
+            "dry_run": True,
+            "service_restart": False,
+        }
+        return plan
+    with deploy_lock(args.state_dir), contextlib.ExitStack() as rollback_stack:
+        ensure_no_pending_bootstrap(args.state_dir)
+        if action == "rollback":
+            # Inspect before creating/acquiring the serialization lock so an
+            # unsafe rollback refusal remains read-only.
+            validate_rollback_creation_state(home)
+            validate_rollback_launch_records(home)
+            rollback_stack.enter_context(rollback_launch_creation_lock(home))
+            # Recheck under the same create lock used by sp launch writers and
+            # hold it until the pointer transaction is complete.
+            validate_rollback_launch_records(home)
+        recovered = recover_activation_transaction(args)
+        # Revalidate under the lock to close the check/switch race.
+        evidence, missing = activation_preconditions(
+            home=home,
+            backup=args.backup_bundle,
+            release=release,
+            root=root,
+            bin_dir=args.bin_dir,
+            require_bootstrap=not args.allow_unbootstrapped,
+            dry_run=False,
+        )
+        marker_content = validated_integration_proof(
+            args, evidence["release"]["commit"]
+        )
+        if action == "rollback":
+            validate_rollback_launch_records(home)
+        marker_path = integration_marker_path(args)
+        previous = release_commit_from_current(root)
+        receipt = {
+            "schema_version": SCHEMA_VERSION,
+            "action": action,
+            "activated_commit": evidence["release"]["commit"],
+            "previous_commit": previous,
+            "backup_bundle": str(args.backup_bundle.resolve()),
+            "activated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        }
+        transaction_paths = activation_transaction_paths(args)
+        transaction_entries = [
+            (path, capture_entry(path)) for path in transaction_paths
+        ]
+        journal_path = activation_journal_path(args.state_dir)
+        journal = {
+            "schema_version": SCHEMA_VERSION,
+            "action": action,
+            "transaction_id": uuid.uuid4().hex,
+            "commit": evidence["release"]["commit"],
+            "require_bootstrap": not args.allow_unbootstrapped,
+            "phase": "prepared",
+            "completed_steps": [],
+            "entries": [
+                {"path": str(path), "saved": encode_saved_entry(saved)}
+                for path, saved in transaction_entries
+            ],
+            "postimage": {
+                "marker_content_base64": base64.b64encode(marker_content).decode(
+                    "ascii"
+                ),
+                "receipt": receipt,
+            },
+        }
+        write_activation_journal(journal_path, journal)
+        committed = False
+        try:
+            remove_entry(marker_path)
+            fsync_dir(marker_path.parent)
+            journal["completed_steps"].append("marker-invalidated")
+            write_activation_journal(journal_path, journal)
+            activation_checkpoint("marker-invalidated")
+            atomic_current_switch(root, release)
+            journal["completed_steps"].append("current")
+            write_activation_journal(journal_path, journal)
+            activation_checkpoint("current")
+            # Re-read the proof after the switch. A concurrent proof edit cannot
+            # silently authorize a different target.
+            marker_content = validated_integration_proof(
+                args, evidence["release"]["commit"]
+            )
+            atomic_bytes(marker_path, marker_content, mode=0o600)
+            journal["completed_steps"].append("marker")
+            write_activation_journal(journal_path, journal)
+            activation_checkpoint("marker")
+            atomic_json(args.state_dir / "last-activation.json", receipt)
+            journal["completed_steps"].append("receipt")
+            write_activation_journal(journal_path, journal)
+            activation_checkpoint("receipt")
+            journal["phase"] = "committed"
+            write_activation_journal(journal_path, journal)
+            committed = True
+            activation_checkpoint("committed")
+            clear_activation_journal(journal_path)
+        except BaseException as original:
+            if committed:
+                # The durable committed journal is sufficient for recovery.
+                raise
+            try:
+                restore_entries(transaction_entries)
+                clear_activation_journal(journal_path)
+            except BaseException as rollback:
+                raise ReleaseError(
+                    f"{action} failed ({original}); transaction rollback also failed: {rollback}"
+                ) from rollback
+            raise
+        plan = {
+            "action": action,
+            "activate_commit": evidence["release"]["commit"],
+            "previous_commit": previous,
+            "backup_bundle": str(args.backup_bundle),
+            "current_link": str(root / "current"),
+            "integration_marker": str(marker_path),
+            "integration_proof": str(args.integration_proof),
+            "missing_sentinels": missing,
+            "dry_run": False,
+            "service_restart": False,
+            "recovered_transaction": recovered,
+        }
+    plan["previous_commit"] = previous
+    plan["result"] = "current-switched"
+    return plan
+
+
+def bootstrap(args: argparse.Namespace) -> dict:
+    if not SHA_RE.fullmatch(args.commit):
+        raise ReleaseError("--commit must be a full lowercase commit ID")
+    release = args.root / "releases" / args.commit
+    if args.dry_run:
+        ensure_no_pending_activation(args.state_dir)
+        evidence, missing = activation_preconditions(
+            home=args.home,
+            backup=args.backup_bundle,
+            release=release,
+            root=args.root,
+            bin_dir=args.bin_dir,
+            require_bootstrap=False,
+            dry_run=True,
+        )
+        source_launcher = release / "deploy" / "session-kit-launcher"
+        if not source_launcher.is_file():
+            raise ReleaseError(f"verified release is missing launcher source: {source_launcher}")
+        plan = {
+            "action": "bootstrap",
+            "commit": evidence["release"]["commit"],
+            "launcher": str(args.root / "launcher"),
+            "helpers": [str(args.bin_dir / helper) for helper in HELPERS],
+            "missing_sentinels": missing,
+            "dry_run": True,
+            "service_restart": False,
+        }
+        return plan
+    with deploy_lock(args.state_dir):
+        ensure_no_pending_activation(args.state_dir)
+        recovered = recover_bootstrap_transaction(args)
+        evidence, missing = activation_preconditions(
+            home=args.home,
+            backup=args.backup_bundle,
+            release=release,
+            root=args.root,
+            bin_dir=args.bin_dir,
+            require_bootstrap=False,
+            dry_run=False,
+        )
+        source_launcher = release / "deploy" / "session-kit-launcher"
+        if not source_launcher.is_file():
+            raise ReleaseError(f"verified release is missing launcher source: {source_launcher}")
+        plan = {
+            "action": "bootstrap",
+            "commit": evidence["release"]["commit"],
+            "launcher": str(args.root / "launcher"),
+            "helpers": [str(args.bin_dir / helper) for helper in HELPERS],
+            "missing_sentinels": missing,
+            "dry_run": False,
+            "service_restart": False,
+        }
+        args.root.mkdir(parents=True, exist_ok=True, mode=0o755)
+        args.bin_dir.mkdir(parents=True, exist_ok=True, mode=0o755)
+        launcher = args.root / "launcher"
+        transaction_paths = bootstrap_transaction_paths(args)
+        saved_entries = [(path, capture_entry(path)) for path in transaction_paths]
+        launcher_content = source_launcher.read_bytes()
+        helper_target = os.path.relpath(launcher, args.bin_dir)
+        receipt = {
+            "schema_version": SCHEMA_VERSION,
+            "action": "bootstrap",
+            "activated_commit": evidence["release"]["commit"],
+            "previous_commit": None,
+            "backup_bundle": str(args.backup_bundle.resolve()),
+            "activated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        }
+        journal_path = bootstrap_journal_path(args.state_dir)
+        journal = {
+            "schema_version": SCHEMA_VERSION,
+            "action": "bootstrap",
+            "transaction_id": uuid.uuid4().hex,
+            "commit": evidence["release"]["commit"],
+            "phase": "prepared",
+            "completed_steps": [],
+            "entries": [
+                {"path": str(path), "saved": encode_saved_entry(saved)}
+                for path, saved in saved_entries
+            ],
+            "postimage": {
+                "launcher_content_base64": base64.b64encode(
+                    launcher_content
+                ).decode("ascii"),
+                "helper_target": helper_target,
+                "receipt": receipt,
+            },
+        }
+        write_bootstrap_journal(journal_path, journal)
+        temporary_paths: list[Path] = []
+        committed = False
+        try:
+            # Current comes first. Until the verified launcher and each helper
+            # link are installed, all previously exposed helpers remain usable.
+            atomic_current_switch(args.root, release)
+            journal["completed_steps"].append("current")
+            write_bootstrap_journal(journal_path, journal)
+            bootstrap_checkpoint("current")
+
+            temp_launcher = args.root / f".launcher.{os.getpid()}.{uuid.uuid4().hex}"
+            temporary_paths.append(temp_launcher)
+            with temp_launcher.open("xb") as output:
+                output.write(launcher_content)
+                output.flush()
+                os.fsync(output.fileno())
+            os.chmod(temp_launcher, 0o555)
+            os.replace(temp_launcher, launcher)
+            fsync_dir(args.root)
+            journal["completed_steps"].append("launcher")
+            write_bootstrap_journal(journal_path, journal)
+            bootstrap_checkpoint("launcher")
+
+            for helper in HELPERS:
+                link = args.bin_dir / helper
+                temp = args.bin_dir / f".{helper}.{os.getpid()}.{uuid.uuid4().hex}"
+                temporary_paths.append(temp)
+                os.symlink(helper_target, temp)
+                os.replace(temp, link)
+                fsync_dir(args.bin_dir)
+                journal["completed_steps"].append(f"helper:{helper}")
+                write_bootstrap_journal(journal_path, journal)
+                bootstrap_checkpoint(f"helper:{helper}")
+
+            validate_bootstrap(args.root, args.bin_dir)
+            atomic_json(
+                args.state_dir / "last-activation.json",
+                receipt,
+            )
+            journal["completed_steps"].append("receipt")
+            write_bootstrap_journal(journal_path, journal)
+            bootstrap_checkpoint("receipt")
+            journal["phase"] = "committed"
+            write_bootstrap_journal(journal_path, journal)
+            committed = True
+            bootstrap_checkpoint("committed")
+            clear_bootstrap_journal(journal_path)
+        except BaseException as original:
+            for temporary in temporary_paths:
+                with contextlib.suppress(FileNotFoundError):
+                    temporary.unlink()
+            if committed:
+                # The durable committed journal is sufficient for the next
+                # invocation to verify and finish this transaction.
+                raise
+            try:
+                restore_entries(saved_entries)
+                clear_bootstrap_journal(journal_path)
+            except BaseException as rollback:
+                raise ReleaseError(
+                    f"bootstrap failed ({original}); entry rollback also failed: {rollback}"
+                ) from rollback
+            raise
+        plan["recovered_transaction"] = recovered
+    plan["result"] = "launcher-installed-and-current-switched"
+    return plan
+
+
+def path_arg(value: str) -> Path:
+    return Path(value).expanduser().absolute()
+
+
+def common_activation(parser: argparse.ArgumentParser) -> None:
+    home = Path.home()
+    parser.add_argument("--commit", required=True, help="full committed release SHA")
+    parser.add_argument("--backup-bundle", required=True, type=path_arg)
+    parser.add_argument(
+        "--root",
+        type=path_arg,
+        default=path_arg(os.environ.get("SESSION_KIT_ROOT", "~/.local/lib/session-kit")),
+    )
+    parser.add_argument("--home", type=path_arg, default=home)
+    parser.add_argument("--bin-dir", type=path_arg, default=home / ".local/bin")
+    parser.add_argument(
+        "--integration-marker",
+        type=path_arg,
+        help="release-bound runtime marker (defaults beside the deploy state directory)",
+    )
+    parser.add_argument(
+        "--integration-proof",
+        type=path_arg,
+        help="mode-0600 owner proof produced by the explicit host migration phase",
+    )
+    parser.add_argument(
+        "--state-dir",
+        type=path_arg,
+        default=path_arg(
+            os.environ.get("SESSION_KIT_DEPLOY_STATE", "~/.local/state/session-kit/deploy")
+        ),
+    )
+    parser.add_argument("--dry-run", action="store_true")
+
+
+def parser() -> argparse.ArgumentParser:
+    top = argparse.ArgumentParser(description=__doc__)
+    commands = top.add_subparsers(dest="command", required=True)
+
+    build = commands.add_parser("build", help="build an immutable release from a commit")
+    build.add_argument("--repo", required=True, type=path_arg)
+    build.add_argument("--sha", required=True)
+    build.add_argument("--release-root", required=True, type=path_arg)
+    build.add_argument("--dry-run", action="store_true")
+
+    verify = commands.add_parser("verify", help="verify an immutable release")
+    verify.add_argument("release", type=path_arg)
+    verify.add_argument("--commit")
+
+    backup = commands.add_parser("verify-backup", help="verify the required pre-deploy backup")
+    backup.add_argument("bundle", type=path_arg)
+
+    boot = commands.add_parser("bootstrap", help="install stable launchers once and activate")
+    common_activation(boot)
+
+    activation = commands.add_parser("activate", help="atomically activate one verified release")
+    common_activation(activation)
+    activation.add_argument(
+        "--allow-unbootstrapped",
+        action="store_true",
+        help="emergency/test only: do not require stable helper launchers",
+    )
+
+    rollback = commands.add_parser("rollback", help="atomically select an earlier verified release")
+    common_activation(rollback)
+    rollback.add_argument(
+        "--allow-unbootstrapped",
+        action="store_true",
+        help="emergency/test only: do not require stable helper launchers",
+    )
+    return top
+
+
+def main() -> int:
+    args = parser().parse_args()
+    try:
+        if args.command == "build":
+            result = build_release(args.repo, args.sha, args.release_root, args.dry_run)
+        elif args.command == "verify":
+            meta = verify_release(args.release, args.commit)
+            result = {"action": "verify", "release": str(args.release), "metadata": meta, "ok": True}
+        elif args.command == "verify-backup":
+            marker = verify_backup_bundle(args.bundle)
+            result = {
+                "action": "verify-backup",
+                "bundle": str(args.bundle),
+                "canonical_head": marker["canonical_head"],
+                "ok": True,
+            }
+        elif args.command == "bootstrap":
+            result = bootstrap(args)
+        elif args.command == "activate":
+            result = activate(args)
+        elif args.command == "rollback":
+            result = activate(args, action="rollback")
+        else:
+            raise ReleaseError(f"unsupported command: {args.command}")
+    except (ReleaseError, OSError) as exc:
+        print(f"session-kit-release: {exc}", file=sys.stderr)
+        return 1
+    json_out(result)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

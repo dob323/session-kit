@@ -1,27 +1,38 @@
 name: Feature request
-description: Suggest an improvement to Session Kit
+description: Suggest one focused improvement for the supported Linux beta
 title: "[Feature]: "
 labels:
   - enhancement
 body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include real sessions, UUIDs, paths, terminal output, provider content, or credentials.
   - type: textarea
     id: problem
     attributes:
       label: Problem
-      description: What session-management problem should this solve?
+      description: What user-visible session-management problem should this solve?
     validations:
       required: true
   - type: textarea
-    id: proposal
+    id: outcome
     attributes:
-      label: Proposed behavior
-      description: Describe the user-visible result.
+      label: Desired outcome
+      description: Describe the behavior and how a user would know it works.
     validations:
       required: true
   - type: textarea
     id: safety
     attributes:
-      label: Safety and compatibility
-      description: Could this affect active sessions, recovery identity, journals, provider data, or supported platforms?
+      label: Safety and privacy
+      description: Explain effects on active sessions, exact identity, provider exit, recovery, cleanup, logs, journals, or retained data.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives
+      description: What can users do today, including doing nothing?
     validations:
       required: true

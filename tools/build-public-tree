@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+"""Export the reviewed public subset from one exact Session Kit commit."""
+
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import json
+from pathlib import Path, PurePosixPath
+import re
+import shutil
+import subprocess
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SHA = re.compile(r"^[0-9a-f]{40}$")
+REQUIRED = {
+    ".github/workflows/ci.yml",
+    "LICENSE",
+    "LICENSES/Apache-2.0.txt",
+    "README.md",
+    "SECURITY.md",
+    "THIRD_PARTY_NOTICES",
+    "bashrc/shpool.bashrc",
+    "bin/codex_resume_here",
+    "bin/session-kit",
+    "bin/session_kit_common",
+    "bin/session_kit_watchdog",
+    "bin/shpool_login",
+    "bin/shpool_reaper",
+    "bin/shpool_status",
+    "bin/sp",
+    "config/projects.example.tsv",
+    "config/session-inventory.example.json",
+    "config/shpool.example.toml",
+    "deploy/session-kit-launcher",
+    "deploy/session-kit-release",
+    "install.sh",
+    "lib/session_inventory.py",
+    "lib/sessionkit_inventory/__init__.py",
+    "lib/sessionkit_inventory/common.py",
+    "lib/sessionkit_inventory/lifecycle.py",
+    "lib/sessionkit_inventory/providers.py",
+    "lib/sessionkit_inventory/reaper.py",
+    "lib/sessionkit_inventory/state_io.py",
+    "public-files.txt",
+    "shpool/config.toml",
+    "systemd/session-kit-watchdog.service",
+    "systemd/shpool-reaper.service",
+    "systemd/shpool-reaper.timer",
+    "systemd/shpool.service",
+    "systemd/shpool.socket",
+    "tests/run",
+    "tests/support.py",
+    "tests/test_lifecycle_shell.py",
+    "tests/test_public_export.py",
+    "tests/test_reaper_autoclose.py",
+    "tests/test_release.py",
+    "tools/build-public-tree",
+    "tools/build-release-artifact",
+    "tools/check-doc-links",
+    "tools/public-scan",
+}
+
+
+def run(*argv: str, text: bool = True) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        argv,
+        cwd=ROOT,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=text,
+    )
+
+
+def selected(path: str, patterns: list[str]) -> bool:
+    return any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns)
+
+
+def valid_relative(path: str) -> bool:
+    value = PurePosixPath(path)
+    return bool(path) and not value.is_absolute() and ".." not in value.parts
+
+
+def manifest_at(commit: str) -> list[str]:
+    payload = run("git", "show", f"{commit}:public-files.txt").stdout
+    patterns = [
+        line.strip()
+        for line in payload.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    if not patterns:
+        raise RuntimeError("public export manifest is empty")
+    if len(patterns) != len(set(patterns)):
+        raise RuntimeError("public export manifest contains duplicate patterns")
+    invalid = [pattern for pattern in patterns if not valid_relative(pattern)]
+    if invalid:
+        raise RuntimeError("unsafe public export pattern: " + invalid[0])
+    return patterns
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--commit", required=True)
+    parser.add_argument("--destination", required=True, type=Path)
+    args = parser.parse_args()
+    if not SHA.fullmatch(args.commit):
+        parser.error("--commit must be a full lowercase Git commit")
+    run("git", "rev-parse", "--verify", f"{args.commit}^{{commit}}")
+    destination = args.destination.resolve()
+    if destination == ROOT or ROOT in destination.parents:
+        parser.error("destination must be outside the source repository")
+    if destination.exists() and any(destination.iterdir()):
+        parser.error("destination must be absent or empty")
+
+    patterns = manifest_at(args.commit)
+    rows = run("git", "ls-tree", "-r", args.commit).stdout.splitlines()
+    source_paths = [row.split("\t", 1)[1] for row in rows]
+    unmatched = [
+        pattern
+        for pattern in patterns
+        if not any(fnmatch.fnmatchcase(path, pattern) for path in source_paths)
+    ]
+    if unmatched:
+        raise RuntimeError("public export pattern matches nothing: " + unmatched[0])
+    destination.mkdir(parents=True, exist_ok=True)
+
+    copied: list[str] = []
+    targets: set[str] = set()
+    try:
+        for row in rows:
+            metadata, path = row.split("\t", 1)
+            mode, kind, object_id = metadata.split()
+            if kind != "blob" or not selected(path, patterns):
+                continue
+            if mode not in {"100644", "100755"}:
+                raise RuntimeError(f"unsupported public file mode {mode}: {path}")
+            public_path = path
+            if not valid_relative(public_path):
+                raise RuntimeError(f"unsafe public target: {public_path}")
+            if public_path in targets:
+                raise RuntimeError(f"duplicate public target: {public_path}")
+            targets.add(public_path)
+            target = destination / public_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            payload = run("git", "cat-file", "blob", object_id, text=False).stdout
+            target.write_bytes(payload)
+            target.chmod(0o755 if mode == "100755" else 0o644)
+            copied.append(public_path)
+
+        missing = sorted(REQUIRED - set(copied))
+        if missing:
+            raise RuntimeError("public export missing: " + ", ".join(missing))
+
+        source_record = {
+            "schema_version": 1,
+            "source_commit": args.commit,
+            "exported_files": len(copied),
+        }
+        (destination / "SOURCE.json").write_text(
+            json.dumps(source_record, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        (destination / "SOURCE.json").chmod(0o644)
+
+        subprocess.run(
+            [
+                str(destination / "tools/public-scan"),
+                str(destination),
+                "--private-markers",
+            ],
+            check=True,
+        )
+        subprocess.run(
+            [str(destination / "tools/check-doc-links"), str(destination)],
+            check=True,
+        )
+    except Exception:
+        shutil.rmtree(destination)
+        raise
+    print(f"exported {len(copied)} committed files to {destination}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

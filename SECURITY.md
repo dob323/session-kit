@@ -2,43 +2,46 @@
 
 ## Supported versions
 
-Session Kit is preparing its first public beta, `v0.1.0`. Until that release is
-tagged, only the current `main` branch receives security fixes. A support
-window for tagged versions will be published with the first release.
+Before `v0.1.0`, only the current `main` branch receives security fixes.
 
-## Reporting a vulnerability
+After the first beta tag, each beta minor line is supported for 90 days after
+its first release or for 30 days after the next beta minor release, whichever
+ends later. Security fixes may require the latest patch release. Unsupported
+platforms, including macOS, are outside this policy.
 
-Do not include vulnerability details, terminal output, conversation UUIDs,
-journal contents, or local paths in a public issue.
+## Report privately
 
-Use GitHub's private vulnerability reporting or open a private security
-advisory from the repository's **Security** tab. If private reporting is not
-available, open a public issue that asks the maintainer to establish a private
-contact channel, without describing the vulnerability.
+Do not publish vulnerability details, exploit steps, terminal output, provider
+content, UUIDs, local paths, or credentials in an issue.
 
-Include:
+Use GitHub private vulnerability reporting from the repository Security tab:
 
-- the affected commit or version;
-- the operating system and relevant dependency versions;
-- the security boundary that was crossed;
-- minimal reproduction steps with secrets removed;
-- whether the problem can modify or expose an active session;
-- any safe workaround.
+<https://github.com/dob323/session-kit/security/advisories/new>
 
-Please allow the maintainer time to confirm the report and prepare a fix before
-public disclosure.
+If private reporting is unavailable, open a public issue containing only a
+request for a private contact channel. Do not describe the vulnerability.
 
-## Security boundaries
+Include privately:
 
-Session Kit is local-only and has no telemetry. It reads process metadata,
-provider-owned local conversation metadata, shpool state, and its own private
-state files.
+- affected tag or full commit;
+- Linux and dependency versions;
+- the security boundary involved;
+- minimal reproduction with secrets removed;
+- whether a live session or private data can be changed or exposed;
+- a safe temporary workaround, if known.
 
-Session Kit does not isolate mutually hostile processes running as the same
-Unix user. A same-account process can inspect owner-readable terminal state,
-forge environment values, or edit owner-writable configuration directly.
+The maintainer will acknowledge a valid private report, investigate it, and
+coordinate disclosure after a fix is available. Response times are a
+best-effort beta service, not an emergency support guarantee.
 
-Terminal journals can contain passwords, tokens, source code, and any other
-text displayed by a terminal. See
-[docs/security-and-data.md](docs/security-and-data.md) before enabling Session
-Kit on a shared or regulated system.
+## Boundaries
+
+Session Kit is local-only and has no telemetry. It reads local process,
+provider, shpool, configuration, and private Session Kit state.
+
+It does not isolate hostile processes running as the same Unix user. Such a
+process may read owner-accessible terminal state or edit owner-writable files.
+
+Optional terminal journals are off by default because they may contain
+credentials, source code, prompts, and terminal output. Read
+[Security and local data](docs/security-and-data.md) before enabling them.

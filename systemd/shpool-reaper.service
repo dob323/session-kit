@@ -1,6 +1,6 @@
 [Unit]
-Description=Reap abandoned empty shpool sessions
+Description=Close exactly verified provider-exited Session Kit terminals
 
 [Service]
 Type=oneshot
-ExecStart=%h/.local/bin/shpool_reaper
+ExecStart=%h/.local/bin/shpool_reaper --auto-close

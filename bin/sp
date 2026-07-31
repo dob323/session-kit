@@ -10,6 +10,8 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 # shellcheck source=session_kit_common
 source "$SCRIPT_DIR/session_kit_common"
 INVENTORY_CORE=${SESSION_KIT_INVENTORY_CORE:-"$SCRIPT_DIR/../lib/session_inventory.py"}
+PICKER_REFUSED_STATUS=74
+PICKER_ATTACH_FAILED_STATUS=75
 
 usage() {
   cat <<'EOF'
@@ -69,6 +71,20 @@ attach_id() {
   exec "$SK_SHPOOL" attach --cmd /bin/false "$id"
 }
 
+picker_attach_id() {
+  local id=$1 cwd=${2:-} force=${3:-0}
+  local -a args=(attach)
+  [[ $force == 1 ]] && args+=(--force)
+  args+=(--cmd /bin/false)
+  [[ -z $cwd ]] || args+=(--dir "$cwd")
+  args+=("$id")
+  "$SK_SHPOOL" "${args[@]}"
+}
+
+picker_action_event() {
+  sk_log_action "$1" "$2" || true
+}
+
 picker_load_fresh() {
   local proof=$1
   sk_prepare_state || return 1
@@ -98,81 +114,116 @@ picker_revalidate_locked() {
 
 picker_open() {
   local proof=$1
-  picker_load_fresh "$proof" || return 1
+  picker_action_event picker_open requested
+  picker_load_fresh "$proof" || {
+    picker_action_event picker_open refused
+    return "$PICKER_REFUSED_STATUS"
+  }
   [[ $SK_STATUS == disconnected || $SK_STATUS == Disconnected ]] || {
     sk_die "$SK_PROOF_ID is already open in another window; nothing changed"
-    return 1
+    picker_action_event picker_open state_changed
+    return "$PICKER_REFUSED_STATUS"
   }
-  picker_lock || return 1
+  picker_lock || {
+    picker_action_event picker_open refused
+    return "$PICKER_REFUSED_STATUS"
+  }
   if ! picker_revalidate_locked ||
      [[ $SK_STATUS != disconnected && $SK_STATUS != Disconnected ]]; then
     sk_lock_release 9
     sk_die "displayed session changed before open; nothing changed"
-    return 1
+    picker_action_event picker_open state_changed
+    return "$PICKER_REFUSED_STATUS"
   fi
   local id=$SK_ID cwd=$SK_CWD
   # Keeping this descriptor across exec would block all managed creation for
   # the lifetime of the attachment. Release it immediately before the guarded
   # name-only request; --cmd /bin/false prevents a persistent raced replacement.
   sk_lock_release 9
-  attach_id "$id" "$cwd"
+  if picker_attach_id "$id" "$cwd"; then
+    picker_action_event picker_open returned
+    return 0
+  fi
+  picker_action_event picker_open attach_failed
+  sk_die "the session manager could not connect to the selected session; its cause was not identified and nothing was called dead"
+  return "$PICKER_ATTACH_FAILED_STATUS"
 }
 
 picker_takeover() {
   local proof=$1
-  picker_load_fresh "$proof" || return 1
+  picker_action_event picker_takeover requested
+  picker_load_fresh "$proof" || {
+    picker_action_event picker_takeover refused
+    return "$PICKER_REFUSED_STATUS"
+  }
   [[ $SK_STATUS != disconnected && $SK_STATUS != Disconnected ]] || {
     sk_die "$SK_PROOF_ID is available; use open instead"
-    return 1
+    picker_action_event picker_takeover state_changed
+    return "$PICKER_REFUSED_STATUS"
   }
   local id=$SK_ID title=$SK_TITLE provider=$SK_PROVIDER
   sk_confirm_exact "Move session to this window" "$id" "$title" "$provider" || {
     echo "Move cancelled."
-    return 1
+    picker_action_event picker_takeover cancelled
+    return "$PICKER_REFUSED_STATUS"
   }
-  picker_lock || return 1
+  picker_lock || {
+    picker_action_event picker_takeover refused
+    return "$PICKER_REFUSED_STATUS"
+  }
   if ! picker_revalidate_locked ||
      [[ $SK_STATUS == disconnected || $SK_STATUS == Disconnected ]]; then
     sk_lock_release 9
     sk_die "displayed session changed while confirming; nothing changed"
-    return 1
+    picker_action_event picker_takeover state_changed
+    return "$PICKER_REFUSED_STATUS"
   fi
   local cwd=$SK_CWD
   sk_lock_release 9
-  if [[ -n $cwd ]]; then
-    exec "$SK_SHPOOL" attach --force --cmd /bin/false --dir "$cwd" "$id"
+  if picker_attach_id "$id" "$cwd" 1; then
+    picker_action_event picker_takeover returned
+    return 0
   fi
-  exec "$SK_SHPOOL" attach --force --cmd /bin/false "$id"
+  picker_action_event picker_takeover attach_failed
+  sk_die "the session manager could not move the selected session; the other window was not described as dead"
+  return "$PICKER_ATTACH_FAILED_STATUS"
 }
 
 picker_close() {
   local proof=$1
-  picker_load_fresh "$proof" || return 1
+  picker_action_event picker_close requested
+  picker_load_fresh "$proof" || {
+    picker_action_event picker_close refused
+    return 1
+  }
   local id=$SK_ID title=$SK_TITLE provider=$SK_PROVIDER
   sk_confirm_exact "Close session and everything running inside it" \
     "$id" "$title" "$provider" || {
     echo "Close cancelled."
+    picker_action_event picker_close cancelled
     return 1
   }
   picker_lock || return 1
   if ! picker_revalidate_locked; then
     sk_lock_release 9
     sk_die "displayed session changed while confirming; nothing closed"
+    picker_action_event picker_close state_changed
     return 1
   fi
   if ! "$SK_SHPOOL" kill "$id"; then
     sk_lock_release 9
     sk_die "shpool refused to close the exact displayed session"
+    picker_action_event picker_close failed
     return 1
   fi
   sk_lock_release 9
+  picker_action_event picker_close closed
   printf 'Closed exact session %s\n' "$id"
 }
 
-# Shared tail of every recovery: end the unreachable session, reap anything it
-# left holding the old terminal, then relaunch the same exact conversation.
-# The caller must already have released the create lock -- `restore_exact`
-# takes it itself.
+# Shared tail after an exact disconnected session has been killed while the
+# create lock was held. Reap anything it left holding the old terminal, then
+# relaunch the same exact conversation. `restore_exact` takes the lock itself.
 # True while an exact conversation is still visible anywhere in the live
 # inventory, including as a process outside shpool.
 conversation_is_active() {
@@ -196,13 +247,9 @@ print("yes" if any(
   [[ $answer == yes ]]
 }
 
-recover_after_kill() {
+finish_recovery_after_kill() {
   local id=$1 provider=$2 uuid=$3 cwd=$4
   local shell_pid=$5 shell_start=$6 provider_pid=$7 provider_start=$8
-  if ! "$SK_SHPOOL" kill "$id"; then
-    sk_die "shpool refused to close the unreachable session; nothing changed"
-    return 1
-  fi
   sk_reap_session_leftovers \
     "$provider_pid" "$provider_start" \
     "$shell_pid" "$shell_start"
@@ -226,8 +273,15 @@ recover_after_kill() {
 # proof, so it can only ever act on the exact row the user selected.
 picker_recover() {
   local proof=$1
-  sk_require_integration || return 1
-  picker_load_fresh "$proof" || return 1
+  picker_action_event picker_recover requested
+  sk_require_integration || {
+    picker_action_event picker_recover refused
+    return 1
+  }
+  picker_load_fresh "$proof" || {
+    picker_action_event picker_recover refused
+    return 1
+  }
   [[ $SK_PROOF_PROVIDER == claude || $SK_PROOF_PROVIDER == codex ]] || {
     sk_die "only an exact Claude or Codex conversation can be moved to a new session"
     return 1
@@ -241,6 +295,13 @@ picker_recover() {
   if ! picker_revalidate_locked; then
     sk_lock_release 9
     sk_die "displayed session changed before recovery; nothing changed"
+    picker_action_event picker_recover state_changed
+    return 1
+  fi
+  if [[ $SK_STATUS != disconnected && $SK_STATUS != Disconnected ]]; then
+    sk_lock_release 9
+    sk_die "the selected session is open in another window; recovery refused and nothing changed"
+    picker_action_event picker_recover attached
     return 1
   fi
   local id=$SK_ID cwd=$SK_CWD
@@ -255,16 +316,34 @@ picker_recover() {
     sk_lock_release 9
     return 1
   }
+  if ! "$SK_SHPOOL" kill "$id"; then
+    sk_lock_release 9
+    sk_die "shpool refused to close the exact disconnected session; nothing changed"
+    picker_action_event picker_recover failed
+    return 1
+  fi
   sk_lock_release 9
-  recover_after_kill "$id" "$provider" "$uuid" "$cwd" \
-    "$shell_pid" "$shell_start" "$provider_pid" "$provider_start"
+  if finish_recovery_after_kill "$id" "$provider" "$uuid" "$cwd" \
+    "$shell_pid" "$shell_start" "$provider_pid" "$provider_start"; then
+    picker_action_event picker_recover recovered
+    return 0
+  fi
+  picker_action_event picker_recover failed
+  return 1
 }
 
 # Watchdog path: same repair, selected by session ID and never interactive.
 repair_target() {
   local selector=$1
-  sk_require_integration || return 1
-  make_guard_snapshot || return 1
+  picker_action_event repair requested
+  sk_require_integration || {
+    picker_action_event repair refused
+    return 1
+  }
+  make_guard_snapshot || {
+    picker_action_event repair refused
+    return 1
+  }
   sk_resolve "$SNAPSHOT" "$selector" || {
     sk_die "no such session: $selector"
     return 1
@@ -287,14 +366,38 @@ repair_target() {
     return 1
   }
   cwd=$(cd -- "$cwd" && pwd -P) || return 1
+  picker_lock || {
+    picker_action_event repair refused
+    return 1
+  }
   sk_revalidate "$id" "$started" "$provider" "$uuid" \
     "$shell_pid" "$shell_start" "$provider_pid" "$provider_start" \
     "$daemon_pid" "$daemon_start" || {
+    sk_lock_release 9
     sk_die "session changed while preparing the repair; nothing changed"
+    picker_action_event repair state_changed
     return 1
   }
-  recover_after_kill "$id" "$provider" "$uuid" "$cwd" \
-    "$shell_pid" "$shell_start" "$provider_pid" "$provider_start"
+  if [[ $SK_STATUS != disconnected && $SK_STATUS != Disconnected ]]; then
+    sk_lock_release 9
+    sk_die "session is open in another window; repair refused and nothing changed"
+    picker_action_event repair attached
+    return 1
+  fi
+  if ! "$SK_SHPOOL" kill "$id"; then
+    sk_lock_release 9
+    sk_die "shpool refused to close the exact disconnected session; nothing changed"
+    picker_action_event repair failed
+    return 1
+  fi
+  sk_lock_release 9
+  if finish_recovery_after_kill "$id" "$provider" "$uuid" "$cwd" \
+    "$shell_pid" "$shell_start" "$provider_pid" "$provider_start"; then
+    picker_action_event repair recovered
+    return 0
+  fi
+  picker_action_event repair failed
+  return 1
 }
 
 start_new() {

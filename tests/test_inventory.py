@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import argparse
 import copy
 import contextlib
 import fcntl
+import hashlib
 import importlib.util
 import io
 import json
@@ -10,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
@@ -26,6 +29,7 @@ assert CORE_SPEC is not None and CORE_SPEC.loader is not None
 inventory_core = importlib.util.module_from_spec(CORE_SPEC)
 sys.modules[CORE_SPEC.name] = inventory_core
 CORE_SPEC.loader.exec_module(inventory_core)
+from sessionkit_inventory import lifecycle as lifecycle_state  # noqa: E402
 
 
 def uuid_for(number: int) -> str:
@@ -989,14 +993,14 @@ class CodexTurnStateTests(unittest.TestCase):
                 inventory_core._rollout_turn_state(rollout.fileno()),
             )
 
-    def test_bounded_tail_requires_decisive_evidence_inside_window(self) -> None:
+    def test_bounded_backward_search_finds_lifecycle_beyond_normal_tail(self) -> None:
         started = self._event("event_msg", {"type": "task_started"})
         oversized = self._event(
             "event_msg",
             {"type": "token_count", "padding": "x" * inventory_core.ROLLOUT_TAIL_BYTES},
         )
         self.assertEqual(
-            "state unavailable",
+            "working",
             self._state([started, oversized]),
         )
         self.assertEqual(
@@ -2939,6 +2943,25 @@ class InventoryInputAndRecoveryTests(unittest.TestCase):
 
 
 class InventoryRenderingTests(unittest.TestCase):
+    def test_rows_hide_operational_ids_and_use_semantic_colors(self) -> None:
+        fixture = inventory_core.build_inventory(
+            *inventory_fixture(2), now=1_800_000_000
+        )
+        fixture["sessions"][0]["needs_you"] = True
+        fixture["sessions"][0]["agent_status"] = "needs your reply"
+        with mock.patch.object(
+            inventory_core, "_color_enabled", return_value=True
+        ):
+            rendered = inventory_core.render_inventory(fixture)
+        visible = re.sub(r"\x1b\[[0-9;]*m", "", rendered)
+        for item in fixture["sessions"]:
+            self.assertNotIn(f"[{item['display_shpool_id']}]", visible)
+        self.assertIn("\x1b[36mClaude", rendered)
+        self.assertIn("\x1b[36mCodex", rendered)
+        self.assertIn("\x1b[32m 1\x1b[0m", rendered)
+        self.assertIn("\x1b[32m 2\x1b[0m", rendered)
+        self.assertIn("\x1b[33mneeds your reply", rendered)
+
     def test_renderer_used_by_picker_strips_csi_osc_and_all_control_bytes(self) -> None:
         malicious = {
             "stale": False,
@@ -3064,6 +3087,268 @@ class InventoryRenderingTests(unittest.TestCase):
                 ),
                 visible,
             )
+
+
+class ProviderLifecycleStateTests(unittest.TestCase):
+    def test_lifecycle_caller_must_descend_from_exact_managed_shell(self) -> None:
+        current_pid = os.getpid()
+        shell_pid = current_pid + 10_000
+        table = {
+            current_pid: process(current_pid, shell_pid, "python3"),
+            shell_pid: process(
+                shell_pid,
+                1,
+                "bash",
+                session_name="main2",
+                start_ticks=987_654,
+            ),
+        }
+        with (
+            mock.patch.object(
+                inventory_core, "_require_supported_platform", return_value="linux"
+            ),
+            mock.patch.object(
+                inventory_core, "scan_process_table", return_value=table
+            ),
+        ):
+            inventory_core._prove_lifecycle_caller(
+                "main2", shell_pid, 987_654
+            )
+            with self.assertRaisesRegex(
+                inventory_core.CollectionError, "outside the exact"
+            ):
+                inventory_core._prove_lifecycle_caller(
+                    "main2", shell_pid, 987_655
+                )
+            table[shell_pid]["session_name"] = "main3"
+            with self.assertRaisesRegex(
+                inventory_core.CollectionError, "outside the exact"
+            ):
+                inventory_core._prove_lifecycle_caller(
+                    "main2", shell_pid, 987_654
+                )
+
+    def test_state_is_private_minimal_and_first_input_is_permanent(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix=".lifecycle-state-", dir=REPO
+        ) as raw:
+            state_dir = Path(raw)
+            session_id = "s20260730-220500-19"
+            boot_id = "11111111-2222-3333-4444-555555555555"
+            created = lifecycle_state.record_provider_exit(
+                state_dir,
+                session_id=session_id,
+                boot_id=boot_id,
+                shell_pid=123,
+                shell_start_ticks=456,
+                provider="codex",
+                exit_code=0,
+                input_tracking=True,
+                now_monotonic_ns=1_800_000_000_000,
+            )
+            path = lifecycle_state.lifecycle_path(state_dir, session_id)
+            self.assertIsNotNone(path)
+            assert path is not None
+            self.assertEqual(0o600, path.stat().st_mode & 0o777)
+            self.assertNotIn(session_id, path.name)
+            self.assertNotEqual(
+                hashlib.sha256(session_id.encode()).hexdigest(),
+                path.stem,
+            )
+            payload = path.read_text(encoding="utf-8")
+            self.assertNotIn(session_id, payload)
+            self.assertNotIn("/srv/", payload)
+            self.assertNotIn("00000000-0000-4000", payload)
+            self.assertTrue(created["input_tracking"])
+            first = lifecycle_state.update_state(
+                state_dir,
+                session_id=session_id,
+                boot_id=boot_id,
+                shell_pid=123,
+                shell_start_ticks=456,
+                event="user-input",
+            )
+            second = lifecycle_state.update_state(
+                state_dir,
+                session_id=session_id,
+                boot_id=boot_id,
+                shell_pid=123,
+                shell_start_ticks=456,
+                event="user-input",
+            )
+            self.assertTrue(first["user_input_after_exit"])
+            self.assertTrue(second["user_input_after_exit"])
+            kept = lifecycle_state.update_state(
+                state_dir,
+                session_id=session_id,
+                boot_id=boot_id,
+                shell_pid=123,
+                shell_start_ticks=456,
+                event="keep",
+                keep=True,
+            )
+            self.assertTrue(kept["keep"])
+            with self.assertRaisesRegex(
+                inventory_core.CollectionError, "generation changed"
+            ):
+                lifecycle_state.update_state(
+                    state_dir,
+                    session_id=session_id,
+                    boot_id=boot_id,
+                    shell_pid=999,
+                    shell_start_ticks=456,
+                    event="user-input",
+                )
+            self.assertEqual(
+                0,
+                lifecycle_state.prune_inactive_state(
+                    state_dir, [session_id]
+                ),
+            )
+            self.assertEqual(
+                1,
+                lifecycle_state.prune_inactive_state(state_dir, []),
+            )
+            self.assertFalse(path.exists())
+
+    def test_exact_exit_overlay_keeps_shell_live_and_recovery_available(self) -> None:
+        fixture = list(inventory_fixture(1, providers=("codex",)))
+        active = inventory_core.build_inventory(
+            *fixture, now=1_800_000_000
+        )
+        expected_uuid = uuid_for(1)
+        root_pid = 1001
+        provider_pid = 2001
+        del fixture[2][provider_pid]
+        fixture[3] = {}
+        idle = inventory_core.build_inventory(
+            *fixture, now=1_800_000_001
+        )
+        self.assertEqual("shell", idle["sessions"][0]["provider"])
+        with tempfile.TemporaryDirectory(
+            prefix=".lifecycle-overlay-", dir=REPO
+        ) as raw:
+            state_dir = Path(raw)
+            lifecycle_state.persist_last_exact(
+                idle,
+                active,
+                state_dir=state_dir,
+                boot_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            )
+            cache_after_race = copy.deepcopy(idle)
+            lifecycle_state.record_provider_exit(
+                state_dir,
+                session_id="main",
+                boot_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                shell_pid=root_pid,
+                shell_start_ticks=fixture[2][root_pid]["start_ticks"],
+                provider="codex",
+                exit_code=0,
+                input_tracking=True,
+                now_monotonic_ns=1_800_000_000_500,
+            )
+            lifecycle_state.apply_provider_exit_states(
+                idle,
+                cache_after_race,
+                state_dir=state_dir,
+                boot_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            )
+        item = idle["sessions"][0]
+        self.assertEqual("shell", item["provider"])
+        self.assertEqual("codex", item["display_provider"])
+        self.assertEqual("provider exited", item["agent_status"])
+        self.assertEqual(active["sessions"][0]["title"], item["title"])
+        self.assertEqual(expected_uuid, item["recovery"]["uuid"])
+        self.assertEqual(
+            {"provider": "codex", "uuid": expected_uuid},
+            item["_terminal_identity_hint"],
+        )
+        self.assertFalse(item["needs_you"])
+
+    def test_reopen_executes_only_generation_bound_exact_recovery(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix=".lifecycle-reopen-", dir=REPO
+        ) as raw:
+            state_dir = Path(raw)
+            boot_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+            lifecycle_state.record_provider_exit(
+                state_dir,
+                session_id="main2",
+                boot_id=boot_id,
+                shell_pid=123,
+                shell_start_ticks=456,
+                provider="codex",
+                exit_code=0,
+                input_tracking=True,
+                now_monotonic_ns=500,
+            )
+            lifecycle_state.update_state(
+                state_dir,
+                session_id="main2",
+                boot_id=boot_id,
+                shell_pid=123,
+                shell_start_ticks=456,
+                event="user-input",
+            )
+            recovery = inventory_core.recovery_spec(
+                "codex", uuid_for(2), str(state_dir)
+            )
+            item = {
+                "provider": "shell",
+                "exited_provider": "codex",
+                "shpool_shell": {
+                    "pid": 123,
+                    "process_start_ticks": 456,
+                },
+                "recovery": recovery,
+            }
+            args = argparse.Namespace(lifecycle_action="reopen")
+            completed = subprocess.CompletedProcess(
+                recovery["argv"], 0
+            )
+            with (
+                mock.patch.object(
+                    inventory_core,
+                    "_lifecycle_environment",
+                    return_value=(state_dir, "main2", boot_id, 123, 456),
+                ),
+                mock.patch.object(
+                    inventory_core, "_prove_lifecycle_caller"
+                ),
+                mock.patch.object(
+                    inventory_core, "load_config", return_value={"state_dir": state_dir}
+                ),
+                mock.patch.object(
+                    inventory_core, "snapshot", return_value={"sessions": [item]}
+                ),
+                mock.patch.object(
+                    inventory_core, "guard_live_inventory", return_value=True
+                ),
+                mock.patch.object(
+                    inventory_core, "lookup", return_value=item
+                ),
+                mock.patch.object(
+                    inventory_core.subprocess,
+                    "run",
+                    return_value=completed,
+                ) as launched,
+            ):
+                self.assertEqual(0, inventory_core._lifecycle_command(args))
+            launched.assert_called_once_with(
+                [
+                    "codex",
+                    "-c",
+                    "check_for_update_on_startup=false",
+                    "--no-alt-screen",
+                    "resume",
+                    uuid_for(2),
+                ],
+                cwd=str(state_dir),
+                check=False,
+            )
+            retained = lifecycle_state.load_state(state_dir, "main2")
+            assert retained is not None
+            self.assertTrue(retained["user_input_after_exit"])
 
 
 if __name__ == "__main__":

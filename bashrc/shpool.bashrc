@@ -178,15 +178,20 @@ PY
       if ! cd -- "$__sk_cwd"; then
         echo "[session-kit: launch directory is unavailable; launch record retained for retry]" >&2
       else
+        __sk_provider_launched=0
+        __sk_provider_exited=0
+        __sk_provider_rc=0
         case "$__sk_provider" in
         claude)
           if ! command -v claude >/dev/null 2>&1; then
             echo "[session-kit: Claude is unavailable; launch record retained for retry]" >&2
           else
+            command rm -- "$__sk_start" "$__sk_expected"
+            __sk_provider_launched=1
             case "$__sk_launch_mode" in
-              new) exec claude ;;
-              resume) exec claude --resume "$__sk_uuid" ;;
-              fork) exec claude --resume "$__sk_uuid" --fork-session ;;
+              new) claude; __sk_provider_rc=$? ;;
+              resume) claude --resume "$__sk_uuid"; __sk_provider_rc=$? ;;
+              fork) claude --resume "$__sk_uuid" --fork-session; __sk_provider_rc=$? ;;
             esac
           fi
           ;;
@@ -200,10 +205,12 @@ PY
             # conversation never loads. Suppressed explicitly here rather than
             # relying on user config.
             __sk_codex_no_update=(-c check_for_update_on_startup=false)
+            command rm -- "$__sk_start" "$__sk_expected"
+            __sk_provider_launched=1
             case "$__sk_launch_mode" in
-              new) exec codex "${__sk_codex_no_update[@]}" --no-alt-screen ;;
-              resume) exec codex "${__sk_codex_no_update[@]}" --no-alt-screen resume "$__sk_uuid" ;;
-              fork) exec codex "${__sk_codex_no_update[@]}" --no-alt-screen fork "$__sk_uuid" ;;
+              new) codex "${__sk_codex_no_update[@]}" --no-alt-screen; __sk_provider_rc=$? ;;
+              resume) codex "${__sk_codex_no_update[@]}" --no-alt-screen resume "$__sk_uuid"; __sk_provider_rc=$? ;;
+              fork) codex "${__sk_codex_no_update[@]}" --no-alt-screen fork "$__sk_uuid"; __sk_provider_rc=$? ;;
             esac
           fi
           ;;
@@ -211,6 +218,28 @@ PY
           command rm -- "$__sk_start" "$__sk_expected"
           ;;
         esac
+        if (( __sk_provider_launched )); then
+          __sk_lifecycle_core=$__sk_inventory_core
+          __sk_lifecycle_session=$SHPOOL_SESSION_NAME
+          __sk_lifecycle_boot=$__sk_current_boot_id
+          __sk_lifecycle_shell_pid=$__sk_shell_pid
+          __sk_lifecycle_shell_start=$__sk_shell_start
+          __sk_lifecycle_provider=$__sk_provider
+          if SESSION_KIT_LIFECYCLE_SESSION_ID=$__sk_lifecycle_session \
+             SESSION_KIT_LIFECYCLE_BOOT_ID=$__sk_lifecycle_boot \
+             SESSION_KIT_LIFECYCLE_SHELL_PID=$__sk_lifecycle_shell_pid \
+             SESSION_KIT_LIFECYCLE_SHELL_START_TICKS=$__sk_lifecycle_shell_start \
+             SESSION_KIT_LIFECYCLE_PROVIDER=$__sk_lifecycle_provider \
+             SESSION_KIT_LIFECYCLE_EXIT_CODE=$__sk_provider_rc \
+             python3 "$__sk_lifecycle_core" lifecycle provider-exited >/dev/null
+          then
+            __sk_provider_exited=1
+            printf '\n%s exited with status %s. This terminal is still open.\n' \
+              "${__sk_provider^}" "$__sk_provider_rc"
+          else
+            echo "[session-kit: provider exited; lifecycle proof is unavailable, so automatic cleanup is blocked]" >&2
+          fi
+        fi
       fi
     else
       echo "[session-kit: launch record has an unavailable directory; retained for retry]" >&2
@@ -224,6 +253,45 @@ PY
   unset __sk_boot_id __sk_current_boot_id __sk_inventory_core __sk_started __sk_shell_pid __sk_shell_start __sk_daemon_pid __sk_daemon_start
   unset __sk_generation_ok __sk_launch_mode_ok __sk_walk_pid __sk_walk_depth __sk_walk_ppid __sk_walk_start
   unset __sk_parent_ppid __sk_parent_start
+  unset __sk_provider_launched __sk_provider_rc
+
+  __sk_lifecycle_event() {
+    local __sk_lifecycle_action=$1
+    shift
+    [[ -n ${__sk_lifecycle_core:-} && -f $__sk_lifecycle_core ]] || return 1
+    if [[ $__sk_lifecycle_action == reopen ]]; then
+      SESSION_KIT_LIFECYCLE_SESSION_ID=$__sk_lifecycle_session \
+        SESSION_KIT_LIFECYCLE_BOOT_ID=$__sk_lifecycle_boot \
+        SESSION_KIT_LIFECYCLE_SHELL_PID=$__sk_lifecycle_shell_pid \
+        SESSION_KIT_LIFECYCLE_SHELL_START_TICKS=$__sk_lifecycle_shell_start \
+        python3 "$__sk_lifecycle_core" lifecycle "$__sk_lifecycle_action" "$@"
+    else
+      SESSION_KIT_LIFECYCLE_SESSION_ID=$__sk_lifecycle_session \
+        SESSION_KIT_LIFECYCLE_BOOT_ID=$__sk_lifecycle_boot \
+        SESSION_KIT_LIFECYCLE_SHELL_PID=$__sk_lifecycle_shell_pid \
+        SESSION_KIT_LIFECYCLE_SHELL_START_TICKS=$__sk_lifecycle_shell_start \
+        python3 "$__sk_lifecycle_core" lifecycle "$__sk_lifecycle_action" "$@" \
+        >/dev/null
+    fi
+  }
+
+  keep_session() {
+    if __sk_lifecycle_event keep on; then
+      echo "Automatic cleanup is disabled for this terminal."
+    else
+      echo "Could not mark this terminal to keep." >&2
+      return 1
+    fi
+  }
+
+  unkeep_session() {
+    if __sk_lifecycle_event keep off; then
+      echo "Automatic cleanup may resume after every safety condition is met."
+    else
+      echo "Could not remove the keep marker." >&2
+      return 1
+    fi
+  }
 
   # `bye` is the convenient confirmed close. A directly typed Bash `exit`
   # retains normal shell semantics, as approved.
@@ -236,6 +304,50 @@ PY
     fi
     echo "Close cancelled."
   }
+
+  __sk_provider_exit_menu() {
+    local __sk_menu_choice
+    while true; do
+      printf '\nProvider exited: [r] reopen conversation  [k] keep terminal  [s] shell  [c] close\n'
+      if ! IFS= read -r -p "Choice: " __sk_menu_choice; then
+        # EOF or a terminal signal is user activity. Closing is safe even when
+        # the private input marker cannot be written.
+        __sk_lifecycle_event user-input >/dev/null 2>&1 || true
+        builtin exit
+      fi
+      __sk_menu_choice=${__sk_menu_choice,,}
+      if [[ $__sk_menu_choice == c || $__sk_menu_choice == close ]]; then
+        __sk_lifecycle_event user-input >/dev/null 2>&1 || true
+        builtin exit
+      fi
+      if ! __sk_lifecycle_event user-input >/dev/null 2>&1; then
+        echo "Choice not applied: Session Kit could not record terminal use. Close remains available." >&2
+        continue
+      fi
+      case "$__sk_menu_choice" in
+        r|reopen)
+          if ! __sk_lifecycle_event reopen; then
+            echo "Exact recovery is not ready. Choose shell to use the provider directly, or close and reopen from the dashboard." >&2
+          fi
+          ;;
+        k|keep)
+          keep_session
+          ;;
+        s|shell)
+          echo "Shell opened. This terminal is permanently excluded from automatic cleanup."
+          return 0
+          ;;
+        *)
+          echo "Unknown choice. Use r, k, s, or c."
+          ;;
+      esac
+    done
+  }
+
+  if [[ ${__sk_provider_exited:-0} == 1 ]]; then
+    __sk_provider_exit_menu
+  fi
+  unset __sk_provider_exited
 
   # Local, scoped Needs-you marker. The renderer caches safely and never sends
   # an external notification.

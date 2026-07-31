@@ -1,5 +1,5 @@
 name: Bug report
-description: Report a reproducible Session Kit problem
+description: Report a reproducible problem on the supported Linux beta
 title: "[Bug]: "
 labels:
   - bug
@@ -7,7 +7,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Remove credentials, conversation UUIDs, private paths, and terminal journal content. Use the Security tab for vulnerabilities.
+        Remove credentials, hostnames, account names, private paths, titles, UUIDs, terminal output, journals, prompts, and responses. Use private vulnerability reporting for any security or data-exposure concern.
   - type: input
     id: version
     attributes:
@@ -18,35 +18,53 @@ body:
   - type: input
     id: platform
     attributes:
-      label: Platform
-      description: Linux distribution and version.
+      label: Linux distribution
+      description: Provide distribution, version, and architecture. macOS and non-systemd systems are unsupported.
     validations:
       required: true
   - type: textarea
     id: dependencies
     attributes:
       label: Relevant versions
-      description: Bash, Python, shpool, Claude Code, and Codex versions as applicable.
+      description: Include Bash, Python, shpool, Claude Code, and Codex versions as applicable.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      options:
+        - Dashboard or color
+        - Reply state
+        - Open or move
+        - Provider exit or reopen
+        - Kill confirmation
+        - Recovery or repair
+        - Cleanup
+        - Install, update, rollback, or uninstall
+        - Privacy or journals
+        - Other
     validations:
       required: true
   - type: textarea
     id: behavior
     attributes:
-      label: What happened?
-      description: Describe the observed and expected behavior.
+      label: Expected and observed behavior
+      description: Describe the result without private session data.
     validations:
       required: true
   - type: textarea
     id: reproduce
     attributes:
-      label: Reproduction
-      description: Give the smallest safe, sanitized sequence that reproduces the problem.
+      label: Minimal sanitized reproduction
+      description: Give the shortest safe sequence that reproduces the problem.
     validations:
       required: true
   - type: dropdown
     id: mutation
     attributes:
-      label: Did the problem modify a session or local state?
+      label: Did anything change?
+      description: Include session attachment, provider lifecycle, and private local state.
       options:
         - "No"
         - "Yes"

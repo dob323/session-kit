@@ -1,9 +1,7 @@
 # Install Session Kit
 
-## Current status
-
-Session Kit is a `v0.1.0` beta candidate. Install it from a reviewed Git clone,
-not by copying individual files into a live setup.
+Session Kit is a Linux-only `v0.1.0` beta. Install from a reviewed Git commit
+under a single-user account where provider conversations are recoverable.
 
 ```bash
 git clone https://github.com/dob323/session-kit.git
@@ -14,94 +12,97 @@ tests/run
 session-kit doctor
 ```
 
-`./install.sh --check` is read-only. Installation copies files and systemd user
-unit definitions but never starts, stops, or restarts a service.
+`./install.sh --check` is read-only. The installer copies files and systemd
+user-unit definitions but does not start, stop, restart, or enable a service.
 
-## Supported target
+## Requirements
 
-The supported target is a single-user Linux account with:
+- Linux with `/proc`
+- systemd user services
+- Bash
+- Python 3.10 or newer
+- shpool 0.11.0
+- Claude Code, Codex, or both
 
-- systemd user services;
-- Bash;
-- `/proc`;
-- Python 3.10 or newer;
-- shpool 0.11.0;
-- Claude Code, Codex, or both.
+The preflight also checks required command-line tools such as `flock`, `git`,
+`journalctl`, `mktemp`, `pgrep`, `ps`, `script`, `sha256sum`, `stat`, and
+`timeout`.
 
-Required command-line tools include `flock`, `git`, `journalctl`, `mktemp`,
-`pgrep`, `ps`, `script`, `sha256sum`, `stat`, `timeout`, and standard POSIX
-file utilities.
+macOS, another init system, or a missing process view is unsupported and must
+stop before installation. No preview switch changes that beta support policy.
 
-The preflight detects the core requirements and stops before changing anything
-when one is missing.
+## shpool
 
-## shpool choice
+Use official shpool 0.11.0 by default. Session Kit includes an optional source
+patch for one heartbeat acknowledgement timeout. It is not installed
+automatically. Review [the patch guide](../shpool-patch/README.md).
 
-Use the official shpool 0.11.0 build by default. It may be installed with Cargo
-or built as described in [../extras/build-static-binary.md](../extras/build-static-binary.md).
+With a current Rust toolchain:
 
-Session Kit includes an optional source patch for a heartbeat acknowledgement
-timeout. The patch is not part of the default installation. Review its evidence,
-limits, build instructions, license notice, and rollback effect in
-[../shpool-patch/README.md](../shpool-patch/README.md).
+```bash
+cargo install shpool --version 0.11.0 --locked
+```
 
-Installing or replacing the shpool binary can require a daemon restart. A
-restart ends the terminal processes managed by that daemon, even when provider
-conversations can later be resumed. The Session Kit installer must never
-restart an existing daemon without explicit approval.
+Replacing a running shpool binary normally requires a daemon restart, which
+ends its managed terminal processes. The Session Kit installer never replaces
+shpool or restarts its daemon.
 
 ## What installation changes
 
 The installer:
 
-1. creates an immutable release under
-   `${HOME}/.local/lib/session-kit/releases/<commit>`;
-2. atomically selects it with the `current` link;
-3. installs stable commands under `${HOME}/.local/bin`;
-4. creates private XDG configuration and state files from examples only when
-   those files are absent;
-5. copies systemd user units on Linux without enabling them;
-6. asks whether to add one guarded Bash block for the SSH picker;
-7. backs up an existing Bash file before first enabling that block;
-8. asks whether to keep local terminal journals, defaulting to on;
-9. leaves the watchdog report-only and notifications disabled.
+1. creates an immutable release at
+   `$HOME/.local/lib/session-kit/releases/<commit>`;
+2. selects it through the `current` link;
+3. installs stable commands under `$HOME/.local/bin`;
+4. creates missing private configuration and state;
+5. copies systemd user units without enabling them;
+6. asks before adding the guarded Bash login block;
+7. backs up a Bash startup file before changing it;
+8. asks whether to enable terminal journals, defaulting to off;
+9. leaves health notifications off.
 
-The installer does not install or replace shpool, alter provider storage, or
-restart the shpool daemon.
+It does not change provider storage, start a service, restart shpool, attach to
+a session, or close a session.
+
+Noninteractive installation leaves login integration and journals off unless
+their explicit flags are supplied.
 
 ## Optional components
 
-The installer should offer these separately:
+- **SSH picker:** opens for an interactive Bash login after explicit enablement.
+- **Terminal journals:** record terminal bytes for new managed sessions after
+  explicit opt-in.
+- **Cleanup observer:** tracks exact eligible provider-exited terminals. It can
+  close only after the timer is enabled and every safety predicate has remained
+  unchanged for 72 continuous hours.
+- **Watchdog:** runs in report-only mode by default. The advanced repair mode is
+  an explicit opt-in that can close and relaunch a proved-broken terminal.
+- **Notification command:** remains disabled unless explicitly configured.
 
-- **SSH picker:** opens automatically in an interactive login shell.
-- **Guided journals:** records new managed terminal output locally. Default on
-  for the guided setup.
-- **Reaper reports:** finds old, disconnected, empty-shell candidates. It never
-  removes them automatically.
-- **Watchdog reports:** reports manager and terminal-health evidence. It never
-  repairs automatically under the public policy.
-- **Notification command:** disabled unless the user supplies and tests a local
-  command.
+## Activate safely
 
-## macOS preview
-
-macOS is an experimental, opt-in core preview. Set
-`SESSION_KIT_MACOS_PREVIEW=1` only in a dedicated test account and read
-[../macos/README.md](../macos/README.md) first.
-
-The preview does not include systemd services, watchdog repair, reaper
-candidate generation, pruning, or feature parity. It must pass the real-Mac
-acceptance gate before it is described as supported.
-
-## Evaluate the source safely
-
-Development tests are isolated:
+After installation:
 
 ```bash
-git clone https://github.com/dob323/session-kit.git
-cd session-kit
+session-kit doctor
+session-kit enable-login
+```
+
+Review copied user units before enabling any timer or service. Activating a
+Session Kit helper does not require a shpool restart.
+
+Use a new test session first. Confirm that disconnecting SSH leaves it running,
+a provider quit leaves the managed terminal alive, exact reopen works, and
+`k <number>` requires confirmation.
+
+## Evaluate without installing
+
+The repository test suite uses temporary fixtures and does not contact a live
+shpool daemon:
+
+```bash
 tests/run
 ```
 
-Do not run deployment or active-session commands merely to evaluate the
-repository.
+Do not run active-session commands merely to inspect the source.

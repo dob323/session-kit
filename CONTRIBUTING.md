@@ -1,29 +1,28 @@
 # Contributing
 
-Session Kit accepts bug reports, feature requests, documentation fixes, and
-pull requests.
+Session Kit welcomes focused bug reports, feature requests, documentation
+fixes, and pull requests.
 
-The project is preparing a `v0.1.0` beta. Compatibility and safety reports are
-especially useful during this stage.
+The project is preparing a Linux-only `v0.1.0` beta. Reports about provider
+compatibility, lifecycle safety, privacy, and clean installation are especially
+useful.
 
 ## Before opening an issue
 
 Search existing issues, then collect:
 
-- the Session Kit commit or version;
+- the Session Kit tag or full commit;
 - Linux distribution and version;
-- Bash, Python, shpool, Claude Code, and Codex versions as applicable;
-- whether the problem affects listing, display, opening, takeover, closing,
-  recovery, journals, or the watchdog;
-- sanitized output that contains no UUIDs, credentials, private paths, or
-  terminal journal content.
+- Bash, Python, shpool, Claude Code, and Codex versions as relevant;
+- whether the problem affects display, reply state, opening, moving, provider
+  exit, kill, recovery, journals, cleanup, or health checks;
+- sanitized expected and observed behavior.
 
-Use the bug or feature template. Security problems belong in the private
-process described by [SECURITY.md](SECURITY.md).
+Remove credentials, hostnames, account names, private paths, titles, UUIDs,
+terminal output, journal content, provider prompts, and provider responses.
+Report security issues through [the private process](SECURITY.md).
 
-## Development setup
-
-Clone the repository and run the isolated test suite:
+## Development
 
 ```bash
 git clone https://github.com/dob323/session-kit.git
@@ -31,10 +30,9 @@ cd session-kit
 tests/run
 ```
 
-The suite creates temporary fixtures and does not contact a live shpool daemon
-or service manager.
+The tests use temporary fixtures and do not contact a live shpool daemon.
 
-For shell changes, also run:
+For shell changes:
 
 ```bash
 bash -n install.sh bin/* bashrc/shpool.bashrc \
@@ -43,10 +41,7 @@ shellcheck install.sh bin/* bashrc/shpool.bashrc \
   deploy/session-kit-launcher tests/run
 ```
 
-Run `python3 -m compileall -q lib tests deploy/session-kit-release` for Python
-syntax checking. Python bytecode is ignored by Git.
-
-Install the pinned development tools in a virtual environment:
+For Python and public-release checks:
 
 ```bash
 python3 -m venv .venv
@@ -55,25 +50,29 @@ python3 -m venv .venv
 .venv/bin/coverage run --branch --source=lib \
   -m unittest discover -s tests -t .
 .venv/bin/coverage report --fail-under=70
+tools/check-doc-links
+tools/public-scan .
+tools/public-scan . --git-history
 ```
 
-CI tests Python 3.10 through 3.13 on Ubuntu 22.04 and 24.04. It also runs the
-focused preview tests on macOS 15. Ruff, ShellCheck, and the 70 percent branch
-coverage floor are required. Mypy currently reports the typed legacy baseline
-without blocking; it becomes required module by module during the
-[inventory split](docs/maintainers/modularization-roadmap.md).
+CI tests Ubuntu 22.04 and 24.04 with Python 3.10 through 3.13. It also checks
+Bash syntax, ShellCheck, Ruff, Python syntax, the type baseline, branch
+coverage, public export, local links, reachable history, the optional shpool
+patch, and release-artifact reproducibility.
 
 ## Pull requests
 
 - Keep one behavior change per pull request.
 - Add regression tests for runtime changes.
-- Update public documentation when commands, configuration, data retention, or
-  support boundaries change.
-- Use account-neutral examples based on `$HOME` or XDG directories.
-- Do not include provider transcripts, real UUIDs, private paths, hostnames,
-  tokens, or production incident data.
-- Preserve fail-closed identity checks and confirmation for mutations.
-- Explain update and rollback effects when state formats change.
+- Update docs for command, configuration, support, privacy, retention, or
+  lifecycle changes.
+- Use `$HOME`, XDG paths, and example UUIDs instead of real local values.
+- Preserve fresh identity proof and confirmation for every mutation.
+- Explain active-session, provider-exit, cleanup, update, and rollback effects.
+- Do not weaken Linux-only fail-closed checks.
+- Do not add telemetry, prompt logging, terminal logging, or notifications by
+  default.
 
 By contributing, you agree that your contribution is licensed under the
-project's [MIT License](LICENSE).
+[MIT License](LICENSE). Changes to the shpool-derived patch remain under
+[Apache License 2.0](LICENSES/Apache-2.0.txt).

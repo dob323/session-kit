@@ -1,9 +1,7 @@
 # Update and roll back
 
-## Current status
-
-Update from a reviewed local clone. Session Kit never pulls source or restarts
-a service on its own.
+Session Kit updates from a reviewed local clone. It does not fetch source or
+restart a service on its own.
 
 ```bash
 git pull --ff-only
@@ -13,8 +11,6 @@ session-kit doctor
 ```
 
 ## Immutable releases
-
-Session Kit's release layout is:
 
 ```text
 $HOME/.local/lib/session-kit/
@@ -30,42 +26,46 @@ $HOME/.local/bin/
 ```
 
 The stable launcher resolves `current` once and pins that physical release for
-the life of the command. Commands already running continue from their pinned
-release; later commands use the newly selected release.
+the command's lifetime. Existing commands finish on their pinned release; new
+commands use the selected release.
 
-Selecting a Session Kit release does not by itself restart, stop, signal, or
-detach from shpool.
+`session-kit update` checks compatibility, installs the exact source commit,
+keeps the prior release, and switches the pointer atomically. Updates default
+journals to off; pass `--journal on` only when the local retention decision
+still applies. The existing login choice is preserved unless a login flag is
+supplied.
 
-`session-kit update` reruns the compatibility check, installs the exact source
-commit as a new immutable release, retains the prior release, and switches the
-pointer atomically. It preserves the current journal choice and does not enable
-login integration unless requested.
+Release selection does not restart, stop, signal, attach to, or detach from
+shpool.
 
-## Supported rollback contract
+## Rollback
 
-`session-kit rollback` selects the previous installed release recorded by the
-last install or update. Use `session-kit rollback --to <full-commit>` for
-another retained release. It updates stable launchers and the private
-integration marker without restarting services.
+`session-kit rollback` selects the prior installed release recorded by the last
+install or update. Use:
+
+```text
+session-kit rollback --to <full-commit>
+```
+
+for another retained release.
+
+Rollback updates stable launchers and the private integration marker without
+restarting services. A state-format change must document whether the older
+release can read new state before the newer release is activated.
 
 ## shpool binary updates
 
-Session Kit release selection and shpool binary replacement are different
-operations.
+Session Kit release selection and shpool binary replacement are separate.
+Replacing shpool may require a daemon restart and can end every managed
+terminal process. Never combine that restart with a routine Session Kit update.
 
-Replacing the shpool binary may require restarting its daemon, which ends its
-managed terminal processes. Never combine that restart with a routine Session
-Kit documentation or helper update. Review active sessions, provider recovery,
-and the prior binary before approving it.
+The optional patch has separate build and rollback instructions in
+[the shpool patch guide](../shpool-patch/README.md).
 
-The official shpool 0.11.0 binary is the default. The optional patch has its own
-build and rollback notes in [../shpool-patch/README.md](../shpool-patch/README.md).
+## Interrupted update
 
-## Recovery from an interrupted update
+Release commands write transaction state before changing exposed paths. A later
+invocation completes a committed transaction or restores an incomplete one.
 
-The release machinery records transaction state before changing exposed
-paths. A later invocation should complete a committed transaction or restore
-an incomplete one.
-
-Do not delete a transaction journal to bypass a refusal. Preserve it and report
-the exact error through a sanitized issue.
+Do not delete a transaction receipt to bypass a refusal. Preserve it and report
+the sanitized error.

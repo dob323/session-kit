@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""Build a deterministic public archive with checksum and provenance."""
+
+from __future__ import annotations
+
+import argparse
+import gzip
+import hashlib
+import io
+import json
+from pathlib import Path
+import re
+import subprocess
+import tarfile
+import tempfile
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SHA = re.compile(r"^[0-9a-f]{40}$")
+BUILD_INPUTS = (
+    "public-files.txt",
+    "tools/build-public-tree",
+    "tools/build-release-artifact",
+    "tools/check-doc-links",
+    "tools/public-scan",
+)
+
+
+def tree_digest(root: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(item for item in root.rglob("*") if item.is_file()):
+        relative = path.relative_to(root).as_posix()
+        mode = path.stat().st_mode & 0o777
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(f"{mode:o}".encode("ascii"))
+        digest.update(b"\0")
+        digest.update(hashlib.sha256(path.read_bytes()).digest())
+    return digest.hexdigest()
+
+
+def require_committed_builder(commit: str) -> None:
+    for relative in BUILD_INPUTS:
+        committed = subprocess.run(
+            ["git", "-C", str(ROOT), "show", f"{commit}:{relative}"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ).stdout
+        if (ROOT / relative).read_bytes() != committed:
+            raise RuntimeError(
+                f"release build input differs from requested commit: {relative}"
+            )
+
+
+def add_tree(archive: tarfile.TarFile, source: Path, prefix: str) -> None:
+    root_info = tarfile.TarInfo(prefix)
+    root_info.type = tarfile.DIRTYPE
+    root_info.mode = 0o755
+    root_info.mtime = 0
+    archive.addfile(root_info)
+
+    for path in sorted(source.rglob("*")):
+        relative = path.relative_to(source).as_posix()
+        info = tarfile.TarInfo(f"{prefix}/{relative}")
+        info.mtime = 0
+        info.uid = 0
+        info.gid = 0
+        info.uname = ""
+        info.gname = ""
+        if path.is_dir():
+            info.type = tarfile.DIRTYPE
+            info.mode = 0o755
+            archive.addfile(info)
+            continue
+        if not path.is_file() or path.is_symlink():
+            raise RuntimeError(f"unsupported artifact entry: {relative}")
+        payload = path.read_bytes()
+        info.mode = path.stat().st_mode & 0o777
+        info.size = len(payload)
+        archive.addfile(info, fileobj=io.BytesIO(payload))
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--commit", required=True)
+    parser.add_argument("--output-dir", required=True, type=Path)
+    args = parser.parse_args()
+    if not SHA.fullmatch(args.commit):
+        parser.error("--commit must be a full lowercase Git commit")
+    subprocess.run(
+        ["git", "-C", str(ROOT), "rev-parse", "--verify", f"{args.commit}^{{commit}}"],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    require_committed_builder(args.commit)
+
+    output = args.output_dir.resolve()
+    if output == ROOT or ROOT in output.parents:
+        parser.error("output directory must be outside the source repository")
+    if output.exists() and any(output.iterdir()):
+        parser.error("output directory must be absent or empty")
+    output.mkdir(parents=True, exist_ok=True)
+
+    basename = f"session-kit-{args.commit}"
+    archive_path = output / f"{basename}.tar.gz"
+    checksum_path = output / f"{basename}.sha256"
+    provenance_path = output / f"{basename}.provenance.json"
+
+    with tempfile.TemporaryDirectory(
+        prefix="session-kit-release.",
+        dir=output.parent,
+    ) as temporary:
+        temporary_root = Path(temporary)
+        public_tree = temporary_root / "public"
+        subprocess.run(
+            [
+                str(ROOT / "tools/build-public-tree"),
+                "--commit",
+                args.commit,
+                "--destination",
+                str(public_tree),
+            ],
+            cwd=ROOT,
+            check=True,
+        )
+        public_digest = tree_digest(public_tree)
+        plain_tar = temporary_root / f"{basename}.tar"
+        with tarfile.open(plain_tar, "w", format=tarfile.GNU_FORMAT) as archive:
+            add_tree(archive, public_tree, basename)
+        with plain_tar.open("rb") as source, archive_path.open("wb") as raw_output:
+            with gzip.GzipFile(
+                filename="",
+                mode="wb",
+                fileobj=raw_output,
+                mtime=0,
+            ) as compressed:
+                while chunk := source.read(1024 * 1024):
+                    compressed.write(chunk)
+
+    archive_digest = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+    checksum_path.write_text(
+        f"{archive_digest}  {archive_path.name}\n",
+        encoding="utf-8",
+    )
+    provenance = {
+        "schema_version": 1,
+        "source_commit": args.commit,
+        "builder_commit": args.commit,
+        "archive": archive_path.name,
+        "archive_sha256": archive_digest,
+        "public_tree_sha256": public_digest,
+        "build_tool": "tools/build-release-artifact",
+        "reproducible_timestamps": True,
+    }
+    provenance_path.write_text(
+        json.dumps(provenance, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    for path in (archive_path, checksum_path, provenance_path):
+        path.chmod(0o644)
+    print(json.dumps(provenance, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

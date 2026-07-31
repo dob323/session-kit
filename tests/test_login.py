@@ -1164,10 +1164,10 @@ class LoginPickerTests(unittest.TestCase):
     def test_refused_action_refreshes_instead_of_exiting_picker(self) -> None:
         fixture = LoginFixture(inventory(row("ready1", number=1)))
         try:
-            # Select the session, decline the recovery offer, then leave.
-            code, output = run_pty(fixture, b"1\n\n\n", sp_exit=7)
+            code, output = run_pty(fixture, b"1\n\n", sp_exit=74)
             self.assertEqual(2, code)
-            self.assertIn("could not be opened", output)
+            self.assertIn("changed or failed a safety check", output)
+            self.assertNotIn("terminal died", output)
             snapshots = [
                 entry for entry in fixture.status_entries() if entry == ["--json"]
             ]
@@ -1175,34 +1175,21 @@ class LoginPickerTests(unittest.TestCase):
         finally:
             fixture.close()
 
-    def test_failed_open_explains_and_offers_conversation_recovery(self) -> None:
-        """A session whose terminal died must not be a silent dead end.
-
-        The old behaviour printed one vague refusal and redrew the list, for
-        ever, on a session that could never be opened again. The human had no
-        way to know the conversation was safe or how to get it back.
-        """
+    def test_attach_failure_is_not_diagnosed_as_a_dead_terminal(self) -> None:
         fixture = LoginFixture(inventory(row("ready1", number=1)))
         try:
-            code, output = run_pty(fixture, b"1\n1\n\n", sp_exit=7)
+            code, output = run_pty(fixture, b"1\n\n", sp_exit=75)
             self.assertEqual(2, code)
-            self.assertIn(
-                "Its terminal died inside the session manager", output
-            )
-            self.assertIn("The conversation itself is saved", output)
-            self.assertIn("Continue this conversation in a new session", output)
+            self.assertIn("could not connect", output)
+            self.assertIn("does not prove the session is dead", output)
             entries = fixture.sp_entries()
             commands = [entry["args"][0] for entry in entries]
             self.assertIn("picker-open", commands)
-            self.assertIn("picker-recover", commands)
-            recover = next(
-                entry for entry in entries if entry["args"][0] == "picker-recover"
-            )
-            self.assertEqual("ready1", recover["proof"]["shpool_id"])
+            self.assertNotIn("picker-recover", commands)
         finally:
             fixture.close()
 
-    def test_failed_open_without_a_conversation_offers_nothing_to_recover(self) -> None:
+    def test_unknown_open_failure_never_offers_unproven_recovery(self) -> None:
         unknown = row("unknown1", number=4, provider="unknown")
         unknown["identity"]["uuid"] = None
         unknown["display_provider"] = "codex"
@@ -1211,9 +1198,46 @@ class LoginPickerTests(unittest.TestCase):
         try:
             code, output = run_pty(fixture, b"4\n\n", sp_exit=7)
             self.assertEqual(2, code)
-            self.assertIn("There is no saved conversation to move", output)
+            self.assertIn("failed without a verified cause", output)
+            self.assertNotIn("terminal died", output)
             commands = [entry["args"][0] for entry in fixture.sp_entries()]
             self.assertNotIn("picker-recover", commands)
+        finally:
+            fixture.close()
+
+    def test_cached_row_selection_is_read_only_before_proof_or_sp(self) -> None:
+        fixture = LoginFixture(inventory(row("ready1", number=1), stale=True))
+        try:
+            code, output = run_pty(fixture, b"1\nk 1\n\n")
+            self.assertEqual(2, code)
+            self.assertIn("Cached rows are read-only", output)
+            self.assertIn("Nothing changed", output)
+            self.assertEqual([], fixture.sp_entries())
+            self.assertNotIn("terminal died", output)
+        finally:
+            fixture.close()
+
+    def test_ordinary_rows_hide_ids_but_search_still_matches_them(self) -> None:
+        hidden = row("private-session-id", number=8)
+        hidden["title"] = "Picker safety work"
+        hidden["display_title"] = "Picker safety work"
+        fixture = LoginFixture(inventory(hidden))
+        try:
+            code, output = run_pty(fixture, b"\n", columns=120)
+            self.assertEqual(2, code)
+            self.assertIn("Picker safety work", output)
+            self.assertNotIn("private-session-id", output)
+        finally:
+            fixture.close()
+
+        fixture = LoginFixture(inventory(hidden))
+        try:
+            code, output = run_pty(
+                fixture, b"/private-session-id\n\n", columns=120
+            )
+            self.assertEqual(2, code)
+            self.assertIn("1 match of 1 session", output)
+            self.assertIn("Picker safety work", output)
         finally:
             fixture.close()
 

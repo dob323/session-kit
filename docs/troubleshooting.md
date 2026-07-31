@@ -1,133 +1,147 @@
 # Troubleshooting
 
-Start with:
+Start with read-only checks:
 
 ```text
 sp health
 sp list
 ```
 
-Sanitize output before sharing it. Titles, UUIDs, working directories, process
-information, and journal content may be private.
+Before sharing output, remove titles, UUIDs, working directories, process
+details, and journal content.
 
-## The picker does not appear
+## Picker does not open
 
-Check:
+Confirm that:
 
-- the shell is interactive and uses Bash;
+- the login shell is interactive Bash;
 - standard input and output are terminals;
 - `$HOME/.no_shpool` is absent;
 - `$HOME/.local/bin/shpool_login` is executable;
-- the guarded Session Kit source line is present in the active Bash startup
-  file.
+- the guarded Session Kit block exists in the active Bash startup file.
 
-Noninteractive shells intentionally skip the picker.
+Noninteractive shells skip the picker. Press Enter in the picker for a normal
+terminal. `session-kit disable-login` removes automatic picker startup without
+removing Session Kit commands.
 
-## I want a normal shell
+## Color is hard to read
 
-Press Enter in the picker. To disable automatic picker display, create:
-
-```text
-$HOME/.no_shpool
-```
-
-The `sp` commands remain available.
-
-## No color or unreadable color
-
-Set:
+Disable it:
 
 ```bash
 export SESSION_KIT_NO_COLOR=1
 ```
 
-Session Kit also honors `NO_COLOR`. Color is automatically disabled when output
-is not a terminal or the terminal type is unsuitable.
+`NO_COLOR` is also supported. The text labels and symbols carry the full
+meaning without color.
 
-## Inventory is unavailable
+## Inventory is unavailable or cached
 
-The inventory requires:
+Live actions require:
 
-- one responding shpool daemon;
-- `shpool list --json`;
+- a responding shpool daemon;
+- valid `shpool list --json`;
 - readable Linux `/proc`;
 - Python 3.10 or newer;
-- provider metadata for exact Claude Code or Codex classification.
+- exact provider metadata for provider-specific actions.
 
-Provider metadata failure should produce an unavailable or unknown state rather
-than selecting a conversation by directory or recency.
+Cached inventory is display-only. Kill, move, repair, and recovery actions stay
+disabled until a fresh guard succeeds.
 
-If the manager probe times out, do not repeatedly attach or kill sessions.
-Preserve logs and investigate the daemon first.
+If a manager probe times out, do not repeatedly attach or kill. Preserve
+owner-only logs and inspect the daemon first.
 
-## A new Codex session says setup is incomplete
+## Reply alert is missing
 
-A new Codex process may not write an open rollout until the first user message.
-Session Kit proves initial startup from the exact process tree, then binds the
-conversation UUID when it becomes available.
+Session Kit uses structured provider events, not prose. Check `sp detail` for
+the session and confirm the provider version is within the tested release
+matrix.
 
-If a retained launch record remains:
+For Codex, only a live unresolved `request_user_input` without automatic
+resolution needs a reply. Completed, aborted, superseded, malformed, or
+optional questions do not show the alert.
+
+## New Codex session says setup is incomplete
+
+Codex may not create its root rollout until the first user message. Session Kit
+first proves the exact process tree, then binds the UUID when it appears.
+
+If instructed:
 
 ```text
 sp verify-start <terminal-number|shpool-id>
 ```
 
-If instructed by the error, open the exact session, start an interactive Bash
-inside it, then run `sp verify-start` again. Do not delete the paired launch
-records.
+Do not delete paired launch records.
 
-## A session is open elsewhere
+## Session is open elsewhere
 
-Select its number to inspect actions or use:
+Selecting the row shows a move action. You can also run:
 
 ```text
 sp takeover <terminal-number|shpool-id>
 ```
 
-Takeover requires confirmation. It moves the managed terminal; it does not
-start a second provider conversation.
+Moving disconnects the earlier terminal view after confirmation. It does not
+create a second provider process.
 
-## A session is quiet
+## Provider exited
 
-Quiet output is not proof of failure. Codex may report a running state both
-while working and while waiting.
+A normal Claude Code or Codex exit should leave the managed terminal alive and
+label it as provider exited. Open that row to reach the provider-exit menu,
+where you can reopen the exact conversation, keep the terminal, open an
+ordinary shell, or close the terminal.
 
-The report-only watchdog may provide direct handoff or thread evidence. Use
-`sp repair` only after reviewing that evidence.
+If the entire row disappears, collect a sanitized `sp health`, `sp detail`, and
+relevant owner-only event timestamps. Do not publish UUIDs or terminal output.
 
-## A terminal cannot be opened
+## `k <number>` changes nothing
 
-An unrecoverable shpool terminal handler can leave provider conversation data
-intact while the terminal no longer accepts an attachment.
+The kill shortcut accepts only a visible number from a fresh dashboard. It
+refuses cached state, an invalid or hidden number, changed identity, and unsafe
+proof files.
 
-Run:
+After resolving the target, it displays the title, provider, and exact shpool
+ID and waits for confirmation. A refusal leaves the session unchanged and
+refreshes the dashboard.
+
+## Quiet session
+
+Quiet output does not prove failure. A provider can be working without recent
+terminal output.
+
+Use `sp repair` only when the health evidence names a direct, unrecoverable
+handoff failure.
+
+## Automatic cleanup did not run
+
+This is usually a safe refusal. A provider-exited terminal must remain detached
+and in the same exact safe state for 72 continuous hours after the cleanup
+timer is enabled. Any live provider, child process, reply, attachment, recovery
+conflict, generation change, or missing evidence blocks cleanup.
+
+Manual inspection remains available through `sp detail` and `sp prune`.
+
+## Terminal cannot be opened
+
+For direct shpool handoff failure evidence:
 
 ```text
 sp repair <terminal-number|shpool-id>
 ```
 
 Repair ends the unreachable managed terminal and resumes the exact provider
-conversation in a new session. It requires direct failure evidence and refuses
-attached, ambiguous, or UUID-less targets.
+conversation in a new one. It refuses attached, ambiguous, or UUID-less
+targets.
 
-## New-session launch is disabled
+## Changed shpool binary report
 
-The active release and the private integration marker do not agree, or shell
-integration has not been validated. This is a safety refusal.
+A package or Cargo update may have replaced the binary used by the running
+daemon. Do not restart the daemon as a diagnostic step. Compare the running
+binary, prior binary, active sessions, and optional patch choice first.
 
-Do not create a marker by hand. Return to the guided installer or updater and
-complete its configuration validation and rollback checks.
+## Report a problem
 
-## Watchdog reports a changed shpool binary
-
-The running daemon's executable fingerprint differs from the recorded
-fingerprint. A package or Cargo update may have replaced it.
-
-Do not restart the daemon as a diagnostic step. Compare the installed and prior
-binary, active sessions, and optional patch choice first.
-
-## Reporting a problem
-
-Use the issue template and include versions, sanitized expected and observed
-behavior, and whether any state changed. Security problems belong in the
-private process in [../SECURITY.md](../SECURITY.md).
+Use the issue template for sanitized behavior reports. Use the private process
+in [Security policy](../SECURITY.md) for any vulnerability or suspected data
+exposure.

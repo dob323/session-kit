@@ -1,115 +1,116 @@
 # Architecture
 
-## Design goals
+Session Kit joins shpool terminals to Claude Code, Codex, or shell processes
+without treating display text as identity.
 
-Session Kit is built around four rules:
+## Core rules
 
-1. Provider conversation UUIDs are durable identity.
-2. Display numbers, names, paths, and recency are context, not authority.
-3. A mutating action must revalidate live identity immediately before it runs.
-4. Existing sessions must survive Session Kit release selection.
+1. A provider conversation UUID is durable identity.
+2. A terminal number, title, directory, and timestamp are display context.
+3. Every mutation must recheck live identity immediately before it runs.
+4. A Session Kit update must not disturb an existing shpool session.
+5. Missing or conflicting evidence fails closed.
 
-## Components
+## Data flow
 
 ```text
 shpool list --json ─┐
-Claude agent state ─┼─> session_inventory.py ─> snapshot ─> picker / sp
-Codex local state  ─┤              │
-Linux /proc ────────┘              ├─> recovery state
-                                   ├─> terminal numbers
-                                   └─> guarded mutation proofs
+Claude Code state  ─┼─> inventory ─> frozen snapshot ─> picker / sp
+Codex local state  ─┤        │
+Linux /proc ────────┘        ├─> terminal-number state
+                             ├─> recovery state
+                             └─> private action proof
 
-stable launcher -> current release -> command helper
-managed Bash -> optional journal -> provider or shell
+stable launcher -> selected immutable release -> helper
+managed Bash -> optional journal -> provider -> persistent managed Bash
 ```
 
-### Inventory core
+`lib/session_inventory.py` is the compatibility entry point. Focused
+implementation is moving into `lib/sessionkit_inventory/` in small,
+behavior-preserving steps.
 
-`lib/session_inventory.py`:
+The inventory:
 
-- collects one shpool snapshot;
-- scans a bounded process tree;
-- joins Claude Code and Codex roots to exact shpool shells;
-- classifies structured reply state;
+- takes one bounded shpool snapshot;
+- scans a bounded Linux process tree;
+- joins provider roots to exact shpool shells;
+- classifies structured reply and provider-exit state;
 - assigns boot-scoped terminal numbers;
-- resolves title priority;
-- maintains private recovery and alias state;
-- renders a bounded, control-safe terminal view.
+- selects one display title;
+- writes private recovery and terminal-number state;
+- renders control-safe terminal output.
 
-Strict and guard snapshots refuse partial provider identity when an operation
-requires exact identity.
+Strict and guard snapshots refuse partial provider identity.
 
-### Command layer
+## Commands and action proofs
 
-`bin/sp` provides explicit session operations. `bin/shpool_login` implements the
-interactive SSH picker. `bin/shpool_status` exposes inventory and lookup views.
-`bin/codex_resume_here` prints or executes an exact Codex resume command.
+`bin/sp` implements explicit operations. `bin/shpool_login` provides the SSH
+picker. `bin/shpool_status` renders and queries inventory.
+`bin/codex_resume_here` prepares an exact Codex resume.
 
-The shared shell library carries proof fields between lookup and action. A
-fresh guard snapshot must still match the displayed daemon, shell, provider,
-UUID, process start times, and shpool generation.
+Before an action, the shared command layer binds and rechecks:
 
-### Shell integration
+- shpool daemon process and start time;
+- shpool terminal ID and generation;
+- managed shell process and start time;
+- provider process, ancestry, and start time;
+- provider and exact conversation UUID;
+- the frozen dashboard generation.
 
-`bashrc/shpool.bashrc`:
+The proof is private, short-lived, owner-only state. If any field changes, the
+action stops and the dashboard refreshes.
 
-- starts a guided journal wrapper for new managed sessions;
-- consumes one-shot launch records;
-- starts Claude Code, Codex, or a shell only after the paired launch record is
-  armed;
-- provides the managed-session prompt marker and `bye` behavior;
-- optionally opens the SSH picker.
+## Managed terminal lifecycle
 
-Session Kit supports Bash only.
+`bashrc/shpool.bashrc` consumes a paired one-shot launch record and starts the
+selected provider only after exact startup proof.
 
-### Journals and recovery
+The provider does not replace the managed shell. When Claude Code or Codex
+exits, the terminal remains alive and records an exited-provider state. The
+terminal menu can reopen the exact conversation, mark the terminal to keep,
+open an ordinary shell, or close the terminal.
 
-New managed sessions write one append-only raw journal segment. Reattachment
-uses shpool's bounded rendered buffer and does not replay the full journal.
+This boundary prevents a normal provider quit from silently deleting a
+recoverable shpool session.
 
-Recovery records retain exact provider, UUID, working directory, title, and
-argument information. Recovery refuses an already-active or ambiguous UUID.
+## Journals
 
-### Reaper
+Journals are optional and off by default. When enabled, each new managed
+session writes an append-only local segment. Reattachment uses shpool's bounded
+rendered buffer rather than replaying the full journal.
 
-The reaper observes disconnected empty shells and records candidates. It never
-kills a session. `sp prune` performs two fresh snapshots and an exact process
-tree check before a confirmed removal.
+Provider-native transcripts remain in provider-owned storage. Session Kit does
+not copy them into logs or upload them.
 
-### Watchdog
+## Cleanup
 
-The public watchdog policy is report-only. It reads the shpool user journal,
-inventory, process table, and optional binary fingerprint. It does not contact
-the daemon or repair sessions automatically.
+The scheduled observer may track a disconnected provider-exited terminal. It
+cannot close the terminal until the cleanup timer is enabled and the same exact
+safe state has been observed continuously for 72 hours.
 
-### Release layout
+Automatic close requires the same exact terminal generation, the same exited
+provider identity, no attachment, no live provider or child work, no pending
+reply, no recovery conflict, and unchanged evidence. Any uncertainty resets or
+blocks eligibility. Manual `sp prune` uses fresh checks and confirmation.
 
-Each committed release is copied into an immutable directory named by its full
-Git commit ID. A stable launcher resolves one `current` symlink and dispatches
-only known helper names.
+## Display model
 
-Activation changes the pointer, integration marker, and receipt as one
-recoverable transaction. It does not restart shpool.
+The main dashboard favors names and state. Internal shpool IDs and provider
+UUIDs are available through detail, JSON, and explicit search views, not normal
+rows.
 
-## Identity and title model
+Semantic color categories are provider, availability, attention, danger, and
+secondary text. Text labels always carry the meaning, so color is optional.
 
-A managed AI root is identified by provider, exact UUID, provider PID and start
-time, shell PID and start time, shpool ID and generation, and daemon generation.
+## Updates
 
-Title sources are display-only:
-
-1. local alias;
-2. explicit provider rename;
-3. retained automatic title;
-4. deterministic fallback;
-5. shortened UUID fallback.
-
-Subagents remain children of their root and do not become top-level managed
-sessions.
+Every installed Git commit has an immutable release directory. A stable
+launcher resolves one `current` link and dispatches only approved helper names.
+Selecting another Session Kit release changes the pointer and receipt but does
+not restart shpool.
 
 ## Platform boundary
 
-The supported implementation depends on Linux `/proc` and systemd user
-services. A future macOS core preview requires platform-specific process and
-service handling plus a real-Mac lifecycle test. Tracking a plist alone does
-not establish support.
+The beta requires Linux `/proc`, Bash, and systemd user services. macOS and
+other process or service models stop before installation or mutation. Files
+kept for future platform work do not establish support.

@@ -1,112 +1,77 @@
 # Inventory modularization roadmap
 
-`lib/session_inventory.py` remains the executable compatibility facade while
-its implementation moves into a sibling `lib/sessionkit_inventory/` package.
-Callers keep using the same path, commands, exit codes, JSON fields, and
-rendered output.
+`lib/session_inventory.py` remains the executable compatibility entry point
+while implementation moves into `lib/sessionkit_inventory/`.
 
-Phase 1 is complete. The first bounded Phase 2 extraction moved the shared
-exception, identity constants, numeric coercion, text and UUID normalization,
-automatic-title validation, natural ordering, and operational-ID policy into
-`common.py`. The second bounded Phase 2 extraction moved path resolution and
-configuration loading behind compatibility wrappers that preserve the facade's
-signatures and patch seams.
+The current facade still combines configuration, Linux process inspection,
+provider discovery, inventory assembly, state, naming, recovery, rendering, and
+CLI parsing. Moving one bounded responsibility at a time makes review and
+testing easier without changing installed command paths.
 
-The source module currently has about 5,500 lines and still has several
-responsibilities:
+## Compatibility contract
 
-- configuration and validation;
-- Linux and macOS process inspection;
-- Claude Code and Codex discovery;
-- inventory assembly;
-- private state and locking;
-- naming and terminal-number persistence;
-- recovery transactions;
-- rendering;
-- CLI parsing.
-
-Source refactoring must not move an installed release link or restart a service.
-
-## Compatibility boundary
-
-Keep these rules through at least one public minor release:
+Through at least one public minor release:
 
 - `lib/session_inventory.py` stays executable and importable by path.
-- Existing constants, classes, public functions, and tested internal names
-  remain available from the facade.
-- `CollectionError`, `StateLock`, and Darwin ctypes classes keep one identity.
-- Function signatures and CLI output stay compatible.
-- Existing monkeypatch seams remain on the facade.
+- Existing tested symbols, signatures, exit codes, JSON fields, and rendered
+  behavior remain available.
 - Extracted modules never import the facade.
-- Imports perform no configuration reads, process scans, locks, or state writes.
+- Imports perform no process scans, locks, configuration reads, or state writes.
+- Existing test patch points continue to work.
+- A refactor never moves the installed release link or restarts a service.
 
-Simple imported aliases are not enough for symbols that tests and downstream
-tools patch. Facade wrappers must pass the patched dependency into the focused
-module. This applies to process identity, live collection, boot identity,
-color selection, terminal sizing, recovery validation, and self-naming.
+## Target package
 
-## Target modules
+| Module | Responsibility |
+| --- | --- |
+| `common.py` | constants, paths, normalization, configuration, command runner |
+| `state_io.py` | private reads, locks, atomic writes, JSON and checksums |
+| `processes.py` | Linux process table, ancestry, generations, boot identity |
+| `providers.py` | shpool, Claude Code, and Codex readers |
+| `model.py` | session records, titles, reply and provider-exit state |
+| `collector.py` | bounded read-only joins |
+| `names.py` | manual and automatic names |
+| `terminal.py` | terminal-number and generation state |
+| `validation.py` | strict snapshot and input validation |
+| `recovery.py` | exact recovery transactions |
+| `reaper.py` | 72-hour eligibility state and final safety proof |
+| `snapshot.py` | collection and private-state orchestration |
+| `render.py` | width, semantic color, dashboard, detail, JSON, and lookup |
+| `self_name.py` | caller proof and automatic naming |
 
-| Module | Responsibility | Depends on |
-| --- | --- | --- |
-| `common.py` | constants, types, paths, text normalization, config loading, command runner | standard library |
-| `state_io.py` | private reads, locks, atomic writes, JSON and checksum helpers | `common` |
-| `processes.py` | Linux and Darwin process tables, roots, descendants, generation and boot identity | `common` |
-| `providers.py` | shpool, Claude Code, and Codex payload/process readers | `common`, `processes`, `state_io` |
-| `model.py` | agent records, titles, output ages, retained launch attribution | `common`, `processes`, `state_io` |
-| `collector.py` | `build_inventory` and `collect_live` read-only joins | `common`, `processes`, `providers`, `model` |
-| `names.py` | aliases, automatic titles, audits, pruning, and alias migration | `common`, `state_io` |
-| `terminal.py` | terminal-number registry and generation matching | `common`, `processes`, `state_io` |
-| `validation.py` | strict and guarded inventory validation and input loading | `common` |
-| `recovery.py` | pending recovery and transactional plan/apply/rollback logic | `common`, `state_io`, `processes`, `terminal`, `validation` |
-| `snapshot.py` | collection plus terminal/recovery persistence orchestration | `collector`, `terminal`, `recovery`, `validation` |
-| `render.py` | display width, age, color, inventory rendering, and lookup | `common` |
-| `self_name.py` | caller proof and automatic self-naming | `processes`, `names`, `validation` |
+The dependency graph must stay acyclic. Recovery and cleanup accept explicit
+callbacks rather than importing the facade.
 
-The facade owns CLI parsing and calls down into these modules. The dependency
-graph must remain acyclic. Recovery accepts collection and validation callbacks
-instead of importing the snapshot facade.
+## Sequence
 
-## Phased commits
+1. Freeze facade behavior with symbol, signature, CLI, and patch-point tests.
+2. Move pure common and configuration helpers.
+3. Move private state I/O.
+4. Move Linux process discovery.
+5. Move provider readers.
+6. Move the data model and collector.
+7. Move validation and rendering separately.
+8. Move naming and terminal-number state.
+9. Move recovery and cleanup transactions.
+10. Move snapshot and self-name orchestration.
+11. Certify install, public export, rollback, and both private and public tests
+    twice.
 
-1. Lock facade behavior with symbol, signature, import, CLI, and patch-seam
-   characterization tests.
-2. Add the package marker and move pure common/config helpers.
-3. Extract generic private state I/O and atomic writes.
-4. Extract Linux, Darwin, and shared process discovery.
-5. Extract provider readers with explicit identity callbacks.
-6. Extract the inventory model, then the read-only collector.
-7. Extract validation and rendering as separate leaf changes.
-8. Extract naming state, then terminal-number state.
-9. Invert recovery callbacks in place; test; then move the transaction unit
-   without redesigning it.
-10. Extract snapshot and self-naming orchestration.
-11. Certify package completeness, public export, installation, rollback, and
-    both private and public test suites twice.
+Do not combine file movement with a behavior change.
 
-Each phase is independently buildable and reviewable. Do not combine code
-movement with behavior changes. Do not activate an intermediate refactor
-release.
+## Checks for each step
 
-## Required checks at every phase
+- compile the facade and package;
+- run focused and full tests;
+- import through normal import and direct file execution;
+- verify the symbol and signature manifest;
+- scan the public tree and reachable history;
+- build the public export and prove package completeness;
+- verify installer and doctor rejection of a partial package;
+- compare frozen Linux fixtures;
+- test unsafe modes, symlinks, interrupted writes, idempotency, and locks for
+  state-moving work.
 
-- compile the facade and every package module;
-- run focused tests for the moved unit;
-- run the full private and public suites;
-- import through direct execution and `spec_from_file_location`;
-- verify the tested facade symbol manifest and signatures;
-- run the public privacy scanner;
-- build the public export and prove every imported package file is included;
-- verify installer and doctor checks reject a partial package;
-- compare frozen Linux and macOS fixtures before and after the move.
-
-State-moving phases also exercise unsafe modes, symlinks, replacement failure,
-partial receipts, resume, rollback, idempotency, and concurrent locks.
-
-## Completion criteria
-
-The split is complete when the facade contains only compatibility wrappers,
-CLI parsing, and `main`; no focused module imports the facade; package
-completeness is enforced by release and installer checks; full tests pass twice;
-and a new immutable candidate passes a dry-run rollback. Activation remains a
-separate live-operation decision.
+The split is complete when the facade contains compatibility wrappers, CLI
+parsing, and `main`; no focused module imports it; export and install tools
+enforce package completeness; and rollback passes from an immutable candidate.

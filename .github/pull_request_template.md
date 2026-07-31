@@ -1,21 +1,24 @@
-## Summary
+## Outcome
 
-Describe the user-visible change and why it is needed.
+Describe the user-visible result and the problem it solves.
 
 ## Validation
 
-- [ ] `tests/run`
-- [ ] Relevant shell syntax and ShellCheck checks
-- [ ] Documentation and examples updated
-- [ ] No credentials, real UUIDs, private paths, transcripts, or production data added
+- [ ] Focused tests pass
+- [ ] `tests/run` passes
+- [ ] Relevant Bash syntax and ShellCheck checks pass
+- [ ] `tools/check-doc-links` passes
+- [ ] `tools/public-scan .` passes
+- [ ] Documentation and examples match the behavior
+- [ ] No credentials, private identities, paths, transcripts, journals, or incident data were added
 
-## Session safety
+## Session, privacy, and platform effects
 
-Explain whether this changes identity checks, active-session behavior,
-recovery, journals, state formats, installation, update, rollback, or
-uninstall. Write `None` if it does not.
+Explain any effect on exact identity, dashboard state, provider exit, opening,
+moving, kill confirmation, recovery, cleanup, logs, journals, supported Linux
+versions, installation, update, rollback, or uninstall. Write `None` if none.
 
 ## Rollback
 
-Describe how the change can be reversed without losing active sessions or
-local state.
+Explain how to reverse the change without losing an active terminal, provider
+conversation, or private state.

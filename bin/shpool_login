@@ -23,6 +23,8 @@ RECOVERY=""
 QUERY=""
 PAGE=1
 PAGE_SIZE=1
+PICKER_REFUSED_STATUS=74
+PICKER_ATTACH_FAILED_STATUS=75
 TEMP_FILES=()
 NEW_TEMP=""
 PICKER_STYLE=0
@@ -358,6 +360,29 @@ matches = [
 ]
 raise SystemExit(0 if len(matches) == 1 else 1)
 PY
+}
+
+view_is_live() {
+  python3 - "$VIEW" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    data = json.load(handle)
+raise SystemExit(
+    0
+    if data.get("source") == "live" and data.get("stale") is False
+    else 1
+)
+PY
+}
+
+require_live_actions() {
+  view_is_live || {
+    echo "  Live session state is unavailable. Cached rows are read-only; refresh and try again."
+    echo "  Nothing changed."
+    return 1
+  }
 }
 
 render_page() {
@@ -1011,56 +1036,6 @@ run_proof_action() {
   fi
 }
 
-# A session whose terminal died inside shpool can never be opened again: the
-# shell and its work are unreachable, but the conversation itself is safe on
-# disk. Say that in plain words and offer the one action that fixes it.
-offer_recovery() {
-  local number=$1 metadata
-  metadata=$(number_metadata "$number") || return 0
-  local -a fields=()
-  mapfile -t fields <<<"$metadata"
-  (( ${#fields[@]} == 8 )) || return 0
-  local display_id provider title uuid
-  display_id=$(decode64 "${fields[2]}")
-  provider=$(decode64 "${fields[3]}")
-  title=$(decode64 "${fields[4]}")
-  uuid=$(decode64 "${fields[6]}")
-
-  echo
-  printf '  %s [%s] could not be opened.\n' "$title" "$display_id"
-  echo "  Its terminal died inside the session manager, so this session cannot be reopened."
-  if [[ ( $provider != claude && $provider != codex ) || -z $uuid ]]; then
-    echo "  There is no saved conversation to move, so nothing can be recovered from it."
-    echo "  Kill it with k $number when you no longer need it."
-    return 0
-  fi
-  echo "  The conversation itself is saved and can continue in a new session."
-  echo
-  echo "  1  Continue this conversation in a new session (this one is closed)"
-  echo "  2  View its full terminal history"
-  echo "  Enter  Leave it alone"
-  echo
-  local action
-  while true; do
-    if ! read -r -p "  action ❯ " action; then
-      exit 2
-    fi
-    case "$action" in
-      "") return 0 ;;
-      1)
-        echo "  Moving the conversation to a new session…"
-        run_proof_action picker-recover "$number" || true
-        return 0
-        ;;
-      2)
-        run_proof_action picker-history "$number" || true
-        return 0
-        ;;
-      *) echo "  Choose 1, 2, or Enter." ;;
-    esac
-  done
-}
-
 refresh_after_action() {
   if ! refresh_snapshot; then
     echo "  Live sessions could not be refreshed. Returning to a regular terminal."
@@ -1070,6 +1045,7 @@ refresh_after_action() {
 
 choose_number() {
   local number=$1 metadata
+  require_live_actions || return
   number_on_page "$number" || {
     echo "  Choose a number shown here. Nothing changed."
     return
@@ -1097,9 +1073,19 @@ choose_number() {
   if [[ $availability == ready ]]; then
     local open_status=0
     PROOF_ACTION_QUIET=1 run_proof_action picker-open "$number" || open_status=$?
-    if (( open_status != 0 )); then
-      offer_recovery "$number"
-    fi
+    case "$open_status" in
+      0) ;;
+      "$PICKER_REFUSED_STATUS")
+        echo "  The displayed session changed or failed a safety check. Nothing changed."
+        ;;
+      "$PICKER_ATTACH_FAILED_STATUS")
+        echo "  The session manager could not connect. This does not prove the session is dead."
+        echo "  The session was left alone; refresh, inspect its history, or try again."
+        ;;
+      *)
+        echo "  The open command failed without a verified cause. The session was left alone."
+        ;;
+    esac
     refresh_after_action
     return
   fi
@@ -1142,6 +1128,7 @@ choose_number() {
 
 direct_close() {
   local number=$1
+  require_live_actions || return
   number_on_page "$number" || {
     echo "  Choose a number shown here. Nothing changed."
     return
@@ -1152,6 +1139,7 @@ direct_close() {
 
 rename_number() {
   local number=$1 metadata provider
+  require_live_actions || return
   number_on_page "$number" || {
     echo "  Choose a number shown here. Nothing changed."
     return
@@ -1182,6 +1170,7 @@ rename_number() {
 
 reset_name_number() {
   local number=$1 metadata provider uuid confidence
+  require_live_actions || return
   number_on_page "$number" || {
     echo "  Choose a number shown here. Nothing changed."
     return
@@ -1207,6 +1196,7 @@ reset_name_number() {
 
 fork_number() {
   local number=$1 metadata provider uuid confidence
+  require_live_actions || return
   number_on_page "$number" || {
     echo "  Choose a number shown here. Nothing changed."
     return
@@ -1272,6 +1262,7 @@ PY
 }
 
 guided_new() {
+  require_live_actions || return
   echo
   echo "  New session"
   echo "  1  Claude Code"
@@ -1415,6 +1406,7 @@ PY
 }
 
 review_recovery() {
+  require_live_actions || return
   recovery_list || {
     echo "  Recovery records are unavailable. Nothing changed."
     return

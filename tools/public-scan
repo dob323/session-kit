@@ -1,59 +1,195 @@
 #!/usr/bin/env python3
-"""Fail when a public tree contains secret formats or unsafe filesystem entries."""
+"""Scan a public tree, and optionally its Git history, without printing secrets."""
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 from pathlib import Path
 import re
+import subprocess
 
 
 TEXT_LIMIT = 4 * 1024 * 1024
 IGNORED_PARTS = {".git", ".mypy_cache", ".ruff_cache", "__pycache__"}
 IGNORED_NAMES = {".coverage"}
 SECRETS = {
-    "private key": re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
-    "GitHub token": re.compile(r"\b(?:ghp|github_pat)_[A-Za-z0-9_]{20,}\b"),
-    "AWS access key": re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    "private key": re.compile(
+        r"-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----"
+    ),
+    "GitHub token": re.compile(
+        r"\b(?:ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{20,}\b"
+    ),
+    "GitLab token": re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}\b"),
+    "AWS access key": re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
+    "Google API key": re.compile(r"\bAIza[0-9A-Za-z_-]{30,}\b"),
     "OpenAI key": re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
+    "Anthropic key": re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}\b"),
     "Slack token": re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{20,}\b"),
+    "Stripe live key": re.compile(r"\b(?:sk|rk)_live_[A-Za-z0-9]{16,}\b"),
+    "npm token": re.compile(r"\bnpm_[A-Za-z0-9]{20,}\b"),
 }
+# Repository-specific words are stored only as one-way digests. The scanner
+# remains safe to publish while still rejecting those words in release trees.
+PRIVATE_TOKEN_DIGESTS = frozenset(
+    {
+        "bcee5f794de98e5f990f21d817f6340df82a99bdcf3f7574f1adbf81be1741d2",
+        "e7c57b9c0eb6672cccff89401253bb0426b7f6a5d856c59c456885550f550128",
+        "9856a5635d21fe7ec66370d38d9326517935b01abae243723ec0d3b1ce610c63",
+        "9fcc02aea1ee9a3091972d30ea9054e0d593501ccb26d21c6c0332121dfa888c",
+        "72615b744fff4e9baeddb92066417fd08f60c8ebbdab199442069dfcd3c571ee",
+        # Neutral test-only marker.
+        "9244bfa2efb5ae19b6f84f62dc79582ad52a25a14f7e904e9c39e739360a7cff",
+    }
+)
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("root", nargs="?", default=".", type=Path)
-    args = parser.parse_args()
-    root = args.root.resolve()
+def scan_text(
+    label: str,
+    payload: bytes,
+    patterns: dict[str, re.Pattern[str]],
+    *,
+    private_markers: bool,
+) -> list[str]:
+    if len(payload) > TEXT_LIMIT:
+        return [f"{label}: file exceeds scan limit"]
+    if b"\0" in payload:
+        return [f"{label}: binary file is not allowed"]
+    text = payload.decode("utf-8", "replace")
+    failures = [
+        f"{label}: {name}" for name, pattern in patterns.items() if pattern.search(text)
+    ]
+    if private_markers:
+        for token in re.findall(r"[A-Za-z0-9_]+", text.casefold()):
+            digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+            if digest in PRIVATE_TOKEN_DIGESTS:
+                failures.append(f"{label}: private marker")
+                break
+    return failures
+
+
+def scan_tree(
+    root: Path,
+    patterns: dict[str, re.Pattern[str]],
+    *,
+    private_markers: bool,
+) -> list[str]:
     failures: list[str] = []
     for path in sorted(root.rglob("*")):
         if (
             any(part in IGNORED_PARTS for part in path.parts)
             or path.name in IGNORED_NAMES
             or path.suffix in {".pyc", ".pyo"}
-            or path.is_dir()
         ):
             continue
+        relative = path.relative_to(root)
         if path.is_symlink():
-            failures.append(f"{path.relative_to(root)}: symlink is not allowed")
+            failures.append(f"{relative}: symlink is not allowed")
             continue
-        payload = path.read_bytes()
-        if len(payload) > TEXT_LIMIT:
-            failures.append(f"{path.relative_to(root)}: file exceeds scan limit")
+        if path.is_dir():
             continue
+        failures.extend(
+            scan_text(
+                str(relative),
+                path.read_bytes(),
+                patterns,
+                private_markers=private_markers,
+            )
+        )
+    return failures
+
+
+def git(root: Path, *args: str, text: bool = True) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", "-C", str(root), *args],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=text,
+    )
+
+
+def scan_history(
+    root: Path,
+    patterns: dict[str, re.Pattern[str]],
+    *,
+    private_markers: bool,
+) -> list[str]:
+    try:
+        rows = git(root, "rev-list", "--objects", "--all").stdout.splitlines()
+    except subprocess.CalledProcessError as exc:
+        detail = exc.stderr.strip() or "not a Git repository"
+        return [f"Git history unavailable: {detail}"]
+
+    failures: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        object_id, _, path = row.partition(" ")
+        if object_id in seen:
+            continue
+        seen.add(object_id)
+        if git(root, "cat-file", "-t", object_id).stdout.strip() != "blob":
+            continue
+        size = int(git(root, "cat-file", "-s", object_id).stdout.strip())
+        label = f"history {object_id[:12]}"
+        if path:
+            label += f" ({path})"
+        if size > TEXT_LIMIT:
+            failures.append(f"{label}: file exceeds scan limit")
+            continue
+        payload = git(root, "cat-file", "blob", object_id, text=False).stdout
         if b"\0" in payload:
-            failures.append(f"{path.relative_to(root)}: binary file is not allowed")
             continue
-        text = payload.decode("utf-8", "replace")
-        for label, pattern in SECRETS.items():
-            if pattern.search(text):
-                failures.append(f"{path.relative_to(root)}: {label}")
+        failures.extend(
+            scan_text(
+                label,
+                payload,
+                patterns,
+                private_markers=private_markers,
+            )
+        )
+    return failures
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("root", nargs="?", default=".", type=Path)
+    parser.add_argument(
+        "--git-history",
+        action="store_true",
+        help="scan every blob reachable from local Git refs",
+    )
+    parser.add_argument(
+        "--private-markers",
+        action="store_true",
+        help="also reject repository-specific private markers",
+    )
+    args = parser.parse_args()
+    root = args.root.resolve()
+    if not root.is_dir():
+        parser.error("root must be a directory")
+
+    failures = scan_tree(
+        root,
+        SECRETS,
+        private_markers=args.private_markers,
+    )
+    if args.git_history:
+        failures.extend(
+            scan_history(
+                root,
+                SECRETS,
+                private_markers=args.private_markers,
+            )
+        )
+    failures = sorted(set(failures))
     if failures:
         print("public scan failed:")
         for failure in failures:
             print(f"  {failure}")
         return 1
-    print("public scan passed")
+    scope = "tree and Git history" if args.git_history else "tree"
+    print(f"public scan passed ({scope})")
     return 0
 
 

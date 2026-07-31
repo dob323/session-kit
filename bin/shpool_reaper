@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # Safe session-kit reaper.
 #
-# Scheduled runs may record verified seven-day empty-shell candidates. They
-# never kill a session, move or delete a journal, or change recovery state.
-# `sp prune` performs the separately confirmed destructive action.
+# The normal report records verified seven-day empty-shell candidates for
+# confirmed `sp prune`. `--auto-close` is narrower and may close only a
+# generated, provider-exited terminal after 72 continuous hours of exact proof.
 
 set -u
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd -P)
+RELEASE_DIR=$(cd -- "$SCRIPT_DIR/.." && pwd -P)
 
 if [[ ${SESSION_KIT_TESTING:-0} == 1 && -n ${SESSION_KIT_TEST_PLATFORM:-} ]]; then
   REAPER_PLATFORM=$SESSION_KIT_TEST_PLATFORM
@@ -24,21 +27,30 @@ SENTINEL=${SESSION_KIT_REAPER_SENTINEL:-"$HOME/.no_shpool_reaper"}
 MAX_AGE_DAYS=${SESSION_KIT_PRUNE_DAYS:-7}
 SHPOOL=${SESSION_KIT_SHPOOL_CMD:-}
 DRY_RUN=${SESSION_KIT_REAPER_DRY_RUN:-0}
+AUTO_CLOSE_HOURS=${SESSION_KIT_AUTO_CLOSE_HOURS:-72}
+STATUS=${SESSION_KIT_STATUS_CMD:-"$SCRIPT_DIR/shpool_status"}
 
 MODE=report
 VERIFY_FILE=
 case "${1:-}" in
   ""|--candidates) ;;
+  --auto-close)
+    [[ -z ${2:-} ]] || {
+      echo "usage: shpool_reaper [--candidates|--auto-close|--verify-candidate <private-json>]" >&2
+      exit 2
+    }
+    MODE=auto
+    ;;
   --verify-candidate)
     [[ -n ${2:-} && -z ${3:-} ]] || {
-      echo "usage: shpool_reaper [--candidates|--verify-candidate <private-json>]" >&2
+      echo "usage: shpool_reaper [--candidates|--auto-close|--verify-candidate <private-json>]" >&2
       exit 2
     }
     MODE=verify
     VERIFY_FILE=$2
     ;;
   *)
-    echo "usage: shpool_reaper [--candidates|--verify-candidate <private-json>]" >&2
+    echo "usage: shpool_reaper [--candidates|--auto-close|--verify-candidate <private-json>]" >&2
     exit 2
     ;;
 esac
@@ -62,6 +74,8 @@ if [[ -e $SENTINEL ]]; then
 fi
 [[ -n $SHPOOL && -x $SHPOOL ]] || fail "shpool executable unavailable"
 [[ $MAX_AGE_DAYS =~ ^[0-9]+$ && $MAX_AGE_DAYS -ge 1 ]] || fail "invalid prune age"
+[[ $AUTO_CLOSE_HOURS =~ ^[0-9]+$ && $AUTO_CLOSE_HOURS -ge 1 &&
+   $AUTO_CLOSE_HOURS -le 8760 ]] || fail "invalid auto-close age"
 
 json=$("$SHPOOL" list --json 2>/dev/null) || fail "shpool list error"
 daemon_pid=${SESSION_KIT_DAEMON_PID:-}
@@ -69,6 +83,120 @@ if [[ -z $daemon_pid && $PROC_ROOT == /proc ]]; then
   daemon_pid=$(pgrep -f '^.*/shpool daemon$' | head -1)
 fi
 [[ $daemon_pid =~ ^[0-9]+$ ]] || fail "daemon PID unavailable"
+
+if [[ $MODE == auto ]]; then
+  [[ -x $STATUS ]] || fail "guard-live status command unavailable"
+  [[ -f $RELEASE_DIR/lib/sessionkit_inventory/reaper.py ]] ||
+    fail "auto-close planner unavailable"
+  inventory=$("$STATUS" --guard-json 2>/dev/null) ||
+    fail "guard-live inventory unavailable"
+  export SK_REAPER_SHPOOL_JSON=$json
+  export SK_REAPER_INVENTORY_JSON=$inventory
+  export SK_REAPER_STATE_DIR=$STATE_DIR
+  export SK_REAPER_PROC_ROOT=$PROC_ROOT
+  export SK_REAPER_DAEMON_PID=$daemon_pid
+  export SK_REAPER_AUTO_CLOSE_HOURS=$AUTO_CLOSE_HOURS
+  plan_args=(plan)
+  if [[ $DRY_RUN == 1 ]]; then plan_args+=(--no-write); fi
+  plan=$(PYTHONPATH="$RELEASE_DIR/lib" \
+    python3 -m sessionkit_inventory.reaper "${plan_args[@]}") ||
+    fail "auto-close planning failed"
+  if [[ $DRY_RUN == 1 ]]; then
+    printf '%s\n' "$plan"
+    exit 0
+  fi
+  umask 077
+  mkdir -p "$STATE_DIR" || fail "state directory creation"
+  chmod 700 "$STATE_DIR" 2>/dev/null || true
+  candidate_file=$STATE_DIR/auto-close-candidates.json
+  [[ -f $candidate_file && ! -L $candidate_file ]] ||
+    fail "auto-close candidate document unavailable"
+  candidate_count=$(python3 - "$candidate_file" <<'PY'
+import json,sys
+value=json.load(open(sys.argv[1],encoding="utf-8"))
+items=value.get("candidates") if isinstance(value,dict) else None
+if not isinstance(items,list):
+    raise SystemExit(1)
+print(len(items))
+PY
+  ) || fail "auto-close candidate document is invalid"
+  if [[ $candidate_count == 0 ]]; then
+    printf '%s\n' "$plan"
+    exit 0
+  fi
+  # The creation lock is the shared Session Kit attach/create/close barrier.
+  exec 9>"$STATE_DIR/create.lock" || fail "creation lock unavailable"
+  flock -x 9 || fail "creation lock unavailable"
+  # Reuse the privacy-minimal capped action log already used by picker actions.
+  # shellcheck source=bin/session_kit_common
+  source "$SCRIPT_DIR/session_kit_common"
+  sk_prepare_state || fail "private action state unavailable"
+  actions=0
+  proof=
+  trap '[[ -z ${proof:-} ]] || rm -f -- "$proof"' EXIT
+  for (( candidate_index=0; candidate_index<candidate_count; candidate_index++ )); do
+    proof=$(mktemp "$STATE_DIR/auto-close-proof.XXXXXX.json") ||
+      fail "private candidate proof creation"
+    chmod 600 "$proof" || fail "private candidate proof permissions"
+    python3 - "$candidate_file" "$candidate_index" "$proof" <<'PY' ||
+import json,os,sys
+source,index,destination=sys.argv[1],int(sys.argv[2]),sys.argv[3]
+value=json.load(open(source,encoding="utf-8"))
+item=value["candidates"][index]
+with open(destination,"w",encoding="utf-8") as handle:
+    json.dump(item,handle,sort_keys=True)
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+PY
+      fail "private candidate proof extraction"
+    target=$(python3 - "$proof" <<'PY'
+import json,sys
+value=json.load(open(sys.argv[1],encoding="utf-8"))
+target=value.get("shpool_id") if isinstance(value,dict) else None
+if not isinstance(target,str):
+    raise SystemExit(1)
+print(target)
+PY
+    ) || fail "private candidate target is invalid"
+    for verification_pass in 1 2; do
+      json=$("$SHPOOL" list --json 2>/dev/null) ||
+        fail "fresh shpool list error"
+      inventory=$("$STATUS" --guard-json 2>/dev/null) ||
+        fail "fresh guard-live inventory unavailable"
+      export SK_REAPER_SHPOOL_JSON=$json
+      export SK_REAPER_INVENTORY_JSON=$inventory
+      PYTHONPATH="$RELEASE_DIR/lib" \
+        python3 -m sessionkit_inventory.reaper verify "$proof" >/dev/null ||
+        fail "auto-close candidate changed or is no longer safe"
+    done
+    sk_log_action auto_close requested ||
+      fail "private action log unavailable; nothing closed"
+    "$SHPOOL" kill "$target" >/dev/null 2>&1 ||
+      fail "exact auto-close action failed"
+    after=$("$SHPOOL" list --json 2>/dev/null) ||
+      fail "post-close shpool list error"
+    SK_REAPER_POST_JSON=$after python3 - "$target" <<'PY' ||
+import json,os,sys
+payload=json.loads(os.environ["SK_REAPER_POST_JSON"])
+rows=payload.get("sessions") if isinstance(payload,dict) else payload
+if not isinstance(rows,list):
+    raise SystemExit(1)
+raise SystemExit(1 if any(
+    isinstance(row,dict) and row.get("name")==sys.argv[1] for row in rows
+) else 0)
+PY
+      fail "closed target is still present"
+    sk_log_action auto_close closed ||
+      fail "close succeeded but private action log update failed"
+    rm -f -- "$proof"
+    proof=
+    actions=$((actions + 1))
+  done
+  trap - EXIT
+  printf 'auto_candidates=%s actions=%s\n' "$candidate_count" "$actions"
+  exit 0
+fi
 
 if [[ $MODE == verify ]]; then
   [[ -f $VERIFY_FILE && ! -L $VERIFY_FILE ]] || fail "candidate proof is not a regular file"

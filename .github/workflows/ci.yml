@@ -42,80 +42,49 @@ jobs:
           bash -n bashrc/shpool.bashrc
           bash -n deploy/session-kit-launcher
           bash -n tests/run
-      - name: Check public tree
+      - name: Check public working tree
         run: tools/public-scan .
       - name: Run tests
         run: tests/run
 
-  macos-preview:
-    name: macOS 15 preview / Python 3.13
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
-        with:
-          python-version: "3.13"
-      - name: Install supported Bash
-        run: brew install bash
-      - name: Check Bash syntax
-        run: |
-          "$(brew --prefix)/bin/bash" -n install.sh
-          "$(brew --prefix)/bin/bash" -n bin/*
-          "$(brew --prefix)/bin/bash" -n bashrc/shpool.bashrc
-          "$(brew --prefix)/bin/bash" -n deploy/session-kit-launcher
-          "$(brew --prefix)/bin/bash" -n tests/run
-      - name: Run native preview tests
-        env:
-          SESSION_KIT_MACOS_PREVIEW: "1"
-          SESSION_KIT_TEST_BASH: /opt/homebrew/bin/bash
-        run: |
-          test "$("$SESSION_KIT_TEST_BASH" -c 'printf "%s" "${BASH_VERSINFO[0]}"')" -ge 4
-          python3 -m unittest -v tests.test_macos_preview
-
   quality:
-    name: Static analysis and coverage
+    name: Quality, privacy, and public export
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.13"
-      - name: Check public tree before tool caches exist
-        run: tools/public-scan .
       - name: Install quality tools
         run: |
           sudo apt-get update
           sudo apt-get install --yes shellcheck
           python -m pip install --requirement requirements-dev.txt
-      - name: Run ShellCheck
+      - name: Check shell
         run: |
           shellcheck install.sh bin/* bashrc/shpool.bashrc \
             deploy/session-kit-launcher tests/run
-      - name: Run Ruff
+      - name: Check Python
         env:
           RUFF_CACHE_DIR: ${{ runner.temp }}/ruff-cache
         run: |
           ruff check .
-          python -m compileall -q lib
-          format_files=(
-            lib/sessionkit_inventory/__init__.py
-            lib/sessionkit_inventory/common.py
-            tests/test_facade.py
-            tests/test_public_scan.py
-          )
-          if [[ -f tests/test_public_export.py ]]; then
-            format_files+=(tests/test_public_export.py)
-          fi
-          if [[ -f public/tests-support.py ]]; then
-            format_files+=(public/tests-support.py)
-          else
-            format_files+=(tests/support.py)
-          fi
-          ruff format --check "${format_files[@]}"
+          ruff check tools/build-public-tree tools/build-release-artifact \
+            tools/check-doc-links tools/public-scan
+          ruff format --check lib/sessionkit_inventory/__init__.py \
+            lib/sessionkit_inventory/common.py \
+            lib/sessionkit_inventory/providers.py \
+            tests/test_doc_links.py tests/test_facade.py \
+            tests/test_public_export.py tests/test_public_scan.py \
+            tests/test_release_artifact.py tests/support.py
+          ruff format --check tools/build-public-tree tools/build-release-artifact \
+            tools/check-doc-links tools/public-scan
+          python -m compileall -q lib tests
+          python -m py_compile tools/build-public-tree \
+            tools/build-release-artifact tools/check-doc-links tools/public-scan
       - name: Report legacy type baseline
         continue-on-error: true
         env:
@@ -123,6 +92,33 @@ jobs:
         run: |
           mypy --ignore-missing-imports \
             lib/session_inventory.py lib/sessionkit_inventory
+      - name: Check documentation links
+        run: tools/check-doc-links
+      - name: Scan working tree and reachable history
+        run: |
+          tools/public-scan .
+          if [[ -f SOURCE.json ]]; then
+            tools/public-scan . --git-history --private-markers
+          else
+            tools/public-scan . --git-history
+          fi
+      - name: Build and test exact public export
+        run: |
+          tools/build-public-tree \
+            --commit "$GITHUB_SHA" \
+            --destination "$RUNNER_TEMP/session-kit-public"
+          "$RUNNER_TEMP/session-kit-public/tests/run"
+      - name: Build reproducible release preparation files
+        run: |
+          tools/build-release-artifact \
+            --commit "$GITHUB_SHA" \
+            --output-dir "$RUNNER_TEMP/artifacts-one"
+          tools/build-release-artifact \
+            --commit "$GITHUB_SHA" \
+            --output-dir "$RUNNER_TEMP/artifacts-two"
+          diff -qr "$RUNNER_TEMP/artifacts-one" "$RUNNER_TEMP/artifacts-two"
+          cd "$RUNNER_TEMP/artifacts-one"
+          sha256sum --check session-kit-"$GITHUB_SHA".sha256
       - name: Enforce tested Python coverage
         env:
           COVERAGE_FILE: ${{ runner.temp }}/coverage
@@ -130,3 +126,24 @@ jobs:
           coverage run --branch --source=lib \
             -m unittest discover -s tests -t .
           coverage report --skip-empty --fail-under=70
+
+  shpool-patch:
+    name: Optional shpool patch applies and builds
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Check patch against shpool 0.11.0
+        run: |
+          git clone --branch v0.11.0 --depth 1 \
+            https://github.com/shell-pool/shpool.git \
+            "$RUNNER_TEMP/shpool"
+          test "$(git -C "$RUNNER_TEMP/shpool" rev-parse HEAD)" = \
+            fe2d11595ff255810523b0868159dec051e303f1
+          git -C "$RUNNER_TEMP/shpool" apply --check \
+            "$GITHUB_WORKSPACE/shpool-patch/0001-heartbeat-ack-timeout-is-not-fatal.patch"
+          git -C "$RUNNER_TEMP/shpool" apply \
+            "$GITHUB_WORKSPACE/shpool-patch/0001-heartbeat-ack-timeout-is-not-fatal.patch"
+          cargo build --locked --release --manifest-path \
+            "$RUNNER_TEMP/shpool/Cargo.toml" --bin shpool

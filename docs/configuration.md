@@ -1,7 +1,7 @@
 # Configuration
 
-Session Kit uses XDG paths and keeps host-specific configuration outside the
-immutable release directory.
+Session Kit keeps host configuration outside immutable release directories and
+uses XDG locations where available.
 
 ## Default paths
 
@@ -10,19 +10,20 @@ immutable release directory.
 | Inventory configuration | `${XDG_CONFIG_HOME:-$HOME/.config}/session-kit/inventory.json` |
 | Project aliases | `${XDG_CONFIG_HOME:-$HOME/.config}/session-kit/projects.tsv` |
 | Session Kit state | `${XDG_STATE_HOME:-$HOME/.local/state}/session-kit` |
-| Terminal journals | `${XDG_STATE_HOME:-$HOME/.local/state}/shpool-journal` |
-| Recovery journals | `${XDG_STATE_HOME:-$HOME/.local/state}/shpool-journal-recovery` |
-| Launch records | `${XDG_STATE_HOME:-$HOME/.local/state}/shpool-start` |
+| Optional terminal journals | `${XDG_STATE_HOME:-$HOME/.local/state}/shpool-journal` |
+| Recovery journal archive | `${XDG_STATE_HOME:-$HOME/.local/state}/shpool-journal-recovery` |
+| Paired launch records | `${XDG_STATE_HOME:-$HOME/.local/state}/shpool-start` |
 | Immutable releases | `$HOME/.local/lib/session-kit/releases` |
 | Stable commands | `$HOME/.local/bin` |
 
 Private directories should be mode `0700`; private files should be mode `0600`.
-Session Kit refuses sensitive mutation proofs with unsafe type, ownership,
-mode, or link count.
+Sensitive proof files also require the expected owner, regular-file type, and
+link count.
 
-## Inventory configuration
+## Inventory settings
 
-Start from [../config/session-inventory.example.json](../config/session-inventory.example.json):
+Start from
+[the inventory example](../config/session-inventory.example.json):
 
 ```json
 {
@@ -34,16 +35,16 @@ Start from [../config/session-inventory.example.json](../config/session-inventor
 }
 ```
 
-The `aliases` and `automatic_titles` objects are managed by Session Kit.
-Manual aliases take priority over provider titles, automatic titles, and
-fallback descriptions.
-
-Use `sp name` for aliases instead of editing UUID keys by hand:
+Session Kit manages local aliases and automatic titles. Set names through the
+command interface so identity checks and locking remain active:
 
 ```text
 sp name <terminal-number|shpool-id> <title>
 sp name reset <terminal-number|shpool-id>
 ```
+
+Manual names take priority over provider titles, retained automatic names, and
+fallback descriptions.
 
 ## Project aliases
 
@@ -56,11 +57,8 @@ api	codex	/absolute/path/to/api
 tools	shell	/absolute/path/to/tools
 ```
 
-An alias contains lowercase letters, numbers, `_`, or `-`. The provider is
-`claude`, `codex`, or `shell`. The directory must be absolute and must exist
-when the alias is used.
-
-With that file:
+Aliases use lowercase letters, numbers, `_`, or `-`. The provider is `claude`,
+`codex`, or `shell`. The directory must be absolute and exist when used.
 
 ```text
 sp new web
@@ -68,10 +66,10 @@ sp new codex api
 sp new shell tools
 ```
 
-## shpool configuration
+## shpool settings
 
-Review [../config/shpool.example.toml](../config/shpool.example.toml). Session
-Kit expects a bounded rendered restore buffer:
+Review [the shpool example](../config/shpool.example.toml). Session Kit expects
+a bounded rendered restore buffer:
 
 ```toml
 session_restore_mode = { lines = 500 }
@@ -80,45 +78,53 @@ vt100_output_spool_width = 200
 prompt_prefix = ""
 ```
 
-The terminal journal remains the full local byte record. Reattaching restores a
-bounded rendered view instead of replaying the whole journal.
+## Journals
 
-## Guided journal policy
+Terminal journals are off by default. Opting in affects new managed sessions;
+it does not add or remove a writer inside a session already running.
 
-The guided installer will enable journals for new managed sessions by default
-after showing where data is stored. Existing journal writers are not replaced
-mid-session.
+The `$HOME/.no_shpool_journal` sentinel forces journals off. Removing it does
+not delete existing files and does not change an active terminal.
 
-Create `$HOME/.no_shpool_journal` before a new managed session starts to skip
-its journal wrapper. This does not delete existing journals.
-
-## Picker and scheduled-component switches
-
-These files disable optional behavior:
+## Optional feature sentinels
 
 ```text
 $HOME/.no_shpool           automatic SSH picker
-$HOME/.no_shpool_reaper    scheduled reaper reports
-$HOME/.no_shpool_watchdog  watchdog reports
+$HOME/.no_shpool_reaper    scheduled cleanup observer
+$HOME/.no_shpool_watchdog  health reports
 $HOME/.no_shpool_journal   journals for new managed sessions
 ```
 
-Removing a sentinel re-enables the corresponding component. Review the current
-configuration before doing so.
+Removing a sentinel re-enables that component only after its other
+configuration checks pass.
+
+## Advanced watchdog repair mode
+
+The installed watchdog defaults to `report` mode. The source also accepts
+`SESSION_KIT_WATCHDOG_MODE=repair` as an explicit advanced opt-in. The installer
+does not enable it, and it is not needed for ordinary health reporting.
+
+Repair mode can close a terminal that has direct evidence of an unrecoverable
+shpool handoff failure and relaunch the exact provider conversation in a new
+managed terminal. That can discard terminal-only state, interrupt child
+processes if the proof is wrong, and depend on provider-native recovery being
+available. Quiet output alone never qualifies. Review the owner-only watchdog
+log and test manual `sp repair` before enabling this mode.
 
 ## Color
 
-Color is used only on an interactive terminal. Set either variable to disable
-it:
+The picker uses color only when output is an interactive, supported terminal.
+Provider, availability, attention, danger, and secondary text each have one
+consistent category. Labels and symbols preserve the meaning without color.
+
+Disable color with either variable:
 
 ```bash
 export NO_COLOR=1
 export SESSION_KIT_NO_COLOR=1
 ```
 
-## Supported overrides
-
-Common test and advanced deployment overrides include:
+## Supported environment overrides
 
 ```text
 SESSION_KIT_CONFIG
@@ -136,6 +142,5 @@ SESSION_KIT_NO_COLOR
 SESSION_KIT_NONINTERACTIVE
 ```
 
-Several additional environment variables in the source are internal test or
-release hooks. They are not a stable public configuration interface unless
-listed here.
+Other environment names in the source are internal test or release hooks and
+are not a stable public interface.

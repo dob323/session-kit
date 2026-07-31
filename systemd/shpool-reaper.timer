@@ -1,5 +1,5 @@
 [Unit]
-Description=Hourly reap of abandoned empty shpool sessions
+Description=Hourly exact provider-exit cleanup check
 
 [Timer]
 OnCalendar=hourly
