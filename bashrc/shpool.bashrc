@@ -223,30 +223,59 @@ PY
             # adopts that pick as the conversation's override once the ID
             # exists, keeping window, picker, and future resumes identical.
             # Fail-open: unknown color or missing theme file launches plain.
-            __sk_codex_theme=()
-            __sk_theme_color=
-            if [[ -f $__sk_inventory_core ]]; then
-              if [[ -n $__sk_uuid ]]; then
-                __sk_theme_color=$(python3 "$__sk_inventory_core" color effective codex "$__sk_uuid" 2>/dev/null || true)
-              else
-                __sk_theme_color=$(python3 "$__sk_inventory_core" color launch-pick "$SHPOOL_SESSION_NAME" 2>/dev/null || true)
-              fi
-            fi
-            case "$__sk_theme_color" in
-              red|blue|green|yellow|purple|orange|pink|cyan)
-                if [[ -r ${CODEX_HOME:-$HOME/.codex}/themes/sk-$__sk_theme_color.tmTheme ]]; then
-                  __sk_codex_theme=(-c "tui.theme=\"sk-$__sk_theme_color\"")
-                fi
-                ;;
-            esac
-            unset __sk_theme_color
             command rm -- "$__sk_start" "$__sk_expected"
             __sk_provider_launched=1
-            case "$__sk_launch_mode" in
-              new) codex "${__sk_codex_no_update[@]}" "${__sk_codex_theme[@]}" --no-alt-screen; __sk_provider_rc=$? ;;
-              resume) codex "${__sk_codex_no_update[@]}" "${__sk_codex_theme[@]}" --no-alt-screen resume "$__sk_uuid"; __sk_provider_rc=$? ;;
-              fork) codex "${__sk_codex_no_update[@]}" "${__sk_codex_theme[@]}" --no-alt-screen fork "$__sk_uuid"; __sk_provider_rc=$? ;;
-            esac
+            # A new-mode Codex boots before any thread title can exist, so its
+            # status bar shows the conversation ID for that process's life.
+            # The marker lets the picker request one safe provider bounce
+            # (codex resume of the same conversation) once a title exists.
+            if [[ $__sk_launch_mode == new ]]; then
+              ( umask 077
+                mkdir -p "$__sk_state_root/session-kit/provider-untitled" &&
+                  : > "$__sk_state_root/session-kit/provider-untitled/$SHPOOL_SESSION_NAME"
+              ) 2>/dev/null || true
+            fi
+            while :; do
+              __sk_codex_theme=()
+              __sk_theme_color=
+              if [[ -f $__sk_inventory_core ]]; then
+                if [[ -n $__sk_uuid ]]; then
+                  __sk_theme_color=$(python3 "$__sk_inventory_core" color effective codex "$__sk_uuid" 2>/dev/null || true)
+                else
+                  __sk_theme_color=$(python3 "$__sk_inventory_core" color launch-pick "$SHPOOL_SESSION_NAME" 2>/dev/null || true)
+                fi
+              fi
+              case "$__sk_theme_color" in
+                red|blue|green|yellow|purple|orange|pink|cyan)
+                  if [[ -r ${CODEX_HOME:-$HOME/.codex}/themes/sk-$__sk_theme_color.tmTheme ]]; then
+                    __sk_codex_theme=(-c "tui.theme=\"sk-$__sk_theme_color\"")
+                  fi
+                  ;;
+              esac
+              unset __sk_theme_color
+              case "$__sk_launch_mode" in
+                new) codex "${__sk_codex_no_update[@]}" "${__sk_codex_theme[@]}" --no-alt-screen; __sk_provider_rc=$? ;;
+                resume) codex "${__sk_codex_no_update[@]}" "${__sk_codex_theme[@]}" --no-alt-screen resume "$__sk_uuid"; __sk_provider_rc=$? ;;
+                fork) codex "${__sk_codex_no_update[@]}" "${__sk_codex_theme[@]}" --no-alt-screen fork "$__sk_uuid"; __sk_provider_rc=$? ;;
+              esac
+              # A kit-requested bounce relaunches the SAME conversation once,
+              # so the fresh process boots with its title and theme. Any other
+              # exit falls through to the normal provider-exit handling.
+              __sk_bounce="$__sk_state_root/session-kit/provider-bounce/$SHPOOL_SESSION_NAME"
+              if [[ -f $__sk_bounce && ! -L $__sk_bounce ]]; then
+                __sk_bounce_uuid=$(command head -c 64 -- "$__sk_bounce" 2>/dev/null | tr -cd '0-9a-fA-F-')
+                command rm -f -- "$__sk_bounce"
+                if [[ $__sk_bounce_uuid =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]]; then
+                  __sk_uuid=$__sk_bounce_uuid
+                  __sk_launch_mode=resume
+                  unset __sk_bounce_uuid __sk_bounce
+                  continue
+                fi
+                unset __sk_bounce_uuid
+              fi
+              unset __sk_bounce
+              break
+            done
           fi
           ;;
         shell)

@@ -129,6 +129,90 @@ picker_revalidate_locked() {
   sk_picker_proof_matches "$SNAPSHOT"
 }
 
+# One safe provider bounce: a new-mode Codex booted before its thread title
+# existed, so its status bar shows the conversation ID forever. When the human
+# opens such a session and a title now exists, terminate the idle provider —
+# the session shell relaunches the SAME conversation immediately (marker
+# handshake with the bashrc), so the window opens named and themed. Guards,
+# all fail-open toward "no bounce": untitled-boot marker present (only
+# new-mode Codex sessions ever write one, so parked or pre-existing lanes are
+# structurally excluded), a title in Codex's thread store, no subagents, not
+# mid-turn, quiet for two minutes, and an exact PID+start-time match before
+# the signal.
+picker_maybe_bounce_codex() {
+  local id=$1
+  [[ ${SK_PROOF_PROVIDER:-} == codex ]] || return 0
+  local uuid=${SK_PROOF_UUID:-}
+  [[ -n $uuid ]] || return 0
+  local untitled="$SK_STATE_DIR/provider-untitled/$id"
+  [[ -f $untitled && ! -L $untitled ]] || return 0
+  # A marker for a long-gone session must never linger into a PID-reuse era.
+  local marker_age
+  marker_age=$(( $(date +%s) - $(stat -c %Y "$untitled" 2>/dev/null || echo 0) ))
+  if (( marker_age > 604800 )); then
+    command rm -f -- "$untitled"
+    return 0
+  fi
+  local pid=${SK_PROOF_PROVIDER_PID:-} start=${SK_PROOF_PROVIDER_START:-}
+  [[ $pid =~ ^[0-9]+$ && $start =~ ^[0-9]+$ ]] || return 0
+  python3 - "$SNAPSHOT" "$id" "$uuid" "$pid" "$start" <<'PY' || return 0
+import json, os, sqlite3, sys
+from pathlib import Path
+
+snapshot, shpool_id, uuid, pid_text, start_text = sys.argv[1:6]
+try:
+    data = json.load(open(snapshot, encoding="utf-8"))
+    row = next(
+        s for s in data.get("sessions", [])
+        if s.get("shpool_id") == shpool_id
+    )
+except (OSError, ValueError, StopIteration):
+    raise SystemExit(1)
+if row.get("subagents"):
+    raise SystemExit(1)
+if str(row.get("agent_status") or "").casefold() == "working":
+    raise SystemExit(1)
+age = row.get("recent_output_age_seconds")
+if not isinstance(age, int) or isinstance(age, bool) or age < 120:
+    raise SystemExit(1)
+codex_root = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+databases = sorted(codex_root.glob("state_*.sqlite"))
+if not databases:
+    raise SystemExit(1)
+try:
+    connection = sqlite3.connect(f"file:{databases[-1]}?mode=ro", uri=True)
+    fetched = connection.execute(
+        "SELECT title FROM threads WHERE id = ?", (uuid,)
+    ).fetchone()
+    connection.close()
+except sqlite3.Error:
+    raise SystemExit(1)
+if not fetched or not (fetched[0] or "").strip():
+    raise SystemExit(1)
+try:
+    stat_text = Path(f"/proc/{pid_text}/stat").read_text()
+    if stat_text.rsplit(")", 1)[1].split()[19] != start_text:
+        raise SystemExit(1)
+    cmdline = Path(f"/proc/{pid_text}/cmdline").read_bytes()
+    if b"codex" not in cmdline:
+        raise SystemExit(1)
+except (OSError, IndexError):
+    raise SystemExit(1)
+raise SystemExit(0)
+PY
+  ( umask 077
+    mkdir -p "$SK_STATE_DIR/provider-bounce" &&
+      printf '%s\n' "$uuid" > "$SK_STATE_DIR/provider-bounce/$id"
+  ) 2>/dev/null || return 0
+  if kill -TERM "$pid" 2>/dev/null; then
+    command rm -f -- "$untitled"
+    picker_action_event picker_open provider_bounced
+  else
+    command rm -f -- "$SK_STATE_DIR/provider-bounce/$id"
+  fi
+  return 0
+}
+
 picker_open() {
   local proof=$1
   picker_action_event picker_open requested
@@ -157,6 +241,7 @@ picker_open() {
   # the lifetime of the attachment. Release it immediately before the guarded
   # name-only request; --cmd /bin/false prevents a persistent raced replacement.
   sk_lock_release 9
+  picker_maybe_bounce_codex "$id" || true
   if picker_attach_id "$id" "$cwd"; then
     picker_action_event picker_open returned
     return 0
