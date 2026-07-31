@@ -527,6 +527,49 @@ class AutoTitleFromHookTests(unittest.TestCase):
                 "conversation already has prior prompts", busy["reason"]
             )
 
+    def test_tool_results_do_not_count_as_prompts(self) -> None:
+        with tempfile.TemporaryDirectory() as base:
+            home, transcript = self._prebaked_home(Path(base))
+            with open(transcript, "a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "type": "user",
+                            "message": {
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "tool_result",
+                                        "tool_use_id": "toolu_x",
+                                        "content": "ok",
+                                    }
+                                ],
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+                handle.write(
+                    json.dumps(
+                        {
+                            "type": "user",
+                            "message": {
+                                "role": "user",
+                                "content": "leap years are there in 2026 and what?",
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+            result = inventory_core.auto_title_from_hook(
+                self._payload(
+                    transcript,
+                    "leap years are there in 2026 and what are the dates?",
+                ),
+                environ={"HOME": str(home)},
+            )
+            self.assertEqual("Leap years are there in 2026", result["title"])
+
     def test_refuses_foreign_transcript_paths(self) -> None:
         with tempfile.TemporaryDirectory() as base:
             home, transcript = self._prebaked_home(Path(base))
@@ -537,6 +580,56 @@ class AutoTitleFromHookTests(unittest.TestCase):
                 environ={"HOME": str(home)},
             )
             self.assertIsNone(result["title"])
+
+    def test_stop_event_titles_from_transcript_first_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as base:
+            home, transcript = self._prebaked_home(Path(base))
+            with open(transcript, "a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "type": "user",
+                            "message": {
+                                "role": "user",
+                                "content": "fix the nginx 502 errors please",
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+            payload = json.dumps(
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": self.UUID,
+                    "transcript_path": str(transcript),
+                }
+            )
+            result = inventory_core.auto_title_from_hook(
+                payload, environ={"HOME": str(home)}
+            )
+            self.assertEqual("Fix the nginx 502 errors please", result["title"])
+
+    def test_first_prompt_outranks_payload_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as base:
+            home, transcript = self._prebaked_home(Path(base))
+            with open(transcript, "a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "type": "user",
+                            "message": {
+                                "role": "user",
+                                "content": "fix the nginx 502 errors please",
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+            result = inventory_core.auto_title_from_hook(
+                self._payload(transcript, "unrelated second question here"),
+                environ={"HOME": str(home)},
+            )
+            self.assertEqual("Fix the nginx 502 errors please", result["title"])
 
 
 if __name__ == "__main__":

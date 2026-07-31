@@ -3110,14 +3110,15 @@ def auto_title_from_hook(
         return skip("hook payload is not valid JSON")
     if not isinstance(payload, Mapping):
         return skip("hook payload is not an object")
-    if payload.get("hook_event_name") != "UserPromptSubmit":
-        return skip("not a UserPromptSubmit event")
+    # UserPromptSubmit fires before the first turn is flushed to disk (the
+    # pre-bake signature is not yet visible then); Stop fires right after the
+    # first answer with everything durable. Supporting both means the title
+    # lands at the end of the first exchange.
+    if payload.get("hook_event_name") not in ("UserPromptSubmit", "Stop"):
+        return skip("not a UserPromptSubmit or Stop event")
     uuid = valid_uuid(str(payload.get("session_id") or ""))
     if not uuid:
         return skip("missing or invalid session_id")
-    title = derive_prompt_title(payload.get("prompt"))
-    if not title:
-        return skip("prompt does not yield a title")
 
     env = environ if environ is not None else os.environ
     home = Path(env.get("HOME") or os.fspath(Path.home()))
@@ -3147,6 +3148,7 @@ def auto_title_from_hook(
 
     signature = False
     real_users = 0
+    first_prompt: str | None = None
     for line in lines:
         try:
             record = json.loads(line)
@@ -3161,20 +3163,33 @@ def auto_title_from_hook(
             continue
         if record.get("isSidechain"):
             continue
-        text = _first_text_block(
+        content = (
             record.get("message", {}).get("content")
             if isinstance(record.get("message"), Mapping)
             else None
         )
+        text = _first_text_block(content)
         if record.get("isMeta"):
             if text.startswith(RESUME_CONTINUATION_TEXT):
                 signature = True
             continue
-        real_users += 1
+        # Tool results are stored as user-typed records too; only records
+        # carrying prompt text count as human prompts.
+        if isinstance(content, str) or text:
+            real_users += 1
+            if first_prompt is None:
+                first_prompt = content if isinstance(content, str) else text
     if not signature:
         return skip("no pre-bake resume signature")
     if real_users > 1:
         return skip("conversation already has prior prompts")
+    # The conversation's own first prompt names the topic; the live payload
+    # prompt is the fallback for the pre-flush window.
+    title = derive_prompt_title(first_prompt) or derive_prompt_title(
+        payload.get("prompt")
+    )
+    if not title:
+        return skip("prompt does not yield a title")
 
     entry = json.dumps(
         {"type": "ai-title", "aiTitle": title, "sessionId": uuid},
