@@ -34,12 +34,14 @@ tests/test_inventory.py
 tests/test_lifecycle_shell.py
 tests/test_login.py
 tests/test_macos_preview.py
+tests/test_provider_title_push.py
 tests/test_public_export.py
 tests/test_public_scan.py
-tests/test_recovery_pending.py
 tests/test_reaper_autoclose.py
+tests/test_recovery_pending.py
 tests/test_release.py
 tests/test_release_artifact.py
+tests/test_session_colors.py
 tests/test_watchdog.py
 tools/build-public-tree
 tools/build-release-artifact
