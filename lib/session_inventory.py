@@ -3031,6 +3031,170 @@ def propagate_provider_title(
     }
 
 
+# A conversation launched through the first-window color pre-bake opens as a
+# resume, and Claude Code never auto-titles a resumed conversation (its
+# once-only guard initializes from the loaded message count, which the
+# resume-synthesized continuation pair makes non-zero). These sessions carry a
+# unique signature: a synthetic isMeta user record holding the resume
+# continuation text, written at load before the human's first prompt. For
+# exactly those sessions the kit derives a title from the first real prompt
+# and writes it through the same native records /rename persists. Sessions
+# outside that signature are never touched, so Claude's own (better) auto
+# titles are never masked.
+RESUME_CONTINUATION_TEXT = "Continue from where you left off."
+MAX_AUTO_TITLE_TRANSCRIPT_BYTES = 8 * 1024 * 1024
+_TITLE_TRAILING_STOPWORDS = frozenset(
+    "a an and any are at be but by each every for from how if in is it of on "
+    "or so that the then there this to was were what when which who why will "
+    "with".split()
+)
+
+
+def derive_prompt_title(prompt: Any) -> str | None:
+    """Derive a short display title from a first user prompt.
+
+    Pure heuristic — no model call: first sentence, at most seven words,
+    trailing function words trimmed, sentence-cased, capped at 64 characters.
+    """
+    if not isinstance(prompt, str):
+        return None
+    text = re.sub(r"\s+", " ", prompt).strip()
+    if not text or text.startswith("/"):
+        return None
+    text = re.split(r"(?<=[.!?])\s", text, maxsplit=1)[0]
+    words = text.split(" ")[:7]
+    trimmed = list(words)
+    while trimmed and trimmed[-1].lower().strip("?,.:;!\"'") in _TITLE_TRAILING_STOPWORDS:
+        trimmed.pop()
+    if not trimmed:
+        trimmed = words
+    title = " ".join(trimmed).rstrip(" ,;:.!?\"'")
+    if len(title) < 4:
+        return None
+    title = title[:64].rstrip()
+    return title[0].upper() + title[1:]
+
+
+def _first_text_block(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, Mapping) and block.get("type") == "text":
+                text = block.get("text")
+                if isinstance(text, str):
+                    return text
+    return ""
+
+
+def auto_title_from_hook(
+    raw: Any, *, environ: Mapping[str, str] | None = None
+) -> dict[str, Any]:
+    """Title a pre-baked Claude conversation from its first real prompt.
+
+    Input is the UserPromptSubmit hook payload (JSON text). Eligibility is
+    strict and every miss fails open with title=null: the transcript must
+    carry the resume-continuation signature, no real conversation beyond the
+    triggering prompt, and no title of any kind (ai, /rename, agent-name,
+    kit name intent) may already exist.
+    """
+    out: dict[str, Any] = {"title": None, "pushes": [], "warnings": []}
+
+    def skip(reason: str) -> dict[str, Any]:
+        out["reason"] = reason
+        return out
+
+    try:
+        payload = json.loads(raw if isinstance(raw, str) else "")
+    except ValueError:
+        return skip("hook payload is not valid JSON")
+    if not isinstance(payload, Mapping):
+        return skip("hook payload is not an object")
+    if payload.get("hook_event_name") != "UserPromptSubmit":
+        return skip("not a UserPromptSubmit event")
+    uuid = valid_uuid(str(payload.get("session_id") or ""))
+    if not uuid:
+        return skip("missing or invalid session_id")
+    title = derive_prompt_title(payload.get("prompt"))
+    if not title:
+        return skip("prompt does not yield a title")
+
+    env = environ if environ is not None else os.environ
+    home = Path(env.get("HOME") or os.fspath(Path.home()))
+    transcript_raw = payload.get("transcript_path")
+    if not isinstance(transcript_raw, str) or not transcript_raw:
+        return skip("missing transcript_path")
+    transcript = Path(transcript_raw)
+    projects = (home / ".claude" / "projects").resolve()
+    try:
+        resolved = transcript.resolve(strict=True)
+    except OSError:
+        return skip("transcript unavailable")
+    if (
+        transcript.is_symlink()
+        or resolved.name != f"{uuid}.jsonl"
+        or resolved.parent.parent != projects
+    ):
+        return skip("transcript path is not this session's own transcript")
+    if (home / ".claude" / "sessions" / f"{uuid}.nameintent").exists():
+        return skip("a kit name intent already exists")
+    try:
+        if resolved.stat().st_size > MAX_AUTO_TITLE_TRANSCRIPT_BYTES:
+            return skip("transcript exceeds the bounded size")
+        lines = resolved.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return skip("transcript unreadable")
+
+    signature = False
+    real_users = 0
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(record, Mapping):
+            continue
+        kind = record.get("type")
+        if kind in ("ai-title", "agent-name", "custom-title"):
+            return skip("the session already has a title")
+        if kind != "user":
+            continue
+        if record.get("isSidechain"):
+            continue
+        text = _first_text_block(
+            record.get("message", {}).get("content")
+            if isinstance(record.get("message"), Mapping)
+            else None
+        )
+        if record.get("isMeta"):
+            if text.startswith(RESUME_CONTINUATION_TEXT):
+                signature = True
+            continue
+        real_users += 1
+    if not signature:
+        return skip("no pre-bake resume signature")
+    if real_users > 1:
+        return skip("conversation already has prior prompts")
+
+    entry = json.dumps(
+        {"type": "ai-title", "aiTitle": title, "sessionId": uuid},
+        separators=(",", ":"),
+    )
+    try:
+        with open(resolved, "a", encoding="utf-8") as handle:
+            handle.write(entry + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        out["pushes"].append("claude-transcript-ai-title")
+    except OSError as exc:
+        return skip(f"transcript not appended: {exc}")
+    pushed = propagate_provider_title("claude", uuid, title, environ=env)
+    out["title"] = title
+    out["pushes"].extend(pushed.get("provider_title_pushes", []))
+    out["warnings"].extend(pushed.get("provider_title_warnings", []))
+    return out
+
+
 def _strict_legacy_aliases(path: Path) -> tuple[bytes, dict[str, str]] | None:
     payload = _read_bounded_owner_file(
         path,
@@ -5837,6 +6001,9 @@ def _automatic_title_command(
     if args.automatic_title_action == "self-name":
         _json_print(self_name_automatic_title(config, args.title))
         return 0
+    if args.automatic_title_action == "from-hook":
+        _json_print(auto_title_from_hook(sys.stdin.read()))
+        return 0
     if args.automatic_title_action == "reset":
         _json_print(
             mutate_canonical_automatic_title(
@@ -5919,6 +6086,7 @@ def _parser() -> argparse.ArgumentParser:
         dest="automatic_title_action", required=True
     )
     automatic_subparsers.add_parser("list")
+    automatic_subparsers.add_parser("from-hook")
     automatic_self = automatic_subparsers.add_parser("self-name")
     automatic_self.add_argument("title")
     automatic_reset = automatic_subparsers.add_parser("reset")

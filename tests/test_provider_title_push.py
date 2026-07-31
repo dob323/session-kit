@@ -360,5 +360,184 @@ class ClaudeAiTitleTests(unittest.TestCase):
         self.assertEqual("derived", parsed[0]["name_source"])
 
 
+class DerivePromptTitleTests(unittest.TestCase):
+    def test_trims_trailing_function_words(self) -> None:
+        self.assertEqual(
+            "Leap years are there in 2026",
+            inventory_core.derive_prompt_title(
+                "leap years are there in 2026 and what are the dates?"
+            ),
+        )
+
+    def test_takes_first_sentence_only(self) -> None:
+        self.assertEqual(
+            "Fix the nginx 502 errors",
+            inventory_core.derive_prompt_title(
+                "fix the nginx 502 errors. they started last night"
+            ),
+        )
+
+    def test_rejects_slash_commands_and_short_prompts(self) -> None:
+        self.assertIsNone(inventory_core.derive_prompt_title("/color 3"))
+        self.assertIsNone(inventory_core.derive_prompt_title("hi"))
+        self.assertIsNone(inventory_core.derive_prompt_title(""))
+        self.assertIsNone(inventory_core.derive_prompt_title(None))
+
+    def test_caps_length_at_64(self) -> None:
+        title = inventory_core.derive_prompt_title(
+            "investigate " + "extraordinarily " * 8 + "long prompt"
+        )
+        assert title is not None
+        self.assertLessEqual(len(title), 64)
+
+
+class AutoTitleFromHookTests(unittest.TestCase):
+    UUID = "00000000-0000-4000-8000-000000000077"
+
+    def _prebaked_home(self, base: Path) -> tuple[Path, Path]:
+        home = base / "home"
+        (home / ".claude" / "sessions").mkdir(parents=True, mode=0o700)
+        project = home / ".claude" / "projects" / "-srv-project"
+        project.mkdir(parents=True, mode=0o700)
+        transcript = project / f"{self.UUID}.jsonl"
+        records = [
+            {"type": "agent-color", "agentColor": "green", "sessionId": self.UUID},
+            {
+                "type": "user",
+                "isMeta": True,
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Continue from where you left off.",
+                        }
+                    ],
+                },
+            },
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "No response requested."}
+                    ],
+                },
+            },
+        ]
+        transcript.write_text(
+            "".join(json.dumps(record) + "\n" for record in records),
+            encoding="utf-8",
+        )
+        return home, transcript
+
+    def _payload(self, transcript: Path, prompt: str) -> str:
+        return json.dumps(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": self.UUID,
+                "transcript_path": str(transcript),
+                "prompt": prompt,
+            }
+        )
+
+    def test_titles_prebaked_conversation_once(self) -> None:
+        with tempfile.TemporaryDirectory() as base:
+            home, transcript = self._prebaked_home(Path(base))
+            env = {"HOME": str(home)}
+            result = inventory_core.auto_title_from_hook(
+                self._payload(
+                    transcript,
+                    "leap years are there in 2026 and what are the dates?",
+                ),
+                environ=env,
+            )
+            self.assertEqual("Leap years are there in 2026", result["title"])
+            self.assertIn("claude-transcript-ai-title", result["pushes"])
+            self.assertIn("claude-transcript-name", result["pushes"])
+            self.assertIn("claude-nameintent", result["pushes"])
+            records = [
+                json.loads(line)
+                for line in transcript.read_text().splitlines()
+            ]
+            self.assertIn("ai-title", [r.get("type") for r in records])
+            self.assertIn("agent-name", [r.get("type") for r in records])
+            again = inventory_core.auto_title_from_hook(
+                self._payload(transcript, "another prompt entirely here"),
+                environ=env,
+            )
+            self.assertIsNone(again["title"])
+
+    def test_refuses_without_prebake_signature(self) -> None:
+        with tempfile.TemporaryDirectory() as base:
+            home, transcript = self._prebaked_home(Path(base))
+            lines = [
+                line
+                for line in transcript.read_text().splitlines()
+                if '"isMeta"' not in line
+            ]
+            transcript.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            result = inventory_core.auto_title_from_hook(
+                self._payload(transcript, "name this session please now"),
+                environ={"HOME": str(home)},
+            )
+            self.assertIsNone(result["title"])
+            self.assertEqual("no pre-bake resume signature", result["reason"])
+
+    def test_refuses_existing_titles_and_busy_conversations(self) -> None:
+        with tempfile.TemporaryDirectory() as base:
+            home, transcript = self._prebaked_home(Path(base))
+            env = {"HOME": str(home)}
+            with open(transcript, "a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "type": "ai-title",
+                            "aiTitle": "Existing title",
+                            "sessionId": self.UUID,
+                        }
+                    )
+                    + "\n"
+                )
+            result = inventory_core.auto_title_from_hook(
+                self._payload(transcript, "name this session please now"),
+                environ=env,
+            )
+            self.assertIsNone(result["title"])
+            home2 = Path(base) / "second"
+            home2.mkdir()
+            home3, transcript3 = self._prebaked_home(home2)
+            with open(transcript3, "a", encoding="utf-8") as handle:
+                for text in ("first question", "second question"):
+                    handle.write(
+                        json.dumps(
+                            {
+                                "type": "user",
+                                "message": {"role": "user", "content": text},
+                            }
+                        )
+                        + "\n"
+                    )
+            busy = inventory_core.auto_title_from_hook(
+                self._payload(transcript3, "third question arrives here"),
+                environ={"HOME": str(home3)},
+            )
+            self.assertIsNone(busy["title"])
+            self.assertEqual(
+                "conversation already has prior prompts", busy["reason"]
+            )
+
+    def test_refuses_foreign_transcript_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as base:
+            home, transcript = self._prebaked_home(Path(base))
+            foreign = Path(base) / "elsewhere.jsonl"
+            foreign.write_text(transcript.read_text(), encoding="utf-8")
+            result = inventory_core.auto_title_from_hook(
+                self._payload(foreign, "name this session please now"),
+                environ={"HOME": str(home)},
+            )
+            self.assertIsNone(result["title"])
+
+
 if __name__ == "__main__":
     unittest.main()
