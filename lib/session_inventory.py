@@ -1191,7 +1191,13 @@ def read_codex_db(
             raise CollectionError("Codex threads table is missing required columns")
         optional = [
             name
-            for name in ("name", "agent_nickname", "agent_path", "thread_source")
+            for name in (
+                "name",
+                "agent_nickname",
+                "agent_path",
+                "thread_source",
+                "first_user_message",
+            )
             if name in columns
         ]
         select = ", ".join(["id", "title", "cwd", *optional])
@@ -1890,10 +1896,26 @@ def build_inventory(
                 or thread.get("title"),
                 120,
             )
-            # Codex database titles may be the raw first prompt. The separately
-            # keyed session-index name is current Codex's exact explicit rename
-            # evidence, so only that source may outrank an automatic title.
-            provider_title_is_explicit = bool(thread.get("session_index_name"))
+            # The session-index name is exact rename evidence. A database
+            # title also counts as a real name on current Codex, which
+            # auto-titles threads there — recognizable by the schema carrying
+            # first_user_message separately. Older stores kept the raw prompt
+            # in the title, and a title that still echoes the first prompt is
+            # that same behavior on any schema.
+            db_title = clean_text(thread.get("title"), 120)
+            first_message = clean_text(thread.get("first_user_message"), 200)
+            has_split_prompt_schema = "first_user_message" in thread
+            title_echoes_prompt = bool(db_title) and bool(first_message) and (
+                first_message.casefold().startswith(db_title.casefold())
+                or db_title.casefold().startswith(first_message.casefold())
+            )
+            provider_title_is_explicit = bool(
+                thread.get("session_index_name")
+            ) or (
+                has_split_prompt_schema
+                and bool(db_title)
+                and not title_echoes_prompt
+            )
             provider = "codex"
             cwd = clean_text(
                 thread.get("cwd") or process_table.get(pid, {}).get("cwd"), 4096
