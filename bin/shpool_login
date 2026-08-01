@@ -462,17 +462,18 @@ GREEN = "\033[32m"
 CYAN = "\033[36m"
 YELLOW = "\033[33m"
 RESET = "\033[0m"
-# One palette across the kit: same codes the inventory renderer uses, so a
-# session's name is the same tint here, in `sp`, and in its own prompt chip.
+# One palette across the kit: same codes the inventory renderer uses, and the
+# same truecolor hex the sk-<color>.tmTheme accents carry, so a session's name
+# is one tint here, in `sp`, and in its own Codex status bar.
 SESSION_PALETTE = {
-    "red": "\033[31m",
-    "blue": "\033[34m",
-    "green": "\033[32m",
-    "yellow": "\033[33m",
-    "purple": "\033[35m",
-    "orange": "\033[38;5;208m",
-    "pink": "\033[38;5;205m",
-    "cyan": "\033[36m",
+    "red": "\033[38;2;255;85;85m",
+    "blue": "\033[38;2;87;168;255m",
+    "green": "\033[38;2;46;232;107m",
+    "yellow": "\033[38;2;255;215;90m",
+    "purple": "\033[38;2;178;110;255m",
+    "orange": "\033[38;2;255;140;66m",
+    "pink": "\033[38;2;255;105;180m",
+    "cyan": "\033[38;2;46;224;216m",
 }
 
 def style(text, *codes):

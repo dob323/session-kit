@@ -5661,16 +5661,19 @@ def render_inventory(inventory: Mapping[str, Any], rows_only: bool = False) -> s
     green = "\033[32m" if color else ""
     yellow = "\033[33m" if color else ""
     reset = "\033[0m" if color else ""
+    # Truecolor values matching the sk-<color>.tmTheme accent anchors, so a
+    # session's name is the same source hex here and in its Codex status bar
+    # (base ANSI codes rendered as the terminal theme's palette instead).
     session_palette = (
         {
-            "red": "\033[31m",
-            "blue": "\033[34m",
-            "green": "\033[32m",
-            "yellow": "\033[33m",
-            "purple": "\033[35m",
-            "orange": "\033[38;5;208m",
-            "pink": "\033[38;5;205m",
-            "cyan": "\033[36m",
+            "red": "\033[38;2;255;85;85m",
+            "blue": "\033[38;2;87;168;255m",
+            "green": "\033[38;2;46;232;107m",
+            "yellow": "\033[38;2;255;215;90m",
+            "purple": "\033[38;2;178;110;255m",
+            "orange": "\033[38;2;255;140;66m",
+            "pink": "\033[38;2;255;105;180m",
+            "cyan": "\033[38;2;46;224;216m",
         }
         if color
         else {}
