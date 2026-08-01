@@ -163,7 +163,7 @@ picker_maybe_bounce_codex() {
   local pid=${SK_PROOF_PROVIDER_PID:-} start=${SK_PROOF_PROVIDER_START:-}
   [[ $pid =~ ^[0-9]+$ && $start =~ ^[0-9]+$ ]] || return 0
   python3 - "$SNAPSHOT" "$id" "$uuid" "$pid" "$start" <<'PY' || return 0
-import json, os, sqlite3, sys
+import json, sys
 from pathlib import Path
 
 snapshot, shpool_id, uuid, pid_text, start_text = sys.argv[1:6]
@@ -185,47 +185,6 @@ if str(row.get("agent_status") or "").casefold() == "working":
 age = row.get("recent_output_age_seconds")
 if isinstance(age, int) and not isinstance(age, bool) and age < 120:
     raise SystemExit(1)
-codex_root = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
-databases = sorted(codex_root.glob("state_*.sqlite"))
-if not databases:
-    raise SystemExit(1)
-try:
-    connection = sqlite3.connect(f"file:{databases[-1]}?mode=ro", uri=True)
-    fetched = connection.execute(
-        "SELECT title FROM threads WHERE id = ?", (uuid,)
-    ).fetchone()
-    connection.close()
-except sqlite3.Error:
-    raise SystemExit(1)
-title = (fetched[0] or "").strip() if fetched else ""
-if not title:
-    raise SystemExit(1)
-# The relaunched process reads its status-bar name from the session index,
-# not the database, so a database-only auto-title is mirrored there first.
-index = codex_root / "session_index.jsonl"
-try:
-    if not index.is_symlink():
-        content = index.read_text(encoding="utf-8") if index.is_file() else ""
-        if f'"{uuid}"' not in content:
-            import datetime as dt
-
-            entry = json.dumps(
-                {
-                    "id": uuid,
-                    "thread_name": title[:100],
-                    "updated_at": dt.datetime.now(dt.timezone.utc)
-                    .isoformat()
-                    .replace("+00:00", "Z"),
-                },
-                separators=(",", ":"),
-            )
-            descriptor = os.open(
-                index, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600
-            )
-            with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
-                handle.write(entry + "\n")
-except OSError:
-    pass
 try:
     stat_text = Path(f"/proc/{pid_text}/stat").read_text()
     if stat_text.rsplit(")", 1)[1].split()[19] != start_text:
@@ -237,6 +196,13 @@ except (OSError, IndexError):
     raise SystemExit(1)
 raise SystemExit(0)
 PY
+  # Only a real name is worth a restart: Codex seeds threads.title with the
+  # raw first prompt, and bouncing on that echo burns the one-shot restart
+  # before the true title exists. A refusal here leaves the untitled marker
+  # in place so a later reopen retries once the thread is really named.
+  local bounce_title
+  bounce_title=$(python3 "$INVENTORY_CORE" codex-bounce-title "$uuid" 2>/dev/null) || return 0
+  [[ -n $bounce_title ]] || return 0
   ( umask 077
     mkdir -p "$SK_STATE_DIR/provider-bounce" &&
       printf '%s\n' "$uuid" > "$SK_STATE_DIR/provider-bounce/$id"

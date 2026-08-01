@@ -625,6 +625,205 @@ class AutoTitleFromHookTests(unittest.TestCase):
                 )
             )
 
+    def _bounce_codex_root(
+        self,
+        base: Path,
+        uuid: str,
+        title: str | None,
+        first_message: str | None,
+        *,
+        database_name: str = "state_5.sqlite",
+        split_schema: bool = True,
+        updated_at: int | None = None,
+    ) -> Path:
+        import sqlite3
+
+        codex = base / ".codex"
+        codex.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(codex / database_name)
+        if split_schema:
+            connection.execute(
+                "CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT,"
+                " first_user_message TEXT, updated_at INTEGER)"
+            )
+            connection.execute(
+                "INSERT INTO threads VALUES (?, ?, ?, ?)",
+                (uuid, title, first_message, updated_at),
+            )
+        else:
+            connection.execute(
+                "CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT)"
+            )
+            connection.execute(
+                "INSERT INTO threads VALUES (?, ?)", (uuid, title)
+            )
+        connection.commit()
+        connection.close()
+        return codex
+
+    def test_bounce_defers_while_title_only_echoes_the_prompt(self) -> None:
+        uuid = "00000000-0000-4000-8000-000000000041"
+        with tempfile.TemporaryDirectory() as base:
+            codex = self._bounce_codex_root(
+                Path(base),
+                uuid,
+                "who was the first person on the moon?",
+                "who was the first person on the moon? and the second?",
+                updated_at=1_800_000_000,
+            )
+            self.assertEqual(
+                "",
+                inventory_core.codex_bounce_prepare(
+                    uuid, codex, now=1_800_000_030
+                ),
+            )
+            self.assertFalse((codex / "session_index.jsonl").exists())
+
+    def test_bounce_accepts_an_echo_title_once_the_thread_settles(
+        self,
+    ) -> None:
+        uuid = "00000000-0000-4000-8000-000000000047"
+        with tempfile.TemporaryDirectory() as base:
+            codex = self._bounce_codex_root(
+                Path(base),
+                uuid,
+                "at lollapalooza chicago in 2016",
+                "at lollapalooza chicago in 2016",
+                updated_at=1_800_000_000,
+            )
+            self.assertEqual(
+                "at lollapalooza chicago in 2016",
+                inventory_core.codex_bounce_prepare(
+                    uuid, codex, now=1_800_000_301
+                ),
+            )
+            last = json.loads(
+                (codex / "session_index.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()[-1]
+            )
+            self.assertEqual(
+                "at lollapalooza chicago in 2016", last["thread_name"]
+            )
+
+    def test_bounce_uses_real_title_and_mirrors_it_to_the_index(self) -> None:
+        uuid = "00000000-0000-4000-8000-000000000042"
+        with tempfile.TemporaryDirectory() as base:
+            codex = self._bounce_codex_root(
+                Path(base),
+                uuid,
+                "Session Naming Timing",
+                "who was the first person on the moon?",
+            )
+            self.assertEqual(
+                "Session Naming Timing",
+                inventory_core.codex_bounce_prepare(uuid, codex),
+            )
+            entries = [
+                json.loads(line)
+                for line in (codex / "session_index.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertEqual(
+                [{"id": uuid, "thread_name": "Session Naming Timing"}],
+                [
+                    {"id": e["id"], "thread_name": e["thread_name"]}
+                    for e in entries
+                ],
+            )
+
+    def test_bounce_heals_an_index_entry_that_echoes_the_prompt(self) -> None:
+        uuid = "00000000-0000-4000-8000-000000000043"
+        with tempfile.TemporaryDirectory() as base:
+            codex = self._bounce_codex_root(
+                Path(base),
+                uuid,
+                "Session Naming Timing",
+                "who was the first person on the moon?",
+            )
+            index = codex / "session_index.jsonl"
+            index.write_text(
+                json.dumps(
+                    {
+                        "id": uuid,
+                        "thread_name": "who was the first person on the moon?",
+                        "updated_at": "2026-07-31T00:00:00Z",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                "Session Naming Timing",
+                inventory_core.codex_bounce_prepare(uuid, codex),
+            )
+            last = json.loads(
+                index.read_text(encoding="utf-8").splitlines()[-1]
+            )
+            self.assertEqual("Session Naming Timing", last["thread_name"])
+
+    def test_bounce_prefers_an_explicit_index_rename(self) -> None:
+        uuid = "00000000-0000-4000-8000-000000000044"
+        with tempfile.TemporaryDirectory() as base:
+            codex = self._bounce_codex_root(
+                Path(base),
+                uuid,
+                "Stale Database Title",
+                "who was the first person on the moon?",
+            )
+            index = codex / "session_index.jsonl"
+            index.write_text(
+                json.dumps({"id": uuid, "thread_name": "Renamed By Dan"})
+                + "\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                "Renamed By Dan",
+                inventory_core.codex_bounce_prepare(uuid, codex),
+            )
+            self.assertEqual(
+                1, len(index.read_text(encoding="utf-8").splitlines())
+            )
+
+    def test_bounce_trusts_any_title_on_a_pre_split_schema(self) -> None:
+        uuid = "00000000-0000-4000-8000-000000000045"
+        with tempfile.TemporaryDirectory() as base:
+            codex = self._bounce_codex_root(
+                Path(base),
+                uuid,
+                "kit pushed name",
+                None,
+                split_schema=False,
+            )
+            self.assertEqual(
+                "kit pushed name",
+                inventory_core.codex_bounce_prepare(uuid, codex),
+            )
+
+    def test_bounce_reads_the_numerically_newest_state_database(self) -> None:
+        uuid = "00000000-0000-4000-8000-000000000046"
+        with tempfile.TemporaryDirectory() as base:
+            codex = self._bounce_codex_root(
+                Path(base),
+                uuid,
+                "Old Schema Name",
+                "unrelated prompt",
+                database_name="state_5.sqlite",
+            )
+            self._bounce_codex_root(
+                Path(base),
+                uuid,
+                "New Schema Name",
+                "unrelated prompt",
+                database_name="state_10.sqlite",
+            )
+            (codex / "state_12.sqlite").write_bytes(b"")
+            self.assertEqual(
+                "New Schema Name",
+                inventory_core.codex_bounce_prepare(uuid, codex),
+            )
+
     def test_placeholder_uuid_is_never_pushed(self) -> None:
         result = inventory_core.propagate_provider_title(
             "codex",
@@ -633,6 +832,23 @@ class AutoTitleFromHookTests(unittest.TestCase):
             environ={"HOME": "/nonexistent"},
         )
         self.assertEqual([], result["provider_title_pushes"])
+
+    def test_explicit_environ_without_home_never_escapes_the_sandbox(
+        self,
+    ) -> None:
+        result = inventory_core.propagate_provider_title(
+            "codex",
+            "00000000-0000-4000-8000-000000000048",
+            "Escapee thread",
+            environ={"SHPOOL_SESSION_NAME": "main"},
+        )
+        self.assertEqual([], result["provider_title_pushes"])
+        self.assertTrue(
+            any(
+                "no HOME" in warning
+                for warning in result["provider_title_warnings"]
+            )
+        )
 
     def test_stop_event_titles_from_transcript_first_prompt(self) -> None:
         with tempfile.TemporaryDirectory() as base:

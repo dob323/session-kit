@@ -1053,10 +1053,13 @@ def _codex_paths() -> tuple[Path, Path]:
     codex_home = Path(
         os.environ.get("SESSION_KIT_CODEX_HOME", str(_home() / ".codex"))
     ).expanduser()
-    db_path = Path(
-        os.environ.get("SESSION_KIT_CODEX_DB", str(codex_home / "state_5.sqlite"))
-    ).expanduser()
-    return codex_home, db_path
+    db_override = os.environ.get("SESSION_KIT_CODEX_DB")
+    if db_override:
+        return codex_home, Path(db_override).expanduser()
+    databases = _codex_state_databases(codex_home)
+    if databases:
+        return codex_home, databases[-1]
+    return codex_home, codex_home / "state_5.sqlite"
 
 
 def _read_bounded_owner_file(
@@ -1905,9 +1908,8 @@ def build_inventory(
             db_title = clean_text(thread.get("title"), 120)
             first_message = clean_text(thread.get("first_user_message"), 200)
             has_split_prompt_schema = "first_user_message" in thread
-            title_echoes_prompt = bool(db_title) and bool(first_message) and (
-                first_message.casefold().startswith(db_title.casefold())
-                or db_title.casefold().startswith(first_message.casefold())
+            title_echoes_prompt = _codex_title_echoes_prompt(
+                db_title, first_message
             )
             provider_title_is_explicit = bool(
                 thread.get("session_index_name")
@@ -2832,6 +2834,174 @@ def _push_claude_title(home: Path, uuid: str, title: str) -> tuple[list[str], li
     return pushed, warnings
 
 
+def _codex_state_databases(codex_root: Path) -> list[Path]:
+    """Codex state stores ordered oldest-to-newest by schema number.
+
+    Lexical order breaks at two digits (state_10 sorts before state_5), so
+    the numeric suffix is the key. Empty files are placeholder artifacts,
+    never the live store.
+    """
+
+    def version(path: Path) -> tuple[int, str]:
+        suffix = path.stem.rsplit("_", 1)[-1]
+        return (int(suffix) if suffix.isdigit() else -1, path.name)
+
+    try:
+        candidates = [
+            path
+            for path in codex_root.glob("state_*.sqlite")
+            if path.stat().st_size > 0
+        ]
+    except OSError:
+        return []
+    return sorted(candidates, key=version)
+
+
+def _codex_title_echoes_prompt(title: str, first_message: str) -> bool:
+    """True when a stored title is just the first prompt (or a prefix cut)."""
+    return bool(title) and bool(first_message) and (
+        first_message.casefold().startswith(title.casefold())
+        or title.casefold().startswith(first_message.casefold())
+    )
+
+
+def codex_bounce_prepare(
+    uuid: str, codex_root: Path | None = None, now: float | None = None
+) -> str:
+    """Resolve the real name a bounced Codex process should boot under.
+
+    Session-index rename evidence wins; otherwise a database title that does
+    not merely echo the first prompt. Codex seeds threads.title with the raw
+    prompt and replaces it within about two minutes of the first answer, so
+    an echo-shaped title only counts once the thread has been quiet long
+    enough that it must be the final title (a terse prompt can BE the real
+    title). The chosen name is mirrored into the session index when its
+    latest entry differs, because the relaunched status bar reads only the
+    index. Returns "" when the thread has no real name yet — the caller must
+    then defer the bounce and keep its one-shot marker so a later reopen
+    retries after the title exists.
+    """
+    import sqlite3
+
+    if codex_root is None:
+        codex_root = Path(
+            os.environ.get("CODEX_HOME")
+            or os.environ.get("SESSION_KIT_CODEX_HOME")
+            or (_home() / ".codex")
+        ).expanduser()
+    title = ""
+    first_message = ""
+    has_split_prompt_schema = False
+    settled = False
+    databases = _codex_state_databases(codex_root)
+    if databases:
+        fetched = None
+        selected_columns: list[str] = []
+        try:
+            connection = sqlite3.connect(
+                f"file:{databases[-1]}?mode=ro", uri=True
+            )
+            try:
+                columns = {
+                    row[1]
+                    for row in connection.execute(
+                        "PRAGMA table_info(threads)"
+                    )
+                }
+                has_split_prompt_schema = "first_user_message" in columns
+                selected_columns = ["title"]
+                if has_split_prompt_schema:
+                    selected_columns.append("first_user_message")
+                if "updated_at" in columns:
+                    selected_columns.append("updated_at")
+                fetched = connection.execute(
+                    "SELECT "
+                    + ", ".join(selected_columns)
+                    + " FROM threads WHERE id = ?",
+                    (uuid,),
+                ).fetchone()
+            finally:
+                connection.close()
+        except sqlite3.Error:
+            fetched = None
+        if fetched:
+            values = dict(zip(selected_columns, fetched))
+            title = str(values.get("title") or "").strip()
+            if has_split_prompt_schema:
+                first_message = str(
+                    values.get("first_user_message") or ""
+                ).strip()
+            updated_at = values.get("updated_at")
+            if isinstance(updated_at, (int, float)) and not isinstance(
+                updated_at, bool
+            ):
+                current = time.time() if now is None else now
+                settled = current - float(updated_at) > 300
+    index = codex_root / "session_index.jsonl"
+    index_name = ""
+    if index.is_file() and not index.is_symlink():
+        try:
+            if index.stat().st_size <= MAX_CODEX_SESSION_INDEX_BYTES:
+                for line in index.read_text(encoding="utf-8").splitlines():
+                    try:
+                        entry = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(entry, dict) and entry.get("id") == uuid:
+                        candidate = str(
+                            entry.get("thread_name") or ""
+                        ).strip()
+                        if candidate:
+                            index_name = candidate
+        except OSError:
+            index_name = ""
+    if has_split_prompt_schema:
+        title_is_explicit = bool(title) and (
+            settled or not _codex_title_echoes_prompt(title, first_message)
+        )
+        index_is_explicit = bool(index_name) and (
+            settled
+            or not _codex_title_echoes_prompt(index_name, first_message)
+        )
+    else:
+        title_is_explicit = bool(title)
+        index_is_explicit = bool(index_name)
+    if index_is_explicit:
+        chosen = index_name
+    elif title_is_explicit:
+        chosen = title
+    else:
+        return ""
+    if index_name != chosen:
+        # A failed mirror would relaunch under the stale bar name and burn
+        # the one-shot bounce on nothing, so it defers instead.
+        if index.is_symlink():
+            return ""
+        try:
+            _append_codex_index_entry(index, uuid, chosen[:100])
+        except OSError:
+            return ""
+    return chosen
+
+
+def _append_codex_index_entry(index: Path, uuid: str, title: str) -> None:
+    entry = json.dumps(
+        {
+            "id": uuid,
+            "thread_name": title,
+            "updated_at": dt.datetime.now(dt.timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z"),
+        },
+        separators=(",", ":"),
+    )
+    descriptor = os.open(index, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
+        handle.write(entry + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
 def _push_codex_thread_title(
     codex_root: Path, uuid: str, title: str
 ) -> tuple[list[str], list[str]]:
@@ -2844,10 +3014,7 @@ def _push_codex_thread_title(
     """
     import sqlite3
 
-    candidates = sorted(
-        codex_root.glob("state_*.sqlite"),
-        key=lambda p: p.name,
-    )
+    candidates = _codex_state_databases(codex_root)
     if not candidates:
         # Older Codex builds have no thread store; nothing to report.
         return [], []
@@ -2875,26 +3042,10 @@ def _push_codex_title(home: Path, uuid: str, title: str) -> tuple[list[str], lis
     index = codex_root / "session_index.jsonl"
     if index.is_symlink():
         return [], ["Codex session index is a symlink; title not pushed"]
-    entry = json.dumps(
-        {
-            "id": uuid,
-            "thread_name": title,
-            "updated_at": dt.datetime.now(dt.timezone.utc)
-            .isoformat()
-            .replace("+00:00", "Z"),
-        },
-        separators=(",", ":"),
-    )
     try:
         if index.exists() and index.stat().st_size > MAX_CODEX_SESSION_INDEX_BYTES:
             return [], ["Codex session index exceeds the bounded size; title not pushed"]
-        descriptor = os.open(
-            index, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600
-        )
-        with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
-            handle.write(entry + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
+        _append_codex_index_entry(index, uuid, title)
     except OSError as exc:
         return [], [f"Codex session index not appended: {exc}"]
     thread_pushes, thread_warnings = _push_codex_thread_title(
@@ -3144,7 +3295,19 @@ def propagate_provider_color(
     if provider != "claude":
         return {"provider_color_pushes": [], "provider_color_warnings": []}
     env = environ if environ is not None else os.environ
-    home = Path(env.get("HOME") or os.fspath(Path.home()))
+    # An explicit environment IS the caller's sandbox; falling back to the
+    # real home from inside one would leak pushes into live provider stores.
+    home_raw = env.get("HOME") or (
+        os.fspath(Path.home()) if environ is None else ""
+    )
+    if not home_raw:
+        return {
+            "provider_color_pushes": [],
+            "provider_color_warnings": [
+                "caller environment has no HOME; provider color not pushed"
+            ],
+        }
+    home = Path(home_raw)
     pushed, warnings = _push_claude_color(home, exact_uuid, color)
     for warning in warnings:
         print(f"session inventory: {warning}", file=sys.stderr)
@@ -3182,7 +3345,18 @@ def propagate_provider_title(
             "provider_title_warnings": ["invalid provider title push request"],
         }
     env = environ if environ is not None else os.environ
-    home_raw = env.get("HOME") or os.fspath(Path.home())
+    # An explicit environment IS the caller's sandbox; falling back to the
+    # real home from inside one would leak pushes into live provider stores.
+    home_raw = env.get("HOME") or (
+        os.fspath(Path.home()) if environ is None else ""
+    )
+    if not home_raw:
+        return {
+            "provider_title_pushes": [],
+            "provider_title_warnings": [
+                "caller environment has no HOME; provider title not pushed"
+            ],
+        }
     home = Path(home_raw)
     if provider == "claude":
         pushed, warnings = _push_claude_title(home, exact_uuid, clean_title)
@@ -6227,6 +6401,8 @@ def _parser() -> argparse.ArgumentParser:
     recovery_parser.add_argument("provider", choices=PROVIDERS)
     recovery_parser.add_argument("uuid")
     recovery_parser.add_argument("--cwd")
+    bounce_parser = subparsers.add_parser("codex-bounce-title")
+    bounce_parser.add_argument("uuid")
     platform_parser = subparsers.add_parser("platform")
     platform_subparsers = platform_parser.add_subparsers(
         dest="platform_action", required=True
@@ -6458,6 +6634,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         config = load_config()
         if args.command == "recovery-command":
             _json_print(recovery_spec(args.provider, args.uuid, args.cwd))
+            return 0
+        if args.command == "codex-bounce-title":
+            bounce_title = codex_bounce_prepare(args.uuid)
+            if not bounce_title:
+                return 1
+            print(bounce_title)
             return 0
         if args.command == "alias":
             return _alias_command(args, config)

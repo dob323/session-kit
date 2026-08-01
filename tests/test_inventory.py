@@ -1677,6 +1677,9 @@ class AutomaticTitleTests(unittest.TestCase):
         environment = {
             "SHPOOL_SESSION_NAME": "main",
             "CODEX_THREAD_ID": exact,
+            # Sandboxed HOME: without it the title/color pushes inside
+            # self-name land in the developer's real provider stores.
+            "HOME": str(config.get("state_dir", "/nonexistent-home")),
         }
         return inventory, fixture[2], environment, 3001
 
