@@ -8,6 +8,8 @@
     <dict><key>settings</key><dict>
       <key>foreground</key><string>#DCDFE4</string>
     </dict></dict>
+    <dict><key>scope</key><string>markup.heading</string>
+      <key>settings</key><dict><key>foreground</key><string>#FF8C42</string></dict></dict>
     <dict><key>scope</key><string>string</string>
       <key>settings</key><dict><key>foreground</key><string>#FF8C42</string></dict></dict>
     <dict><key>scope</key><string>variable, support.type</string>
