@@ -5661,19 +5661,20 @@ def render_inventory(inventory: Mapping[str, Any], rows_only: bool = False) -> s
     green = "\033[32m" if color else ""
     yellow = "\033[33m" if color else ""
     reset = "\033[0m" if color else ""
-    # Truecolor values matching the sk-<color>.tmTheme accent anchors, so a
-    # session's name is the same source hex here and in its Codex status bar
-    # (base ANSI codes rendered as the terminal theme's palette instead).
+    # Truecolor values equal to what Codex RENDERS for each sk-<color> theme
+    # accent (measured from captured frames — Codex contrast-adjusts the raw
+    # theme hex), so a session's name is pixel-identical here and in its own
+    # Codex status bar. Remeasure if the theme anchors ever change.
     session_palette = (
         {
-            "red": "\033[38;2;255;85;85m",
-            "blue": "\033[38;2;87;168;255m",
-            "green": "\033[38;2;46;232;107m",
-            "yellow": "\033[38;2;255;215;90m",
-            "purple": "\033[38;2;178;110;255m",
-            "orange": "\033[38;2;255;140;66m",
-            "pink": "\033[38;2;255;105;180m",
-            "cyan": "\033[38;2;46;224;216m",
+            "red": "\033[38;2;237;93;93m",
+            "blue": "\033[38;2;97;166;240m",
+            "green": "\033[38;2;63;221;115m",
+            "yellow": "\033[38;2;249;215;108m",
+            "purple": "\033[38;2;173;115;239m",
+            "orange": "\033[38;2;242;144;81m",
+            "pink": "\033[38;2;240;113;177m",
+            "cyan": "\033[38;2;64;216;209m",
         }
         if color
         else {}
