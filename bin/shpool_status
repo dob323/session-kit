@@ -6,6 +6,17 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 CORE=${SESSION_KIT_INVENTORY_CORE:-"$SCRIPT_DIR/../lib/session_inventory.py"}
 
 case "${1:-}" in
+  ""|--rows|--waiting-count|--json|--strict-json|--guard-json|--lookup)
+    # Codex has no title hook, so pending threads are titled before every
+    # fresh inventory build — menu, tab, and bounce all see a real name on
+    # the human's first look after an answer. Fail-open and cheap (a no-op
+    # read once every recent thread carries an index entry). Replay paths
+    # (--render-file/--lookup-file) never build fresh state and are skipped.
+    python3 "$CORE" automatic-title codex-pending >/dev/null 2>&1 || true
+    ;;
+esac
+
+case "${1:-}" in
   "") exec python3 "$CORE" render ;;
   --rows) exec python3 "$CORE" render --rows ;;
   --waiting-count) exec python3 "$CORE" waiting-count ;;

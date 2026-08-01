@@ -59,6 +59,7 @@ REQUIRED_SYMBOLS = {
     "canonical_aliases",
     "canonical_automatic_titles",
     "codex_bounce_prepare",
+    "codex_pending_auto_titles",
     "codex_open_rollouts",
     "collect_live",
     "descendants",
@@ -171,7 +172,7 @@ def referenced_facade_symbols() -> set[str]:
 
 class InventoryFacadeTests(unittest.TestCase):
     def test_contract_matches_every_current_test_reference(self) -> None:
-        self.assertEqual(len(REQUIRED_SYMBOLS), 84)
+        self.assertEqual(len(REQUIRED_SYMBOLS), 85)
         self.assertEqual(REQUIRED_SYMBOLS, referenced_facade_symbols())
 
     def test_current_tested_symbols_remain_available(self) -> None:

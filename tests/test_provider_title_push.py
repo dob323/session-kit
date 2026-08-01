@@ -733,35 +733,38 @@ class AutoTitleFromHookTests(unittest.TestCase):
                 ],
             )
 
-    def test_bounce_heals_an_index_entry_that_echoes_the_prompt(self) -> None:
+    def test_bounce_honors_an_echo_shaped_index_entry_as_deliberate(
+        self,
+    ) -> None:
+        # Codex never writes the index itself; an echo-shaped entry is a
+        # kit auto-title and counts as the real name.
         uuid = "00000000-0000-4000-8000-000000000043"
         with tempfile.TemporaryDirectory() as base:
             codex = self._bounce_codex_root(
                 Path(base),
                 uuid,
-                "Session Naming Timing",
-                "who was the first person on the moon?",
+                "what band does billy corgan play for?",
+                "what band does billy corgan play for?",
             )
             index = codex / "session_index.jsonl"
             index.write_text(
                 json.dumps(
                     {
                         "id": uuid,
-                        "thread_name": "who was the first person on the moon?",
-                        "updated_at": "2026-07-31T00:00:00Z",
+                        "thread_name": "What band does billy corgan play",
+                        "updated_at": "2026-08-01T00:00:00Z",
                     }
                 )
                 + "\n",
                 encoding="utf-8",
             )
             self.assertEqual(
-                "Session Naming Timing",
+                "What band does billy corgan play",
                 inventory_core.codex_bounce_prepare(uuid, codex),
             )
-            last = json.loads(
-                index.read_text(encoding="utf-8").splitlines()[-1]
+            self.assertEqual(
+                1, len(index.read_text(encoding="utf-8").splitlines())
             )
-            self.assertEqual("Session Naming Timing", last["thread_name"])
 
     def test_bounce_prefers_an_explicit_index_rename(self) -> None:
         uuid = "00000000-0000-4000-8000-000000000044"
@@ -899,6 +902,130 @@ class AutoTitleFromHookTests(unittest.TestCase):
                 environ={"HOME": str(home)},
             )
             self.assertEqual("Fix the nginx 502 errors please", result["title"])
+
+
+class CodexPendingAutoTitleTests(unittest.TestCase):
+    def _codex_root(self, base: Path, rows: list[tuple]) -> Path:
+        import sqlite3
+
+        codex = base / ".codex"
+        codex.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(codex / "state_5.sqlite")
+        connection.execute(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT,"
+            " first_user_message TEXT, updated_at INTEGER)"
+        )
+        connection.executemany(
+            "INSERT INTO threads VALUES (?, ?, ?, ?)", rows
+        )
+        connection.commit()
+        connection.close()
+        return codex
+
+    def _run(self, base: Path, codex: Path) -> list[dict[str, str]]:
+        with mock.patch.dict(
+            os.environ,
+            {"SESSION_KIT_CODEX_HOME": str(codex)},
+            clear=False,
+        ):
+            os.environ.pop("SESSION_KIT_CODEX_DB", None)
+            return inventory_core.codex_pending_auto_titles(
+                environ={"HOME": str(base)}
+            )
+
+    def test_titles_a_recent_echo_thread_into_both_stores(self) -> None:
+        import sqlite3
+        import time
+
+        uuid = "00000000-0000-4000-8000-000000000051"
+        now = int(time.time())
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            codex = self._codex_root(
+                base,
+                [
+                    (
+                        uuid,
+                        "what band does billy corgan play for?",
+                        "what band does billy corgan play for?",
+                        now - 60,
+                    )
+                ],
+            )
+            titled = self._run(base, codex)
+            self.assertEqual(
+                [{"uuid": uuid, "title": "What band does billy corgan play"}],
+                titled,
+            )
+            connection = sqlite3.connect(codex / "state_5.sqlite")
+            self.assertEqual(
+                ("What band does billy corgan play",),
+                connection.execute(
+                    "SELECT title FROM threads WHERE id = ?", (uuid,)
+                ).fetchone(),
+            )
+            connection.close()
+            entries = [
+                json.loads(line)
+                for line in (codex / "session_index.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertEqual(
+                [(uuid, "What band does billy corgan play")],
+                [(e["id"], e["thread_name"]) for e in entries],
+            )
+            # Self-terminating: the index entry excludes it next pass.
+            self.assertEqual([], self._run(base, codex))
+
+    def test_never_touches_named_stale_or_indexed_threads(self) -> None:
+        import time
+
+        now = int(time.time())
+        named = "00000000-0000-4000-8000-000000000052"
+        stale = "00000000-0000-4000-8000-000000000053"
+        indexed = "00000000-0000-4000-8000-000000000054"
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            codex = self._codex_root(
+                base,
+                [
+                    (named, "Real Name", "unrelated prompt", now - 60),
+                    (stale, "old echo", "old echo", now - 8 * 86400),
+                    (indexed, "echo text", "echo text", now - 60),
+                ],
+            )
+            (codex / "session_index.jsonl").write_text(
+                json.dumps({"id": indexed, "thread_name": "Kept Name"})
+                + "\n",
+                encoding="utf-8",
+            )
+            self.assertEqual([], self._run(base, codex))
+
+    def test_kill_switch_disables_the_titler(self) -> None:
+        import time
+
+        uuid = "00000000-0000-4000-8000-000000000055"
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            codex = self._codex_root(
+                base, [(uuid, "echo", "echo", int(time.time()) - 60)]
+            )
+            with mock.patch.dict(
+                os.environ,
+                {"SESSION_KIT_CODEX_HOME": str(codex)},
+                clear=False,
+            ):
+                for kill in (
+                    {"SESSION_KIT_AUTO_NAME": "0"},
+                    {"SESSION_KIT_CODEX_AUTOTITLE": "0"},
+                ):
+                    self.assertEqual(
+                        [],
+                        inventory_core.codex_pending_auto_titles(
+                            environ={"HOME": str(base), **kill}
+                        ),
+                    )
 
 
 if __name__ == "__main__":

@@ -15,6 +15,12 @@ REPO = Path(__file__).resolve().parents[1]
 RELEASE_TOOL = REPO / "deploy" / "session-kit-release"
 HELPERS = ("sp", "shpool_login", "shpool_status", "shpool_reaper", "codex_resume_here")
 
+# Suite-wide sandbox belt: harness subprocesses inherit this environment, and
+# any real bin script they run would otherwise auto-title the developer's live
+# Codex threads through the snapshot hook. Tests of the titler itself pass an
+# explicit environ without this key, so the feature stays fully tested.
+os.environ.setdefault("SESSION_KIT_CODEX_AUTOTITLE", "0")
+
 
 def run(
     argv: Iterable[os.PathLike[str] | str],

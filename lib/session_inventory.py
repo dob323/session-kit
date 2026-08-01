@@ -2955,17 +2955,17 @@ def codex_bounce_prepare(
                             index_name = candidate
         except OSError:
             index_name = ""
+    # Codex never writes the session index itself: every entry is a
+    # deliberate push (kit title, auto-titler, rename mirror), so any entry
+    # counts as a real name even when it is echo-shaped. Only the database
+    # title needs the seed-vs-final test.
+    index_is_explicit = bool(index_name)
     if has_split_prompt_schema:
         title_is_explicit = bool(title) and (
             settled or not _codex_title_echoes_prompt(title, first_message)
         )
-        index_is_explicit = bool(index_name) and (
-            settled
-            or not _codex_title_echoes_prompt(index_name, first_message)
-        )
     else:
         title_is_explicit = bool(title)
-        index_is_explicit = bool(index_name)
     if index_is_explicit:
         chosen = index_name
     elif title_is_explicit:
@@ -2982,6 +2982,109 @@ def codex_bounce_prepare(
         except OSError:
             return ""
     return chosen
+
+
+def codex_pending_auto_titles(
+    environ: Mapping[str, str] | None = None,
+) -> list[dict[str, str]]:
+    """Kit-side auto-titler for Codex threads nobody has named.
+
+    Codex seeds threads.title with the raw first prompt and has no title
+    hook, and agents only self-name work they judge substantive — so a plain
+    question thread stays unnamed on every surface. Recent split-schema
+    threads whose title is empty or still echoes the first prompt, and which
+    have no session-index entry (the deliberate-name evidence), get the same
+    seven-word heuristic title Claude sessions get, pushed into both Codex
+    stores. Self-terminating: the push writes the index entry that excludes
+    the thread from every later pass, and a later agent self-name simply
+    overwrites it (last-writer-wins).
+    """
+    import sqlite3
+
+    env = environ if environ is not None else os.environ
+    if not automatic_naming_enabled(env):
+        return []
+    if str(env.get("SESSION_KIT_CODEX_AUTOTITLE", "")).strip().casefold() in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
+        return []
+    codex_root, database = _codex_paths()
+    if not database.is_file():
+        return []
+    try:
+        connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+        try:
+            columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(threads)")
+            }
+            if not {"id", "title", "first_user_message", "updated_at"} <= columns:
+                return []
+            rows = connection.execute(
+                "SELECT id, title, first_user_message, updated_at"
+                " FROM threads"
+                " WHERE first_user_message IS NOT NULL"
+                " AND first_user_message != ''"
+                " ORDER BY updated_at DESC LIMIT 200"
+            ).fetchall()
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        return []
+    index = codex_root / "session_index.jsonl"
+    indexed: set[str] = set()
+    if index.is_file() and not index.is_symlink():
+        try:
+            if index.stat().st_size > MAX_CODEX_SESSION_INDEX_BYTES:
+                return []
+            for line in index.read_text(encoding="utf-8").splitlines():
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(entry, Mapping) and entry.get("id"):
+                    indexed.add(str(entry["id"]))
+        except OSError:
+            # Unable to prove which threads already carry deliberate names;
+            # titling anyway could overwrite one, so do nothing.
+            return []
+    cutoff = time.time() - 7 * 86400
+    results: list[dict[str, str]] = []
+    for uuid, raw_title, first_message, updated_at in rows:
+        exact = valid_uuid(uuid)
+        if not exact or exact in indexed:
+            continue
+        if exact == "00000000-0000-0000-0000-000000000000":
+            continue
+        if (
+            not isinstance(updated_at, (int, float))
+            or isinstance(updated_at, bool)
+            or float(updated_at) < cutoff
+        ):
+            continue
+        title = str(raw_title or "").strip()
+        first = str(first_message or "").strip()
+        if title and not _codex_title_echoes_prompt(title, first):
+            # A real name someone wrote; never replace it.
+            continue
+        derived = derive_prompt_title(first)
+        if not derived:
+            continue
+        # Both writes target the exact store tree the candidates were read
+        # from — pushing anywhere else would split reads and writes across
+        # different Codex homes.
+        try:
+            _append_codex_index_entry(index, exact, derived[:100])
+        except OSError:
+            continue
+        _push_codex_thread_title(codex_root, exact, derived)
+        results.append({"uuid": exact, "title": derived})
+        if len(results) >= 20:
+            break
+    return results
 
 
 def _append_codex_index_entry(index: Path, uuid: str, title: str) -> None:
@@ -6364,6 +6467,9 @@ def _automatic_title_command(
     if args.automatic_title_action == "from-hook":
         _json_print(auto_title_from_hook(sys.stdin.read()))
         return 0
+    if args.automatic_title_action == "codex-pending":
+        _json_print({"titled": codex_pending_auto_titles()})
+        return 0
     if args.automatic_title_action == "reset":
         _json_print(
             mutate_canonical_automatic_title(
@@ -6451,6 +6557,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     automatic_subparsers.add_parser("list")
     automatic_subparsers.add_parser("from-hook")
+    automatic_subparsers.add_parser("codex-pending")
     automatic_self = automatic_subparsers.add_parser("self-name")
     automatic_self.add_argument("title")
     automatic_reset = automatic_subparsers.add_parser("reset")
