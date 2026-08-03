@@ -66,7 +66,7 @@ Open, move, kill, repair, recovery, fork, and cleanup actions use fresh live
 evidence. A stale, duplicate, partial, malformed, or unsafe target is refused.
 
 `k <number>` resolves the visible number to one exact shpool ID, displays the
-title, provider, and exact ID, and asks for confirmation. Cached inventory
+title, provider, and exact ID it acts on. Cached inventory
 disables the action.
 
 ## Automatic cleanup

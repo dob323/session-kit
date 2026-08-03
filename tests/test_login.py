@@ -553,7 +553,7 @@ class LoginPickerTests(unittest.TestCase):
                 "Unavailable: 1 session record without a live shell (no actions",
                 output,
             )
-            self.assertIn("Choose a number shown here. Nothing changed.", output)
+            self.assertIn("2 is not shown here. Nothing changed.", output)
             self.assertNotIn("[no-shell]", output)
             entries = fixture.sp_entries()
             self.assertEqual(1, len(entries))
@@ -1057,16 +1057,60 @@ class LoginPickerTests(unittest.TestCase):
                 finally:
                     fixture.close()
 
+    def test_kill_accepts_lists_and_ranges_and_refuses_on_one_bad_token(
+        self,
+    ) -> None:
+        fixture = LoginFixture(
+            inventory(
+                row("open1", number=4, provider="codex"),
+                row("open2", number=5, provider="codex"),
+                row("open3", number=6, provider="claude"),
+            )
+        )
+        try:
+            code, output = run_pty(fixture, b"k 4, 6\n\n\n")
+            self.assertEqual(2, code)
+            entries = fixture.sp_entries()
+            self.assertEqual(2, len(entries))
+            self.assertEqual(
+                {("picker-close", "open1"), ("picker-close", "open3")},
+                {
+                    (entry["args"][0], entry["proof"]["shpool_id"])
+                    for entry in entries
+                },
+            )
+        finally:
+            fixture.close()
+        # A range expands; one unshown number refuses the WHOLE request.
+        fixture = LoginFixture(
+            inventory(
+                row("open1", number=4, provider="codex"),
+                row("open2", number=5, provider="codex"),
+            )
+        )
+        try:
+            code, output = run_pty(fixture, b"k 4-9\nk 4-5\n\n\n")
+            self.assertEqual(2, code)
+            self.assertIn("not shown here", output)
+            entries = fixture.sp_entries()
+            self.assertEqual(2, len(entries))
+            self.assertEqual(
+                {"open1", "open2"},
+                {entry["proof"]["shpool_id"] for entry in entries},
+            )
+        finally:
+            fixture.close()
+
     def test_kill_shortcut_refuses_invalid_or_unshown_numbers(self) -> None:
         fixture = LoginFixture(inventory(row("open1", number=9)))
         try:
             code, output = run_pty(fixture, b"k nope\nk 99\n\n")
             self.assertEqual(2, code)
             self.assertIn(
-                "Use k followed by a visible number. Nothing changed.",
+                "Use k with visible numbers (k 5, 6, 8). Nothing changed.",
                 output,
             )
-            self.assertIn("Choose a number shown here. Nothing changed.", output)
+            self.assertIn("99 is not shown here. Nothing changed.", output)
             self.assertEqual([], fixture.sp_entries())
         finally:
             fixture.close()
@@ -1077,7 +1121,7 @@ class LoginPickerTests(unittest.TestCase):
             code, output = run_pty(fixture, b"?\n\n")
             self.assertEqual(2, code)
             self.assertIn(
-                "k <number>    Kill the exact displayed session after exact-ID confirmation",
+                "k <numbers>   Close displayed sessions: k 5 · k 5, 6, 8 · k 4-7",
                 output,
             )
             self.assertIn("x <number>    Compatibility alias for k", output)

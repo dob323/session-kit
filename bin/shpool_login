@@ -1301,14 +1301,46 @@ choose_number() {
   done
 }
 
+# Accepts one number, a comma/space list, or ranges: k 5 · k 5, 6, 8 · k 4-7.
+# Every number is validated against the CURRENT page before anything closes;
+# one bad token refuses the whole request so a typo never kills a neighbor.
 direct_close() {
-  local number=$1
-  require_live_actions || return
-  number_on_page "$number" || {
-    echo "  Choose a number shown here. Nothing changed."
+  local raw=$1 token
+  local -a numbers=()
+  raw=${raw//,/ }
+  for token in $raw; do
+    if [[ $token =~ ^[0-9]+$ ]]; then
+      numbers+=("$token")
+    elif [[ $token =~ ^([0-9]+)-([0-9]+)$ ]]; then
+      local first=${BASH_REMATCH[1]} last=${BASH_REMATCH[2]}
+      if (( first > last || last - first > 98 )); then
+        echo "  Use k with visible numbers or small ranges. Nothing changed."
+        return
+      fi
+      local expanded
+      for (( expanded=first; expanded<=last; expanded++ )); do
+        numbers+=("$expanded")
+      done
+    else
+      echo "  Use k with visible numbers (k 5, 6, 8). Nothing changed."
+      return
+    fi
+  done
+  (( ${#numbers[@]} > 0 )) || {
+    echo "  Use k with visible numbers (k 5, 6, 8). Nothing changed."
     return
   }
-  run_proof_action picker-close "$number" || true
+  require_live_actions || return
+  local number
+  for number in "${numbers[@]}"; do
+    number_on_page "$number" || {
+      echo "  $number is not shown here. Nothing changed."
+      return
+    }
+  done
+  for number in "${numbers[@]}"; do
+    run_proof_action picker-close "$number" || true
+  done
   CONFIRM_FORGIVE=1
   refresh_after_action
 }
@@ -1734,7 +1766,7 @@ show_help() {
   echo
   echo "  number        Open an available session or show actions for one open elsewhere"
   echo "  n             Guided Claude, Codex, or managed-shell creation"
-  echo "  k <number>    Kill the exact displayed session after exact-ID confirmation"
+  echo "  k <numbers>   Close displayed sessions: k 5 · k 5, 6, 8 · k 4-7"
   echo "  x <number>    Compatibility alias for k"
   echo "  /text         Search names, providers, projects, IDs, and conversation UUIDs"
   echo "  r             Refresh live state and clear search"
@@ -1855,12 +1887,7 @@ while true; do
       }
       ;;
     k\ *|K\ *|x\ *|X\ *)
-      number=${choice#* }
-      if [[ $number =~ ^[0-9]+$ ]]; then
-        direct_close "$number"
-      else
-        echo "  Use k followed by a visible number. Nothing changed."
-      fi
+      direct_close "${choice#* }"
       ;;
     name\ reset\ *|NAME\ RESET\ *|Name\ reset\ *)
       number=${choice##* }

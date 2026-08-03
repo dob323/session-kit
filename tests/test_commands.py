@@ -2805,12 +2805,10 @@ class JournalHistoryTests(unittest.TestCase):
 
 
 class ConfirmExactDrainTests(unittest.TestCase):
-    def test_confirm_drains_the_enter_after_the_keypress(self) -> None:
-        """y-then-Enter must not leave a newline for the caller's next read.
-
-        The leftover Enter was consumed by the picker's menu read as an empty
-        choice, which means "go to a regular terminal" — killing a session
-        silently ended the picker every time.
+    def test_confirm_is_promptless_and_consumes_no_input(self) -> None:
+        """Interactive confirms are gone (Dan 2026-08-02): the action header
+        is the safety display, and nothing typed afterwards may be eaten —
+        the very next read must see the human's own input untouched.
         """
         import pty
         import select
@@ -2826,7 +2824,7 @@ class ConfirmExactDrainTests(unittest.TestCase):
         if pid == 0:
             os.chdir(REPO)
             os.execvp("bash", ["bash", "-c", script])
-        os.write(descriptor, b"y\nPROBE\n")
+        os.write(descriptor, b"PROBE\n")
         output = bytearray()
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:

@@ -351,6 +351,12 @@ picker_takeover() {
   fi
   local cwd=$SK_CWD
   sk_lock_release 9
+  # A takeover is how every reopen arrives once a window was closed without
+  # detaching (the session stays "attached" to the dead client), so the
+  # untitled-codex bounce must fire here too or those sessions never get
+  # their named bar. Identical guards: positive idle, no subagents, fresh
+  # pre-TERM recheck; the abandoned client sees nothing.
+  picker_maybe_bounce_codex "$id" || true
   if picker_attach_id "$id" "$cwd" 1; then
     picker_action_event picker_takeover returned
     return 0

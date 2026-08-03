@@ -7,8 +7,8 @@ When enabled, the picker opens in an interactive Bash login:
 ```text
 number          open a ready session or inspect one open elsewhere
 n               create a Claude Code, Codex, or shell session
-k <number>      kill the exact displayed session after confirmation
-x <number>      compatibility alias for k
+k <numbers>     close displayed sessions: k 5 · k 5, 6, 8 · k 4-7
+x <numbers>     compatibility alias for k
 /text           search names, providers, projects, and exact IDs
 r               refresh live state and clear search
 o               show provider roots outside shpool, read-only
@@ -21,8 +21,8 @@ next / prev     change page
 Enter           return to a regular terminal
 ```
 
-Selecting a session already open elsewhere shows a move menu. Session Kit never
-moves it without a separate choice and confirmation.
+Selecting a session already open elsewhere shows a move menu. Session Kit
+never moves it without a separate, explicit choice.
 
 Normal rows omit shpool IDs and provider UUIDs. Use `sp detail`, JSON, or an
 explicit search for exact identity. Colors identify provider, availability,
@@ -63,7 +63,7 @@ sp takeover <terminal-number|shpool-id>
 ```
 
 `sp go` opens a detached exact managed session. `sp takeover` moves an attached
-session to the current terminal after a fresh identity check and confirmation.
+session to the current terminal after a fresh identity check.
 The earlier window returns to its picker; the provider conversation is not
 duplicated.
 
@@ -84,8 +84,8 @@ c  close the terminal
 Do not use a generic latest-conversation command. If exact identity cannot be
 proved, reopen is disabled. From an ordinary managed shell, `keep_session`
 disables automatic cleanup, `unkeep_session` allows it to resume after all
-safety conditions are met, and `bye` closes the terminal only after exact-ID
-confirmation. A directly typed Bash `exit` keeps its normal shell behavior.
+safety conditions are met, and `bye` closes the terminal after an exact-ID
+check. A directly typed Bash `exit` keeps its normal shell behavior.
 
 ## Name
 
@@ -119,9 +119,9 @@ From a shell:
 sp close <terminal-number|shpool-id>
 ```
 
-Before killing, Session Kit refreshes live evidence, resolves the number to one
-exact shpool ID, displays the title, provider, and exact ID, and requires
-confirmation. Cached inventory, changed generations, or ambiguous identity
+Before killing, Session Kit refreshes live evidence, resolves each number to
+one exact shpool ID, and displays the title, provider, and exact ID it is
+acting on. Cached inventory, changed generations, or ambiguous identity
 disables the action.
 
 Killing ends the managed terminal. It does not delete provider-native
@@ -137,7 +137,7 @@ Attachment, a live provider, child work, pending reply, recovery conflict,
 identity change, missing evidence, or a new terminal generation resets or
 blocks eligibility.
 
-`sp prune` performs fresh checks and confirmation for a manual cleanup.
+`sp prune` performs fresh checks for a manual cleanup.
 
 ## History and recovery
 

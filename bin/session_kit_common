@@ -1051,9 +1051,10 @@ PY
   return 1
 }
 
-# One keypress, never a typed session name. The caller has already selected an
-# exact session and the line below names it, so retyping an ID proved nothing
-# except that the human could copy a string.
+# No interactive confirmation (Dan 2026-08-02): the caller already selected
+# an exact session under a frozen proof, and the line below names exactly
+# what is being acted on — that display is the safety net, a y/N added only
+# friction. Non-interactive automation still has to name the exact ID.
 sk_confirm_exact() {
   local action=$1 id=$2 title=$3 provider=$4
   printf '\n  %s\n  %s  [%s]  %s\n' "$action" "$title" "$id" "$provider"
@@ -1061,21 +1062,7 @@ sk_confirm_exact() {
     [[ ${SESSION_KIT_CONFIRM_ID:-} == "$id" ]]
     return
   fi
-  local answer=""
-  read -r -n 1 -p "  Confirm? [y/N] " answer
-  # Humans type y-then-Enter. The single-character read leaves that Enter in
-  # the terminal buffer, where the caller's next menu read would consume it
-  # as an empty choice — which means "go to a regular terminal" and silently
-  # ended the picker after every kill. Drain the rest of the line. A human
-  # pausing longer than this window is covered by the picker's one-shot
-  # forgiveness of an empty choice right after a confirmed action.
-  if [[ $answer != "" && $answer != $'\n' ]]; then
-    local __sk_confirm_rest=""
-    IFS= read -r -s -t 0.3 __sk_confirm_rest 2>/dev/null || true
-    : "${__sk_confirm_rest}"
-  fi
-  printf '\n'
-  [[ $answer == y || $answer == Y ]]
+  return 0
 }
 
 sk_recovery_journal() {

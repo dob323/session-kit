@@ -94,7 +94,7 @@ Session Kit helper does not require a shpool restart.
 
 Use a new test session first. Confirm that disconnecting SSH leaves it running,
 a provider quit leaves the managed terminal alive, exact reopen works, and
-`k <number>` requires confirmation.
+`k <numbers>` resolves each number to one exact session under a frozen proof.
 
 ## Evaluate without installing
 
