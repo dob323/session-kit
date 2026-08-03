@@ -1,32 +1,61 @@
 #!/usr/bin/env bash
 # Install and maintain a per-user Session Kit installation.
 
+if [[ $(uname -s 2>/dev/null) == Darwin && ${BASH_VERSINFO[0]} -lt 4 ]]; then
+  for modern_bash in /opt/homebrew/bin/bash /usr/local/bin/bash; do
+    if [[ -x $modern_bash ]]; then
+      export PATH="${modern_bash%/*}:$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
+      exec "$modern_bash" "$0" "$@"
+    fi
+  done
+  printf '%s\n' 'session-kit: install Homebrew Bash, Python, Rust, and shpool first' >&2
+  printf '%s\n' '  brew install bash python rust' >&2
+  printf '%s\n' '  cargo install shpool --version 0.11.0 --locked' >&2
+  exit 69
+fi
+
 set -euo pipefail
+
+export PATH="$HOME/.cargo/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 program=${0##*/}
 install_root=${SESSION_KIT_ROOT:-"$HOME/.local/lib/session-kit"}
 bin_dir=${SESSION_KIT_BIN_DIR:-"$HOME/.local/bin"}
 config_root=${SESSION_KIT_CONFIG_ROOT:-"${XDG_CONFIG_HOME:-"$HOME/.config"}/session-kit"}
 state_root=${SESSION_KIT_STATE_DIR:-"${XDG_STATE_HOME:-"$HOME/.local/state"}/session-kit"}
-systemd_root=${SESSION_KIT_SYSTEMD_ROOT:-"${XDG_CONFIG_HOME:-"$HOME/.config"}/systemd/user"}
+case "$(uname -s 2>/dev/null || true)" in
+  Darwin)
+    service_root=${SESSION_KIT_SERVICE_ROOT:-${SESSION_KIT_LAUNCHD_ROOT:-"$HOME/Library/LaunchAgents"}}
+    ;;
+  *)
+    service_root=${SESSION_KIT_SERVICE_ROOT:-${SESSION_KIT_SYSTEMD_ROOT:-"${XDG_CONFIG_HOME:-"$HOME/.config"}/systemd/user"}}
+    ;;
+esac
 bashrc_path=${SESSION_KIT_BASHRC:-"$HOME/.bashrc"}
+bash_profile_path=${SESSION_KIT_BASH_PROFILE:-"$HOME/.bash_profile"}
+zshrc_path=${SESSION_KIT_ZSHRC:-"$HOME/.zshrc"}
 integration_marker=${SESSION_KIT_INTEGRATION_MARKER:-"$state_root/integration-ready-v1"}
 receipt_path=$state_root/install.json
 shpool_config=${XDG_CONFIG_HOME:-"$HOME/.config"}/shpool/config.toml
 login_start="# >>> session-kit managed integration >>>"
 login_end="# <<< session-kit managed integration <<<"
-helpers=(sp shpool_login shpool_status shpool_reaper codex_resume_here)
-units=(
+helpers=(kit sp shpool_login shpool_status shpool_reaper codex_resume_here)
+systemd_units=(
   shpool.service
   shpool.socket
   shpool-reaper.service
   shpool-reaper.timer
   session-kit-watchdog.service
 )
-required_commands=(
-  bash python3 git shpool
-  cmp cp find flock install journalctl mkdir mktemp mv pgrep ps rm script
-  sha256sum stat systemctl timeout
+launchd_units=(
+  com.session-kit.shpool.plist
+  com.session-kit.reaper.plist
+  com.session-kit.watchdog.plist
+)
+launchd_template_root=$config_root/launchd
+launchd_receipt=$state_root/launchd-active.json
+common_required_commands=(
+  bash python3 shpool cmp cp find install mkdir mktemp mv pgrep ps rm script stat
 )
 inventory_files=(
   lib/session_inventory.py
@@ -49,6 +78,7 @@ Usage:
   session-kit doctor [--json]
   session-kit update [--source PATH] [--enable-login|--disable-login] [--journal on|off]
   session-kit rollback [--to COMMIT]
+  session-kit services <enable|disable|status>
   session-kit disable-login
   session-kit enable-login
   session-kit uninstall [--purge-code] [--purge-config]
@@ -82,7 +112,8 @@ platform() {
 
 validate_roots() {
   python3 - "$HOME" "$install_root" "$bin_dir" "$config_root" "$state_root" \
-    "$systemd_root" "$bashrc_path" "${SESSION_KIT_TESTING:-0}" <<'PY'
+    "$service_root" "$bashrc_path" "$bash_profile_path" "$zshrc_path" \
+    "${SESSION_KIT_TESTING:-0}" <<'PY'
 import os
 import pathlib
 import sys
@@ -91,7 +122,7 @@ home, *raw, testing = sys.argv[1:]
 home_path = pathlib.Path(home).resolve(strict=False)
 labels = (
     "install root", "binary directory", "config root", "state root",
-    "systemd root", "shell file",
+    "service root", "Bash file", "Bash login file", "zsh file",
 )
 paths = [pathlib.Path(value).resolve(strict=False) for value in raw]
 raw_paths = [pathlib.Path(value) for value in raw]
@@ -105,7 +136,7 @@ for label, raw_path, path in zip(labels, raw_paths, paths):
         raise SystemExit(f"session-kit: refusing broad {label}: {path}")
     if len(path.parts) < 4 and testing != "1":
         raise SystemExit(f"session-kit: refusing broad {label}: {path}")
-install, binary, config, state, systemd, shell = paths
+install, binary, config, state, service, bashrc, bash_profile, zshrc = paths
 for label, path in (("install root", install), ("config root", config), ("state root", state)):
     if path in {
         home_path / ".local",
@@ -114,11 +145,14 @@ for label, path in (("install root", install), ("config root", config), ("state 
         home_path / ".config",
     }:
         raise SystemExit(f"session-kit: refusing broad {label}: {path}")
-if shell.parent == pathlib.Path("/") or shell == home_path:
-    raise SystemExit(f"session-kit: refusing unsafe shell file: {shell}")
-if len({install, binary, config, state, systemd}) != 5:
+for shell in (bashrc, bash_profile, zshrc):
+    if shell.parent == pathlib.Path("/") or shell == home_path:
+        raise SystemExit(f"session-kit: refusing unsafe shell file: {shell}")
+if len({bashrc, bash_profile, zshrc}) != 3:
+    raise SystemExit("session-kit: shell integration files must differ")
+if len({install, binary, config, state, service}) != 5:
     raise SystemExit("session-kit: lifecycle roots must not overlap exactly")
-roots = (install, binary, config, state, systemd)
+roots = (install, binary, config, state, service)
 for index, left in enumerate(roots):
     for right in roots[index + 1:]:
         if left in right.parents or right in left.parents:
@@ -135,13 +169,53 @@ release_id_from_source() {
   if [[ -n $release_id && ${SESSION_KIT_TESTING:-0} != 1 ]]; then
     die "SESSION_KIT_RELEASE_ID is reserved for isolated tests"
   fi
-  if [[ -z $release_id ]] && command -v git >/dev/null 2>&1 &&
-      git -C "$source" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  if [[ -z $release_id ]] && source_is_git_root "$source"; then
     release_id=$(git -C "$source" rev-parse HEAD 2>/dev/null || true)
+  elif [[ -z $release_id ]]; then
+    release_id=$(source_record_commit "$source") ||
+      die "install source needs an exact Git root or valid SOURCE.json artifact"
   fi
   [[ $release_id =~ ^[0-9a-f]{40}$ ]] ||
-    die "install source must be a Git clone at a full 40-character commit"
+    die "install source must identify one full 40-character commit"
   printf '%s\n' "$release_id"
+}
+
+source_is_git_root() {
+  local source=$1 top=
+  command -v git >/dev/null 2>&1 || return 1
+  top=$(git -C "$source" rev-parse --show-toplevel 2>/dev/null) || return 1
+  [[ $(cd -- "$top" && pwd -P) == "$source" ]]
+}
+
+source_record_commit() {
+  python3 - "$1/SOURCE.json" <<'PY'
+import json
+import os
+import pathlib
+import re
+import stat
+import sys
+
+path = pathlib.Path(sys.argv[1])
+try:
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_size > 4096:
+        raise ValueError("unsafe SOURCE.json")
+    value = json.loads(path.read_text(encoding="utf-8"))
+except (OSError, UnicodeError, ValueError):
+    raise SystemExit(1)
+if (
+    not isinstance(value, dict)
+    or value.get("schema_version") != 1
+    or set(value) != {"schema_version", "source_commit", "exported_files"}
+    or not re.fullmatch(r"[0-9a-f]{40}", str(value.get("source_commit", "")))
+    or not isinstance(value.get("exported_files"), int)
+    or isinstance(value.get("exported_files"), bool)
+    or value["exported_files"] < 1
+):
+    raise SystemExit(1)
+print(value["source_commit"])
+PY
 }
 
 check_source() {
@@ -149,15 +223,18 @@ check_source() {
   current_platform=$(platform)
   case "$current_platform" in
     linux) printf 'OK    operating system: Linux\n' ;;
-    macos)
-      printf 'FAIL  macOS lifecycle operations are not supported; install is Linux-only\n'
-      failed=1
-      ;;
+    macos) printf 'OK    operating system: macOS\n' ;;
     *)
-      printf 'FAIL  operating system: only Linux and the macOS core preview are supported\n'
+      printf 'FAIL  operating system: only Linux and macOS are supported\n'
       failed=1
       ;;
   esac
+  local -a required_commands=("${common_required_commands[@]}")
+  if [[ $current_platform == linux ]]; then
+    required_commands+=(flock journalctl systemctl)
+  elif [[ $current_platform == macos ]]; then
+    required_commands+=(launchctl plutil sw_vers)
+  fi
   for command in "${required_commands[@]}"; do
     if command -v "$command" >/dev/null 2>&1; then
       printf 'OK    command: %s\n' "$command"
@@ -172,26 +249,52 @@ check_source() {
   else
     printf 'OK    Bash: %s\n' "$BASH_VERSION"
   fi
-  if ! python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)'; then
-    printf 'FAIL  Python 3.10 or newer is required\n'
+  local python_floor=10
+  [[ $current_platform != macos ]] || python_floor=11
+  if ! python3 -c "import sys; raise SystemExit(0 if sys.version_info >= (3, $python_floor) else 1)"; then
+    printf 'FAIL  Python 3.%s or newer is required on %s\n' "$python_floor" "$current_platform"
     failed=1
   fi
   if ! command -v shpool >/dev/null 2>&1; then
     printf 'FAIL  shpool missing: install v0.11.0 with cargo install shpool --version 0.11.0 --locked\n'
     failed=1
   fi
-  if [[ ! -d /proc && ${SESSION_KIT_TESTING:-0} != 1 ]]; then
-    printf 'FAIL  Linux /proc is required for process identity checks\n'
-    failed=1
-  else
-    printf 'OK    process filesystem: /proc\n'
-  fi
-  if [[ ${SESSION_KIT_TESTING:-0} == 1 ]] ||
-      systemctl --user show-environment >/dev/null 2>&1; then
-    printf 'OK    user service manager: systemd\n'
-  else
-    printf 'FAIL  systemd user manager is unavailable\n'
-    failed=1
+  if [[ $current_platform == linux ]]; then
+    if [[ ! -d /proc && ${SESSION_KIT_TESTING:-0} != 1 ]]; then
+      printf 'FAIL  Linux /proc is required for process identity checks\n'
+      failed=1
+    else
+      printf 'OK    process adapter: Linux /proc\n'
+    fi
+    if [[ ${SESSION_KIT_TESTING:-0} == 1 ]] ||
+        systemctl --user show-environment >/dev/null 2>&1; then
+      printf 'OK    user service manager: systemd\n'
+    else
+      printf 'FAIL  systemd user manager is unavailable\n'
+      failed=1
+    fi
+  elif [[ $current_platform == macos ]]; then
+    if [[ ${SESSION_KIT_TESTING:-0} != 1 ]]; then
+      local mac_major mac_arch
+      mac_major=$(sw_vers -productVersion | cut -d. -f1)
+      mac_arch=$(uname -m)
+      [[ $mac_major =~ ^[0-9]+$ && $mac_major -ge 14 ]] || {
+        printf 'FAIL  macOS 14 or newer is required\n'
+        failed=1
+      }
+      [[ $mac_arch == arm64 || $mac_arch == x86_64 ]] || {
+        printf 'FAIL  unsupported Mac architecture: %s\n' "$mac_arch"
+        failed=1
+      }
+    fi
+    if [[ ${SESSION_KIT_TESTING:-0} == 1 ]] ||
+        python3 "$source/lib/session_inventory.py" platform boot-id >/dev/null 2>&1; then
+      printf 'OK    process adapter: Darwin native APIs\n'
+    else
+      printf 'FAIL  Darwin native process or boot APIs are unavailable\n'
+      failed=1
+    fi
+    printf 'OK    user service manager: launchd\n'
   fi
   if command -v claude >/dev/null 2>&1 || command -v codex >/dev/null 2>&1; then
     printf 'OK    provider CLI: Claude Code or Codex\n'
@@ -210,12 +313,22 @@ check_source() {
       failed=1
     fi
   done
-  if ! git -C "$source" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    printf 'FAIL  source is not a Git worktree\n'
-    failed=1
-  elif [[ ${SESSION_KIT_TESTING:-0} != 1 ]] &&
+  if source_is_git_root "$source"; then
+    if ! command -v git >/dev/null 2>&1; then
+      printf 'FAIL  command missing: git (required for Git checkout installs)\n'
+      failed=1
+    fi
+    if [[ ${SESSION_KIT_TESTING:-0} != 1 ]] &&
       [[ -n $(git -C "$source" status --porcelain --untracked-files=all) ]]; then
-    printf 'FAIL  source worktree has uncommitted or untracked files\n'
+      printf 'FAIL  source worktree has uncommitted or untracked files\n'
+      failed=1
+    else
+      printf 'OK    source provenance: clean Git root\n'
+    fi
+  elif source_record_commit "$source" >/dev/null 2>&1; then
+    printf 'OK    source provenance: release artifact\n'
+  else
+    printf 'FAIL  source has neither an exact Git root nor valid SOURCE.json\n'
     failed=1
   fi
   (( failed == 0 )) || return 1
@@ -401,6 +514,8 @@ transaction_targets() {
     "$install_root/current" \
     "$bin_dir/session-kit" \
     "$bashrc_path" \
+    "$bash_profile_path" \
+    "$zshrc_path" \
     "$integration_marker" \
     "$HOME/.no_shpool_journal" \
     "$receipt_path" \
@@ -411,7 +526,11 @@ transaction_targets() {
     "$config_root/inventory.json" \
     "$shpool_config"
   for helper in "${helpers[@]}"; do printf '%s\n' "$bin_dir/$helper"; done
-  for unit in "${units[@]}"; do printf '%s\n' "$systemd_root/$unit"; done
+  if [[ $(platform) == macos ]]; then
+    for unit in "${launchd_units[@]}"; do printf '%s\n' "$launchd_template_root/$unit"; done
+  else
+    for unit in "${systemd_units[@]}"; do printf '%s\n' "$service_root/$unit"; done
+  fi
 }
 
 begin_transaction() {
@@ -556,6 +675,9 @@ install_defaults() {
     install -m 0600 "$install_root/releases/$release_id/config/shpool.example.toml" \
       "$shpool_config"
   fi
+  if [[ $(platform) == macos ]]; then
+    configure_macos_shpool_shell
+  fi
   # Session-color Codex themes. Kit-owned sk-*.tmTheme files track the
   # release; anything else in the themes directory is left alone.
   if [[ -d $install_root/releases/$release_id/config/codex-themes ]]; then
@@ -568,17 +690,63 @@ install_defaults() {
   fi
 }
 
+configure_macos_shpool_shell() {
+  local modern_bash
+  modern_bash=$(command -v bash)
+  python3 - "$shpool_config" "$modern_bash" <<'PY'
+import os
+import pathlib
+import stat
+import sys
+import tempfile
+import tomllib
+
+path = pathlib.Path(sys.argv[1])
+shell = pathlib.Path(sys.argv[2]).resolve(strict=True)
+info = path.lstat()
+if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+    raise SystemExit("session-kit: shpool config must be an owner-controlled regular file")
+text = path.read_text(encoding="utf-8")
+try:
+    value = tomllib.loads(text)
+except tomllib.TOMLDecodeError as exc:
+    raise SystemExit(f"session-kit: shpool config is invalid: {exc}")
+configured = value.get("shell")
+if configured is not None and configured != str(shell):
+    raise SystemExit(
+        f"session-kit: shpool config selects {configured!r}; macOS requires {str(shell)!r}"
+    )
+if configured == str(shell):
+    raise SystemExit(0)
+escaped = str(shell).replace("\\", "\\\\").replace('"', '\\"')
+updated = f'shell = "{escaped}"\n' + text
+fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+try:
+    os.fchmod(fd, stat.S_IMODE(info.st_mode))
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(updated)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+finally:
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+PY
+}
+
 install_systemd_units() {
   local release_id=$1
   [[ $(platform) == linux ]] || return 0
-  mkdir -p "$systemd_root"
+  mkdir -p "$service_root"
   local unit shpool_path
-  for unit in "${units[@]}"; do
+  for unit in "${systemd_units[@]}"; do
     install -m 0644 "$install_root/releases/$release_id/systemd/$unit" \
-      "$systemd_root/$unit"
+      "$service_root/$unit"
   done
   shpool_path=$(command -v shpool)
-  python3 - "$systemd_root/shpool.service" "$shpool_path" <<'PY'
+  python3 - "$service_root/shpool.service" "$shpool_path" <<'PY'
 import os
 import pathlib
 import sys
@@ -606,6 +774,124 @@ finally:
     except FileNotFoundError:
         pass
 PY
+}
+
+install_launchd_units() {
+  local release_id=$1
+  [[ $(platform) == macos ]] || return 0
+  local shpool_path modern_bash_path
+  shpool_path=$(command -v shpool)
+  modern_bash_path=$(command -v bash)
+  [[ $(shpool version 2>/dev/null) == "shpool 0.11.0" ]] ||
+    die "macOS requires shpool 0.11.0"
+  python3 - "$shpool_path" <<'PY'
+import os,pathlib,stat,sys
+path=pathlib.Path(sys.argv[1])
+info=path.stat()
+if (
+    not path.is_absolute()
+    or not stat.S_ISREG(info.st_mode)
+    or info.st_uid != os.geteuid()
+    or info.st_mode & 0o022
+    or not os.access(path, os.X_OK)
+):
+    raise SystemExit("session-kit: shpool must be an owner-controlled, non-writable executable")
+PY
+  mkdir -p "$launchd_template_root" "$state_root/logs"
+  chmod 700 "$state_root" "$state_root/logs" 2>/dev/null || true
+  python3 - "$launchd_template_root" "$shpool_path" "$bin_dir/shpool_reaper" \
+    "$install_root/current/bin/session_kit_watchdog" "$state_root/logs" \
+    "$install_root" "$config_root" "$state_root" "$bin_dir" \
+    "${XDG_CONFIG_HOME:-$HOME/.config}" "${XDG_STATE_HOME:-$HOME/.local/state}" \
+    "$modern_bash_path" "$shpool_config" <<'PY'
+import os
+import pathlib
+import plistlib
+import sys
+import tempfile
+
+(
+    root, shpool, reaper, watchdog, logs, install_root, config_root,
+    state_root, bin_dir, xdg_config, xdg_state, modern_bash, shpool_config,
+) = map(pathlib.Path, sys.argv[1:])
+for executable in (shpool, reaper, watchdog):
+    if not executable.is_absolute():
+        raise SystemExit(f"session-kit: launchd executable must be absolute: {executable}")
+path_value = ":".join(
+    value for value in (
+        str(pathlib.Path.home() / ".local/bin"),
+        str(pathlib.Path.home() / ".cargo/bin"),
+        "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin",
+    )
+)
+specs = {
+    "com.session-kit.shpool.plist": {
+        "Label": "com.session-kit.shpool",
+        "ProgramArguments": [str(shpool), "--config-file", str(shpool_config), "daemon"],
+        "KeepAlive": True,
+        "ProcessType": "Background",
+        "ThrottleInterval": 10,
+    },
+    "com.session-kit.reaper.plist": {
+        "Label": "com.session-kit.reaper",
+        "ProgramArguments": [str(reaper), "--auto-close"],
+        "StartInterval": 3600,
+    },
+    "com.session-kit.watchdog.plist": {
+        "Label": "com.session-kit.watchdog",
+        "ProgramArguments": [str(watchdog), "--once"],
+        "StartInterval": 60,
+        "EnvironmentVariables": {"SESSION_KIT_WATCHDOG_MODE": "report"},
+    },
+}
+for filename, value in specs.items():
+    label = value["Label"]
+    value.setdefault("EnvironmentVariables", {})["PATH"] = path_value
+    value["EnvironmentVariables"]["HOME"] = str(pathlib.Path.home())
+    value["EnvironmentVariables"]["SHELL"] = str(modern_bash)
+    value["EnvironmentVariables"].update({
+        "SESSION_KIT_ROOT": str(install_root),
+        "SESSION_KIT_CONFIG_ROOT": str(config_root),
+        "SESSION_KIT_STATE_DIR": str(state_root),
+        "SESSION_KIT_BIN_DIR": str(bin_dir),
+        "XDG_CONFIG_HOME": str(xdg_config),
+        "XDG_STATE_HOME": str(xdg_state),
+    })
+    value["WorkingDirectory"] = str(pathlib.Path.home())
+    value["StandardOutPath"] = str(logs / f"{label}.out.log")
+    value["StandardErrorPath"] = str(logs / f"{label}.err.log")
+    for key in ("StandardOutPath", "StandardErrorPath"):
+        log_path = pathlib.Path(value[key])
+        descriptor = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        os.close(descriptor)
+        os.chmod(log_path, 0o600)
+    path = root / filename
+    fd, temporary = tempfile.mkstemp(prefix=f".{filename}.", dir=root)
+    try:
+        os.fchmod(fd, 0o644)
+        with os.fdopen(fd, "wb") as handle:
+            plistlib.dump(value, handle, fmt=plistlib.FMT_XML, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+PY
+  local unit
+  for unit in "${launchd_units[@]}"; do
+    plutil -lint "$launchd_template_root/$unit" >/dev/null || die "invalid launchd plist: $unit"
+  done
+}
+
+install_platform_services() {
+  if [[ $(platform) == macos ]]; then
+    install_launchd_units "$1"
+  else
+    install_systemd_units "$1"
+  fi
 }
 
 validate_purge_ownership() {
@@ -650,7 +936,14 @@ validate_mutable_targets() {
       # Pre-receipt layouts linked helpers into the install root itself. A
       # symlink resolving inside $install_root is the kit's own legacy
       # launcher; install(1) replaces the link, never its target.
-      resolved=$(readlink -f -- "$target" 2>/dev/null) || resolved=""
+      resolved=$(python3 - "$target" <<'PY'
+import pathlib,sys
+try:
+    print(pathlib.Path(sys.argv[1]).resolve(strict=True))
+except OSError:
+    raise SystemExit(1)
+PY
+      ) || resolved=""
       [[ -n $resolved && $resolved == "$install_root"/* ]] ||
         die "refusing symlinked lifecycle target: $target"
       continue
@@ -686,21 +979,26 @@ validate_uninstall_launchers() {
 }
 
 rewrite_login() {
-  local action=$1
-  mkdir -p "$(dirname -- "$bashrc_path")"
-  if [[ $action == disable && ! -e $bashrc_path && ! -L $bashrc_path ]]; then
-    return 0
-  fi
-  [[ -e $bashrc_path ]] || : > "$bashrc_path"
-  [[ -f $bashrc_path && ! -L $bashrc_path ]] ||
-    die "refusing to modify non-regular shell file: $bashrc_path"
-  python3 - "$bashrc_path" "$action" "$login_start" "$login_end" <<'PY'
+  local action=$1 shell_path shell_kind
+  local -a shell_specs=("$bashrc_path:bash")
+  [[ $(platform) != macos ]] || shell_specs+=("$bash_profile_path:bash-login" "$zshrc_path:zsh")
+  for shell_kind in "${shell_specs[@]}"; do
+    shell_path=${shell_kind%:*}
+    shell_kind=${shell_kind##*:}
+    mkdir -p "$(dirname -- "$shell_path")"
+    if [[ $action == disable && ! -e $shell_path && ! -L $shell_path ]]; then
+      continue
+    fi
+    [[ -e $shell_path ]] || : > "$shell_path"
+    [[ -f $shell_path && ! -L $shell_path ]] ||
+      die "refusing to modify non-regular shell file: $shell_path"
+    python3 - "$shell_path" "$action" "$login_start" "$login_end" "$shell_kind" <<'PY'
 import os
 import pathlib
 import sys
 import tempfile
 
-path_raw, action, start, end = sys.argv[1:5]
+path_raw, action, start, end, shell_kind = sys.argv[1:6]
 path = pathlib.Path(path_raw)
 text = path.read_text(encoding="utf-8")
 begin = text.find(start)
@@ -715,13 +1013,17 @@ if begin >= 0:
     after = text[finish:].lstrip("\n")
     text = before + ("\n" if before and after else "") + after
 if action == "enable":
-    block = (
-        f"{start}\n"
-        'if [[ -r "$HOME/.local/lib/session-kit/current/bashrc/shpool.bashrc" ]]; then\n'
-        '  source "$HOME/.local/lib/session-kit/current/bashrc/shpool.bashrc"\n'
-        "fi\n"
-        f"{end}\n"
-    )
+    if shell_kind in {"bash", "bash-login"}:
+        body = (
+            'if [[ -r "$HOME/.local/lib/session-kit/current/bashrc/shpool.bashrc" ]]; then\n'
+            '  source "$HOME/.local/lib/session-kit/current/bashrc/shpool.bashrc"\n'
+            "fi\n"
+        )
+    else:
+        body = (
+            'export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"\n'
+        )
+    block = f"{start}\n{body}{end}\n"
     text = text.rstrip("\n") + ("\n\n" if text.strip() else "") + block
 fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
 try:
@@ -737,24 +1039,31 @@ finally:
     except FileNotFoundError:
         pass
 PY
+  done
 }
 
 backup_login_once() {
-  local backup_root=$state_root/backups
-  local backup=$backup_root/bashrc.before-session-kit
-  local absent=$backup_root/bashrc.was-absent
-  [[ -e $backup || -e $absent ]] && return 0
+  local backup_root=$state_root/backups shell_path shell_name backup absent
   umask 077
   mkdir -p "$backup_root"
   chmod 700 "$backup_root" 2>/dev/null || true
-  if [[ -e $bashrc_path || -L $bashrc_path ]]; then
-    [[ -f $bashrc_path && ! -L $bashrc_path ]] ||
-      die "refusing to back up non-regular shell file: $bashrc_path"
-    install -m 0600 "$bashrc_path" "$backup"
-  else
-    : > "$absent"
-    chmod 600 "$absent"
-  fi
+  local -a shell_specs=("$bashrc_path:bashrc")
+  [[ $(platform) != macos ]] || shell_specs+=("$bash_profile_path:bash-profile" "$zshrc_path:zshrc")
+  for shell_name in "${shell_specs[@]}"; do
+    shell_path=${shell_name%:*}
+    shell_name=${shell_name##*:}
+    backup=$backup_root/$shell_name.before-session-kit
+    absent=$backup_root/$shell_name.was-absent
+    [[ -e $backup || -e $absent ]] && continue
+    if [[ -e $shell_path || -L $shell_path ]]; then
+      [[ -f $shell_path && ! -L $shell_path ]] ||
+        die "refusing to back up non-regular shell file: $shell_path"
+      install -m 0600 "$shell_path" "$backup"
+    else
+      : > "$absent"
+      chmod 600 "$absent"
+    fi
+  done
 }
 
 set_journal_choice() {
@@ -790,7 +1099,12 @@ enable_login() {
     printf 'session-kit-integration-v1 %s\n' "$release_id" > "$integration_marker"
     chmod 600 "$integration_marker"
   fi
-  printf 'SSH picker enabled in %s\n' "$bashrc_path"
+  if [[ $(platform) == macos ]]; then
+    printf 'SSH picker enabled in %s, %s, and %s\n' \
+      "$bashrc_path" "$bash_profile_path" "$zshrc_path"
+  else
+    printf 'SSH picker enabled in %s\n' "$bashrc_path"
+  fi
 }
 
 disable_login() {
@@ -991,7 +1305,7 @@ install_command() {
   lifecycle_failpoint current
   install_launchers "$release_id"
   install_defaults "$release_id"
-  install_systemd_units "$release_id"
+  install_platform_services "$release_id"
   set_journal_choice "$journal"
   if [[ $login == enable ]]; then enable_login; else disable_login; fi
   write_ownership_markers
@@ -1002,6 +1316,9 @@ install_command() {
     printf 'User services were installed but not started. Review them, then run:\n'
     printf '  systemctl --user daemon-reload\n'
     printf '  systemctl --user enable --now shpool.socket shpool-reaper.timer\n'
+  elif [[ $current_platform == macos ]]; then
+    printf 'LaunchAgents were installed but not loaded. Review them, then run:\n'
+    printf '  session-kit services enable\n'
   fi
   printf 'Run session-kit doctor before opening a new managed session.\n'
 }
@@ -1034,7 +1351,12 @@ doctor_command() {
   else
     add_check fail release "no valid active release"
   fi
-  local -a missing_commands=()
+  local -a required_commands=("${common_required_commands[@]}") missing_commands=()
+  if [[ $current_platform == linux ]]; then
+    required_commands+=(flock journalctl systemctl)
+  elif [[ $current_platform == macos ]]; then
+    required_commands+=(launchctl plutil sw_vers)
+  fi
   for required in "${required_commands[@]}"; do
     command -v "$required" >/dev/null 2>&1 || missing_commands+=("$required")
   done
@@ -1043,16 +1365,45 @@ doctor_command() {
   else
     add_check fail prerequisites "commands unavailable: ${missing_commands[*]}"
   fi
-  if [[ -d /proc || ${SESSION_KIT_TESTING:-0} == 1 ]]; then
-    add_check ok proc "process identity filesystem is available"
-  else
-    add_check fail proc "/proc is unavailable"
-  fi
-  if [[ ${SESSION_KIT_TESTING:-0} == 1 ]] ||
-      systemctl --user show-environment >/dev/null 2>&1; then
-    add_check ok systemd "user service manager is available"
-  else
-    add_check fail systemd "user service manager is unavailable"
+  if [[ $current_platform == linux ]]; then
+    if [[ -d /proc || ${SESSION_KIT_TESTING:-0} == 1 ]]; then
+      add_check ok process "Linux /proc is available"
+    else
+      add_check fail process "/proc is unavailable"
+    fi
+    if [[ ${SESSION_KIT_TESTING:-0} == 1 ]] ||
+        systemctl --user show-environment >/dev/null 2>&1; then
+      add_check ok services "systemd user manager is available"
+    else
+      add_check fail services "systemd user manager is unavailable"
+    fi
+  elif [[ $current_platform == macos ]]; then
+    if [[ ${SESSION_KIT_TESTING:-0} == 1 ]] ||
+        python3 "$install_root/current/lib/session_inventory.py" platform boot-id >/dev/null 2>&1; then
+      add_check ok process "Darwin native process adapter is available"
+    else
+      add_check fail process "Darwin native process adapter is unavailable"
+    fi
+    local loaded=0 unit label
+    for unit in "${launchd_units[@]}"; do
+      [[ -f $launchd_template_root/$unit && ! -L $launchd_template_root/$unit ]] || {
+        add_check fail services "missing LaunchAgent: $unit"
+        continue
+      }
+      plutil -lint "$launchd_template_root/$unit" >/dev/null 2>&1 || {
+        add_check fail services "invalid LaunchAgent: $unit"
+        continue
+      }
+      label=${unit%.plist}
+      launchctl print "gui/$UID/$label" >/dev/null 2>&1 && loaded=$((loaded + 1))
+    done
+    if (( loaded == ${#launchd_units[@]} )); then
+      add_check ok services "all Session Kit LaunchAgents are loaded"
+    elif (( loaded == 0 )); then
+      add_check warn services "LaunchAgents are installed but unloaded"
+    else
+      add_check warn services "$loaded of ${#launchd_units[@]} LaunchAgents are loaded"
+    fi
   fi
   if command -v claude >/dev/null 2>&1 || command -v codex >/dev/null 2>&1; then
     add_check ok provider "Claude Code or Codex is available"
@@ -1122,7 +1473,7 @@ update_command() {
       *) die "unknown update option: $1" ;;
     esac
   done
-  [[ $(platform) == linux ]] || die "update is supported only on Linux"
+  [[ $(platform) != unsupported ]] || die "update is supported only on Linux and macOS"
   if [[ -z $source && -r $receipt_path ]]; then
     source=$(python3 - "$receipt_path" <<'PY'
 import json,sys
@@ -1155,7 +1506,7 @@ rollback_command() {
       *) die "unknown rollback option: $1" ;;
     esac
   done
-  [[ $(platform) == linux ]] || die "rollback is supported only on Linux"
+  [[ $(platform) != unsupported ]] || die "rollback is supported only on Linux and macOS"
   recover_pending_transaction
   if [[ -z $target && -r $receipt_path ]]; then
     target=$(python3 - "$receipt_path" <<'PY'
@@ -1201,7 +1552,7 @@ PY
   atomic_symlink "$install_root/releases/$target" "$install_root/current"
   lifecycle_failpoint current
   install_launchers "$target"
-  install_systemd_units "$target"
+  install_platform_services "$target"
   if [[ -f $integration_marker && ! -L $integration_marker ]]; then
     printf 'session-kit-integration-v1 %s\n' "$target" > "$integration_marker"
     chmod 600 "$integration_marker"
@@ -1210,6 +1561,213 @@ PY
   write_receipt "$target" "$source" "$previous" "$(platform)"
   commit_transaction
   printf 'Rolled back Session Kit to %s. Services were not restarted.\n' "$target"
+}
+
+launchd_receipt_matches() {
+  python3 - "$launchd_receipt" "$1" "$2" <<'PY'
+import hashlib,json,os,pathlib,stat,sys
+receipt=pathlib.Path(sys.argv[1]); unit=sys.argv[2]; active=pathlib.Path(sys.argv[3])
+try:
+    info=receipt.lstat()
+    value=json.loads(receipt.read_text(encoding="utf-8"))
+    active_info=active.lstat()
+except (OSError,ValueError):
+    raise SystemExit(1)
+if (
+    not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+    or stat.S_IMODE(info.st_mode) != 0o600
+    or not stat.S_ISREG(active_info.st_mode) or active_info.st_uid != os.geteuid()
+    or value.get("schema_version") != 1
+    or set(value) != {"schema_version", "digests"}
+    or not isinstance(value.get("digests"), dict)
+):
+    raise SystemExit(1)
+expected=value["digests"].get(unit)
+actual=hashlib.sha256(active.read_bytes()).hexdigest()
+raise SystemExit(0 if isinstance(expected,str) and expected==actual else 1)
+PY
+}
+
+write_launchd_receipt() {
+  python3 - "$launchd_receipt" "$service_root" "${launchd_units[@]}" <<'PY'
+import hashlib,json,os,pathlib,tempfile,sys
+receipt=pathlib.Path(sys.argv[1]); root=pathlib.Path(sys.argv[2]); units=sys.argv[3:]
+payload={
+    "schema_version":1,
+    "digests":{unit:hashlib.sha256((root/unit).read_bytes()).hexdigest() for unit in units},
+}
+receipt.parent.mkdir(parents=True,exist_ok=True)
+fd,temporary=tempfile.mkstemp(prefix=f".{receipt.name}.",dir=receipt.parent)
+try:
+    os.fchmod(fd,0o600)
+    with os.fdopen(fd,"w",encoding="utf-8") as handle:
+        json.dump(payload,handle,indent=2,sort_keys=True); handle.write("\n")
+        handle.flush(); os.fsync(handle.fileno())
+    os.replace(temporary,receipt)
+finally:
+    try: os.unlink(temporary)
+    except FileNotFoundError: pass
+PY
+}
+
+services_command() {
+  local action=${1:-}
+  [[ $# == 1 ]] || die "services requires exactly one action: enable, disable, or status"
+  case "$action" in enable|disable|status) ;; *) die "services action must be enable, disable, or status" ;; esac
+  local current_platform unit label domain="gui/$UID"
+  current_platform=$(platform)
+  if [[ $current_platform == linux ]]; then
+    case "$action" in
+      enable)
+        systemctl --user daemon-reload
+        systemctl --user enable --now shpool.socket shpool-reaper.timer
+        ;;
+      disable)
+        systemctl --user disable --now shpool-reaper.timer shpool.socket
+        ;;
+      status)
+        systemctl --user --no-pager status shpool.socket shpool-reaper.timer
+        ;;
+    esac
+    return
+  fi
+  [[ $current_platform == macos ]] || die "services is supported only on Linux and macOS"
+  validate_roots
+  for unit in "${launchd_units[@]}"; do
+    [[ -f $launchd_template_root/$unit && ! -L $launchd_template_root/$unit ]] ||
+      die "LaunchAgent template is missing or unsafe: $launchd_template_root/$unit"
+    plutil -lint "$launchd_template_root/$unit" >/dev/null || die "invalid LaunchAgent: $unit"
+  done
+  service_list_json() {
+    python3 "$install_root/current/lib/session_inventory.py" platform timeout 10 -- \
+      shpool -D list --json
+  }
+  sessions_are_empty() {
+    python3 -c 'import json,sys; v=json.load(sys.stdin); raise SystemExit(0 if isinstance(v,dict) and v.get("sessions")==[] else 1)'
+  }
+  validate_active_launchagents() {
+    local active_unit
+    for active_unit in "${launchd_units[@]}"; do
+      if [[ -e $service_root/$active_unit || -L $service_root/$active_unit ]]; then
+        [[ -f $service_root/$active_unit && ! -L $service_root/$active_unit ]] ||
+          die "refusing unsafe LaunchAgent destination: $service_root/$active_unit"
+        if ! cmp -s "$launchd_template_root/$active_unit" "$service_root/$active_unit" &&
+            ! launchd_receipt_matches "$active_unit" "$service_root/$active_unit"; then
+          die "refusing a modified or unowned LaunchAgent: $service_root/$active_unit"
+        fi
+      fi
+    done
+  }
+  case "$action" in
+    enable)
+      launchctl print "$domain" >/dev/null 2>&1 ||
+        die "the macOS GUI user domain is unavailable; log into the Mac desktop first"
+      label=com.session-kit.shpool
+      validate_active_launchagents
+      if ! launchctl print "$domain/$label" >/dev/null 2>&1; then
+        local probe_status=0
+        service_list_json >/dev/null 2>&1 || probe_status=$?
+        if (( probe_status == 0 )); then
+          die "an unmanaged shpool daemon is already reachable; refusing a second daemon"
+        elif (( probe_status == 124 )); then
+          die "the shpool probe timed out; refusing a possible second daemon"
+        fi
+      fi
+      mkdir -p "$service_root"
+      for unit in "${launchd_units[@]}"; do
+        label=${unit%.plist}
+        if launchctl print "$domain/$label" >/dev/null 2>&1; then
+          [[ -f $service_root/$unit && ! -L $service_root/$unit ]] ||
+            die "loaded label has no owned LaunchAgent file: $label"
+          cmp -s "$launchd_template_root/$unit" "$service_root/$unit" ||
+            die "loaded label has a pending definition; disable services before enabling again: $label"
+          printf 'Already loaded: %s\n' "$label"
+          continue
+        fi
+        if [[ -e $service_root/$unit || -L $service_root/$unit ]]; then
+          [[ -f $service_root/$unit && ! -L $service_root/$unit ]] ||
+            die "refusing unsafe LaunchAgent destination: $service_root/$unit"
+          cmp -s "$launchd_template_root/$unit" "$service_root/$unit" ||
+            die "refusing to replace a different LaunchAgent: $service_root/$unit"
+        else
+          install -m 0644 "$launchd_template_root/$unit" "$service_root/$unit"
+        fi
+        if ! launchctl bootstrap "$domain" "$service_root/$unit"; then
+          die "failed to load LaunchAgent: $label; previously loaded jobs were left running"
+        fi
+        printf 'Loaded: %s\n' "$label"
+      done
+      write_launchd_receipt
+      ;;
+    disable)
+      validate_active_launchagents
+      local sessions_json lock_file=$state_root/create.lock shpool_loaded=0
+      launchctl print "$domain/com.session-kit.shpool" >/dev/null 2>&1 && shpool_loaded=1
+      mkdir -p "$state_root"
+      exec 9>"$lock_file" || die "cannot open the Session Kit action lock"
+      python3 - 9 <<'PY'
+import fcntl,sys
+fcntl.flock(int(sys.argv[1]),fcntl.LOCK_EX)
+PY
+      if (( shpool_loaded )); then
+        sessions_json=$(service_list_json 2>/dev/null) ||
+          die "cannot prove shpool has no sessions; refusing to unload services"
+        sessions_are_empty <<<"$sessions_json" || die "shpool still has sessions; refusing to unload services"
+      fi
+      for unit in com.session-kit.watchdog.plist com.session-kit.reaper.plist; do
+        label=${unit%.plist}
+        if launchctl print "$domain/$label" >/dev/null 2>&1; then
+          launchctl bootout "$domain/$label"
+          printf 'Unloaded: %s\n' "$label"
+        else
+          printf 'Already unloaded: %s\n' "$label"
+        fi
+        if [[ -e $service_root/$unit || -L $service_root/$unit ]]; then
+          [[ -f $service_root/$unit && ! -L $service_root/$unit ]] ||
+            die "refusing unsafe LaunchAgent destination: $service_root/$unit"
+          cmp -s "$launchd_template_root/$unit" "$service_root/$unit" ||
+            die "refusing to remove a different LaunchAgent: $service_root/$unit"
+          command rm -- "$service_root/$unit"
+        fi
+      done
+      if (( shpool_loaded )); then
+        sessions_json=$(service_list_json 2>/dev/null) ||
+          die "cannot re-prove empty shpool before unload; shpool was left running"
+        sessions_are_empty <<<"$sessions_json" ||
+          die "a session appeared during disable; shpool was left running"
+      fi
+      unit=com.session-kit.shpool.plist
+      label=${unit%.plist}
+      if launchctl print "$domain/$label" >/dev/null 2>&1; then
+        launchctl bootout "$domain/$label"
+        printf 'Unloaded: %s\n' "$label"
+      else
+        printf 'Already unloaded: %s\n' "$label"
+      fi
+      if [[ -e $service_root/$unit ]]; then
+        command rm -- "$service_root/$unit"
+      fi
+      if [[ -e $launchd_receipt || -L $launchd_receipt ]]; then
+        [[ -f $launchd_receipt && ! -L $launchd_receipt ]] ||
+          die "refusing unsafe LaunchAgent receipt: $launchd_receipt"
+        command rm -- "$launchd_receipt"
+      fi
+      exec 9>&-
+      ;;
+    status)
+      local any_missing=0
+      for unit in "${launchd_units[@]}"; do
+        label=${unit%.plist}
+        if launchctl print "$domain/$label" >/dev/null 2>&1; then
+          printf 'LOADED   %s\n' "$label"
+        else
+          printf 'UNLOADED %s\n' "$label"
+          any_missing=1
+        fi
+      done
+      (( any_missing == 0 ))
+      ;;
+  esac
 }
 
 uninstall_command() {
@@ -1223,6 +1781,16 @@ uninstall_command() {
   done
   recover_pending_transaction
   validate_roots
+  if [[ $(platform) == macos ]]; then
+    local unit label
+    for unit in "${launchd_units[@]}"; do
+      label=${unit%.plist}
+      launchctl print "gui/$UID/$label" >/dev/null 2>&1 &&
+        die "unload Session Kit LaunchAgents first: session-kit services disable"
+      [[ ! -e $service_root/$unit && ! -L $service_root/$unit ]] ||
+        die "remove inactive LaunchAgents safely with: session-kit services disable"
+    done
+  fi
   validate_uninstall_launchers
   if (( purge_config )); then
     validate_purge_ownership config "$config_root" "$config_root/.session-kit-owned.json"
@@ -1274,6 +1842,7 @@ case "$command_name" in
   doctor) doctor_command "$@" ;;
   update) update_command "$@" ;;
   rollback) rollback_command "$@" ;;
+  services) services_command "$@" ;;
   enable-login) (($# == 0)) || die "enable-login takes no options"; enable_login ;;
   disable-login) (($# == 0)) || die "disable-login takes no options"; disable_login ;;
   uninstall) uninstall_command "$@" ;;

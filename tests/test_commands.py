@@ -329,6 +329,22 @@ with lock.open("a+") as held:
             """#!/usr/bin/env python3
 import json, os, pathlib, sys, tempfile, unicodedata
 args=sys.argv[1:]
+if args[:2] == ["platform", "process-is"] and len(args) == 5:
+    pid=int(args[2]); generation=int(args[3]); executable=args[4]
+    try:
+        stat_text=pathlib.Path(f"/proc/{pid}/stat").read_text()
+        current=int(stat_text.rsplit(")",1)[1].split()[19])
+        argv=pathlib.Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\\0")
+        actual=pathlib.Path(argv[0].decode("utf-8","replace")).name
+    except (OSError,ValueError,IndexError):
+        raise SystemExit(1)
+    raise SystemExit(0 if current == generation and actual == executable else 1)
+if args[:1] == ["codex-bounce-title"] and len(args) == 2:
+    title=os.environ.get("STUB_CODEX_BOUNCE_TITLE", "")
+    if title:
+        print(title)
+        raise SystemExit(0)
+    raise SystemExit(1)
 if args[:2] == ["automatic-title", "self-name"] and len(args) == 3:
     print(json.dumps({
         "schema_version":1,
@@ -1075,8 +1091,8 @@ exec /bin/date "$@"
         self.assertRegex(shpool_id, r"^s20260728-010203-[0-9]+-1$")
         reserved = self.fixture.start / f"{shpool_id.removesuffix('-1')}.expected"
         self.assertEqual(stale_content, reserved.read_bytes())
-        self.assertTrue((self.fixture.start / shpool_id).is_file())
-        self.assertTrue((self.fixture.start / f"{shpool_id}.expected").is_file())
+        self.assertFalse((self.fixture.start / shpool_id).exists())
+        self.assertFalse((self.fixture.start / f"{shpool_id}.expected").exists())
 
     def test_start_writer_refuses_existing_expected_namespace(self) -> None:
         self.fixture.start.mkdir()
@@ -1482,9 +1498,18 @@ exec /bin/mv "$@"
 
         self.fixture.snapshot_count.unlink()
         env.pop("STUB_SECOND_INVENTORY")
+        self.fixture.start.mkdir(exist_ok=True)
+        retained = self.fixture.start / "target"
+        retained_expected = self.fixture.start / "target.expected"
+        retained.write_text("retained-start\n", encoding="utf-8")
+        retained_expected.write_text("retained-expected\n", encoding="utf-8")
         closed = run([SP, "close", "target"], env=env)
         self.assertIn("Closed exact session target", closed.stdout)
         self.assertEqual("kill target\n", self.fixture.shpool_log.read_text())
+        self.assertFalse(retained.exists())
+        self.assertFalse(retained_expected.exists())
+        archived = list((self.fixture.start / "failed").glob("target.*.closed.*"))
+        self.assertEqual(2, len(archived))
 
     def test_target_revalidation_uses_guard_with_unrelated_unknown_session(self) -> None:
         target = session_row("target")
@@ -1909,6 +1934,34 @@ class PickerProofTests(unittest.TestCase):
         )
         return write_picker_proof(self.fixture.base / "picker-proof.json", row)
 
+    def _live_idle_codex(self, status: str) -> tuple[dict, subprocess.Popen]:
+        executable = self.fixture.base / "codex"
+        executable.symlink_to("/bin/sleep")
+        process = subprocess.Popen([executable, "60"])
+        deadline = time.monotonic() + 2
+        stat_text = ""
+        while time.monotonic() < deadline:
+            try:
+                stat_text = Path(f"/proc/{process.pid}/stat").read_text()
+                break
+            except OSError:
+                time.sleep(0.01)
+        self.assertTrue(stat_text)
+        start = int(stat_text.rsplit(")", 1)[1].split()[19])
+        live = session_row("main2", status=status)
+        live["identity"]["pid"] = process.pid
+        live["identity"]["process_start_ticks"] = start
+        live["agent_status"] = "idle"
+        live["recent_output_age_seconds"] = 300
+        return live, process
+
+    def _mark_title_pending(self) -> Path:
+        marker_root = self.fixture.state / "provider-untitled"
+        marker_root.mkdir(exist_ok=True)
+        marker = marker_root / "main2"
+        marker.touch()
+        return marker
+
     def test_picker_open_uses_exact_proof_and_releases_lock_before_attach(self) -> None:
         proof = self._prime(session_row("main2"))
         env = self.fixture.env()
@@ -1933,6 +1986,64 @@ class PickerProofTests(unittest.TestCase):
         self.assertIn("main2", moved.stdout)
         self.assertNotIn("Type the exact ID", moved.stdout)
         self.assertEqual("attach main2\n", self.fixture.shpool_log.read_text())
+
+    def test_attached_takeover_never_restarts_pending_title_automatically(self) -> None:
+        row, process = self._live_idle_codex("Attached")
+        proof = self._prime(row)
+        marker = self._mark_title_pending()
+        env = self.fixture.env()
+        env.update(
+            {
+                "SESSION_KIT_CONFIRM_ID": "main2",
+                "STUB_CODEX_BOUNCE_TITLE": "Release Notes",
+            }
+        )
+        try:
+            moved = run([SP, "picker-takeover", proof], env=env)
+            self.assertEqual(0, moved.returncode)
+            self.assertIsNone(process.poll())
+            self.assertTrue(marker.exists())
+        finally:
+            process.terminate()
+            process.wait(timeout=2)
+
+    def test_explicit_pending_title_refresh_restarts_only_idle_exact_codex(self) -> None:
+        row, process = self._live_idle_codex("Attached")
+        proof = self._prime(row)
+        marker = self._mark_title_pending()
+        env = self.fixture.env()
+        env["STUB_CODEX_BOUNCE_TITLE"] = "Release Notes"
+        try:
+            refreshed = run([SP, "picker-title-refresh", proof], env=env)
+            process.wait(timeout=2)
+            self.assertEqual(0, refreshed.returncode)
+            self.assertIn("Restarted the idle Codex provider", refreshed.stdout)
+            self.assertFalse(marker.exists())
+            bounce = self.fixture.state / "provider-bounce" / "main2"
+            self.assertEqual(row["identity"]["uuid"], bounce.read_text().strip())
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=2)
+
+    def test_explicit_pending_title_refresh_refuses_working_provider(self) -> None:
+        row, process = self._live_idle_codex("Attached")
+        row["agent_status"] = "working"
+        proof = self._prime(row)
+        marker = self._mark_title_pending()
+        env = self.fixture.env()
+        env["STUB_CODEX_BOUNCE_TITLE"] = "Release Notes"
+        try:
+            refused = run(
+                [SP, "picker-title-refresh", proof], env=env, check=False
+            )
+            self.assertEqual(74, refused.returncode)
+            self.assertIsNone(process.poll())
+            self.assertTrue(marker.exists())
+            self.assertIn("not proven idle", refused.stderr)
+        finally:
+            process.terminate()
+            process.wait(timeout=2)
 
     def test_picker_open_maps_attach_failure_without_calling_session_dead(self) -> None:
         proof = self._prime(session_row("main2"))

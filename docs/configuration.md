@@ -13,8 +13,11 @@ uses XDG locations where available.
 | Optional terminal journals | `${XDG_STATE_HOME:-$HOME/.local/state}/shpool-journal` |
 | Recovery journal archive | `${XDG_STATE_HOME:-$HOME/.local/state}/shpool-journal-recovery` |
 | Paired launch records | `${XDG_STATE_HOME:-$HOME/.local/state}/shpool-start` |
+| shpool configuration | `${XDG_CONFIG_HOME:-$HOME/.config}/shpool/config.toml` |
 | Immutable releases | `$HOME/.local/lib/session-kit/releases` |
 | Stable commands | `$HOME/.local/bin` |
+| macOS launchd templates | `${XDG_CONFIG_HOME:-$HOME/.config}/session-kit/launchd` |
+| Active macOS LaunchAgents | `$HOME/Library/LaunchAgents` |
 
 Private directories should be mode `0700`; private files should be mode `0600`.
 Sensitive proof files also require the expected owner, regular-file type, and
@@ -78,6 +81,11 @@ vt100_output_spool_width = 200
 prompt_prefix = ""
 ```
 
+On macOS, installation also records the resolved Homebrew Bash executable in
+this file. Session Kit refuses a different existing `shell` value. The launchd
+shpool job receives this exact configuration path explicitly because shpool's
+native macOS default is under `~/Library/Application Support`.
+
 ## Journals
 
 Terminal journals are off by default. Opting in affects new managed sessions;
@@ -89,7 +97,6 @@ not delete existing files and does not change an active terminal.
 ## Optional feature sentinels
 
 ```text
-$HOME/.no_shpool           automatic SSH picker
 $HOME/.no_shpool_reaper    scheduled cleanup observer
 $HOME/.no_shpool_watchdog  health reports
 $HOME/.no_shpool_journal   journals for new managed sessions
@@ -98,11 +105,17 @@ $HOME/.no_shpool_journal   journals for new managed sessions
 Removing a sentinel re-enables that component only after its other
 configuration checks pass.
 
+The Bash integration itself is managed by `session-kit enable-login` and
+`session-kit disable-login`. These compatibility commands add or remove the
+guarded `kit` function and SSH hint; they do not enable automatic picker
+startup.
+
 ## Advanced watchdog repair mode
 
-The installed watchdog defaults to `report` mode. The source also accepts
-`SESSION_KIT_WATCHDOG_MODE=repair` as an explicit advanced opt-in. The installer
-does not enable it, and it is not needed for ordinary health reporting.
+The installed watchdog defaults to `report` mode. On Linux, the source also
+accepts `SESSION_KIT_WATCHDOG_MODE=repair` as an explicit advanced opt-in. The
+installer does not enable repair mode. macOS supports report mode only because
+watchdog repair requires Linux daemon-thread evidence.
 
 Repair mode can close a terminal that has direct evidence of an unrecoverable
 shpool handoff failure and relaunch the exact provider conversation in a new

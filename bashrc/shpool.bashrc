@@ -2,6 +2,11 @@
 # ---- session-kit shpool integration -----------------------------------------
 # Source this block from ~/.bashrc. Installed releases keep this file immutable.
 
+if [[ ${__SESSION_KIT_SHPOOL_BASHRC_LOADED:-0} == 1 ]]; then
+  return 0
+fi
+__SESSION_KIT_SHPOOL_BASHRC_LOADED=1
+
 export PATH="$HOME/.cargo/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 # Keep AI TUI output in normal terminal history. The session journal is the
@@ -40,11 +45,6 @@ if [[ -n ${SHPOOL_SESSION_NAME:-} && -z ${SHPOOL_JOURNAL:-} && $- == *i* && -t 1
     exec bash -i
   fi
   if [[ $(uname -s 2>/dev/null) == Darwin ]]; then
-    if [[ ${SESSION_KIT_MACOS_PREVIEW:-0} != 1 ]]; then
-      echo "[session-kit: macOS preview is disabled; continuing without capture]" >&2
-      export SHPOOL_JOURNAL=disabled
-      exec bash -i
-    fi
     script -q -F -a "$SHPOOL_JOURNAL" bash -i
   else
     script -qfa "$SHPOOL_JOURNAL" -c "bash -i"
@@ -132,8 +132,7 @@ PY
     unset __sk_release_root
     if [[ -n ${SESSION_KIT_BOOT_ID_FILE:-} ]]; then
       __sk_current_boot_id=$(command cat -- "$SESSION_KIT_BOOT_ID_FILE" 2>/dev/null || true)
-    elif [[ $(uname -s 2>/dev/null) == Darwin && ${SESSION_KIT_MACOS_PREVIEW:-0} == 1 &&
-            -f $__sk_inventory_core ]]; then
+    elif [[ $(uname -s 2>/dev/null) == Darwin && -f $__sk_inventory_core ]]; then
       __sk_current_boot_id=$(python3 "$__sk_inventory_core" platform boot-id 2>/dev/null || true)
     else
       __sk_current_boot_id=$(command cat -- /proc/sys/kernel/random/boot_id 2>/dev/null || true)
@@ -145,8 +144,7 @@ PY
       local __sk_pid=$1 __sk_stat __sk_tail
       local -a __sk_fields
       if [[ $(uname -s 2>/dev/null) == Darwin ]]; then
-        [[ ${SESSION_KIT_MACOS_PREVIEW:-0} == 1 && -f $__sk_inventory_core ]] ||
-          return 1
+        [[ -f $__sk_inventory_core ]] || return 1
         python3 "$__sk_inventory_core" platform process-info "$__sk_pid" 2>/dev/null |
           command tr '\t' ' '
         return
@@ -201,15 +199,19 @@ PY
         claude)
           if ! command -v claude >/dev/null 2>&1; then
             echo "[session-kit: Claude is unavailable; launch record retained for retry]" >&2
-          else
+          elif [[ $__sk_launch_mode != new ]] || \
+              __sk_new_claude_uuid=$(python3 -c 'import uuid; print(uuid.uuid4())'); then
             command rm -- "$__sk_start" "$__sk_expected"
             __sk_provider_launched=1
             case "$__sk_launch_mode" in
-              new) claude; __sk_provider_rc=$? ;;
+              new) claude --session-id "$__sk_new_claude_uuid"; __sk_provider_rc=$? ;;
               resume) claude --resume "$__sk_uuid"; __sk_provider_rc=$? ;;
               fork) claude --resume "$__sk_uuid" --fork-session; __sk_provider_rc=$? ;;
             esac
+          else
+            echo "[session-kit: Claude session identity could not be allocated; launch record retained for retry]" >&2
           fi
+          unset __sk_new_claude_uuid
           ;;
         codex)
           if ! command -v codex >/dev/null 2>&1; then
@@ -221,6 +223,94 @@ PY
             # conversation never loads. Suppressed explicitly here rather than
             # relying on user config.
             __sk_codex_no_update=(-c check_for_update_on_startup=false)
+            # A private per-repository coordination config can opt future Codex
+            # sessions into a local App Server plus an exact-thread broker.
+            # Existing direct sessions are never changed. Invalid, unsafe, or
+            # absent config fails back to the normal direct TUI launch.
+            __sk_coord_broker=
+            __sk_coord_config="$HOME/.config/session-kit/coordination.json"
+            if [[ -f $__sk_coord_config && ! -L $__sk_coord_config ]]; then
+              __sk_coord_broker=$(python3 - "$__sk_coord_config" "$__sk_cwd" <<'PY'
+import json
+import os
+import stat
+import sys
+
+config_path, launch_cwd = sys.argv[1:]
+try:
+    metadata = os.lstat(config_path)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_mode & 0o022
+        or metadata.st_size > 8192
+    ):
+        raise ValueError("unsafe config")
+    with open(config_path, encoding="utf-8") as stream:
+        config = json.load(stream)
+    repo_root = os.path.realpath(config["repo_root"])
+    broker = config["codex_broker"]
+    if (
+        config.get("codex_app_server") is not True
+        or os.path.realpath(launch_cwd) != repo_root
+        or not os.path.isabs(broker)
+        or not os.path.isfile(broker)
+        or os.path.islink(broker)
+    ):
+        raise ValueError("inactive config")
+    broker_metadata = os.stat(broker)
+    if broker_metadata.st_uid != os.geteuid() or broker_metadata.st_mode & 0o022:
+        raise ValueError("unsafe broker")
+    print(broker)
+except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+    pass
+PY
+              )
+            fi
+            __sk_codex_remote=()
+            __sk_app_server_pid=
+            __sk_broker_pid=
+            __sk_app_socket=
+            if [[ -n $__sk_coord_broker ]]; then
+              __sk_app_dir="$__sk_state_root/session-kit/app-server/$SHPOOL_SESSION_NAME"
+              if mkdir -p -- "$__sk_app_dir" && chmod 700 -- "$__sk_app_dir"; then
+                __sk_app_socket="$__sk_app_dir/app.sock"
+                __sk_app_log="$__sk_app_dir/app-server.log"
+                if [[ ! -e $__sk_app_socket ]]; then
+                  codex "${__sk_codex_no_update[@]}" app-server \
+                    --listen "unix://$__sk_app_socket" \
+                    >>"$__sk_app_log" 2>&1 &
+                  __sk_app_server_pid=$!
+                  for __sk_app_attempt in {1..50}; do
+                    [[ -S $__sk_app_socket ]] && break
+                    kill -0 "$__sk_app_server_pid" 2>/dev/null || break
+                    sleep 0.1
+                  done
+                  if [[ -S $__sk_app_socket ]] && \
+                     kill -0 "$__sk_app_server_pid" 2>/dev/null; then
+                    chmod 600 -- "$__sk_app_socket" 2>/dev/null || true
+                    __sk_codex_remote=(--remote "unix://$__sk_app_socket")
+                    __sk_broker_args=(
+                      --socket "$__sk_app_socket"
+                      --repo "$__sk_cwd"
+                      --server-pid "$__sk_app_server_pid"
+                    )
+                    [[ $__sk_launch_mode == resume && -n $__sk_uuid ]] && \
+                      __sk_broker_args+=(--thread "$__sk_uuid")
+                    python3 "$__sk_coord_broker" "${__sk_broker_args[@]}" \
+                      >>"$__sk_app_dir/broker.log" 2>&1 &
+                    __sk_broker_pid=$!
+                  else
+                    [[ -n $__sk_app_server_pid ]] && \
+                      kill "$__sk_app_server_pid" 2>/dev/null || true
+                    [[ -n $__sk_app_server_pid ]] && \
+                      wait "$__sk_app_server_pid" 2>/dev/null || true
+                    __sk_app_server_pid=
+                    echo "[session-kit: Codex App Server unavailable; using direct TUI]" >&2
+                  fi
+                fi
+              fi
+            fi
             # Codex has no per-thread color; the session's kit color rides in
             # as a per-launch theme override (status line, thread-title item).
             # Resumes and forks color from the conversation's effective color;
@@ -260,9 +350,9 @@ PY
               esac
               unset __sk_theme_color
               case "$__sk_launch_mode" in
-                new) codex "${__sk_codex_no_update[@]}" "${__sk_codex_theme[@]}" --no-alt-screen; __sk_provider_rc=$? ;;
-                resume) codex "${__sk_codex_no_update[@]}" "${__sk_codex_theme[@]}" --no-alt-screen resume "$__sk_uuid"; __sk_provider_rc=$? ;;
-                fork) codex "${__sk_codex_no_update[@]}" "${__sk_codex_theme[@]}" --no-alt-screen fork "$__sk_uuid"; __sk_provider_rc=$? ;;
+                new) codex "${__sk_codex_no_update[@]}" "${__sk_codex_theme[@]}" "${__sk_codex_remote[@]}" --no-alt-screen; __sk_provider_rc=$? ;;
+                resume) codex "${__sk_codex_no_update[@]}" "${__sk_codex_theme[@]}" "${__sk_codex_remote[@]}" --no-alt-screen resume "$__sk_uuid"; __sk_provider_rc=$? ;;
+                fork) codex "${__sk_codex_no_update[@]}" "${__sk_codex_theme[@]}" "${__sk_codex_remote[@]}" --no-alt-screen fork "$__sk_uuid"; __sk_provider_rc=$? ;;
               esac
               # A kit-requested bounce relaunches the SAME conversation once,
               # so the fresh process boots with its title and theme. Any other
@@ -282,6 +372,16 @@ PY
               unset __sk_bounce
               break
             done
+            if [[ -n $__sk_broker_pid ]]; then
+              kill "$__sk_broker_pid" 2>/dev/null || true
+              wait "$__sk_broker_pid" 2>/dev/null || true
+            fi
+            if [[ -n $__sk_app_server_pid ]]; then
+              kill "$__sk_app_server_pid" 2>/dev/null || true
+              wait "$__sk_app_server_pid" 2>/dev/null || true
+            fi
+            [[ -n $__sk_app_socket && -S $__sk_app_socket ]] && \
+              command rm -- "$__sk_app_socket"
           fi
           ;;
         shell)
@@ -435,7 +535,9 @@ PY
         umask 077
         mkdir -p "$(dirname "$__sk_cache")"
         touch -- "$__sk_cache"
-        if timeout -k 2 15 "$HOME/.local/bin/shpool_status" --waiting-count > "$__sk_cache.new" 2>/dev/null; then
+        if python3 "$HOME/.local/lib/session-kit/current/lib/session_inventory.py" \
+          platform timeout 15 -- "$HOME/.local/bin/shpool_status" --waiting-count \
+          > "$__sk_cache.new" 2>/dev/null; then
           mv -f -- "$__sk_cache.new" "$__sk_cache"
         else
           rm -f -- "$__sk_cache.new"

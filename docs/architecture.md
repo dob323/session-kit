@@ -17,7 +17,7 @@ without treating display text as identity.
 shpool list --json ─┐
 Claude Code state  ─┼─> inventory ─> frozen snapshot ─> picker / sp
 Codex local state  ─┤        │
-Linux /proc ────────┘        ├─> terminal-number state
+native processes  ──┘        ├─> terminal-number state
                              ├─> recovery state
                              └─> private action proof
 
@@ -32,7 +32,7 @@ behavior-preserving steps.
 The inventory:
 
 - takes one bounded shpool snapshot;
-- scans a bounded Linux process tree;
+- scans a bounded native process tree;
 - joins provider roots to exact shpool shells;
 - classifies structured reply and provider-exit state;
 - assigns boot-scoped terminal numbers;
@@ -41,6 +41,12 @@ The inventory:
 - renders control-safe terminal output.
 
 Strict and guard snapshots refuse partial provider identity.
+
+On Linux, process identity comes from `/proc`, including a boot-scoped process
+start generation. On macOS, Session Kit uses `PROC_PIDTBSDINFO` for process and
+start-time identity, double-reads that identity around `KERN_PROCARGS2`, and
+uses `kern.boottime` as boot identity. A PID whose generation changes during a
+read is discarded.
 
 ## Commands and action proofs
 
@@ -91,7 +97,8 @@ safe state has been observed continuously for 72 hours.
 Automatic close requires the same exact terminal generation, the same exited
 provider identity, no attachment, no live provider or child work, no pending
 reply, no recovery conflict, and unchanged evidence. Any uncertainty resets or
-blocks eligibility. Manual `sp prune` uses fresh checks and confirmation.
+blocks eligibility. Manual `sp prune` uses fresh checks and an exact-target
+safety display.
 
 ## Display model
 
@@ -106,11 +113,23 @@ secondary text. Text labels always carry the meaning, so color is optional.
 
 Every installed Git commit has an immutable release directory. A stable
 launcher resolves one `current` link and dispatches only approved helper names.
+Linux installs systemd user definitions. macOS installs inactive per-user
+LaunchAgent templates; only `session-kit services enable` copies and loads them.
 Selecting another Session Kit release changes the pointer and receipt but does
-not restart shpool.
+not restart or reload services.
 
 ## Platform boundary
 
-The beta requires Linux `/proc`, Bash, and systemd user services. macOS and
-other process or service models stop before installation or mutation. Files
-kept for future platform work do not establish support.
+The beta supports these two platform models:
+
+- Linux uses `/proc`, Bash, Python 3.10 or newer, and systemd user services.
+- macOS 14 or newer supports Apple Silicon and Intel with Python 3.11 or newer,
+  Homebrew Bash 4 or newer, official shpool 0.11.0, native Darwin process APIs,
+  and per-user LaunchAgents in the logged-in GUI user's `gui/$UID` domain.
+
+The outer macOS login shell may remain zsh, but the managed shpool shell is the
+validated modern Bash executable. The LaunchAgents are not privileged or
+headless daemons and are unavailable before the user logs into the Mac desktop.
+The macOS watchdog is report-only; repair mode remains Linux-only because it
+depends on Linux daemon-thread evidence. Other operating systems and service
+models stop before installation or mutation.

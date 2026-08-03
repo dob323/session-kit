@@ -4,6 +4,7 @@ import base64
 import json
 import os
 from pathlib import Path
+import plistlib
 import shutil
 import subprocess
 import tempfile
@@ -27,10 +28,17 @@ class InstallerTests(unittest.TestCase):
         self.home.mkdir()
         self.fake_bin = self.temp / "bin"
         self.fake_bin.mkdir()
-        for command in ("shpool", "codex"):
+        for command in ("shpool", "codex", "launchctl", "plutil", "sw_vers"):
             executable = self.fake_bin / command
+            body = "#!/usr/bin/env bash\nexit 0\n"
+            if command == "shpool":
+                body = (
+                    "#!/usr/bin/env bash\n"
+                    "if [[ ${1:-} == version ]]; then echo 'shpool 0.11.0'; fi\n"
+                    "exit 0\n"
+                )
             executable.write_text(
-                "#!/usr/bin/env bash\nexit 0\n", encoding="utf-8"
+                body, encoding="utf-8"
             )
             executable.chmod(0o755)
         self.env = os.environ.copy()
@@ -293,20 +301,64 @@ class InstallerTests(unittest.TestCase):
         self.assertIn("refusing broad install root", result.stderr)
         self.assertEqual(list(self.home.iterdir()), [])
 
-    def test_macos_install_update_and_rollback_fail_closed(self) -> None:
+    def test_macos_install_update_and_rollback_are_transactional(self) -> None:
         self.env["SESSION_KIT_TEST_PLATFORM"] = "macos"
-        install = self.run_installer("--non-interactive", check=False)
-        self.assertNotEqual(install.returncode, 0)
-        self.assertIn("macOS lifecycle operations are not supported", install.stdout)
-        self.assertEqual(list(self.home.iterdir()), [])
+        self.env["SESSION_KIT_SERVICE_ROOT"] = str(self.temp / "LaunchAgents")
+        self.run_installer("--enable-login", "--journal", "off")
+        current = self.home / ".local/lib/session-kit/current"
+        self.assertEqual(current.resolve().name, RELEASE_A)
+        templates = self.home / ".config/session-kit/launchd"
+        self.assertEqual(
+            {path.name for path in templates.glob("*.plist")},
+            {
+                "com.session-kit.shpool.plist",
+                "com.session-kit.reaper.plist",
+                "com.session-kit.watchdog.plist",
+            },
+        )
+        self.assertFalse((self.temp / "LaunchAgents").exists())
+        shpool_plist = plistlib.loads(
+            (templates / "com.session-kit.shpool.plist").read_bytes()
+        )
+        self.assertEqual(
+            shpool_plist["EnvironmentVariables"]["SHELL"],
+            shutil.which("bash", path=self.env["PATH"]),
+        )
+        self.assertEqual(
+            shpool_plist["ProgramArguments"],
+            [
+                str(self.fake_bin / "shpool"),
+                "--config-file",
+                str(self.home / ".config/shpool/config.toml"),
+                "daemon",
+            ],
+        )
+        zshrc = self.home / ".zshrc"
+        self.assertIn("$HOME/.local/bin", zshrc.read_text(encoding="utf-8"))
+        self.assertNotIn("exec", zshrc.read_text(encoding="utf-8"))
+        bash_profile = self.home / ".bash_profile"
+        self.assertIn(
+            ".local/lib/session-kit/current/bashrc/shpool.bashrc",
+            bash_profile.read_text(encoding="utf-8"),
+        )
+        self.installed("disable-login")
+        self.assertNotIn(
+            "session-kit managed integration",
+            bash_profile.read_text(encoding="utf-8"),
+        )
+        self.installed("enable-login")
+        self.assertTrue((self.home / ".local/bin/kit").is_file())
+        shpool_config = self.home / ".config/shpool/config.toml"
+        self.assertIn(
+            f'shell = "{shutil.which("bash", path=self.env["PATH"])}"',
+            shpool_config.read_text(encoding="utf-8"),
+        )
 
-        self.env["SESSION_KIT_TEST_PLATFORM"] = "linux"
-        self.run_installer("--non-interactive")
-        self.env["SESSION_KIT_TEST_PLATFORM"] = "macos"
-        update = self.installed("update", "--source", str(REPO), check=False)
-        rollback = self.installed("rollback", "--to", RELEASE_A, check=False)
-        self.assertIn("update is supported only on Linux", update.stderr)
-        self.assertIn("rollback is supported only on Linux", rollback.stderr)
+        self.env["SESSION_KIT_RELEASE_ID"] = RELEASE_B
+        self.installed("update", "--source", str(REPO))
+        self.assertEqual(current.resolve().name, RELEASE_B)
+        self.installed("rollback")
+        self.assertEqual(current.resolve().name, RELEASE_A)
 
     def test_rollback_restores_helpers_units_pointer_and_receipt(self) -> None:
         self.run_installer("--non-interactive")

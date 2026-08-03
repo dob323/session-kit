@@ -16,7 +16,8 @@ Describe the user-visible result and the problem it solves.
 
 Explain any effect on exact identity, dashboard state, provider exit, opening,
 moving, kill confirmation, recovery, cleanup, logs, journals, supported Linux
-versions, installation, update, rollback, or uninstall. Write `None` if none.
+or macOS versions, systemd or launchd behavior, installation, update, rollback,
+or uninstall. Write `None` if none.
 
 ## Rollback
 

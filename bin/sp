@@ -178,27 +178,27 @@ picker_revalidate_locked() {
 # structurally excluded), a title in Codex's thread store, no subagents, not
 # mid-turn, quiet for two minutes, and an exact PID+start-time match before
 # the signal.
-picker_maybe_bounce_codex() {
-  local id=$1
-  [[ ${SK_PROOF_PROVIDER:-} == codex ]] || return 0
+picker_bounce_codex() {
+  local id=$1 mode=${2:-automatic}
+  [[ $mode == automatic || $mode == explicit ]] || return 2
+  [[ ${SK_PROOF_PROVIDER:-} == codex ]] || return 1
   local uuid=${SK_PROOF_UUID:-}
-  [[ -n $uuid ]] || return 0
+  [[ -n $uuid ]] || return 1
   local untitled="$SK_STATE_DIR/provider-untitled/$id"
-  [[ -f $untitled && ! -L $untitled ]] || return 0
+  [[ -f $untitled && ! -L $untitled ]] || return 1
   # An old marker is skipped, never deleted: the session may simply have
   # been parked past the window, and deleting would burn the only chance a
   # later reopen has to repair the title. The reaper clears markers whose
   # sessions are proven gone.
   local marker_age
-  marker_age=$(( $(date +%s) - $(stat -c %Y "$untitled" 2>/dev/null || echo 0) ))
-  (( marker_age <= 604800 )) || return 0
+  marker_age=$(( $(date +%s) - $(stat -c %Y "$untitled" 2>/dev/null || stat -f %m "$untitled" 2>/dev/null || echo 0) ))
+  (( marker_age <= 604800 )) || return 1
   local pid=${SK_PROOF_PROVIDER_PID:-} start=${SK_PROOF_PROVIDER_START:-}
-  [[ $pid =~ ^[0-9]+$ && $start =~ ^[0-9]+$ ]] || return 0
-  python3 - "$SNAPSHOT" "$id" "$uuid" "$pid" "$start" <<'PY' || return 0
+  [[ $pid =~ ^[0-9]+$ && $start =~ ^[0-9]+$ ]] || return 1
+  python3 - "$SNAPSHOT" "$id" "$uuid" "$pid" "$start" "$mode" <<'PY' || return 1
 import json, sys
-from pathlib import Path
 
-snapshot, shpool_id, uuid, pid_text, start_text = sys.argv[1:6]
+snapshot, shpool_id, uuid, pid_text, start_text, mode = sys.argv[1:7]
 try:
     data = json.load(open(snapshot, encoding="utf-8"))
     row = next(
@@ -206,6 +206,15 @@ try:
         if s.get("shpool_id") == shpool_id
     )
 except (OSError, ValueError, StopIteration):
+    raise SystemExit(1)
+if mode == "automatic" and row.get("availability") != "ready":
+    raise SystemExit(1)
+identity = row.get("identity") or {}
+if (
+    identity.get("uuid") != uuid
+    or str(identity.get("pid")) != pid_text
+    or str(identity.get("process_start_ticks")) != start_text
+):
     raise SystemExit(1)
 if row.get("subagents"):
     raise SystemExit(1)
@@ -221,39 +230,33 @@ if str(row.get("agent_status") or "").casefold() != "idle":
 age = row.get("recent_output_age_seconds")
 if isinstance(age, int) and not isinstance(age, bool) and age < 120:
     raise SystemExit(1)
-try:
-    stat_text = Path(f"/proc/{pid_text}/stat").read_text()
-    if stat_text.rsplit(")", 1)[1].split()[19] != start_text:
-        raise SystemExit(1)
-    cmdline = Path(f"/proc/{pid_text}/cmdline").read_bytes()
-    if b"codex" not in cmdline:
-        raise SystemExit(1)
-except (OSError, IndexError):
-    raise SystemExit(1)
 raise SystemExit(0)
 PY
+  python3 "$INVENTORY_CORE" platform process-is "$pid" "$start" codex \
+    >/dev/null 2>&1 || return 1
   # Only a real name is worth a restart: Codex seeds threads.title with the
   # raw first prompt, and bouncing on that echo burns the one-shot restart
   # before the true title exists. A refusal here leaves the untitled marker
   # in place so a later reopen retries once the thread is really named.
   local bounce_title
-  bounce_title=$(python3 "$INVENTORY_CORE" codex-bounce-title "$uuid" 2>/dev/null) || return 0
-  [[ -n $bounce_title ]] || return 0
+  bounce_title=$(python3 "$INVENTORY_CORE" codex-bounce-title "$uuid" 2>/dev/null) || return 1
+  [[ -n $bounce_title ]] || return 1
   ( umask 077
     mkdir -p "$SK_STATE_DIR/provider-bounce" &&
       printf '%s\n' "$uuid" > "$SK_STATE_DIR/provider-bounce/$id"
-  ) 2>/dev/null || return 0
+  ) 2>/dev/null || return 1
   # The decision above ran on a snapshot taken before the create lock was
   # released; re-prove idleness on FRESH state immediately before the TERM,
   # or a turn that started meanwhile gets killed mid-work.
   local recheck
   recheck=$(mktemp "$SK_STATE_DIR/bounce-recheck.XXXXXX.json") || {
     command rm -f -- "$SK_STATE_DIR/provider-bounce/$id"
-    return 0
+    return 1
   }
   if ! sk_guard_snapshot_file "$recheck" 2>/dev/null ||
-     ! python3 - "$recheck" "$id" <<'PY'
+     ! python3 - "$recheck" "$id" "$uuid" "$pid" "$start" "$mode" <<'PY'
 import json, sys
+
 try:
     data = json.load(open(sys.argv[1], encoding="utf-8"))
     row = next(
@@ -262,24 +265,56 @@ try:
     )
 except (OSError, ValueError, StopIteration):
     raise SystemExit(1)
+uuid, pid_text, start_text, mode = sys.argv[3:7]
+identity = row.get("identity") or {}
+if (
+    identity.get("uuid") != uuid
+    or str(identity.get("pid")) != pid_text
+    or str(identity.get("process_start_ticks")) != start_text
+):
+    raise SystemExit(1)
+if mode == "automatic" and row.get("availability") != "ready":
+    raise SystemExit(1)
 if row.get("subagents"):
     raise SystemExit(1)
-raise SystemExit(
-    0 if str(row.get("agent_status") or "").casefold() == "idle" else 1
-)
+if str(row.get("agent_status") or "").casefold() != "idle":
+    raise SystemExit(1)
+raise SystemExit(0)
 PY
   then
     command rm -f -- "$recheck" "$SK_STATE_DIR/provider-bounce/$id"
-    return 0
+    return 1
+  fi
+  if ! python3 "$INVENTORY_CORE" platform process-is "$pid" "$start" codex \
+    >/dev/null 2>&1; then
+    command rm -f -- "$recheck" "$SK_STATE_DIR/provider-bounce/$id"
+    return 1
   fi
   command rm -f -- "$recheck"
   if kill -TERM "$pid" 2>/dev/null; then
     command rm -f -- "$untitled"
-    picker_action_event picker_open provider_bounced
+    picker_action_event title_refresh provider_restarted
   else
     command rm -f -- "$SK_STATE_DIR/provider-bounce/$id"
+    return 1
   fi
   return 0
+}
+
+picker_refresh_title() {
+  local proof=$1
+  picker_action_event title_refresh requested
+  picker_load_fresh "$proof" || {
+    picker_action_event title_refresh refused
+    return "$PICKER_REFUSED_STATUS"
+  }
+  if picker_bounce_codex "$SK_ID" explicit; then
+    printf 'Restarted the idle Codex provider for exact session %s; its conversation and shell were preserved.\n' "$SK_ID"
+    return 0
+  fi
+  picker_action_event title_refresh refused
+  sk_die "the Codex title is not pending or the provider is not proven idle with no subagents; nothing restarted"
+  return "$PICKER_REFUSED_STATUS"
 }
 
 picker_open() {
@@ -310,7 +345,7 @@ picker_open() {
   # the lifetime of the attachment. Release it immediately before the guarded
   # name-only request; --cmd /bin/false prevents a persistent raced replacement.
   sk_lock_release 9
-  picker_maybe_bounce_codex "$id" || true
+  picker_bounce_codex "$id" automatic || true
   if picker_attach_id "$id" "$cwd"; then
     picker_action_event picker_open returned
     return 0
@@ -351,12 +386,6 @@ picker_takeover() {
   fi
   local cwd=$SK_CWD
   sk_lock_release 9
-  # A takeover is how every reopen arrives once a window was closed without
-  # detaching (the session stays "attached" to the dead client), so the
-  # untitled-codex bounce must fire here too or those sessions never get
-  # their named bar. Identical guards: positive idle, no subagents, fresh
-  # pre-TERM recheck; the abandoned client sees nothing.
-  picker_maybe_bounce_codex "$id" || true
   if picker_attach_id "$id" "$cwd" 1; then
     picker_action_event picker_takeover returned
     return 0
@@ -388,7 +417,7 @@ picker_close() {
     return 1
   fi
   sk_kill_status=0
-  timeout -k 5 20 "$SK_SHPOOL" kill "$id" || sk_kill_status=$?
+  sk_timeout 20 "$SK_SHPOOL" kill "$id" || sk_kill_status=$?
   if (( sk_kill_status == 124 || sk_kill_status == 137 )); then
     sk_die "the close did not confirm within 20s — the session may or may not have ended; refresh the list before acting again"
     sk_lock_release 9 2>/dev/null
@@ -508,7 +537,7 @@ picker_recover() {
     return 1
   }
   sk_kill_status=0
-  timeout -k 5 20 "$SK_SHPOOL" kill "$id" || sk_kill_status=$?
+  sk_timeout 20 "$SK_SHPOOL" kill "$id" || sk_kill_status=$?
   if (( sk_kill_status == 124 || sk_kill_status == 137 )); then
     sk_die "the close did not confirm within 20s — the session may or may not have ended; refresh the list before acting again"
     sk_lock_release 9 2>/dev/null
@@ -583,7 +612,7 @@ repair_target() {
     return 1
   fi
   sk_kill_status=0
-  timeout -k 5 20 "$SK_SHPOOL" kill "$id" || sk_kill_status=$?
+  sk_timeout 20 "$SK_SHPOOL" kill "$id" || sk_kill_status=$?
   if (( sk_kill_status == 124 || sk_kill_status == 137 )); then
     sk_die "the close did not confirm within 20s — the session may or may not have ended; refresh the list before acting again"
     sk_lock_release 9 2>/dev/null
@@ -628,8 +657,13 @@ sk_prebake_claude() {
     2>/dev/null) || return 1
   ( cd "$cwd" 2>/dev/null &&
     { sleep 4; printf '/color %s\r' "$color"; sleep 3; } |
-      timeout 14 env -u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_SESSION_ID \
-        script -qec "timeout 11 claude --session-id $minted" /dev/null
+      if [[ $(sk_platform) == Darwin ]]; then
+        sk_timeout 14 env -u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_SESSION_ID \
+          script -q /dev/null claude --session-id "$minted"
+      else
+        sk_timeout 14 env -u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_SESSION_ID \
+          script -qec "claude --session-id $minted" /dev/null
+      fi
   ) >/dev/null 2>&1 || true
   transcript=$(compgen -G "$HOME/.claude/projects/*/$minted.jsonl" | head -1) ||
     return 1
@@ -698,7 +732,7 @@ start_new() {
     return 1
   }
   sk_attach_status=0
-  timeout -k 5 30 "$SK_SHPOOL" attach --background --dir "$cwd" "$id" || sk_attach_status=$?
+  sk_timeout 30 "$SK_SHPOOL" attach --background --dir "$cwd" "$id" || sk_attach_status=$?
   if (( sk_attach_status != 0 && sk_attach_status != 124 && sk_attach_status != 137 )); then
     local quarantine
     quarantine=$(sk_quarantine_start_record "$id" attach-failed 2>/dev/null || true)
@@ -727,8 +761,16 @@ start_new() {
       sk_lock_release 9
       sk_die "launch generation could not be armed; record quarantined at ${quarantine:-$SK_START_DIR/failed}"
       return 1
-    }
+  }
   sk_lock_release 9
+  if [[ $provider == shell ]] &&
+     ! sk_clear_start_record "$id" "$provider" "$cwd" "$launch_uuid" \
+       "$created_boot_id" "$created_started" "$created_shell_pid" \
+       "$created_shell_start" "$created_daemon_pid" "$created_daemon_start" \
+       "$launch_mode"; then
+    sk_die "session $id is open, but its completed shell launch record could not be cleared"
+    return 1
+  fi
   if [[ $provider != shell ]] && ! sk_wait_for_provider "$id" "$provider" "$cwd" \
     "$launch_uuid" \
     "$created_boot_id" "$created_started" "$created_shell_pid" "$created_shell_start" \
@@ -833,7 +875,7 @@ print("yes" if any(
   python3 "$INVENTORY_CORE" color propagate "$provider" "$uuid" \
     >/dev/null 2>&1 || true
   sk_attach_status=0
-  timeout -k 5 30 "$SK_SHPOOL" attach --background --dir "$cwd" "$id" || sk_attach_status=$?
+  sk_timeout 30 "$SK_SHPOOL" attach --background --dir "$cwd" "$id" || sk_attach_status=$?
   if (( sk_attach_status != 0 && sk_attach_status != 124 && sk_attach_status != 137 )); then
     local quarantine
     quarantine=$(sk_quarantine_start_record "$id" attach-failed 2>/dev/null || true)
@@ -939,7 +981,7 @@ close_target() {
     return 1
   }
   sk_kill_status=0
-  timeout -k 5 20 "$SK_SHPOOL" kill "$id" || sk_kill_status=$?
+  sk_timeout 20 "$SK_SHPOOL" kill "$id" || sk_kill_status=$?
   if (( sk_kill_status == 124 || sk_kill_status == 137 )); then
     sk_die "the close did not confirm within 20s — the session may or may not have ended; refresh the list before acting again"
     sk_lock_release 9 2>/dev/null
@@ -954,14 +996,17 @@ close_target() {
   sk_reap_session_leftovers \
     "${provider_pid:-}" "${provider_start:-}" \
     "${shell_pid:-}" "${shell_start:-}"
+  if [[ -e $SK_START_DIR/$id || -L $SK_START_DIR/$id ||
+        -e $SK_START_DIR/$id.expected || -L $SK_START_DIR/$id.expected ]]; then
+    if ! sk_quarantine_start_record "$id" closed >/dev/null; then
+      sk_die "session $id was closed, but its retained launch record could not be archived"
+      return 1
+    fi
+  fi
   printf 'Closed exact session %s\n' "$id"
 }
 
 show_prune() {
-  if [[ $(sk_platform) == Darwin ]]; then
-    sk_die "prune is unavailable in the macOS preview; nothing changed"
-    return 1
-  fi
   local candidate_file="$SK_STATE_DIR/prune-candidates.json"
   "$SCRIPT_DIR/shpool_reaper" --candidates >/dev/null || return 1
   if [[ ! -s $candidate_file ]]; then
@@ -1051,7 +1096,7 @@ prune_target() {
     return 1
   }
   sk_kill_status=0
-  timeout -k 5 20 "$SK_SHPOOL" kill "$id" || sk_kill_status=$?
+  sk_timeout 20 "$SK_SHPOOL" kill "$id" || sk_kill_status=$?
   if (( sk_kill_status == 124 || sk_kill_status == 137 )); then
     sk_die "the close did not confirm within 20s — the session may or may not have ended; refresh the list before acting again"
     sk_lock_release 9 2>/dev/null
@@ -1273,7 +1318,7 @@ picker_fork() {
     sk_lock_release 9
     return 1
   }
-  if ! timeout -k 5 30 "$SK_SHPOOL" attach --background --dir "$cwd" "$id"; then
+  if ! sk_timeout 30 "$SK_SHPOOL" attach --background --dir "$cwd" "$id"; then
     local quarantine
     quarantine=$(sk_quarantine_start_record "$id" attach-failed 2>/dev/null || true)
     sk_lock_release 9
@@ -1392,10 +1437,6 @@ verify_start_target() {
 }
 
 command=${1:-list}
-if [[ $command == prune && $(sk_platform) == Darwin ]]; then
-  sk_die "prune is unavailable in the macOS preview; nothing changed"
-  exit 1
-fi
 sk_require_shpool || exit 1
 case "$command" in
   list)
@@ -1497,6 +1538,10 @@ case "$command" in
   picker-name-reset)
     [[ $# -eq 2 ]] || { usage >&2; exit 2; }
     picker_alias "$2" delete
+    ;;
+  picker-title-refresh)
+    [[ $# -eq 2 ]] || { usage >&2; exit 2; }
+    picker_refresh_title "$2"
     ;;
   picker-fork)
     [[ $# -eq 2 ]] || { usage >&2; exit 2; }

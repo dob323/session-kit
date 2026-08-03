@@ -42,6 +42,11 @@ PRIVATE_TOKEN_DIGESTS = frozenset(
         "9244bfa2efb5ae19b6f84f62dc79582ad52a25a14f7e904e9c39e739360a7cff",
     }
 )
+APPROVED_BINARY_SHA256 = {
+    "docs/assets/session-kit-dashboard.png": (
+        "b14518a8a78aa077be5ee7d21bdc76929b43e1f035420a1519df8965cf94e3db"
+    ),
+}
 
 
 def scan_text(
@@ -68,6 +73,23 @@ def scan_text(
     return failures
 
 
+def scan_payload(
+    label: str,
+    path: str,
+    payload: bytes,
+    patterns: dict[str, re.Pattern[str]],
+    *,
+    private_markers: bool,
+) -> list[str]:
+    expected_digest = APPROVED_BINARY_SHA256.get(path)
+    if expected_digest is not None:
+        actual_digest = hashlib.sha256(payload).hexdigest()
+        if actual_digest != expected_digest:
+            return [f"{label}: approved binary digest mismatch"]
+        return []
+    return scan_text(label, payload, patterns, private_markers=private_markers)
+
+
 def scan_tree(
     root: Path,
     patterns: dict[str, re.Pattern[str]],
@@ -89,8 +111,9 @@ def scan_tree(
         if path.is_dir():
             continue
         failures.extend(
-            scan_text(
+            scan_payload(
                 str(relative),
+                relative.as_posix(),
                 path.read_bytes(),
                 patterns,
                 private_markers=private_markers,
@@ -138,11 +161,10 @@ def scan_history(
             failures.append(f"{label}: file exceeds scan limit")
             continue
         payload = git(root, "cat-file", "blob", object_id, text=False).stdout
-        if b"\0" in payload:
-            continue
         failures.extend(
-            scan_text(
+            scan_payload(
                 label,
+                path,
                 payload,
                 patterns,
                 private_markers=private_markers,

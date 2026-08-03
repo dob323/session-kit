@@ -20,15 +20,20 @@ require upgrading to the latest patch.
    timestamps, credentials, or internal services remain.
 3. License, notices, security policy, changelog, support policy, and behavior
    documentation agree.
-4. Ubuntu 22.04 and 24.04 pass on Python 3.10 through 3.13.
+4. Ubuntu 22.04 and 24.04 pass on Python 3.10 through 3.13. Native macOS 15
+   runners pass on Apple Silicon and Intel with Python 3.13 and Homebrew Bash.
 5. Bash syntax, ShellCheck, Ruff, Python syntax, type baseline, and branch
    coverage pass.
 6. Local documentation links pass.
 7. The optional shpool patch applies to its pinned upstream tag and builds.
-8. A clean disposable Linux account passes preflight, install, doctor, picker,
-   provider exit, exact reopen, kill confirmation, update, rollback, and
-   uninstall checks.
-9. macOS and other unsupported platforms fail closed.
+8. Clean disposable Linux and at least one supported macOS account pass
+   preflight, install, doctor, picker, provider exit, exact reopen, close safety
+   display, update, rollback, and uninstall checks. Native CI covers every
+   architecture claimed by the release; the notes distinguish CI coverage from
+   real-device coverage.
+9. Unsupported operating systems, macOS versions, architectures, and service
+   models fail closed. macOS watchdog repair also refuses to run because it
+   requires Linux daemon-thread evidence.
 10. Journals and notifications default off.
 11. Normal logs contain no prompt, response, terminal, credential, or journal
     content.
@@ -91,8 +96,10 @@ bounded older schemas for installed rollback targets.
 
 ## Acceptance
 
-The installer must not start or restart services. Record process and daemon
-generations before and after each acceptance step.
+The installer must not start or restart services. On macOS it creates inactive
+LaunchAgent templates only; the operator must run `session-kit services enable`
+while logged into the Mac desktop. Update and rollback must not reload services.
+Record process and daemon generations before and after each acceptance step.
 
 Test at least:
 
@@ -103,11 +110,42 @@ Test at least:
 - provider exit leaving the managed terminal alive;
 - exact reopen without latest-directory fallback;
 - same-session move between two SSH windows;
-- `k <number>` exact-ID confirmation and cached-state refusal;
+- `k <number>` exact-target display, promptless action, and cached-state
+  refusal;
 - 72-hour cleanup boundary after timer enablement, reset conditions, and
   retained provider history;
 - update and rollback with detached sessions;
 - uninstall retaining private data.
+
+For macOS, also test on at least one release-listed device with macOS 14 or
+newer, Python 3.11 or newer, Homebrew Bash 4 or newer, and official shpool
+0.11.0. Run native CI on every supported architecture and state which
+architectures had real-device acceptance:
+
+- the outer login may remain zsh while shpool starts the exact configured modern
+  Bash executable;
+- `kern.boottime` remains stable during acceptance, while fixture tests prove a
+  changed boot identity invalidates saved process generations without requiring
+  a release-device reboot;
+- list, picker, new, attach, takeover, resume, fork, naming, journals, reaper,
+  and manual prune use native Darwin process identity;
+- PID churn cannot satisfy a saved process generation, and `kern.boottime`
+  changes after a real reboot;
+- Claude Code and Codex preserve exact conversation identity and reply state;
+- an SSH disconnect and reconnect preserve the managed terminal while the GUI
+  user LaunchAgent domain is available;
+- service enable refuses an already reachable unmanaged shpool daemon;
+- service disable refuses while any shpool session remains and unloads the
+  watchdog and reaper before shpool;
+- the watchdog reports findings, and repair mode makes no change and fails with
+  the documented Linux-evidence error;
+- update, rollback, and uninstall preserve live sessions and private data.
+
+The native macOS CI jobs validate both architectures, the Darwin adapter, and
+fixture-based lifecycle and export behavior. They do not replace real shpool,
+provider, launchd, disconnect, or reboot acceptance on dedicated Macs. Release
+notes must name the exact operating system, architecture, shpool, Claude Code,
+Codex, Python, and Bash versions that passed that gate.
 
 ## Publish
 

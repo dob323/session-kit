@@ -3,19 +3,19 @@
 Session Kit welcomes focused bug reports, feature requests, documentation
 fixes, and pull requests.
 
-The project is preparing a Linux-only `v0.1.0` beta. Reports about provider
-compatibility, lifecycle safety, privacy, and clean installation are especially
-useful.
+The project is preparing a Linux and macOS `v0.1.0` beta. Reports about
+provider compatibility, lifecycle safety, privacy, and clean installation are
+especially useful.
 
 ## Before opening an issue
 
 Search existing issues, then collect:
 
 - the Session Kit tag or full commit;
-- Linux distribution and version;
+- operating system version and architecture;
 - Bash, Python, shpool, Claude Code, and Codex versions as relevant;
 - whether the problem affects display, reply state, opening, moving, provider
-  exit, kill, recovery, journals, cleanup, or health checks;
+  exit, close, recovery, journals, cleanup, or health checks;
 - sanitized expected and observed behavior.
 
 Remove credentials, hostnames, account names, private paths, titles, UUIDs,
@@ -55,10 +55,15 @@ tools/public-scan .
 tools/public-scan . --git-history
 ```
 
-CI tests Ubuntu 22.04 and 24.04 with Python 3.10 through 3.13. It also checks
-Bash syntax, ShellCheck, Ruff, Python syntax, the type baseline, branch
+CI tests Ubuntu 22.04 and 24.04 with Python 3.10 through 3.13. Native macOS 15
+runners cover Apple Silicon and Intel with Python 3.13 and Homebrew Bash. CI
+also checks Bash syntax, ShellCheck, Ruff, Python syntax, types, branch
 coverage, public export, local links, reachable history, the optional shpool
 patch, and release-artifact reproducibility.
+
+The macOS CI lane proves the native process adapter and fixture-based lifecycle
+behavior. It does not replace acceptance with a real shpool daemon and provider
+installations on a persistent Mac account.
 
 ## Pull requests
 
@@ -67,9 +72,12 @@ patch, and release-artifact reproducibility.
 - Update docs for command, configuration, support, privacy, retention, or
   lifecycle changes.
 - Use `$HOME`, XDG paths, and example UUIDs instead of real local values.
-- Preserve fresh identity proof and confirmation for every mutation.
+- Preserve fresh identity proof and an exact-target safety display for every
+  mutation.
 - Explain active-session, provider-exit, cleanup, update, and rollback effects.
-- Do not weaken Linux-only fail-closed checks.
+- Preserve both Linux `/proc` and Darwin native process-generation checks.
+- Keep platform-specific service operations explicit: systemd on Linux and
+  per-user launchd jobs on macOS.
 - Do not add telemetry, prompt logging, terminal logging, or notifications by
   default.
 

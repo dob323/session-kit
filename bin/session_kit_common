@@ -46,14 +46,10 @@ sk_platform() {
   fi
 }
 
-sk_darwin_preview() {
-  [[ $(sk_platform) == Darwin && ${SESSION_KIT_MACOS_PREVIEW:-0} == 1 ]]
-}
-
 sk_boot_id() {
   if [[ -n ${SESSION_KIT_BOOT_ID_FILE:-} ]]; then
     command cat -- "$SESSION_KIT_BOOT_ID_FILE"
-  elif sk_darwin_preview; then
+  elif [[ $(sk_platform) == Darwin ]]; then
     python3 "$SK_INVENTORY_CORE" platform boot-id
   else
     command cat -- /proc/sys/kernel/random/boot_id
@@ -68,9 +64,10 @@ sk_now_unix_ms() {
   fi
 }
 
-# Linux keeps its established flock semantics. The Darwin preview uses a
-# single atomic directory and never removes a lock it did not acquire. A crash
-# therefore fails closed until the preview operator inspects and removes it.
+# Linux keeps its established flock command. Darwin uses the native flock(2)
+# binding through Python, holding the lock on the inherited Bash descriptor so
+# a killed command releases it with the descriptor instead of leaving stale
+# lock state behind.
 sk_lock_acquire() {
   local fd=$1 path=$2
   if [[ $(sk_platform) != Darwin ]]; then
@@ -81,36 +78,49 @@ sk_lock_acquire() {
     flock -x "$fd"
     return
   fi
-  sk_darwin_preview || {
-    sk_die "macOS preview is disabled"
-    return 1
-  }
-  local directory="${path}.darwin-lock"
-  mkdir "$directory" 2>/dev/null || {
-    sk_die "macOS preview lock is busy: $directory"
-    return 1
-  }
-  printf '%s\n' "$$" > "$directory/owner" || {
-    command rm -- "$directory/owner" 2>/dev/null || true
-    rmdir "$directory" 2>/dev/null || true
-    return 1
-  }
-  SK_DARWIN_LOCK_DIR=$directory
+  python3 - "$fd" <<'PY'
+import fcntl
+import sys
+
+fcntl.flock(int(sys.argv[1]), fcntl.LOCK_EX)
+PY
 }
 
 sk_lock_release() {
-  local fd=$1 result=0
-  if [[ -n ${SK_DARWIN_LOCK_DIR:-} ]]; then
-    command rm -- "$SK_DARWIN_LOCK_DIR/owner" 2>/dev/null || result=1
-    rmdir "$SK_DARWIN_LOCK_DIR" 2>/dev/null || result=1
-    if (( result == 0 )); then
-      SK_DARWIN_LOCK_DIR=
-    else
-      sk_die "macOS preview lock release failed; lock retained"
-    fi
-  fi
+  local fd=$1
   eval "exec ${fd}>&-"
-  return "$result"
+}
+
+sk_timeout() {
+  local seconds=$1
+  shift
+  python3 - "$seconds" "$@" <<'PY'
+import os
+import subprocess
+import sys
+
+seconds = float(sys.argv[1])
+if not 0 < seconds <= 3600 or len(sys.argv) < 3:
+    raise SystemExit(2)
+process = subprocess.Popen(sys.argv[2:], start_new_session=True)
+try:
+    status = process.wait(timeout=seconds)
+except subprocess.TimeoutExpired:
+    try:
+        os.killpg(process.pid, 15)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, 9)
+        except ProcessLookupError:
+            pass
+        process.wait()
+    raise SystemExit(124)
+raise SystemExit(status if status >= 0 else 128 - status)
+PY
 }
 
 sk_integration_marker_ok() {
@@ -396,7 +406,6 @@ sk_proc_is_exact() {
   [[ $pid =~ ^[0-9]+$ && $start_ticks =~ ^[0-9]+$ ]] || return 1
   (( pid > 0 && start_ticks > 0 )) || return 1
   if [[ $(sk_platform) == Darwin ]]; then
-    sk_darwin_preview || return 1
     local current
     current=$(python3 "$SK_INVENTORY_CORE" platform process-info "$pid" 2>/dev/null) || return 1
     [[ ${current#*$'\t'} == "$start_ticks" ]]
@@ -434,7 +443,6 @@ sk_provider_process_present() {
   fi
   sk_proc_is_exact "$shell_pid" "$shell_start" || return 1
   if [[ $(sk_platform) == Darwin ]]; then
-    sk_darwin_preview || return 1
     python3 "$SK_INVENTORY_CORE" platform provider-present \
       "$shell_pid" "$shell_start" "$provider" >/dev/null
     return

@@ -53,6 +53,7 @@ REQUIRED_SYMBOLS = {
     "TERMINAL_NUMBER_QUARANTINE_SECONDS",
     "acknowledge_pending",
     "apply_legacy_recovery_manifest",
+    "apply_provider_title_states",
     "apply_retained_setup_attributions",
     "apply_terminal_numbers",
     "atomic_write_json",
@@ -176,7 +177,7 @@ def referenced_facade_symbols() -> set[str]:
 
 class InventoryFacadeTests(unittest.TestCase):
     def test_contract_matches_every_current_test_reference(self) -> None:
-        self.assertEqual(len(REQUIRED_SYMBOLS), 89)
+        self.assertEqual(len(REQUIRED_SYMBOLS), 90)
         self.assertEqual(REQUIRED_SYMBOLS, referenced_facade_symbols())
 
     def test_current_tested_symbols_remain_available(self) -> None:

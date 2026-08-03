@@ -1,7 +1,9 @@
 # Update and roll back
 
-Session Kit updates from a reviewed local clone. It does not fetch source or
+Session Kit installs from reviewed local source. It does not fetch source or
 restart a service on its own.
+
+From an updated local Git checkout:
 
 ```bash
 git pull --ff-only
@@ -10,33 +12,59 @@ session-kit update --source "$PWD"
 session-kit doctor
 ```
 
+`session-kit update` can omit `--source` when the source recorded by the current
+install receipt is still available. If that path no longer exists, provide a
+reviewed local Git checkout or supported extracted release source explicitly.
+
 ## Immutable releases
 
 ```text
 $HOME/.local/lib/session-kit/
-  launcher
   current -> releases/<full-commit-id>
   releases/<full-commit-id>/
 $HOME/.local/bin/
-  sp -> ../lib/session-kit/launcher
-  shpool_login -> ../lib/session-kit/launcher
-  shpool_status -> ../lib/session-kit/launcher
-  shpool_reaper -> ../lib/session-kit/launcher
-  codex_resume_here -> ../lib/session-kit/launcher
+  session-kit
+  kit
+  sp
+  shpool_login
+  shpool_status
+  shpool_reaper
+  codex_resume_here
 ```
 
-The stable launcher resolves `current` once and pins that physical release for
-the command's lifetime. Existing commands finish on their pinned release; new
-commands use the selected release.
+The files in `$HOME/.local/bin` are stable executable launcher copies, not
+symlinks into a release. Each launcher resolves `current` once and pins that
+physical release for the command's lifetime. Existing commands finish on their
+pinned release; new commands use the selected release.
 
 `session-kit update` checks compatibility, installs the exact source commit,
-keeps the prior release, and switches the pointer atomically. Updates default
-journals to off; pass `--journal on` only when the local retention decision
-still applies. The existing login choice is preserved unless a login flag is
-supplied.
+keeps the prior release, updates the launchers, and switches the pointer
+atomically. Updates default journals to off; pass `--journal on` only when the
+local retention decision still applies. The existing login-integration choice
+is preserved unless an explicit login flag is supplied.
 
 Release selection does not restart, stop, signal, attach to, or detach from
 shpool.
+
+## Service definitions
+
+On Linux, update refreshes the installed user-service definitions but does not
+run `systemctl --user daemon-reload` or start or restart a unit. Review service
+state and activate a definition change separately.
+
+On macOS, update regenerates private LaunchAgent templates. Any jobs already
+loaded by launchd continue using their active definitions. To apply a changed
+definition, first reach a safe point with no managed sessions, then run:
+
+```bash
+session-kit services disable
+session-kit services enable
+session-kit services status
+```
+
+The disable command refuses to unload shpool if live sessions exist or their
+absence cannot be proved. `services enable` also refuses to overwrite a loaded
+job whose active definition differs from the generated template.
 
 ## Rollback
 
@@ -49,9 +77,14 @@ session-kit rollback --to <full-commit>
 
 for another retained release.
 
-Rollback updates stable launchers and the private integration marker without
-restarting services. A state-format change must document whether the older
-release can read new state before the newer release is activated.
+Rollback validates the retained release, updates the pointer and stable
+launchers, regenerates platform service templates, and updates the private
+integration marker and receipt. It does not restart or reload services. On
+macOS, a loaded LaunchAgent therefore continues using its prior active
+definition until the same safe disable and enable cycle described above.
+
+A state-format change must document whether the older release can read new
+state before the newer release is activated.
 
 ## shpool binary updates
 
@@ -64,8 +97,9 @@ The optional patch has separate build and rollback instructions in
 
 ## Interrupted update
 
-Release commands write transaction state before changing exposed paths. A later
-invocation completes a committed transaction or restores an incomplete one.
+Lifecycle commands record the exact pre-change file state before changing
+exposed paths. A later Session Kit lifecycle invocation completes a committed
+transaction or restores an incomplete one.
 
 Do not delete a transaction receipt to bypass a refusal. Preserve it and report
 the sanitized error.

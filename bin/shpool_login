@@ -123,7 +123,7 @@ refresh_snapshot() {
   # Bounded: a jammed daemon must degrade to "previous view" messaging, not
   # hang the login window before any menu appears. kill-after covers a child
   # that ignores the TERM.
-  if ! timeout -k 5 "${SK_REFRESH_TIMEOUT:-30}" "$STATUS_CMD" --json > "$fresh"; then
+  if ! sk_timeout "${SK_REFRESH_TIMEOUT:-30}" "$STATUS_CMD" --json > "$fresh"; then
     command rm -- "$fresh"
     return 1
   fi
@@ -631,6 +631,8 @@ if selected:
                 details.insert(0, name_detail)
             if automatic_name_state == "failed":
                 warning_status = True
+        if str(row.get("provider_title_state") or "").casefold() == "pending":
+            details.append("title pending")
         status_details = (
             [primary_status]
             if needs_attention
@@ -1223,12 +1225,20 @@ choose_number() {
     echo "  The displayed row changed format. Nothing changed."
     return
   fi
-  local availability mutation display_id provider title
+  local availability mutation display_id provider title title_state
   availability=$(decode64 "${fields[0]}")
   mutation=$(decode64 "${fields[1]}")
   display_id=$(decode64 "${fields[2]}")
   provider=$(decode64 "${fields[3]}")
   title=$(decode64 "${fields[4]}")
+  title_state=$(python3 - "$VIEW" "$number" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    rows = json.load(handle).get("sessions", [])
+matches = [row for row in rows if row.get("terminal_number") == int(sys.argv[2])]
+print(str(matches[0].get("provider_title_state") or "") if len(matches) == 1 else "")
+PY
+) || title_state=""
   if [[ $mutation != true ]]; then
     printf '  %s is display-only. Nothing changed.\n' "$display_id"
     return
@@ -1273,6 +1283,9 @@ choose_number() {
     echo "  1  Move it here (the other window disconnects)"
     echo "  2  View full terminal history"
     echo "  3  Close it (the shell and everything inside will end)"
+    if [[ $provider == codex && $title_state == pending ]]; then
+      echo "  4  Apply the pending title (restarts only a proven-idle Codex provider)"
+    fi
     echo "  Enter  Back"
     echo
     local action
@@ -1295,6 +1308,14 @@ choose_number() {
         CONFIRM_FORGIVE=1
         refresh_after_action
         return
+        ;;
+      4)
+        if [[ $provider == codex && $title_state == pending ]]; then
+          run_proof_action picker-title-refresh "$number" || true
+          refresh_after_action
+          return
+        fi
+        echo "  That session has no pending Codex title. Nothing changed."
         ;;
       *) echo "  Unknown choice. Nothing changed." ;;
     esac
@@ -1775,6 +1796,7 @@ show_help() {
   echo "  name <number> Rename an exact Claude or Codex conversation"
   echo "  name reset #  Remove the local name and show the provider name"
   echo "  fork <number> Start a separate fork of an exact Claude or Codex conversation"
+  echo "  action 4      Apply a pending Codex bar title only when the provider is proven idle"
   echo "  next / prev   Move between pages; only visible page numbers accept actions"
   echo "  Enter / EOF   Return to a regular terminal without a session action"
   echo "  Ctrl-C        Redraw this menu (never exits; use Enter for a terminal)"

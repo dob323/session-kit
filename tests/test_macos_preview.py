@@ -130,13 +130,126 @@ class DarwinParserTests(unittest.TestCase):
         }
         with mock.patch.object(
             inventory_core, "_runtime_platform", return_value="darwin"
+        ), mock.patch.object(
+            inventory_core,
+            "codex_rollout_by_uuid",
+            return_value=[
+                {
+                    "session_id": uuid,
+                    "id": uuid,
+                    "source": "cli",
+                    "_turn_state": "idle",
+                }
+            ],
         ):
             indexed = inventory_core.index_codex_processes(
                 table, Path("/proc"), Path("/unused")
             )
         self.assertEqual(indexed[30][0]["session_id"], uuid)
-        self.assertEqual(indexed[30][0]["_turn_state"], "state unavailable")
+        self.assertEqual(indexed[30][0]["_turn_state"], "idle")
         self.assertEqual(indexed[31], [])
+
+    def test_native_claude_session_argument_is_exact_identity(self) -> None:
+        uuid = "00000000-0000-4000-8000-000000000019"
+        session_name = "s20260729-120000-1"
+        process_table = {
+            10: {
+                "pid": 10,
+                "ppid": 1,
+                "start_ticks": 100,
+                "cmdline": ["/opt/homebrew/bin/shpool", "daemon"],
+                "comm": "shpool",
+            },
+            20: {
+                "pid": 20,
+                "ppid": 10,
+                "start_ticks": 200,
+                "cmdline": ["-bash"],
+                "comm": "bash",
+                "session_name": session_name,
+            },
+            30: {
+                "pid": 30,
+                "ppid": 20,
+                "start_ticks": 300,
+                "cmdline": ["claude", "--session-id", uuid],
+                "comm": "claude.exe",
+                "cwd": "/Users/test/project",
+            },
+        }
+        result = inventory_core.build_inventory(
+            {
+                "sessions": [
+                    {
+                        "name": session_name,
+                        "status": "Disconnected",
+                        "started_at_unix_ms": 1_800_000_000_000,
+                    }
+                ]
+            },
+            [],
+            process_table,
+            {},
+            ({}, {}),
+            {},
+            now=1_800_000_001,
+        )
+        row = result["sessions"][0]
+        self.assertEqual(row["provider"], "claude")
+        self.assertEqual(row["identity"]["uuid"], uuid)
+        self.assertEqual(row["identity"]["confidence"], "exact")
+        self.assertTrue(row["mutation_allowed"])
+
+    def test_unused_native_codex_reports_provider_working_directory(self) -> None:
+        session_name = "s20260729-120000-2"
+        process_table = {
+            10: {
+                "pid": 10,
+                "ppid": 1,
+                "start_ticks": 100,
+                "cmdline": ["/opt/homebrew/bin/shpool", "daemon"],
+                "comm": "shpool",
+            },
+            20: {
+                "pid": 20,
+                "ppid": 10,
+                "start_ticks": 200,
+                "cmdline": ["-bash"],
+                "comm": "bash",
+                "session_name": session_name,
+                "cwd": "",
+            },
+            30: {
+                "pid": 30,
+                "ppid": 20,
+                "start_ticks": 300,
+                "cmdline": ["codex", "--no-alt-screen"],
+                "comm": "codex",
+                "cwd": "/Users/test/project",
+            },
+        }
+        result = inventory_core.build_inventory(
+            {
+                "sessions": [
+                    {
+                        "name": session_name,
+                        "status": "Disconnected",
+                        "started_at_unix_ms": 1_800_000_000_000,
+                    }
+                ]
+            },
+            [],
+            process_table,
+            {},
+            ({}, {}),
+            {},
+            now=1_800_000_001,
+        )
+        row = result["sessions"][0]
+        self.assertEqual(row["provider"], "unknown")
+        self.assertEqual(row["display_provider"], "codex")
+        self.assertEqual(row["cwd"], "/Users/test/project")
+        self.assertEqual(row["title"], "Codex started, no messages yet")
 
     def test_darwin_age_uses_epoch_microseconds(self) -> None:
         now = time.time()
@@ -148,20 +261,17 @@ class DarwinParserTests(unittest.TestCase):
         }
         self.assertIn(inventory_core._process_age(7, table, now), {41, 42})
 
-    def test_macos_requires_explicit_preview_opt_in(self) -> None:
+    def test_macos_is_a_supported_native_platform(self) -> None:
         with (
             mock.patch.object(
                 inventory_core, "_runtime_platform", return_value="darwin"
             ),
             mock.patch.dict(os.environ, {}, clear=True),
         ):
-            with self.assertRaisesRegex(
-                inventory_core.CollectionError, "experimental preview"
-            ):
-                inventory_core._require_supported_platform()
+            self.assertEqual(inventory_core._require_supported_platform(), "darwin")
 
 
-class DarwinFailClosedCommandTests(unittest.TestCase):
+class DarwinSupportedCommandTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(prefix=".macos-preview-", dir=REPO)
         self.base = Path(self.temp.name)
@@ -174,7 +284,6 @@ class DarwinFailClosedCommandTests(unittest.TestCase):
             **os.environ,
             "PATH": f"{self.bin}:/usr/bin:/bin",
             "HOME": str(self.base / "home"),
-            "SESSION_KIT_MACOS_PREVIEW": "1",
             "SESSION_KIT_TESTING": "1",
             "SESSION_KIT_TEST_PLATFORM": "Darwin",
             "SESSION_KIT_STATE_DIR": str(self.base / "state"),
@@ -194,25 +303,37 @@ class DarwinFailClosedCommandTests(unittest.TestCase):
             check=False,
         )
 
-    def test_reaper_watchdog_and_prune_refuse_darwin(self) -> None:
-        cases = (
-            (REPO / "bin/shpool_reaper", (), "reaper is unavailable"),
-            (REPO / "bin/session_kit_watchdog", (), "watchdog repair is unavailable"),
-            (REPO / "bin/sp", ("prune",), "prune is unavailable"),
-        )
-        for path, args, message in cases:
-            with self.subTest(path=path.name):
-                result = self.run_bash(path, *args)
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn(message, result.stderr)
-        self.assertFalse((self.base / "state").exists())
+    def test_maintenance_commands_no_longer_have_preview_refusals(self) -> None:
+        for relative, message in (
+            ("bin/shpool_reaper", "reaper is unavailable"),
+            ("bin/session_kit_watchdog", "watchdog repair is unavailable in the macOS preview"),
+            ("bin/sp", "prune is unavailable"),
+        ):
+            with self.subTest(path=relative):
+                self.assertNotIn(
+                    message,
+                    (REPO / relative).read_text(encoding="utf-8"),
+                )
 
-    def test_darwin_mutex_is_atomic_and_explicitly_released(self) -> None:
+    def test_watchdog_repair_requires_linux_thread_evidence(self) -> None:
+        env = {**self.env, "SESSION_KIT_WATCHDOG_MODE": "repair"}
+        result = subprocess.run(
+            [self.bash, str(REPO / "bin/session_kit_watchdog"), "--once"],
+            cwd=REPO,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("requires Linux daemon-thread evidence", result.stderr)
+
+    def test_darwin_mutex_is_file_backed_and_explicitly_released(self) -> None:
         lock = self.base / "create.lock"
         command = (
             f"source {REPO / 'bin/session_kit_common'}; "
             f"exec 9>{lock}; sk_lock_acquire 9 {lock}; "
-            "test -d " + str(lock) + ".darwin-lock; "
+            f"test -f {lock}; "
             "sk_lock_release 9; test ! -e " + str(lock) + ".darwin-lock"
         )
         result = subprocess.run(

@@ -2111,6 +2111,24 @@ class AutomaticTitleTests(unittest.TestCase):
                     "Session Kit Updates",
                     document["aliases"][f"codex:{exact}"],
                 )
+                repeated = inventory_core.self_name_automatic_title(
+                    config,
+                    "Session Kit Release",
+                    inventory=inventory,
+                    process_table=table,
+                    environ=environment,
+                    current_pid=current_pid,
+                )
+                document = json.loads(config_path.read_text(encoding="utf-8"))
+                self.assertEqual("Session Kit Release", repeated["title"])
+                self.assertEqual(
+                    "Session Kit Release",
+                    document["aliases"][f"codex:{exact}"],
+                )
+                self.assertEqual(
+                    "Session Kit Release",
+                    document["automatic_titles"][f"codex:{exact}"],
+                )
 
                 bad_thread = dict(environment)
                 bad_thread["CODEX_THREAD_ID"] = uuid_for(99)
@@ -2188,6 +2206,42 @@ class AutomaticTitleTests(unittest.TestCase):
                         environment,
                         current_pid,
                     )
+
+    def test_provider_title_pending_requires_a_private_regular_marker(self) -> None:
+        with tempfile.TemporaryDirectory(prefix=".title-state-", dir=REPO) as raw:
+            state = Path(raw)
+            marker_root = state / "provider-untitled"
+            marker_root.mkdir()
+            live = {
+                "sessions": [
+                    {
+                        "provider": "codex",
+                        "shpool_id_raw": "main2",
+                    },
+                    {
+                        "provider": "claude",
+                        "shpool_id_raw": "main3",
+                    },
+                ]
+            }
+            (marker_root / "main2").touch()
+            inventory_core.apply_provider_title_states(
+                live, {"state_dir": state}
+            )
+            self.assertEqual(
+                "pending", live["sessions"][0]["provider_title_state"]
+            )
+            self.assertNotIn("provider_title_state", live["sessions"][1])
+
+            (marker_root / "main2").unlink()
+            (marker_root / "target").touch()
+            (marker_root / "main2").symlink_to(marker_root / "target")
+            inventory_core.apply_provider_title_states(
+                live, {"state_dir": state}
+            )
+            self.assertEqual(
+                "ready", live["sessions"][0]["provider_title_state"]
+            )
 
     def test_retained_titles_audit_and_dry_run_token_gate_prune(self) -> None:
         with tempfile.TemporaryDirectory(prefix=".automatic-prune-", dir=REPO) as raw:

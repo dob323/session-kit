@@ -15,12 +15,6 @@ if [[ ${SESSION_KIT_TESTING:-0} == 1 && -n ${SESSION_KIT_TEST_PLATFORM:-} ]]; th
 else
   REAPER_PLATFORM=$(uname -s 2>/dev/null)
 fi
-if [[ $REAPER_PLATFORM == Darwin ]]; then
-  echo "session-kit: reaper is unavailable in the macOS preview; nothing changed" >&2
-  exit 1
-fi
-unset REAPER_PLATFORM
-
 STATE_DIR=${SESSION_KIT_STATE_DIR:-${XDG_STATE_HOME:-"$HOME/.local/state"}/session-kit}
 PROC_ROOT=${SESSION_KIT_PROC_ROOT:-/proc}
 SENTINEL=${SESSION_KIT_REAPER_SENTINEL:-"$HOME/.no_shpool_reaper"}
@@ -29,6 +23,9 @@ SHPOOL=${SESSION_KIT_SHPOOL_CMD:-}
 DRY_RUN=${SESSION_KIT_REAPER_DRY_RUN:-0}
 AUTO_CLOSE_HOURS=${SESSION_KIT_AUTO_CLOSE_HOURS:-72}
 STATUS=${SESSION_KIT_STATUS_CMD:-"$SCRIPT_DIR/shpool_status"}
+INVENTORY_CORE=${SESSION_KIT_INVENTORY_CORE:-"$RELEASE_DIR/lib/session_inventory.py"}
+DARWIN_PROC_SNAPSHOT=
+DARWIN_DAEMON_PID=
 
 MODE=report
 VERIFY_FILE=
@@ -70,6 +67,7 @@ fail() {
 
 expire_picker_temp_files() {
   [[ $MODE != verify && $DRY_RUN != 1 ]] || return 0
+  [[ $REAPER_PLATFORM != Darwin ]] || return 0
   local expired
   expired=$(python3 - "$STATE_DIR" "$PROC_ROOT" <<'PY'
 import os
@@ -189,6 +187,71 @@ PY
   printf '%s expired_picker_temp_files=%s\n' "$(timestamp)" "$expired" >&2
 }
 
+prepare_darwin_proc_snapshot() {
+  [[ $REAPER_PLATFORM == Darwin ]] || return 0
+  [[ -f $INVENTORY_CORE ]] || fail "Darwin process adapter unavailable"
+  DARWIN_PROC_SNAPSHOT=$(mktemp -d "${TMPDIR:-/tmp}/session-kit-proc.XXXXXX") ||
+    fail "Darwin process snapshot creation"
+  chmod 700 "$DARWIN_PROC_SNAPSHOT" || fail "Darwin process snapshot permissions"
+  trap '[[ -z ${DARWIN_PROC_SNAPSHOT:-} ]] || rm -rf -- "$DARWIN_PROC_SNAPSHOT"' EXIT
+  local process_json=$DARWIN_PROC_SNAPSHOT/process-table.json
+  python3 "$INVENTORY_CORE" platform process-table > "$process_json" || return 1
+  chmod 600 "$process_json" || return 1
+  DARWIN_DAEMON_PID=$(python3 - "$DARWIN_PROC_SNAPSHOT" "$process_json" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+payload = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+rows = payload.get("processes") if isinstance(payload, dict) else None
+if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+    raise SystemExit("session-kit: invalid Darwin process snapshot")
+daemons = []
+for row in rows:
+    argv = row.get("cmdline")
+    if isinstance(argv, list) and argv and pathlib.Path(str(argv[0])).name == "shpool" and "daemon" in argv[1:]:
+        daemons.append(row)
+if len(daemons) != 1:
+    raise SystemExit("session-kit: expected exactly one shpool daemon")
+daemon_pid = daemons[0].get("pid")
+if not isinstance(daemon_pid, int) or daemon_pid <= 0:
+    raise SystemExit("session-kit: invalid shpool daemon identity")
+for row in rows:
+    if row.get("ppid") != daemon_pid:
+        continue
+    if row.get("args_available") is not True or not row.get("session_name"):
+        raise SystemExit("session-kit: unreadable shpool child; cleanup refused")
+for row in rows:
+    pid = row.get("pid")
+    ppid = row.get("ppid")
+    generation = row.get("start_ticks")
+    if not all(isinstance(value, int) and value >= 0 for value in (pid, ppid, generation)):
+        raise SystemExit("session-kit: invalid Darwin process identity")
+    base = root / str(pid)
+    base.mkdir(mode=0o700)
+    comm = str(row.get("comm") or "process").replace(")", "")[:128]
+    fields = ["S", str(ppid), *(["0"] * 17), str(generation), *(["0"] * 30)]
+    (base / "stat").write_text(f"{pid} ({comm}) {' '.join(fields)}\n", encoding="utf-8")
+    (base / "comm").write_text(f"{comm}\n", encoding="utf-8")
+    argv = row.get("cmdline") if isinstance(row.get("cmdline"), list) else []
+    (base / "cmdline").write_bytes(b"\0".join(str(value).encode() for value in argv) + (b"\0" if argv else b""))
+    session = row.get("session_name")
+    environ = b"SHPOOL_SESSION_NAME=" + str(session).encode() + b"\0" if session else b""
+    (base / "environ").write_bytes(environ)
+    cwd = row.get("cwd")
+    if isinstance(cwd, str) and cwd.startswith("/"):
+        try:
+            os.symlink(cwd, base / "cwd")
+        except OSError:
+            pass
+print(daemon_pid)
+PY
+  ) || return 1
+  command rm -- "$process_json"
+}
+
 if [[ -e $SENTINEL ]]; then
   printf '%s reaper disabled by %s\n' "$(timestamp)" "$SENTINEL" >&2
   exit 3
@@ -206,6 +269,7 @@ expire_picker_temp_files
 # three regardless, and never more than ten deletions per run.
 expire_stale_releases() {
   [[ $MODE != verify && $DRY_RUN != 1 ]] || return 0
+  [[ $REAPER_PLATFORM != Darwin ]] || return 0
   python3 - "$PROC_ROOT" <<'PY' || true
 import json
 import os
@@ -310,9 +374,29 @@ PY
 }
 expire_stale_releases
 
+if [[ $REAPER_PLATFORM == Darwin ]]; then
+  prepare_darwin_proc_snapshot || fail "Darwin process snapshot unavailable"
+  PROC_ROOT=$DARWIN_PROC_SNAPSHOT
+  daemon_pid=$DARWIN_DAEMON_PID
+fi
+
 json=$("$SHPOOL" list --json 2>/dev/null) || fail "shpool list error"
-daemon_pid=${SESSION_KIT_DAEMON_PID:-}
-if [[ -z $daemon_pid && $PROC_ROOT == /proc ]]; then
+daemon_pid=${SESSION_KIT_DAEMON_PID:-${daemon_pid:-}}
+if [[ -z $daemon_pid && $REAPER_PLATFORM == Darwin ]]; then
+  daemon_pid=$(python3 - "$PROC_ROOT" <<'PY'
+import pathlib,sys
+root=pathlib.Path(sys.argv[1])
+for entry in root.iterdir():
+    try:
+        argv=(entry/"cmdline").read_bytes().split(b"\0")
+    except OSError:
+        continue
+    if argv and pathlib.Path(argv[0].decode("utf-8","replace")).name=="shpool" and b"daemon" in argv[1:]:
+        print(entry.name)
+        break
+PY
+)
+elif [[ -z $daemon_pid && $PROC_ROOT == /proc ]]; then
   daemon_pid=$(pgrep -f '^.*/shpool daemon$' | head -1)
 fi
 [[ $daemon_pid =~ ^[0-9]+$ ]] || fail "daemon PID unavailable"
@@ -358,12 +442,12 @@ PY
     exit 0
   fi
   # The creation lock is the shared Session Kit attach/create/close barrier.
-  exec 9>"$STATE_DIR/create.lock" || fail "creation lock unavailable"
-  flock -x 9 || fail "creation lock unavailable"
   # Reuse the privacy-minimal capped action log already used by picker actions.
   # shellcheck source=bin/session_kit_common
   source "$SCRIPT_DIR/session_kit_common"
   sk_prepare_state || fail "private action state unavailable"
+  exec 9>"$STATE_DIR/create.lock" || fail "creation lock unavailable"
+  sk_lock_acquire 9 "$STATE_DIR/create.lock" || fail "creation lock unavailable"
   actions=0
   proof=
   trap '[[ -z ${proof:-} ]] || rm -f -- "$proof"' EXIT
@@ -555,6 +639,20 @@ if direct:
 if stat(shell) != (processes[shell]["ppid"], processes[shell]["start_ticks"]):
     raise SystemExit(2)
 PY
+  if [[ $REAPER_PLATFORM == Darwin ]]; then
+    read -r native_shell_pid native_shell_generation < <(
+      python3 - "$VERIFY_FILE" <<'PY'
+import json,sys
+value=json.load(open(sys.argv[1],encoding="utf-8"))
+print(value.get("shell_pid", ""), value.get("shell_start_ticks", ""))
+PY
+    )
+    [[ $native_shell_pid =~ ^[0-9]+$ && $native_shell_generation =~ ^[0-9]+$ ]] ||
+      fail "candidate has no native shell generation"
+    python3 "$INVENTORY_CORE" platform process-generation-is \
+      "$native_shell_pid" "$native_shell_generation" >/dev/null 2>&1 ||
+      fail "candidate shell generation changed"
+  fi
   second=$("$SHPOOL" list --json 2>/dev/null) || fail "second shpool list error"
   export SK_REAPER_SECOND_JSON=$second
   python3 - "$VERIFY_FILE" <<'PY' || fail "candidate changed after process proof"

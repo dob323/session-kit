@@ -173,6 +173,9 @@ def _safe_candidate(
         if isinstance(item, Mapping)
         else None
     )
+    if not _positive_int(exit_ns):
+        return None
+    assert isinstance(exit_ns, int)
     uuid = (
         valid_uuid(recovery.get("uuid"))
         if isinstance(recovery, Mapping)
@@ -196,7 +199,6 @@ def _safe_candidate(
         or item.get("provider_exit_input_tracking") is not True
         or item.get("user_input_after_provider_exit") is not False
         or item.get("provider_exit_keep") is not False
-        or not _positive_int(exit_ns)
         or exit_ns > now_monotonic_ns
         or not isinstance(shell, Mapping)
         or not isinstance(fact, Mapping)
@@ -294,6 +296,8 @@ def plan_auto_close(
     candidates: list[dict[str, Any]] = []
     for row in _rows(shpool_payload):
         session_id = row.get("name")
+        if not isinstance(session_id, str):
+            continue
         phantom = None
         proof = _safe_candidate(
             row,
@@ -321,6 +325,8 @@ def plan_auto_close(
             and _positive_int(prior.get("first_verified_monotonic_ns"))
             else now_monotonic_ns
         )
+        if not isinstance(first, int):
+            raise CollectionError("auto-close observation clock is invalid")
         observations[session_id] = {
             "proof_hash": proof_hash,
             "first_verified_monotonic_ns": first,

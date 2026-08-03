@@ -1,4 +1,16 @@
 #!/usr/bin/env bash
+
+if [[ $(uname -s 2>/dev/null) == Darwin && ${BASH_VERSINFO[0]} -lt 4 ]]; then
+  for modern_bash in /opt/homebrew/bin/bash /usr/local/bin/bash; do
+    if [[ -x $modern_bash ]]; then
+      export PATH="${modern_bash%/*}:$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
+      exec "$modern_bash" "$0" "$@"
+    fi
+  done
+  echo "session-kit launcher: Homebrew Bash 4 or newer is required" >&2
+  exit 69
+fi
+
 set -euo pipefail
 
 # Stable top-level entry point. Resolve `current` once, then execute from that
@@ -6,7 +18,7 @@ set -euo pipefail
 # two releases.
 helper=${0##*/}
 case "$helper" in
-  sp|shpool_login|shpool_status|shpool_reaper|codex_resume_here) ;;
+  kit|sp|shpool_login|shpool_status|shpool_reaper|codex_resume_here) ;;
   *) echo "session-kit launcher: unsupported helper: $helper" >&2; exit 64 ;;
 esac
 
@@ -26,7 +38,11 @@ case "$release_dir" in
   *) echo "session-kit launcher: release escapes $root/releases" >&2; exit 78 ;;
 esac
 
-target=$release_dir/bin/$helper
+if [[ $helper == kit ]]; then
+  target=$release_dir/bin/shpool_login
+else
+  target=$release_dir/bin/$helper
+fi
 if [[ ! -x $target ]]; then
   echo "session-kit launcher: helper missing from pinned release: $helper" >&2
   exit 69

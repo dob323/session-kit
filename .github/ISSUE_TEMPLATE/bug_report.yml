@@ -1,5 +1,5 @@
 name: Bug report
-description: Report a reproducible problem on the supported Linux beta
+description: Report a reproducible problem on the supported Linux or macOS beta
 title: "[Bug]: "
 labels:
   - bug
@@ -18,8 +18,8 @@ body:
   - type: input
     id: platform
     attributes:
-      label: Linux distribution
-      description: Provide distribution, version, and architecture. macOS and non-systemd systems are unsupported.
+      label: Operating system
+      description: Provide Linux distribution or macOS version, architecture, and user-service manager.
     validations:
       required: true
   - type: textarea

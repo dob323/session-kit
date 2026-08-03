@@ -4,7 +4,7 @@
 The collector takes one shpool JSON snapshot and one Claude agents JSON
 snapshot, then joins provider identities to a bounded native process table.
 Linux Codex identities come from a native Codex process's open root rollout;
-the opt-in Darwin preview uses that exact process's ``CODEX_THREAD_ID``. It
+Darwin uses that exact process's ``CODEX_THREAD_ID``. It
 never selects a conversation by cwd or recency.
 """
 
@@ -66,7 +66,6 @@ DEFAULT_MAX_PROC_NODES = 16384
 ABSENT_ALIAS_CONFIG_BACKUP = b"session-kit-alias-config-absent-v1\n"
 Runner = Callable[[Sequence[str], float], str]
 
-DARWIN_PREVIEW_ENV = "SESSION_KIT_MACOS_PREVIEW"
 DARWIN_PLATFORM = "darwin"
 
 
@@ -78,17 +77,8 @@ def _runtime_platform() -> str:
     return sys.platform
 
 
-def _darwin_preview_enabled() -> bool:
-    return os.environ.get(DARWIN_PREVIEW_ENV) == "1"
-
-
 def _require_supported_platform() -> str:
     platform = _runtime_platform()
-    if platform == DARWIN_PLATFORM and not _darwin_preview_enabled():
-        raise CollectionError(
-            "macOS support is an experimental preview; set "
-            f"{DARWIN_PREVIEW_ENV}=1 to opt in"
-        )
     if platform != DARWIN_PLATFORM and not platform.startswith("linux"):
         raise CollectionError(f"unsupported platform: {platform}")
     return platform
@@ -721,7 +711,15 @@ def scan_darwin_process_table(
         try:
             before = read_bsd(pid)
             generation = _darwin_generation(before)
+        except (OSError, ValueError):
+            continue
+        args_available = True
+        try:
             argv, environ = _parse_darwin_procargs2(read_args(pid))
+        except (OSError, ValueError):
+            argv, environ = [], {}
+            args_available = False
+        try:
             after = read_bsd(pid)
             after_generation = _darwin_generation(after)
         except (OSError, ValueError):
@@ -739,6 +737,7 @@ def scan_darwin_process_table(
             "ppid": before_identity[1],
             "start_ticks": generation,
             "generation_kind": "darwin-start-usec",
+            "args_available": args_available,
             "cmdline": argv,
             "comm": clean_text(
                 _decode_c_string(bytes(before.pbi_name))
@@ -790,7 +789,7 @@ def shpool_roots(
     roots: dict[str, int] = {}
     diagnostics: dict[str, list[str]] = {name: [] for name in wanted}
     if len(daemons) != 1:
-        reason = f"expected one shpool daemon in /proc, found {len(daemons)}"
+        reason = f"expected one shpool daemon in the process table, found {len(daemons)}"
         for name in wanted:
             diagnostics[name].append(reason)
         return roots, diagnostics
@@ -885,6 +884,27 @@ def _is_native_codex(process: Mapping[str, Any]) -> bool:
         return False
     executable = Path(argv[0]).name
     return executable == "codex" and process.get("comm") != "node"
+
+
+def _is_native_claude(process: Mapping[str, Any]) -> bool:
+    argv = process.get("cmdline") or []
+    executable = Path(str(argv[0])).name if argv else ""
+    comm = clean_text(process.get("comm"), 128)
+    return executable == "claude" or comm in {"claude", "claude.exe"}
+
+
+def _native_claude_uuid(process: Mapping[str, Any]) -> str | None:
+    if not _is_native_claude(process):
+        return None
+    argv = list(process.get("cmdline") or [])
+    if "--parent-session-id" in argv or "--fork-session" in argv:
+        return None
+    candidate = (
+        _arg_value(argv, "--session-id")
+        or _arg_value(argv, "--resume")
+        or str(process.get("claude_session_id", ""))
+    )
+    return valid_uuid(candidate)
 
 
 ROLLOUT_TAIL_BYTES = _providers.ROLLOUT_TAIL_BYTES
@@ -1011,6 +1031,60 @@ def codex_open_rollouts(
     return result
 
 
+def codex_rollout_by_uuid(
+    codex_home: Path,
+    uuid: str,
+    *,
+    max_files: int = 10_000,
+) -> list[dict[str, Any]]:
+    """Read one exact Darwin Codex rollout selected only by its process UUID."""
+    sessions = codex_home / "sessions"
+    try:
+        root = sessions.resolve(strict=True)
+    except OSError:
+        return []
+    seen = 0
+    candidates: list[Path] = []
+    try:
+        for directory, names, files in os.walk(root):
+            names[:] = sorted(name for name in names if not name.startswith("."))
+            for name in sorted(files):
+                seen += 1
+                if seen > max_files:
+                    raise CollectionError("Codex rollout tree exceeds safety bound")
+                if uuid in name and name.startswith("rollout-") and name.endswith(".jsonl"):
+                    candidates.append(Path(directory) / name)
+    except OSError:
+        return []
+    if len(candidates) != 1:
+        return []
+    path = candidates[0]
+    try:
+        resolved = path.resolve(strict=True)
+        resolved.relative_to(root)
+        descriptor = os.open(
+            resolved,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except (OSError, ValueError):
+        return []
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not statmod.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+        ):
+            return []
+        meta = _rollout_meta_fd(descriptor)
+        if meta is None or valid_uuid(meta.get("id")) != uuid:
+            return []
+        return [meta]
+    finally:
+        os.close(descriptor)
+
+
 def index_codex_processes(
     process_table: Mapping[int, Mapping[str, Any]], proc_root: Path, codex_home: Path
 ) -> dict[int, list[dict[str, Any]]]:
@@ -1020,18 +1094,7 @@ def index_codex_processes(
             if not _is_native_codex(process):
                 continue
             uuid = valid_uuid(process.get("codex_thread_id"))
-            result[pid] = (
-                [
-                    {
-                        "session_id": uuid,
-                        "id": uuid,
-                        "source": "cli",
-                        "_turn_state": "state unavailable",
-                    }
-                ]
-                if uuid
-                else []
-            )
+            result[pid] = codex_rollout_by_uuid(codex_home, uuid) if uuid else []
         return result
     return {
         pid: codex_open_rollouts(
@@ -1714,7 +1777,10 @@ def apply_retained_setup_attributions(
             if not isinstance(item, dict) or item.get("provider") != "unknown":
                 continue
             raw_id = item.get("shpool_id_raw")
-            if shpool_id_mutation_policy(raw_id) != (True, None):
+            if (
+                not isinstance(raw_id, str)
+                or shpool_id_mutation_policy(raw_id) != (True, None)
+            ):
                 continue
             shell = item.get("shpool_shell")
             identity = item.get("identity")
@@ -1879,16 +1945,30 @@ def build_inventory(
             if pid in claude_by_pid
             and claude_by_pid[pid].get("kind") in {"", "interactive"}
         ]
+        native_claude_candidates = [
+            (pid, native_uuid)
+            for pid in tree
+            if pid not in claude_by_pid
+            and (native_uuid := _native_claude_uuid(process_table.get(pid, {})))
+        ]
         codex_candidates: list[tuple[int, str]] = []
-        for pid in tree:
-            for uuid in _root_codex_uuid(codex_index.get(pid, ())):
-                codex_candidates.append((pid, uuid))
+        for candidate_pid in tree:
+            for candidate_uuid in _root_codex_uuid(
+                codex_index.get(candidate_pid, ())
+            ):
+                codex_candidates.append((candidate_pid, candidate_uuid))
         codex_candidates = sorted(set(codex_candidates))
 
+        pid: int | None
+        uuid: str | None
         starting_provider = None
         provider_title_is_explicit = True
         claude_color_evidence = ""
-        if len(claude_candidates) == 1 and not codex_candidates:
+        if (
+            len(claude_candidates) == 1
+            and not native_claude_candidates
+            and not codex_candidates
+        ):
             pid = claude_candidates[0]
             agent = claude_by_pid[pid]
             uuid = agent["uuid"]
@@ -1915,7 +1995,34 @@ def build_inventory(
             mapped_claude.add(pid)
             agent_status = agent["status"]
             needs_you = agent["needs_you"]
-        elif len(codex_candidates) == 1 and not claude_candidates:
+        elif (
+            len(native_claude_candidates) == 1
+            and not claude_candidates
+            and not codex_candidates
+        ):
+            pid, uuid = native_claude_candidates[0]
+            provider = "claude"
+            native_title = "Claude started"
+            cwd = clean_text(process_table.get(pid, {}).get("cwd"), 4096)
+            identity = _agent_identity(
+                provider=provider,
+                uuid=uuid,
+                pid=pid,
+                process_table=process_table,
+                provenance="native Claude CLI session argument",
+                confidence="exact",
+            )
+            subagents = claude_subagents(uuid, process_table)
+            recovery = recovery_spec(provider, uuid, cwd or None)
+            mapped_claude.add(pid)
+            agent_status = "running"
+            needs_you = False
+            provider_title_is_explicit = False
+        elif (
+            len(codex_candidates) == 1
+            and not claude_candidates
+            and not native_claude_candidates
+        ):
             pid, uuid = codex_candidates[0]
             thread = codex_threads.get(uuid, {})
             native_title = clean_text(
@@ -1963,20 +2070,36 @@ def build_inventory(
             needs_you = turn_state == "needs your reply"
         else:
             known_provider_process = any(
-                clean_text(process_table.get(pid, {}).get("comm"), 128) in {"claude", "codex"}
+                _is_native_claude(process_table.get(pid, {}))
                 or _is_native_codex(process_table.get(pid, {}))
                 for pid in tree
             )
-            ambiguous = len(claude_candidates) > 1 or len(codex_candidates) > 1 or (
-                bool(claude_candidates) and bool(codex_candidates)
+            claude_count = len(claude_candidates) + len(native_claude_candidates)
+            ambiguous = claude_count > 1 or len(codex_candidates) > 1 or (
+                bool(claude_count) and bool(codex_candidates)
             )
             if ambiguous or known_provider_process or not root_pid:
                 provider = "unknown"
                 pid = root_pid
                 native_title = "Unresolved provider session"
                 cwd = clean_text(process_table.get(root_pid or -1, {}).get("cwd"), 4096)
+                provider_cwds = {
+                    candidate_cwd
+                    for candidate in tree
+                    if (
+                        _is_native_claude(process_table.get(candidate, {}))
+                        or _is_native_codex(process_table.get(candidate, {}))
+                    )
+                    and (
+                        candidate_cwd := clean_text(
+                            process_table.get(candidate, {}).get("cwd"), 4096
+                        )
+                    ).startswith("/")
+                }
+                if not cwd and len(provider_cwds) == 1:
+                    cwd = next(iter(provider_cwds))
                 diagnostics.append(
-                    f"identity candidates: Claude={len(claude_candidates)}, Codex={len(codex_candidates)}"
+                    f"identity candidates: Claude={claude_count}, Codex={len(codex_candidates)}"
                 )
                 agent_status = "unknown"
                 # A new Codex session has no rollout until its first message, so
@@ -1988,10 +2111,8 @@ def build_inventory(
                     running = {
                         "codex"
                         if _is_native_codex(process_table.get(candidate, {}))
-                        or clean_text(
-                            process_table.get(candidate, {}).get("comm"), 128
-                        )
-                        == "codex"
+                        else "claude"
+                        if _is_native_claude(process_table.get(candidate, {}))
                         else clean_text(
                             process_table.get(candidate, {}).get("comm"), 128
                         )
@@ -2226,19 +2347,22 @@ def build_inventory(
         # hash or the list shows a different color than the session itself
         # (a stored pink rendered yellow, proven live 2026-08-02). Explicit
         # config overrides still win over both.
-        uuid = (item.get("identity") or {}).get("uuid")
+        raw_uuid = (item.get("identity") or {}).get("uuid")
+        display_uuid = valid_uuid(raw_uuid)
+        item_provider = item.get("provider")
+        provider = item_provider if isinstance(item_provider, str) else "unknown"
         evidence = item.get("_claude_agent_color")
         if (
             item.get("provider") == "claude"
-            and uuid
+            and display_uuid
             and evidence in SESSION_COLORS
-            and f"claude:{valid_uuid(uuid) or ''}" not in color_overrides
+            and f"claude:{display_uuid}" not in color_overrides
         ):
             item["display_color"] = evidence
         else:
             item["display_color"] = session_color(
-                item.get("provider"),
-                uuid,
+                provider,
+                display_uuid,
                 color_overrides,
             )
         item.pop("_claude_agent_color", None)
@@ -2252,6 +2376,33 @@ def build_inventory(
         "sessions": sessions,
         "outside_agents": outside_agents,
     }
+
+
+def apply_provider_title_states(
+    inventory: dict[str, Any], config: Mapping[str, Any]
+) -> None:
+    """Expose a safe, display-only state for Codex bars awaiting a restart."""
+    state_dir = config.get("state_dir")
+    if not state_dir:
+        return
+    marker_root = Path(str(state_dir)) / "provider-untitled"
+    for item in inventory.get("sessions", []):
+        if not isinstance(item, dict) or item.get("provider") != "codex":
+            continue
+        shpool_id = clean_text(item.get("shpool_id_raw"), 128)
+        if not shpool_id or "/" in shpool_id or shpool_id.startswith("."):
+            continue
+        marker = marker_root / shpool_id
+        try:
+            marker_stat = marker.lstat()
+        except OSError:
+            item["provider_title_state"] = "ready"
+            continue
+        item["provider_title_state"] = (
+            "pending"
+            if statmod.S_ISREG(marker_stat.st_mode) and not marker.is_symlink()
+            else "ready"
+        )
 
 
 def _shpool_executable() -> str:
@@ -2355,13 +2506,14 @@ def collect_live(
         config,
         recent_output_by_shpool_id=recent_outputs,
     )
+    apply_provider_title_states(inventory, config)
     apply_retained_setup_attributions(inventory)
     inventory["warnings"].extend(warnings)
     inventory["naming_warnings"] = naming_warnings
     # Optional providers may be absent on a general-purpose installation.
     # A query failure is material only when that provider is visibly running.
     claude_visible = any(
-        clean_text(process.get("comm"), 128) == "claude"
+        _is_native_claude(process)
         for process in process_table.values()
     )
     inventory["_complete"] = not (
@@ -2602,7 +2754,6 @@ def mutate_canonical_automatic_title(
     title: str | None,
     *,
     overwrite: bool = False,
-    alias_owned_ok: bool = False,
     revalidate: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Atomically set/reset one automatic title without crossing alias provenance."""
@@ -2624,7 +2775,7 @@ def mutate_canonical_automatic_title(
             _private_alias_parent(path)
             document = _private_alias_document(path, allow_missing=True)
             aliases = dict(document["aliases"])
-            if clean_title is not None and key in aliases and not alias_owned_ok:
+            if clean_title is not None and key in aliases:
                 raise CollectionError("explicit local alias already owns this title")
             titles = _valid_automatic_titles(document.get("automatic_titles"))
             failures = _valid_automatic_title_failures(
@@ -2662,6 +2813,69 @@ def mutate_canonical_automatic_title(
                 "provider": provider,
                 "uuid": exact_uuid,
                 "title": clean_title,
+                "automatic_titles": verified_titles,
+            }
+
+
+def mutate_canonical_self_name(
+    config: Mapping[str, Any],
+    provider: str,
+    uuid: str,
+    title: str,
+    *,
+    revalidate: Callable[[], None] | None = None,
+) -> dict[str, Any]:
+    """Atomically set the paired alias and automatic title for a proved caller."""
+    exact_uuid = valid_uuid(uuid)
+    if provider not in PROVIDERS or not exact_uuid:
+        raise CollectionError(
+            "self-name requires provider claude|codex and an exact UUID"
+        )
+    if not automatic_naming_enabled():
+        raise CollectionError("automatic naming is disabled")
+    clean_title = normalize_automatic_title(title)
+    path = config_path()
+    paths = _state_paths(config)
+    key = f"{provider}:{exact_uuid}"
+    with StateLock(paths["root"], paths["config_lock"]):
+        with StateLock(paths["root"], paths["lock"]):
+            if revalidate is not None:
+                revalidate()
+            _private_alias_parent(path)
+            document = _private_alias_document(path, allow_missing=True)
+            aliases = dict(document["aliases"])
+            titles = _valid_automatic_titles(document.get("automatic_titles"))
+            failures = _valid_automatic_title_failures(
+                document.get("automatic_title_failures")
+            )
+            aliases[key] = clean_title
+            titles[key] = clean_title
+            failures.pop(key, None)
+            document["aliases"] = dict(sorted(aliases.items()))
+            document["automatic_titles"] = dict(sorted(titles.items()))
+            if failures:
+                document["automatic_title_failures"] = dict(
+                    sorted(failures.items())
+                )
+            else:
+                document.pop("automatic_title_failures", None)
+            atomic_write_json(path, document)
+            verified = _private_alias_document(path, allow_missing=False)
+            verified_titles = _valid_automatic_titles(
+                verified.get("automatic_titles")
+            )
+            if verified["aliases"].get(key) != clean_title:
+                raise CollectionError("self-name alias atomic verification failed")
+            if verified_titles.get(key) != clean_title:
+                raise CollectionError(
+                    "self-name automatic title atomic verification failed"
+                )
+            return {
+                "schema_version": SCHEMA_VERSION,
+                "provider": provider,
+                "uuid": exact_uuid,
+                "title": clean_title,
+                "aliases": dict(verified["aliases"]),
                 "automatic_titles": verified_titles,
             }
 
@@ -3811,7 +4025,10 @@ def _alias_migration_images(
             backup_bytes, label="alias migration backup"
         )
         preimage_bytes = backup_bytes
-    merged = {**preimage["aliases"], **runtime_aliases}
+    merged = {
+        **_valid_aliases(preimage.get("aliases")),
+        **dict(runtime_aliases),
+    }
     postimage = dict(preimage)
     postimage["aliases"] = dict(sorted(merged.items()))
     return preimage_bytes, postimage, _atomic_json_bytes(postimage)
@@ -3844,6 +4061,8 @@ def migrate_runtime_aliases(config: Mapping[str, Any]) -> dict[str, Any]:
                         max_bytes=MAX_PRIVATE_JSON_BYTES,
                         exact_mode=0o600,
                     )
+                    if backup_bytes is None:
+                        raise CollectionError("alias migration backup is unavailable")
                     before = _read_bounded_owner_file(
                         config_file,
                         label="canonical alias config",
@@ -3885,7 +4104,7 @@ def migrate_runtime_aliases(config: Mapping[str, Any]) -> dict[str, Any]:
                     "aliases": canonical_aliases(config),
                 }
             rollback_retry = archived is not None
-            if rollback_retry and archived[0] != legacy[0]:
+            if archived is not None and archived[0] != legacy[0]:
                 raise CollectionError(
                     "active and archived runtime aliases differ"
                 )
@@ -3943,9 +4162,12 @@ def migrate_runtime_aliases(config: Mapping[str, Any]) -> dict[str, Any]:
                 max_bytes=MAX_PRIVATE_JSON_BYTES,
                 exact_mode=0o600,
             )
+            if durable_archive is None:
+                raise CollectionError(
+                    "runtime alias archive did not reach its durable postcondition"
+                )
             if (
-                durable_archive is None
-                or durable_archive[0] != legacy[0]
+                durable_archive[0] != legacy[0]
                 or source_backup != legacy[0]
                 or paths["aliases"].exists()
             ):
@@ -3969,23 +4191,21 @@ def _boot_id() -> str | None:
             return None
         return value or None
     if _runtime_platform() == DARWIN_PLATFORM:
-        if not _darwin_preview_enabled():
-            return None
         try:
             libc, _ = _darwin_libraries()
-            value = _DarwinTimeval()
-            size = ctypes.c_size_t(ctypes.sizeof(value))
+            boot_time = _DarwinTimeval()
+            size = ctypes.c_size_t(ctypes.sizeof(boot_time))
             if libc.sysctlbyname(
                 b"kern.boottime",
-                ctypes.byref(value),
+                ctypes.byref(boot_time),
                 ctypes.byref(size),
                 None,
                 0,
             ) != 0:
                 return None
-            if value.tv_sec <= 0 or value.tv_usec < 0:
+            if boot_time.tv_sec <= 0 or boot_time.tv_usec < 0:
                 return None
-            return f"darwin:{value.tv_sec}:{value.tv_usec}"
+            return f"darwin:{boot_time.tv_sec}:{boot_time.tv_usec}"
         except (OSError, ValueError):
             return None
     try:
@@ -4292,6 +4512,7 @@ def apply_terminal_numbers(
     recycle = allocate and retired is not None
     now = current_time if current_time is not None else time.time()
     if recycle:
+        assert retired is not None
         # Bindings whose number finished its quarantine are pruned; the
         # number becomes allocatable below. Live numbers are never here.
         expired = {
@@ -4302,8 +4523,8 @@ def apply_terminal_numbers(
         if expired:
             for key in [k for k, v in bindings.items() if v in expired]:
                 del bindings[key]
-            for number in expired:
-                retired.pop(number, None)
+            for expired_number in expired:
+                retired.pop(expired_number, None)
     reserved_numbers: set[int] = set(bindings.values())
     active_numbers: set[int] = set()
     for item in inventory.get("sessions", ()):
@@ -4338,6 +4559,7 @@ def apply_terminal_numbers(
             if generation_number is not None
             else None
         )
+        number: int | None
         if ai_number is not None:
             # Exact AI identity is the continuity proof when a recovered
             # conversation appears in a newly created shpool generation.  The
@@ -4388,6 +4610,7 @@ def apply_terminal_numbers(
         item["terminal_number"] = number
         item.pop("_terminal_identity_hint", None)
     if recycle:
+        assert retired is not None
         # Stamp newly dead numbers; clear stamps on anything alive again
         # (an exact recovery inside the quarantine window).
         bound = set(bindings.values())
@@ -5335,6 +5558,7 @@ def update_recovery_state(paths: Mapping[str, Path], inventory: Mapping[str, Any
             return
 
     if existing_valid and existing_key != detected_key:
+        assert existing_key is not None
         boot_changed = existing_key[0] != detected_key[0]
         new_pending = {
             "schema_version": SCHEMA_VERSION,
@@ -5658,10 +5882,11 @@ def snapshot(*, write_state: bool = True, config: dict[str, Any] | None = None) 
         live = None
         failure = str(exc)
     else:
+        assert live is not None
         failure = "; ".join(live.get("warnings", ()))
     complete = bool(live and live.pop("_complete", True))
-    if complete:
-        result = live
+    if complete and live is not None:
+        result: dict[str, Any] = live
         try:
             boot_id = _boot_id()
             if not boot_id:
@@ -6087,9 +6312,13 @@ def strict_live_inventory(inventory: Mapping[str, Any]) -> bool:
         ):
             return False
         if provider in PROVIDERS:
-            uuid = identity.get("uuid")
+            if not isinstance(provider, str):
+                return False
+            uuid = valid_uuid(identity.get("uuid"))
+            if not uuid:
+                return False
             key = (provider, uuid)
-            if valid_uuid(uuid) != uuid or key in exact_provider_uuids:
+            if key in exact_provider_uuids:
                 return False
             exact_provider_uuids.add(key)
         elif identity.get("uuid") is not None:
@@ -6111,9 +6340,13 @@ def strict_live_inventory(inventory: Mapping[str, Any]) -> bool:
             or identity.get("process_start_ticks", 0) <= 0
         ):
             return False
-        uuid = identity.get("uuid")
+        if not isinstance(provider, str):
+            return False
+        uuid = valid_uuid(identity.get("uuid"))
+        if not uuid:
+            return False
         key = (provider, uuid)
-        if valid_uuid(uuid) != uuid or key in exact_provider_uuids:
+        if key in exact_provider_uuids:
             return False
         exact_provider_uuids.add(key)
     return True
@@ -6166,7 +6399,9 @@ def guard_live_inventory(inventory: Mapping[str, Any]) -> bool:
         terminal_number = item.get("terminal_number")
         if _missing_shell_generation_is_quarantined(item):
             if (
-                not positive_int(row)
+                isinstance(row, bool)
+                or not isinstance(row, int)
+                or row <= 0
                 or row in rows
                 or not isinstance(raw_id, str)
                 or raw_id in raw_ids
@@ -6177,7 +6412,9 @@ def guard_live_inventory(inventory: Mapping[str, Any]) -> bool:
             continue
         mutation_allowed, mutation_reason = shpool_id_mutation_policy(raw_id)
         if (
-            not positive_int(row)
+            isinstance(row, bool)
+            or not isinstance(row, int)
+            or row <= 0
             or row in rows
             or not isinstance(raw_id, str)
             or not raw_id
@@ -6222,12 +6459,11 @@ def guard_live_inventory(inventory: Mapping[str, Any]) -> bool:
         ):
             return False
         if provider in {"claude", "codex"}:
-            uuid = identity.get("uuid")
+            uuid = valid_uuid(identity.get("uuid"))
+            if not uuid:
+                return False
             key = (provider, uuid)
-            if (
-                valid_uuid(uuid) != uuid
-                or key in exact_provider_uuids
-            ):
+            if key in exact_provider_uuids:
                 return False
             exact_provider_uuids.add(key)
         elif identity.get("uuid") is not None:
@@ -6246,12 +6482,13 @@ def guard_live_inventory(inventory: Mapping[str, Any]) -> bool:
             or not positive_int(identity.get("process_start_ticks"))
         ):
             return False
-        uuid = identity.get("uuid")
+        if not isinstance(provider, str):
+            return False
+        uuid = valid_uuid(identity.get("uuid"))
+        if not uuid:
+            return False
         key = (provider, uuid)
-        if (
-            valid_uuid(uuid) != uuid
-            or key in exact_provider_uuids
-        ):
+        if key in exact_provider_uuids:
             return False
         exact_provider_uuids.add(key)
 
@@ -6484,16 +6721,13 @@ def self_name_automatic_title(
         raise CollectionError(
             f"automatic title rejected ({reason}); {suffix}"
         ) from reason
-    # overwrite + alias_owned_ok: an agent may self-name repeatedly as its
-    # task evolves, and its own earlier self-name (now in the alias tier)
-    # must never block the update.
-    result = mutate_canonical_automatic_title(
+    # A self-name owns both display tiers. Write them in one transaction so a
+    # repeated rename cannot trip over the alias created by the previous one.
+    result = mutate_canonical_self_name(
         config,
         str(evidence["provider"]),
         str(evidence["uuid"]),
         normalized,
-        overwrite=True,
-        alias_owned_ok=True,
         revalidate=revalidate,
     )
     result["caller"] = evidence
@@ -6503,12 +6737,6 @@ def self_name_automatic_title(
     # lost to the provider's own ai-title, so the picker kept showing a stale
     # native name after an agent explicitly renamed itself. `sp name reset`
     # still demotes it like any alias.
-    result["aliases"] = mutate_canonical_alias(
-        config,
-        str(evidence["provider"]),
-        str(evidence["uuid"]),
-        normalized,
-    )
     result.update(
         propagate_provider_title(
             str(evidence["provider"]),
@@ -6541,11 +6769,40 @@ def _json_print(value: Any) -> None:
 
 def _platform_command(args: argparse.Namespace) -> int:
     platform = _require_supported_platform()
+    if args.platform_action == "timeout":
+        if not 0 < args.seconds <= 3600:
+            raise CollectionError("timeout seconds are outside the safe range")
+        command = list(args.argv)
+        if command and command[0] == "--":
+            command.pop(0)
+        if not command:
+            raise CollectionError("timeout command is empty")
+        child = subprocess.Popen(command, start_new_session=True)
+        try:
+            returncode = child.wait(timeout=args.seconds)
+            return returncode if returncode >= 0 else 128 - returncode
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(child.pid, 15)
+            try:
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(child.pid, 9)
+                child.wait()
+            return 124
     if args.platform_action == "boot-id":
         value = _boot_id()
         if not value:
             raise CollectionError("current boot identity is unavailable")
         print(value)
+        return 0
+    if args.platform_action == "process-table":
+        table = platform_process_table(
+            Path(os.environ.get("SESSION_KIT_PROC_ROOT", "/proc")),
+            DEFAULT_MAX_PROC_NODES,
+        )
+        _json_print({"processes": [table[pid] for pid in sorted(table)]})
         return 0
     root = Path(os.environ.get("SESSION_KIT_PROC_ROOT", "/proc"))
     if platform == DARWIN_PLATFORM and args.platform_action == "process-info":
@@ -6557,6 +6814,16 @@ def _platform_command(args: argparse.Namespace) -> int:
         raise CollectionError("process generation is unavailable")
     if args.platform_action == "process-info":
         print(f"{process.get('ppid', 0)}\t{process.get('start_ticks', 0)}")
+        return 0
+    if args.platform_action == "process-generation-is":
+        if process.get("start_ticks") != args.generation:
+            raise CollectionError("process generation changed")
+        return 0
+    if args.platform_action == "process-is":
+        argv = process.get("cmdline") or []
+        executable = Path(str(argv[0])).name if argv else str(process.get("comm", ""))
+        if process.get("start_ticks") != args.generation or executable != args.executable:
+            raise CollectionError("process executable or generation changed")
         return 0
     if process.get("start_ticks") != args.generation:
         raise CollectionError("process generation changed")
@@ -6587,10 +6854,11 @@ def _alias_command(args: argparse.Namespace, config: dict[str, Any]) -> int:
     if args.alias_action == "migrate-runtime":
         _json_print(migrate_runtime_aliases(config))
         return 0
-    title = args.title if args.alias_action == "set" else None
+    title = str(args.title) if args.alias_action == "set" else None
     aliases = mutate_canonical_alias(config, args.provider, args.uuid, title)
     payload: dict[str, Any] = {"schema_version": SCHEMA_VERSION, "aliases": aliases}
     if args.alias_action == "set":
+        assert title is not None
         # Explicit assignment pushes once into the provider's own surfaces;
         # deletion only clears the local alias and leaves provider titles alone.
         payload.update(propagate_provider_title(args.provider, args.uuid, title))
@@ -6724,8 +6992,19 @@ def _parser() -> argparse.ArgumentParser:
         dest="platform_action", required=True
     )
     platform_subparsers.add_parser("boot-id")
+    platform_subparsers.add_parser("process-table")
+    platform_timeout = platform_subparsers.add_parser("timeout")
+    platform_timeout.add_argument("seconds", type=float)
+    platform_timeout.add_argument("argv", nargs=argparse.REMAINDER)
     platform_process = platform_subparsers.add_parser("process-info")
     platform_process.add_argument("pid", type=int)
+    platform_generation = platform_subparsers.add_parser("process-generation-is")
+    platform_generation.add_argument("pid", type=int)
+    platform_generation.add_argument("generation", type=int)
+    platform_is = platform_subparsers.add_parser("process-is")
+    platform_is.add_argument("pid", type=int)
+    platform_is.add_argument("generation", type=int)
+    platform_is.add_argument("executable")
     platform_provider = platform_subparsers.add_parser("provider-present")
     platform_provider.add_argument("pid", type=int)
     platform_provider.add_argument("generation", type=int)
@@ -6830,15 +7109,18 @@ def _prove_lifecycle_caller(
     shell_pid: int,
     shell_start: int,
 ) -> None:
-    if _require_supported_platform() != "linux":
-        raise CollectionError("lifecycle state is supported on Linux only")
+    platform = _require_supported_platform()
     proc_root = Path("/proc")
     if (
         os.environ.get("SESSION_KIT_TESTING") == "1"
         and os.environ.get("SESSION_KIT_PROC_ROOT")
     ):
         proc_root = Path(os.environ["SESSION_KIT_PROC_ROOT"])
-    process_table = scan_process_table(proc_root, DEFAULT_MAX_PROC_NODES)
+    process_table = (
+        scan_darwin_process_table(DEFAULT_MAX_PROC_NODES)
+        if platform == DARWIN_PLATFORM
+        else scan_process_table(proc_root, DEFAULT_MAX_PROC_NODES)
+    )
     chain = _process_ancestor_chain(process_table, os.getpid())
     shell = process_table.get(shell_pid)
     if (
@@ -6857,13 +7139,6 @@ def _lifecycle_command(args: argparse.Namespace) -> int:
         _lifecycle_environment()
     )
     _prove_lifecycle_caller(session_id, shell_pid, shell_start)
-    common = {
-        "state_dir": state_dir,
-        "session_id": session_id,
-        "boot_id": boot_id,
-        "shell_pid": shell_pid,
-        "shell_start_ticks": shell_start,
-    }
     if args.lifecycle_action == "provider-exited":
         provider = os.environ.get("SESSION_KIT_LIFECYCLE_PROVIDER", "")
         try:
@@ -6873,13 +7148,24 @@ def _lifecycle_command(args: argparse.Namespace) -> int:
         except ValueError as exc:
             raise CollectionError("lifecycle provider exit code is invalid") from exc
         value = _lifecycle.record_provider_exit(
-            **common,
+            state_dir,
+            session_id=session_id,
+            boot_id=boot_id,
+            shell_pid=shell_pid,
+            shell_start_ticks=shell_start,
             provider=provider,
             exit_code=exit_code,
             input_tracking=True,
         )
     elif args.lifecycle_action == "user-input":
-        value = _lifecycle.update_state(**common, event="user-input")
+        value = _lifecycle.update_state(
+            state_dir,
+            session_id=session_id,
+            boot_id=boot_id,
+            shell_pid=shell_pid,
+            shell_start_ticks=shell_start,
+            event="user-input",
+        )
     elif args.lifecycle_action == "reopen":
         state = _lifecycle.load_state(state_dir, session_id)
         if state is None:
@@ -6933,7 +7219,11 @@ def _lifecycle_command(args: argparse.Namespace) -> int:
             )
         completed = subprocess.run(argv, cwd=cwd, check=False)
         value = _lifecycle.record_provider_exit(
-            **common,
+            state_dir,
+            session_id=session_id,
+            boot_id=boot_id,
+            shell_pid=shell_pid,
+            shell_start_ticks=shell_start,
             provider=provider,
             exit_code=completed.returncode % 256,
             input_tracking=True,
@@ -6941,7 +7231,11 @@ def _lifecycle_command(args: argparse.Namespace) -> int:
         return 0
     else:
         value = _lifecycle.update_state(
-            **common,
+            state_dir,
+            session_id=session_id,
+            boot_id=boot_id,
+            shell_pid=shell_pid,
+            shell_start_ticks=shell_start,
             event="keep",
             keep=args.choice == "on",
         )

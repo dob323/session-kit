@@ -784,6 +784,42 @@ class LoginPickerTests(unittest.TestCase):
         finally:
             fixture.close()
 
+    def test_pending_provider_bar_title_is_visible(self) -> None:
+        pending = row(
+            "title-pending",
+            number=6,
+            provider="codex",
+            availability="attached",
+        )
+        pending["provider_title_state"] = "pending"
+        fixture = LoginFixture(inventory(pending))
+        try:
+            code, output = run_pty(fixture, b"\n", columns=120)
+            self.assertEqual(2, code)
+            self.assertIn("working | title pending", output)
+        finally:
+            fixture.close()
+
+    def test_open_elsewhere_pending_title_offers_proof_bound_refresh(self) -> None:
+        pending = row(
+            "title-pending",
+            number=6,
+            provider="codex",
+            availability="attached",
+        )
+        pending["provider_title_state"] = "pending"
+        fixture = LoginFixture(inventory(pending))
+        try:
+            code, output = run_pty(fixture, b"6\n4\n\n", columns=120)
+            self.assertEqual(2, code)
+            self.assertIn("Apply the pending title", output)
+            entries = fixture.sp_entries()
+            self.assertEqual(1, len(entries))
+            self.assertEqual("picker-title-refresh", entries[0]["args"][0])
+            self.assertEqual("title-pending", entries[0]["proof"]["shpool_id"])
+        finally:
+            fixture.close()
+
         combined = row(
             "combined",
             number=4,

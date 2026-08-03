@@ -14,10 +14,12 @@ bashrc/**
 bin/**
 config/**
 docs/**
+docs/assets/session-kit-dashboard.png
 deploy/session-kit-launcher
 deploy/session-kit-release
 install.sh
 lib/**
+macos/README.md
 public-files.txt
 shpool-patch/**
 shpool/config.toml
@@ -47,3 +49,4 @@ tools/build-public-tree
 tools/build-release-artifact
 tools/check-doc-links
 tools/public-scan
+tools/render-readme-dashboard

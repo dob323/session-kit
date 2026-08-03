@@ -47,6 +47,62 @@ jobs:
       - name: Run tests
         run: tests/run
 
+  macos:
+    name: macOS ${{ matrix.arch }} / Python 3.13
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            arch: arm64
+          - os: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.13"
+      - name: Install supported Bash
+        run: |
+          brew install bash
+          modern_bash="$(brew --prefix bash)/bin/bash"
+          test -x "$modern_bash"
+          printf 'SESSION_KIT_TEST_BASH=%s\n' "$modern_bash" >> "$GITHUB_ENV"
+          printf '%s\n' "${modern_bash%/*}" >> "$GITHUB_PATH"
+      - name: Verify native Darwin adapter
+        env:
+          EXPECTED_ARCH: ${{ matrix.arch }}
+        run: |
+          test "$(uname -m)" = "$EXPECTED_ARCH"
+          test -n "$(python3 lib/session_inventory.py platform boot-id)"
+          "$SESSION_KIT_TEST_BASH" -c '
+            set -euo pipefail
+            info=$(python3 lib/session_inventory.py platform process-info $$)
+            generation=${info#*$'"'"'\t'"'"'}
+            test "$generation" -gt 0
+            python3 lib/session_inventory.py platform process-is \
+              $$ "$generation" bash
+          '
+      - name: Check supported Bash syntax
+        run: |
+          "$SESSION_KIT_TEST_BASH" -n install.sh
+          "$SESSION_KIT_TEST_BASH" -n bin/*
+          "$SESSION_KIT_TEST_BASH" -n bashrc/shpool.bashrc
+          "$SESSION_KIT_TEST_BASH" -n deploy/session-kit-launcher
+          "$SESSION_KIT_TEST_BASH" -n tests/run
+      - name: Run native and fixture-only macOS tests
+        run: |
+          python3 -m unittest -v \
+            tests.test_macos_preview \
+            tests.test_install.InstallerTests.test_macos_install_update_and_rollback_are_transactional \
+            tests.test_public_export \
+            tests.test_release_artifact \
+            tests.test_public_scan \
+            tests.test_doc_links
+
   quality:
     name: Quality, privacy, and public export
     runs-on: ubuntu-24.04
@@ -85,8 +141,7 @@ jobs:
           python -m compileall -q lib tests
           python -m py_compile tools/build-public-tree \
             tools/build-release-artifact tools/check-doc-links tools/public-scan
-      - name: Report legacy type baseline
-        continue-on-error: true
+      - name: Check types
         env:
           MYPY_CACHE_DIR: ${{ runner.temp }}/mypy-cache
         run: |

@@ -9,6 +9,7 @@ import unittest
 
 REPO = Path(__file__).resolve().parents[1]
 SCANNER = REPO / "tools" / "public-scan"
+APPROVED_DASHBOARD = REPO / "docs" / "assets" / "session-kit-dashboard.png"
 
 
 class PublicScanTests(unittest.TestCase):
@@ -52,6 +53,14 @@ class PublicScanTests(unittest.TestCase):
     def commit(self, message: str) -> None:
         subprocess.run(["git", "-C", self.root, "add", "."], check=True)
         subprocess.run(["git", "-C", self.root, "commit", "-qm", message], check=True)
+
+    def copy_dashboard(
+        self, relative: str = "docs/assets/session-kit-dashboard.png"
+    ) -> Path:
+        target = self.root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(APPROVED_DASHBOARD, target)
+        return target
 
     def test_clean_tree_ignores_tool_and_git_caches(self) -> None:
         secret = "ghp_" + ("a" * 20)
@@ -128,6 +137,72 @@ class PublicScanTests(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("linked-directory: symlink is not allowed", result.stdout)
+
+    def test_approved_dashboard_binary_is_accepted(self) -> None:
+        self.copy_dashboard()
+
+        result = self.run_scan()
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_dashboard_with_changed_digest_is_rejected(self) -> None:
+        dashboard = self.copy_dashboard()
+        payload = bytearray(dashboard.read_bytes())
+        payload[-1] ^= 1
+        dashboard.write_bytes(payload)
+
+        result = self.run_scan()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("approved binary digest mismatch", result.stdout)
+
+    def test_approved_dashboard_bytes_at_another_path_are_rejected(self) -> None:
+        self.copy_dashboard("docs/assets/other.png")
+
+        result = self.run_scan()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("binary file is not allowed", result.stdout)
+
+    def test_other_binary_is_rejected(self) -> None:
+        (self.root / "other.bin").write_bytes(b"fixture\0binary")
+
+        result = self.run_scan()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("binary file is not allowed", result.stdout)
+
+    def test_history_rejects_superseded_dashboard_digest(self) -> None:
+        self.init_git()
+        dashboard = self.copy_dashboard()
+        payload = bytearray(dashboard.read_bytes())
+        payload[-1] ^= 1
+        dashboard.write_bytes(payload)
+        self.commit("add altered dashboard")
+        self.copy_dashboard()
+        self.commit("restore approved dashboard")
+
+        tree_only = self.run_scan()
+        history = self.run_scan("--git-history")
+
+        self.assertEqual(tree_only.returncode, 0, tree_only.stdout + tree_only.stderr)
+        self.assertNotEqual(history.returncode, 0)
+        self.assertIn("approved binary digest mismatch", history.stdout)
+
+    def test_history_rejects_removed_other_binary(self) -> None:
+        self.init_git()
+        other = self.root / "other.bin"
+        other.write_bytes(b"fixture\0binary")
+        self.commit("add other binary")
+        other.unlink()
+        self.commit("remove other binary")
+
+        tree_only = self.run_scan()
+        history = self.run_scan("--git-history")
+
+        self.assertEqual(tree_only.returncode, 0, tree_only.stdout + tree_only.stderr)
+        self.assertNotEqual(history.returncode, 0)
+        self.assertIn("binary file is not allowed", history.stdout)
 
 
 if __name__ == "__main__":

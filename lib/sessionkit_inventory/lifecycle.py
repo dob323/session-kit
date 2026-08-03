@@ -199,9 +199,13 @@ def record_provider_exit(
         "exit_code": exit_code,
         "input_tracking": input_tracking,
         "user_input_after_exit": bool(
-            same_generation and previous["user_input_after_exit"]
+            previous["user_input_after_exit"]
+            if same_generation and previous is not None
+            else False
         ),
-        "keep": bool(same_generation and previous["keep"]),
+        "keep": bool(
+            previous["keep"] if same_generation and previous is not None else False
+        ),
     }
     checked = _validated_state(value, key)
     path = lifecycle_path(state_dir, session_id)

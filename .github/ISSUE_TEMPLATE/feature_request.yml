@@ -1,5 +1,5 @@
 name: Feature request
-description: Suggest one focused improvement for the supported Linux beta
+description: Suggest one focused improvement for the Linux and macOS beta
 title: "[Feature]: "
 labels:
   - enhancement

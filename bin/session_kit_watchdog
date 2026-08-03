@@ -24,11 +24,6 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 # shellcheck source=session_kit_common
 source "$SCRIPT_DIR/session_kit_common"
 
-if [[ $(sk_platform) == Darwin ]]; then
-  sk_die "watchdog repair is unavailable in the macOS preview; nothing changed"
-  exit 1
-fi
-
 SP_CMD=${SESSION_KIT_SP_CMD:-"$SCRIPT_DIR/sp"}
 STATUS_CMD=${SESSION_KIT_STATUS_CMD:-"$SCRIPT_DIR/shpool_status"}
 STATE_ROOT=${XDG_STATE_HOME:-"$HOME/.local/state"}
@@ -68,6 +63,10 @@ esac
   echo "session-kit: SESSION_KIT_WATCHDOG_MODE must be report or repair" >&2
   exit 2
 }
+if [[ $(sk_platform) == Darwin && $WATCHDOG_MODE == repair ]]; then
+  sk_die "watchdog repair requires Linux daemon-thread evidence; use report mode on macOS"
+  exit 1
+fi
 
 sk_require_shpool || exit 1
 sk_prepare_state || exit 1
@@ -77,7 +76,7 @@ umask 077
 chmod 600 "$LOG_FILE" 2>/dev/null || true
 
 log() {
-  printf '%s %s\n' "$(date -Is)" "$1" >> "$LOG_FILE"
+  printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$1" >> "$LOG_FILE"
 }
 
 # Records every repair so the picker can tell the human what happened even if
@@ -142,6 +141,7 @@ notify() {
 # deliberately not used as a trigger.
 flagged_sessions() {
   local since=$1
+  [[ $(sk_platform) != Darwin ]] || return 0
   journalctl --user -u "$JOURNAL_UNIT" --since "$since" -o cat --no-pager 2>/dev/null |
     grep -F 'failed to tell shell->client to disconnect' |
     grep -oE 's="[^"]+"' |
@@ -184,6 +184,8 @@ daemon_pid = daemon.get("pid")
 if not isinstance(daemon_pid, int) or daemon_pid <= 0:
     sys.exit(3)
 
+sessions = list(inventory.get("sessions", ()))
+
 # Count the daemon threads that serve session terminals. One per session is
 # healthy; fewer means at least one session has no thread left to serve it.
 # The override exists so the count can be fixed in tests and inspected by
@@ -191,6 +193,8 @@ if not isinstance(daemon_pid, int) or daemon_pid <= 0:
 override = os.environ.get("SESSION_KIT_WATCHDOG_SERVING_THREADS", "")
 if override.isdigit():
     serving = int(override)
+elif sys.platform == "darwin":
+    serving = len(sessions)
 else:
     serving = 0
     try:
@@ -204,7 +208,6 @@ else:
     except OSError:
         sys.exit(3)
 
-sessions = list(inventory.get("sessions", ()))
 missing_thread = serving < len(sessions)
 
 for row in sessions:
@@ -410,7 +413,7 @@ sweep() {
 # found by walking into it. `list` is read-only and is what the inventory
 # already calls constantly, so asking is free and cannot disturb a session.
 manager_answers() {
-  timeout "$MANAGER_PROBE_TIMEOUT" "$SK_SHPOOL" list >/dev/null 2>&1
+  sk_timeout "$MANAGER_PROBE_TIMEOUT" "$SK_SHPOOL" list >/dev/null 2>&1
 }
 
 # Is the running daemon still the binary we expect?
@@ -424,6 +427,21 @@ daemon_binary_matches() {
   local expected actual pid
   IFS= read -r expected < "$BINARY_FINGERPRINT" || return 0
   [[ $expected =~ ^[0-9a-f]{64}$ ]] || return 0
+  if [[ $(sk_platform) == Darwin ]]; then
+    python3 "$SK_INVENTORY_CORE" platform process-table 2>/dev/null |
+      python3 -c '
+import hashlib,json,pathlib,sys
+expected=sys.argv[1]
+payload=json.load(sys.stdin)
+rows=[]
+for row in payload.get("processes",[]):
+    argv=row.get("cmdline") or []
+    if argv and pathlib.Path(str(argv[0])).name=="shpool" and "daemon" in argv[1:]:
+        rows.append(pathlib.Path(str(argv[0])).resolve())
+raise SystemExit(0 if len(rows)==1 and hashlib.sha256(rows[0].read_bytes()).hexdigest()==expected else 1)
+' "$expected"
+    return
+  fi
   pid=$(pgrep -f "^${SK_SHPOOL} daemon$" | head -n 1)
   [[ -n $pid && -r /proc/$pid/exe ]] || return 0
   actual=$(sha256sum "/proc/$pid/exe" 2>/dev/null | cut -d' ' -f1)

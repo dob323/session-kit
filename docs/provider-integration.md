@@ -5,10 +5,13 @@ Session Kit can manage Claude Code, Codex, or both in one shpool inventory.
 ## Exact provider identity
 
 Claude Code identity comes from structured Claude agent state joined to the
-exact Linux process tree.
+exact native platform process tree.
 
-Codex identity comes from the native Codex root process and its open CLI
-rollout, joined to local metadata when available.
+On Linux, Codex identity comes from the native Codex root process and its open
+CLI rollout. On macOS, it comes from that exact process's `CODEX_THREAD_ID` and
+the single owner-controlled local rollout whose structured UUID matches it.
+macOS does not depend on Linux open-file-descriptor traversal. The matched
+rollout also supplies structured turn and reply state.
 
 Working directory, title, timestamp, and terminal output are never enough to
 choose a conversation. A missing, duplicated, or malformed provider identity
@@ -92,6 +95,7 @@ ambiguous, already-active, or changed identity.
 ## Compatibility
 
 Provider local formats and command interfaces can change. Each beta release
-must publish the exact Claude Code and Codex versions used in install, reply,
-exit, resume, recovery, and fork tests. Versions outside that release evidence
-are best-effort until verified.
+must publish the exact Claude Code and Codex versions, operating system, and
+architecture used in install, reply, exit, resume, recovery, and fork tests.
+Versions and platform combinations outside that release evidence are
+best-effort until verified.

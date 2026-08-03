@@ -1,8 +1,11 @@
 # Use Session Kit
 
-## SSH picker
+## Session picker
 
-When enabled, the picker opens in an interactive Bash login:
+When shell integration is enabled, SSH opens a regular shell. Type `kit` to
+open the picker. Linux Bash may print a short `kit: open sessions` hint. On
+macOS, zsh receives the command path but does not start the picker or replace
+the shell:
 
 ```text
 number          open a ready session or inspect one open elsewhere
@@ -43,6 +46,14 @@ The last form uses the provider stored for the project alias.
 A terminal number stays with the session for the current host boot. It is not a
 durable provider identity.
 
+Managed terminals use modern Bash on macOS even when the account's normal SSH
+shell is zsh. A new Claude session starts with an explicit UUID so native macOS
+process evidence can bind it immediately. A new Codex TUI has no conversation
+UUID until its first message. Before that message, the picker labels it
+`Codex started, no messages yet`; exact terminal open and close remain
+available, while UUID-dependent recovery, fork, name, and color actions wait
+for Codex to publish its thread identity.
+
 ## List, inspect, and search
 
 ```text
@@ -66,6 +77,19 @@ sp takeover <terminal-number|shpool-id>
 session to the current terminal after a fresh identity check.
 The earlier window returns to its picker; the provider conversation is not
 duplicated.
+
+## Pending Codex bar title
+
+A new Codex provider may start before its thread name exists. The process keeps
+the initial conversation ID in its status bar until that provider is restarted,
+so the dashboard marks the row `title pending`.
+
+Opening a detached session can refresh a proven-idle provider automatically.
+Session Kit never restarts an attached provider automatically. For an attached
+row, open its action menu and choose the pending-title action. The action is
+refused unless the exact provider generation is idle, has no subagents, has a
+real stored title, and still matches a fresh proof. The shell and conversation
+remain the same.
 
 ## Provider exited
 
@@ -119,10 +143,10 @@ From a shell:
 sp close <terminal-number|shpool-id>
 ```
 
-Before killing, Session Kit refreshes live evidence, resolves each number to
-one exact shpool ID, and displays the title, provider, and exact ID it is
-acting on. Cached inventory, changed generations, or ambiguous identity
-disables the action.
+Before killing, Session Kit refreshes live evidence and resolves every number
+to one exact shpool ID. Cached inventory, changed generations, hidden numbers,
+or ambiguous identity disables the whole action. No per-session confirmation
+prompt is required after that proof succeeds.
 
 Killing ends the managed terminal. It does not delete provider-native
 conversation history or optional journal files.
@@ -161,13 +185,13 @@ sp repair <terminal-number|shpool-id>
 
 Repair is reserved for direct evidence of an unrecoverable shpool handoff
 failure. The installed watchdog reports evidence and does not repair in its
-default mode. Its advanced repair mode is a separate explicit opt-in with
-terminal-state risk. Silence alone does not qualify.
+default mode. Its advanced repair mode is a separate Linux-only opt-in with
+terminal-state risk. The macOS watchdog remains report-only. Silence alone does
+not qualify.
 
-## Noninteractive confirmation
+## Noninteractive close authorization
 
-Mutations are interactive by default. Noninteractive close requires an explicit
-opt-in and the exact shpool ID:
+Noninteractive close requires an explicit opt-in and the exact shpool ID:
 
 ```bash
 SESSION_KIT_NONINTERACTIVE=1 \

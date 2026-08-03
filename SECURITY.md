@@ -6,8 +6,12 @@ Before `v0.1.0`, only the current `main` branch receives security fixes.
 
 After the first beta tag, each beta minor line is supported for 90 days after
 its first release or for 30 days after the next beta minor release, whichever
-ends later. Security fixes may require the latest patch release. Unsupported
-platforms, including macOS, are outside this policy.
+ends later. Security fixes may require the latest patch release.
+
+The `v0.1.x` beta supports its documented Linux targets and macOS 14 or newer
+on Apple Silicon and Intel. Other operating systems, older macOS releases,
+Apple Bash 3.2, and service arrangements outside the documented systemd and
+per-user launchd models are outside this policy.
 
 ## Report privately
 
@@ -24,7 +28,7 @@ request for a private contact channel. Do not describe the vulnerability.
 Include privately:
 
 - affected tag or full commit;
-- Linux and dependency versions;
+- operating system, architecture, and dependency versions;
 - the security boundary involved;
 - minimal reproduction with secrets removed;
 - whether a live session or private data can be changed or exposed;
@@ -41,6 +45,11 @@ provider, shpool, configuration, and private Session Kit state.
 
 It does not isolate hostile processes running as the same Unix user. Such a
 process may read owner-accessible terminal state or edit owner-writable files.
+
+On macOS, Session Kit uses a per-user LaunchAgent in the logged-in GUI user's
+domain. It does not install a privileged system daemon and does not provide a
+service before that user logs into the Mac desktop. Watchdog repair is
+Linux-only in `v0.1.0`; the macOS watchdog remains report-only.
 
 Optional terminal journals are off by default because they may contain
 credentials, source code, prompts, and terminal output. Read
