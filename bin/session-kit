@@ -1219,7 +1219,6 @@ manifest.write_text("\n".join(lines) + "\n", encoding="utf-8")
 os.chmod(manifest, 0o444)
 for path in sorted((path for path in root.rglob("*") if path.is_dir()), reverse=True):
     os.chmod(path, 0o555)
-os.chmod(root, 0o555)
 PY
 }
 
@@ -1244,6 +1243,7 @@ install_release() {
   find "$staging/bin" "$staging/deploy" -type f -exec chmod 0755 {} +
   write_release_manifest "$staging" "$release_id"
   mv "$staging" "$release_dir"
+  chmod 0555 "$release_dir"
   verify_release "$release_dir" "$release_id"
 }
 

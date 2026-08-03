@@ -318,6 +318,7 @@ class InstallerTests(unittest.TestCase):
         self.run_installer("--enable-login", "--journal", "off")
         current = self.home / ".local/lib/session-kit/current"
         self.assertEqual(current.resolve().name, RELEASE_A)
+        self.assertEqual(current.resolve().stat().st_mode & 0o777, 0o555)
         templates = self.home / ".config/session-kit/launchd"
         self.assertEqual(
             {path.name for path in templates.glob("*.plist")},
