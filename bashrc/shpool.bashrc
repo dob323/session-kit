@@ -71,6 +71,12 @@ if [[ -n ${SHPOOL_SESSION_NAME:-} && $- == *i* ]]; then
       [[ -r $__sk_expected ]] && break
       sleep 0.1
     done
+    # An exhausted wait means sp died between writing the start record and
+    # arming it. Every later shell in this session would silently stall 3s
+    # here; say it once instead.
+    if [[ ! -r $__sk_expected ]]; then
+      echo "[session-kit: launch record incomplete; starting a plain shell]"
+    fi
   fi
   if [[ -n ${SHPOOL_JOURNAL:-} && -r $__sk_start && -r $__sk_expected ]]; then
     __sk_provider= __sk_cwd= __sk_uuid= __sk_launch_mode=
@@ -423,10 +429,17 @@ PY
     __sk_mtime=$(stat -c %Y "$__sk_cache" 2>/dev/null || stat -f %m "$__sk_cache" 2>/dev/null || echo 0)
     __sk_age=$((__sk_now - __sk_mtime))
     if (( __sk_age > 20 )); then
+      # touch first: even if the probe hangs against a jammed manager, the
+      # next 20s of prompts skip spawning more; timeout reaps the straggler.
       (
         umask 077
         mkdir -p "$(dirname "$__sk_cache")"
-        "$HOME/.local/bin/shpool_status" --waiting-count > "$__sk_cache" 2>/dev/null
+        touch -- "$__sk_cache"
+        if timeout -k 2 15 "$HOME/.local/bin/shpool_status" --waiting-count > "$__sk_cache.new" 2>/dev/null; then
+          mv -f -- "$__sk_cache.new" "$__sk_cache"
+        else
+          rm -f -- "$__sk_cache.new"
+        fi
       ) &
     fi
     if [[ -r $__sk_cache ]]; then

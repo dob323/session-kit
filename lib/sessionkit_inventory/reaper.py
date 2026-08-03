@@ -225,6 +225,50 @@ def _safe_candidate(
     )
 
 
+def _phantom_candidate(
+    row: Mapping[str, Any],
+    item: Mapping[str, Any] | None,
+    fact: Mapping[str, Any] | None,
+) -> tuple[Any, ...] | None:
+    """A daemon-listed session whose shell process no longer exists at all.
+
+    The daemon keeps advertising it (an ESRCH during a kill aborts removal on
+    stock shpool), the kit quarantines it, and no picker action can touch it —
+    it lies in the list until a daemon restart. There is nothing to preserve:
+    no shell, no provider, no identity. Nominated only after the full
+    observation window proves the state durable.
+    """
+    session_id = row.get("name")
+    if (
+        not isinstance(session_id, str)
+        or not GENERATED_SESSION_RE.fullmatch(session_id)
+        or str(row.get("status", "")).casefold() != "disconnected"
+        or not _positive_int(row.get("started_at_unix_ms"))
+        or not isinstance(item, Mapping)
+        or item.get("shpool_id_raw") != session_id
+        or item.get("provider") != "unknown"
+        or item.get("mutation_allowed") is not False
+        or item.get("mutation_rejection_reason") != "missing-shell-generation"
+        or item.get("shpool_shell") is not None
+        or item.get("subagents")
+        or fact is not None
+    ):
+        return None
+    identity = item.get("identity")
+    if isinstance(identity, Mapping) and identity.get("pid") is not None:
+        return None
+    diagnostics = item.get("diagnostics")
+    if not isinstance(diagnostics, list) or not any(
+        isinstance(entry, str) and "found 0" in entry for entry in diagnostics
+    ):
+        return None
+    return (
+        "phantom",
+        session_id,
+        row["started_at_unix_ms"],
+    )
+
+
 def plan_auto_close(
     shpool_payload: Any,
     inventory: Mapping[str, Any],
@@ -250,6 +294,7 @@ def plan_auto_close(
     candidates: list[dict[str, Any]] = []
     for row in _rows(shpool_payload):
         session_id = row.get("name")
+        phantom = None
         proof = _safe_candidate(
             row,
             inventory_rows.get(session_id),
@@ -257,7 +302,14 @@ def plan_auto_close(
             now_monotonic_ns=now_monotonic_ns,
         )
         if proof is None:
-            continue
+            phantom = _phantom_candidate(
+                row,
+                inventory_rows.get(session_id),
+                shell_facts.get(session_id),
+            )
+            if phantom is None:
+                continue
+            proof = phantom
         proof_hash = hashlib.sha256(
             json.dumps(proof, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
@@ -273,6 +325,19 @@ def plan_auto_close(
             "proof_hash": proof_hash,
             "first_verified_monotonic_ns": first,
         }
+        if phantom is not None:
+            if now_monotonic_ns - first < minimum_age_ns:
+                continue
+            candidates.append(
+                {
+                    "class": "shell-less-phantom",
+                    "shpool_id": proof[1],
+                    "started_at_unix_ms": proof[2],
+                    "proof_hash": proof_hash,
+                    "first_verified_monotonic_ns": first,
+                }
+            )
+            continue
         if now_monotonic_ns - max(first, proof[-1]) < minimum_age_ns:
             continue
         candidates.append(

@@ -121,6 +121,88 @@ class AutoClosePlanningTests(unittest.TestCase):
         self.assertEqual(10_000, candidate["shell_start_ticks"])
         self.assertEqual(UUID, candidate["provider_uuid"])
 
+    def test_shell_less_phantom_needs_the_full_window_and_exact_shape(
+        self,
+    ) -> None:
+        phantom_id = "s20260730-012406-838224"
+        shpool = {
+            "sessions": [
+                {
+                    "name": phantom_id,
+                    "status": "Disconnected",
+                    "started_at_unix_ms": 1_800_000_000_000,
+                    "last_disconnected_at_unix_ms": 1_800_000_100_000,
+                }
+            ]
+        }
+        item = {
+            "shpool_id_raw": phantom_id,
+            "provider": "unknown",
+            "mutation_allowed": False,
+            "mutation_rejection_reason": "missing-shell-generation",
+            "shpool_shell": None,
+            "subagents": [],
+            "identity": {"uuid": None, "pid": None},
+            "diagnostics": [
+                f"expected one daemon child for {phantom_id!r}, found 0",
+                "identity candidates: Claude=0, Codex=0",
+            ],
+        }
+        inventory = {
+            "source": "live",
+            "stale": False,
+            "warnings": [],
+            "sessions": [item],
+        }
+        first_at = 20 * HOUR_NS
+        observations, candidates = reaper.plan_auto_close(
+            shpool,
+            inventory,
+            {},
+            None,
+            now_monotonic_ns=first_at,
+            minimum_age_ns=72 * HOUR_NS,
+        )
+        # Observed but never nominated before the window closes.
+        self.assertEqual([], candidates["candidates"])
+        self.assertIn(phantom_id, observations["observations"])
+        ready = reaper.plan_auto_close(
+            shpool,
+            inventory,
+            {},
+            observations,
+            now_monotonic_ns=first_at + 72 * HOUR_NS,
+            minimum_age_ns=72 * HOUR_NS,
+        )[1]
+        self.assertEqual(1, len(ready["candidates"]))
+        candidate = ready["candidates"][0]
+        self.assertEqual("shell-less-phantom", candidate["class"])
+        self.assertEqual(phantom_id, candidate["shpool_id"])
+        # ANY surviving shell fact, live pid, or different quarantine reason
+        # disqualifies the phantom shape entirely.
+        for breaker in (
+            lambda: {"facts": {phantom_id: {"shell_pid": 1, "shell_start_ticks": 2, "empty": True}}},
+            lambda: {"item": {"identity": {"uuid": None, "pid": 4242}}},
+            lambda: {"item": {"mutation_rejection_reason": "outside-shpool"}},
+            lambda: {"item": {"mutation_allowed": True}},
+            lambda: {"item": {"diagnostics": ["one daemon child present"]}},
+            lambda: {"item": {"subagents": [{"pid": 7}]}},
+        ):
+            change = breaker()
+            broken_item = {**item, **change.get("item", {})}
+            broken_inventory = {**inventory, "sessions": [broken_item]}
+            result = reaper.plan_auto_close(
+                shpool,
+                broken_inventory,
+                change.get("facts", {}),
+                observations,
+                now_monotonic_ns=first_at + 72 * HOUR_NS,
+                minimum_age_ns=72 * HOUR_NS,
+            )[1]
+            self.assertEqual(
+                [], result["candidates"], msg=f"breaker leaked: {change}"
+            )
+
     def test_every_authorized_safety_predicate_fails_closed(self) -> None:
         cases = {
             "attached": lambda s, i, f: (

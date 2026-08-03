@@ -185,13 +185,13 @@ picker_maybe_bounce_codex() {
   [[ -n $uuid ]] || return 0
   local untitled="$SK_STATE_DIR/provider-untitled/$id"
   [[ -f $untitled && ! -L $untitled ]] || return 0
-  # A marker for a long-gone session must never linger into a PID-reuse era.
+  # An old marker is skipped, never deleted: the session may simply have
+  # been parked past the window, and deleting would burn the only chance a
+  # later reopen has to repair the title. The reaper clears markers whose
+  # sessions are proven gone.
   local marker_age
   marker_age=$(( $(date +%s) - $(stat -c %Y "$untitled" 2>/dev/null || echo 0) ))
-  if (( marker_age > 604800 )); then
-    command rm -f -- "$untitled"
-    return 0
-  fi
+  (( marker_age <= 604800 )) || return 0
   local pid=${SK_PROOF_PROVIDER_PID:-} start=${SK_PROOF_PROVIDER_START:-}
   [[ $pid =~ ^[0-9]+$ && $start =~ ^[0-9]+$ ]] || return 0
   python3 - "$SNAPSHOT" "$id" "$uuid" "$pid" "$start" <<'PY' || return 0
@@ -209,7 +209,11 @@ except (OSError, ValueError, StopIteration):
     raise SystemExit(1)
 if row.get("subagents"):
     raise SystemExit(1)
-if str(row.get("agent_status") or "").casefold() == "working":
+# Positive proof of idleness, not merely "not working": a session showing
+# "needs your reply" has a pending interaction the human opened the window
+# to answer, and "state unavailable" means nothing is proven at all. TERM
+# is only safe against a provider proven between turns.
+if str(row.get("agent_status") or "").casefold() != "idle":
     raise SystemExit(1)
 # With journals disabled the output age is unknown for every session; the
 # rollout-derived turn state above is then the idleness signal. A known
@@ -239,6 +243,36 @@ PY
     mkdir -p "$SK_STATE_DIR/provider-bounce" &&
       printf '%s\n' "$uuid" > "$SK_STATE_DIR/provider-bounce/$id"
   ) 2>/dev/null || return 0
+  # The decision above ran on a snapshot taken before the create lock was
+  # released; re-prove idleness on FRESH state immediately before the TERM,
+  # or a turn that started meanwhile gets killed mid-work.
+  local recheck
+  recheck=$(mktemp "$SK_STATE_DIR/bounce-recheck.XXXXXX.json") || {
+    command rm -f -- "$SK_STATE_DIR/provider-bounce/$id"
+    return 0
+  }
+  if ! sk_guard_snapshot_file "$recheck" 2>/dev/null ||
+     ! python3 - "$recheck" "$id" <<'PY'
+import json, sys
+try:
+    data = json.load(open(sys.argv[1], encoding="utf-8"))
+    row = next(
+        s for s in data.get("sessions", [])
+        if s.get("shpool_id") == sys.argv[2]
+    )
+except (OSError, ValueError, StopIteration):
+    raise SystemExit(1)
+if row.get("subagents"):
+    raise SystemExit(1)
+raise SystemExit(
+    0 if str(row.get("agent_status") or "").casefold() == "idle" else 1
+)
+PY
+  then
+    command rm -f -- "$recheck" "$SK_STATE_DIR/provider-bounce/$id"
+    return 0
+  fi
+  command rm -f -- "$recheck"
   if kill -TERM "$pid" 2>/dev/null; then
     command rm -f -- "$untitled"
     picker_action_event picker_open provider_bounced

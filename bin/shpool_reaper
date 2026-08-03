@@ -83,8 +83,10 @@ state = os.path.abspath(state_raw)
 proc = os.path.abspath(proc_raw)
 uid = os.geteuid()
 pattern = re.compile(
-    r"^(?:login-(?:snapshot|view|projects|recovery)|picker-proof|sp-guard)"
-    r"\.[A-Za-z0-9_]{6,16}\.json$"
+    r"^(?:(?:login-(?:snapshot|view|projects|recovery)|picker-proof|sp-guard"
+    r"|provider-proof|bounce-recheck|auto-close-proof)"
+    r"\.[A-Za-z0-9_]{6,16}\.json"
+    r"|\.inventory\.json\.[A-Za-z0-9_]{6,16})$"
 )
 
 try:

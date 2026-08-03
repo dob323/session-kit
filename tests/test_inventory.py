@@ -902,6 +902,46 @@ class CodexTurnStateTests(unittest.TestCase):
         aborted = self._event("event_msg", {"type": "turn_aborted"})
         self.assertEqual("idle", self._state([question, aborted]))
 
+    def test_completed_turn_ending_in_a_prose_question_is_reply_optional(
+        self,
+    ) -> None:
+        started = self._event("event_msg", {"type": "task_started"})
+        asking = self._event(
+            "response_item",
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": "I checked both configs.\n\nWhich hostname should I use?",
+                    }
+                ],
+            },
+        )
+        completed = self._event("event_msg", {"type": "task_complete"})
+        # A finished turn whose last words ask the human something is a soft
+        # wait, not idle — but never the hard "needs your reply".
+        self.assertEqual(
+            "reply optional", self._state([started, asking, completed])
+        )
+        # A statement ending the turn stays idle.
+        stating = self._event(
+            "response_item",
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {"type": "output_text", "text": "Done. Both configs match."}
+                ],
+            },
+        )
+        self.assertEqual("idle", self._state([started, stating, completed]))
+        # A NEW turn clears the stale question.
+        self.assertEqual(
+            "working", self._state([started, asking, completed, started])
+        )
+
     def test_timed_question_is_optional_and_never_blocking(self) -> None:
         state = self._state(
             [
@@ -1166,6 +1206,158 @@ class TerminalNumberRegistryTests(unittest.TestCase):
             loaded = getattr(inventory_core, "load_inventory_input")(path)
         self.assertEqual(1, loaded["sessions"][0]["terminal_number"])
         self.assertIsNone(loaded["sessions"][1]["terminal_number"])
+
+    def test_recycled_numbers_respect_the_quarantine_and_continuity(self) -> None:
+        quarantine = inventory_core.TERMINAL_NUMBER_QUARANTINE_SECONDS
+        now = 1_800_000_000.0
+        # Pass 1: two live sessions take 1 and 2.
+        inventory = inventory_core.build_inventory(
+            *inventory_fixture(2), now=1_800_000_000
+        )
+        retired: dict[int, float] = {}
+        registry = inventory_core.apply_terminal_numbers(
+            inventory,
+            inventory_core._empty_terminal_registry("boot-a"),
+            boot_id="boot-a",
+            allocate=True,
+            retired=retired,
+            current_time=now,
+        )
+        self.assertEqual(
+            [1, 2], [item["terminal_number"] for item in inventory["sessions"]]
+        )
+        self.assertEqual({}, retired)
+
+        # Pass 2: session 1 died — its number enters quarantine.
+        survivor = inventory_core.build_inventory(
+            *inventory_fixture(2), now=1_800_000_100
+        )
+        survivor["sessions"] = [survivor["sessions"][1]]
+        registry = inventory_core.apply_terminal_numbers(
+            survivor,
+            registry,
+            boot_id="boot-a",
+            allocate=True,
+            retired=retired,
+            current_time=now + 100,
+        )
+        self.assertEqual(2, survivor["sessions"][0]["terminal_number"])
+        self.assertEqual({1: now + 100}, retired)
+
+        # Pass 3, inside the quarantine: a NEW session must not take 1.
+        fresh = inventory_core.build_inventory(
+            *inventory_fixture(3), now=1_800_000_200
+        )
+        fresh["sessions"] = fresh["sessions"][1:]
+        registry = inventory_core.apply_terminal_numbers(
+            fresh,
+            registry,
+            boot_id="boot-a",
+            allocate=True,
+            retired=retired,
+            current_time=now + 200,
+        )
+        numbers = {
+            item["shpool_id_raw"]: item["terminal_number"]
+            for item in fresh["sessions"]
+        }
+        self.assertEqual(2, numbers["main2"])
+        self.assertEqual(3, numbers["main3"])
+        self.assertIn(1, retired)
+
+        # Pass 4: the dead conversation RECOVERS inside the window — its AI
+        # binding hands its old number back and the retirement clears.
+        revived = inventory_core.build_inventory(
+            *inventory_fixture(3), now=1_800_000_300
+        )
+        registry = inventory_core.apply_terminal_numbers(
+            revived,
+            registry,
+            boot_id="boot-a",
+            allocate=True,
+            retired=retired,
+            current_time=now + 300,
+        )
+        revived_numbers = {
+            item["shpool_id_raw"]: item["terminal_number"]
+            for item in revived["sessions"]
+        }
+        self.assertEqual(1, revived_numbers["main"])
+        self.assertNotIn(1, retired)
+
+        # Pass 5: dead again, and the quarantine EXPIRES — the number frees,
+        # its bindings prune, and the next new session takes the lowest gap.
+        after = inventory_core.build_inventory(
+            *inventory_fixture(3), now=1_800_000_400
+        )
+        after["sessions"] = after["sessions"][1:]
+        registry = inventory_core.apply_terminal_numbers(
+            after,
+            registry,
+            boot_id="boot-a",
+            allocate=True,
+            retired=retired,
+            current_time=now + 400,
+        )
+        self.assertEqual({1: now + 400}, {n: retired[n] for n in retired if n == 1})
+        expired_pass = inventory_core.build_inventory(
+            *inventory_fixture(4), now=1_800_000_500
+        )
+        expired_pass["sessions"] = expired_pass["sessions"][1:]
+        registry = inventory_core.apply_terminal_numbers(
+            expired_pass,
+            registry,
+            boot_id="boot-a",
+            allocate=True,
+            retired=retired,
+            current_time=now + 400 + quarantine + 1,
+        )
+        expired_numbers = {
+            item["shpool_id_raw"]: item["terminal_number"]
+            for item in expired_pass["sessions"]
+        }
+        # main4 is new; 1 finished quarantine and is the lowest free number.
+        self.assertEqual(1, expired_numbers["main4"])
+        self.assertNotIn(1, retired)
+        self.assertNotIn(
+            f"ai:claude:{uuid_for(1)}", registry["bindings"]
+        )
+        # Legacy invariant for pinned releases stays intact.
+        self.assertGreater(
+            registry["next_number"], max(registry["bindings"].values())
+        )
+
+    def test_retirement_ledger_round_trip_and_boot_reset(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "terminal-numbers-retired.json"
+            payload = inventory_core._terminal_retirement_payload(
+                {3: 1_800_000_000.0, 1: 1_700_000_000.5}, "boot-a"
+            )
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            os.chmod(path, 0o600)
+            self.assertEqual(
+                {1: 1_700_000_000.5, 3: 1_800_000_000.0},
+                inventory_core._read_terminal_retirements(path, "boot-a"),
+            )
+            # A different boot voids the ledger (numbers restart anyway).
+            self.assertEqual(
+                {}, inventory_core._read_terminal_retirements(path, "boot-b")
+            )
+            # Junk keys/values never surface.
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": payload["schema_version"],
+                        "boot_id": "boot-a",
+                        "retired": {"x": 5, "2": True, "4": -1, "5": 9.5},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                {5: 9.5},
+                inventory_core._read_terminal_retirements(path, "boot-a"),
+            )
 
     def test_only_exact_inert_orphan_shape_can_skip_numbering(self) -> None:
         base = inventory_core.build_inventory(

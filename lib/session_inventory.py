@@ -2382,6 +2382,7 @@ def _state_paths(config: Mapping[str, Any]) -> dict[str, Path]:
         "aliases_source_backup": root / "aliases.json.pre-migration-v1",
         "terminal_numbers": root / "terminal-numbers.json",
         "terminal_numbers_epoch": root / "terminal-numbers.initialized.json",
+        "terminal_numbers_retired": root / "terminal-numbers-retired.json",
         "config_lock": root / "config.lock",
         "lock": root / "inventory.lock",
     }
@@ -4217,17 +4218,89 @@ def _missing_shell_generation_is_quarantined(
     )
 
 
+# A dead session's number stays reserved this long before a new session may
+# take it (Dan 2026-08-02: recycle-with-quarantine). A conversation recovered
+# inside the window keeps its number via its surviving AI binding.
+TERMINAL_NUMBER_QUARANTINE_SECONDS = 7 * 86400
+
+
+def _read_terminal_retirements(path: Path, boot_id: str) -> dict[int, float]:
+    """Retirement ledger: number -> unix time its last session disappeared.
+
+    Kept OUTSIDE the registry file: pinned schema-v1 releases reject unknown
+    registry keys, and standing windows keep running them. A boot change
+    resets the ledger with the registry (numbers restart at 1 anyway).
+    """
+    raw_bytes = _read_bounded_owner_file(
+        path,
+        label="terminal retirement ledger",
+        max_bytes=MAX_PRIVATE_JSON_BYTES,
+        exact_mode=0o600,
+        allow_missing=True,
+    )
+    if raw_bytes is None:
+        return {}
+    try:
+        payload = json.loads(raw_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return {}
+    if not isinstance(payload, Mapping) or payload.get("boot_id") != boot_id:
+        return {}
+    raw = payload.get("retired")
+    result: dict[int, float] = {}
+    if isinstance(raw, Mapping):
+        for key, value in raw.items():
+            if (
+                isinstance(key, str)
+                and key.isdigit()
+                and int(key) > 0
+                and isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and value > 0
+            ):
+                result[int(key)] = float(value)
+    return result
+
+
+def _terminal_retirement_payload(
+    retired: Mapping[int, float], boot_id: str
+) -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "boot_id": boot_id,
+        "retired": {str(k): retired[k] for k in sorted(retired)},
+    }
+
+
 def apply_terminal_numbers(
     inventory: dict[str, Any],
     registry: dict[str, Any],
     *,
     boot_id: str,
     allocate: bool,
+    retired: dict[int, float] | None = None,
+    current_time: float | None = None,
 ) -> dict[str, Any]:
     """Apply boot-stable selectors without changing contiguous internal rows."""
     checked = _validate_terminal_registry(registry, boot_id)
     bindings: dict[str, int] = dict(checked["bindings"])
     next_number = checked["next_number"]
+    recycle = allocate and retired is not None
+    now = current_time if current_time is not None else time.time()
+    if recycle:
+        # Bindings whose number finished its quarantine are pruned; the
+        # number becomes allocatable below. Live numbers are never here.
+        expired = {
+            number
+            for number, stamp in retired.items()
+            if now - stamp >= TERMINAL_NUMBER_QUARANTINE_SECONDS
+        }
+        if expired:
+            for key in [k for k, v in bindings.items() if v in expired]:
+                del bindings[key]
+            for number in expired:
+                retired.pop(number, None)
+    reserved_numbers: set[int] = set(bindings.values())
     active_numbers: set[int] = set()
     for item in inventory.get("sessions", ()):
         if not isinstance(item, dict):
@@ -4276,6 +4349,15 @@ def apply_terminal_numbers(
             # conversation. A read-only guard must not expose that number as
             # belonging to this unrelated identity.
             number = None
+        elif allocate and recycle:
+            # Lowest free number: anything not reserved by a live or
+            # quarantined binding. Keeps numbers small forever.
+            number = 1
+            while number in reserved_numbers:
+                number += 1
+            reserved_numbers.add(number)
+            if number >= next_number:
+                next_number = number + 1
         elif allocate:
             number = next_number
             next_number += 1
@@ -4301,6 +4383,19 @@ def apply_terminal_numbers(
                     bindings[ai_key] = number
         item["terminal_number"] = number
         item.pop("_terminal_identity_hint", None)
+    if recycle:
+        # Stamp newly dead numbers; clear stamps on anything alive again
+        # (an exact recovery inside the quarantine window).
+        bound = set(bindings.values())
+        for number in bound - active_numbers:
+            retired.setdefault(number, now)
+        for number in active_numbers:
+            retired.pop(number, None)
+        # Legacy invariant for pinned releases: next_number stays above
+        # every stored binding even after pruning shrank the map.
+        top = max(bound, default=0)
+        if next_number <= top:
+            next_number = top + 1
     return {
         "schema_version": SCHEMA_VERSION,
         "boot_id": boot_id,
@@ -5595,11 +5690,22 @@ def snapshot(*, write_state: bool = True, config: dict[str, Any] | None = None) 
                         boot_id,
                         paths["terminal_numbers_epoch"],
                     )
+                    retired_numbers = _read_terminal_retirements(
+                        paths["terminal_numbers_retired"], boot_id
+                    )
                     updated_registry = apply_terminal_numbers(
-                        result, registry, boot_id=boot_id, allocate=True
+                        result,
+                        registry,
+                        boot_id=boot_id,
+                        allocate=True,
+                        retired=retired_numbers,
                     )
                     atomic_write_json(
                         paths["terminal_numbers"], updated_registry
+                    )
+                    atomic_write_json(
+                        paths["terminal_numbers_retired"],
+                        _terminal_retirement_payload(retired_numbers, boot_id),
                     )
                     atomic_write_json(
                         paths["terminal_numbers_epoch"],

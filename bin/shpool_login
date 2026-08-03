@@ -130,6 +130,7 @@ refresh_snapshot() {
   SNAPSHOT=$fresh
   QUERY=""
   PAGE=1
+  refresh_pending_cache
   build_view
 }
 
@@ -814,13 +815,29 @@ except OSError:
 PY
 }
 
+# Recovery pending count is refreshed with the snapshot, not on every
+# keystroke: recovery state only changes through actions or refreshes, and
+# recomputing it per redraw ran a full status build each keypress — most of
+# the visible menu lag on a loaded box.
+PENDING_CACHE=0
+refresh_pending_cache() {
+  PENDING_CACHE=$(recovery_count 2>/dev/null || printf '0')
+  [[ $PENDING_CACHE =~ ^[0-9]+$ ]] || PENDING_CACHE=0
+}
+
 render_main() {
   local pending other_count unavailable_count
-  pending=$(recovery_count 2>/dev/null || printf '0')
-  [[ $pending =~ ^[0-9]+$ ]] || pending=0
-  other_count=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1])).get("outside_agents",[])))' "$VIEW" 2>/dev/null || printf '0')
+  pending=$PENDING_CACHE
+  # One python pass for both counts (was two spawns per redraw).
+  local counts
+  counts=$(python3 -c 'import json,sys
+data = json.load(open(sys.argv[1]))
+print(len(data.get("outside_agents", [])))
+print(int((data.get("_picker") or {}).get("unavailable_total") or 0))' \
+    "$VIEW" 2>/dev/null) || counts=$'0\n0'
+  other_count=${counts%%$'\n'*}
+  unavailable_count=${counts##*$'\n'}
   [[ $other_count =~ ^[0-9]+$ ]] || other_count=0
-  unavailable_count=$(python3 -c 'import json,sys; print(int((json.load(open(sys.argv[1])).get("_picker") or {}).get("unavailable_total") or 0))' "$VIEW" 2>/dev/null || printf '0')
   [[ $unavailable_count =~ ^[0-9]+$ ]] || unavailable_count=0
   PAGE_SIZE=$(page_size "$pending" "$REPAIR_BANNER_LINES")
   # A failed sizing helper must degrade to a usable page, never to a bash
@@ -868,8 +885,8 @@ show_more_menu() {
   while true; do
     # Recomputed every pass: restoring recoveries from inside this menu must
     # not leave it advertising counts that are no longer true.
-    pending=$(recovery_count 2>/dev/null || printf '0')
-    [[ $pending =~ ^[0-9]+$ ]] || pending=0
+    refresh_pending_cache
+    pending=$PENDING_CACHE
     other_count=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1])).get("outside_agents",[])))' "$VIEW" 2>/dev/null || printf '0')
     [[ $other_count =~ ^[0-9]+$ ]] || other_count=0
     unavailable_count=$(python3 -c 'import json,sys; print(int((json.load(open(sys.argv[1])).get("_picker") or {}).get("unavailable_total") or 0))' "$VIEW" 2>/dev/null || printf '0')

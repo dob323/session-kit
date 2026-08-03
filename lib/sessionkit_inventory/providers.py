@@ -33,9 +33,32 @@ def _aligned_bounded_tail(
     return raw
 
 
+def _final_text_asks_a_question(payload: Mapping) -> bool:
+    """True when an assistant message ends by asking the human something.
+
+    Codex serializes only explicit request_user_input calls as questions, but
+    assistants routinely finish a turn with prose like "which hostname should
+    I use?" and then task_complete — the human is being waited on while every
+    structured signal says idle. Conservative test: the LAST assistant
+    message's final non-empty line ends with a question mark.
+    """
+    if payload.get("role") != "assistant":
+        return False
+    content = payload.get("content")
+    if not isinstance(content, list):
+        return False
+    text = ""
+    for part in content:
+        if isinstance(part, Mapping) and isinstance(part.get("text"), str):
+            text = part["text"]
+    lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
+    return bool(lines) and lines[-1].endswith("?")
+
+
 def _parse_rollout_state(raw: bytes) -> str:
     lifecycle_state = "state unavailable"
     pending_questions: dict[str, bool] = {}
+    final_message_asks = False
     for line in raw.splitlines():
         if not line:
             continue
@@ -53,6 +76,7 @@ def _parse_rollout_state(raw: bytes) -> str:
             lifecycle = payload.get("type")
             if lifecycle == "task_started":
                 pending_questions.clear()
+                final_message_asks = False
                 lifecycle_state = "working"
             elif lifecycle in {"task_complete", "turn_aborted"}:
                 pending_questions.clear()
@@ -70,6 +94,9 @@ def _parse_rollout_state(raw: bytes) -> str:
             if call_id in pending_questions:
                 pending_questions.pop(call_id)
                 lifecycle_state = "working"
+            continue
+        if kind == "message":
+            final_message_asks = _final_text_asks_a_question(payload)
             continue
         if kind != "function_call" or payload.get("name") != "request_user_input":
             continue
@@ -99,6 +126,11 @@ def _parse_rollout_state(raw: bytes) -> str:
     if pending_questions:
         if any(not optional for optional in pending_questions.values()):
             return "needs your reply"
+        return "reply optional"
+    if lifecycle_state == "idle" and final_message_asks:
+        # A completed turn whose last words are a question: the human is
+        # being waited on even though no structured request exists. Soft
+        # signal only — never the hard "needs your reply".
         return "reply optional"
     return lifecycle_state
 

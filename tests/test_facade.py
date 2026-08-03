@@ -40,6 +40,8 @@ REQUIRED_SYMBOLS = {
     "_parse_claude_payload",
     "_provider_title_info",
     "_read_terminal_registry",
+    "_read_terminal_retirements",
+    "_terminal_retirement_payload",
     "_valid_colors",
     "_release_sha",
     "_require_supported_platform",
@@ -48,6 +50,7 @@ REQUIRED_SYMBOLS = {
     "_state_paths",
     "_terminal_generation_key",
     "_validate_terminal_registry",
+    "TERMINAL_NUMBER_QUARANTINE_SECONDS",
     "acknowledge_pending",
     "apply_legacy_recovery_manifest",
     "apply_retained_setup_attributions",
@@ -83,6 +86,7 @@ REQUIRED_SYMBOLS = {
     "prune_automatic_titles",
     "publish_legacy_migration_plan",
     "read_claude_ai_title",
+    "read_claude_transcript_signals",
     "read_codex_db",
     "read_codex_session_index",
     "recent_output_times",
@@ -172,7 +176,7 @@ def referenced_facade_symbols() -> set[str]:
 
 class InventoryFacadeTests(unittest.TestCase):
     def test_contract_matches_every_current_test_reference(self) -> None:
-        self.assertEqual(len(REQUIRED_SYMBOLS), 85)
+        self.assertEqual(len(REQUIRED_SYMBOLS), 89)
         self.assertEqual(REQUIRED_SYMBOLS, referenced_facade_symbols())
 
     def test_current_tested_symbols_remain_available(self) -> None:
