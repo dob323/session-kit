@@ -2679,6 +2679,57 @@ class PickerProofTests(unittest.TestCase):
             )
         )
 
+    def test_picker_open_arms_bracketed_paste_on_a_real_terminal(self) -> None:
+        """The attach handover re-arms bracketed paste before shpool runs.
+
+        shpool's restore replays screen contents only, never input modes, so
+        a reopened window lost bracketed paste: terminal paste protection
+        prompted on every multi-line paste and each newline submitted the
+        composer early. The picker path must emit the mode when stdout is a
+        terminal; the piped runs elsewhere in this file prove it stays silent
+        without one.
+        """
+        import pty
+        import select
+        import time
+
+        proof = self._prime(session_row("main2"))
+        env = os.environ.copy()
+        env.update(self.fixture.env())
+        env["FAKE_EXPECT_CREATE_LOCK"] = "unlocked"
+        pid, descriptor = pty.fork()
+        if pid == 0:
+            os.execvpe(str(SP), [str(SP), "picker-open", str(proof)], env)
+        output = bytearray()
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select([descriptor], [], [], 0.1)
+            if ready:
+                try:
+                    chunk = os.read(descriptor, 65536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                output.extend(chunk)
+            done, _ = os.waitpid(pid, os.WNOHANG)
+            if done == pid:
+                while True:
+                    ready, _, _ = select.select([descriptor], [], [], 0)
+                    if not ready:
+                        break
+                    try:
+                        chunk = os.read(descriptor, 65536)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    output.extend(chunk)
+                break
+        os.close(descriptor)
+        self.assertIn(b"\x1b[?2004h", bytes(output))
+        self.assertEqual("attach main2\n", self.fixture.shpool_log.read_text())
+
 
 class JournalHistoryTests(unittest.TestCase):
     def setUp(self) -> None:

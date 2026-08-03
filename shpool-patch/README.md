@@ -1,10 +1,13 @@
-# Optional shpool 0.11.0 heartbeat patch
+# Optional shpool 0.11.0 patches
 
-Session Kit uses official shpool 0.11.0 by default. This directory contains an
-optional one-file source patch for users who have confirmed the matching
-heartbeat failure in their own daemon logs.
+Session Kit uses official shpool 0.11.0 by default. This directory contains
+optional one-file source patches: `0001` for a heartbeat failure confirmed in
+daemon logs, `0002` for input-mode loss on reattach, and `0003` for sessions
+that become unkillable once their shell dies on its own. Apply them in
+numeric order; `0002` touches a different file and is independent of the
+other two.
 
-The patch is not installed, built, selected, or activated by Session Kit.
+The patches are not installed, built, selected, or activated by Session Kit.
 
 ## Problem
 
@@ -86,6 +89,51 @@ Kit state if you use binary-change monitoring.
 
 Rollback restores the prior binary and also requires a planned daemon restart.
 Session Kit never performs either restart.
+
+## Input-mode restore patch (0002)
+
+On attach, shpool replays restorable screen contents but not the input modes
+the application enabled: bracketed paste, application cursor and keypad keys,
+and the mouse protocol. A freshly connected terminal — a new window
+reattaching to a long-lived session — starts with those modes off while the
+application inside still believes they are on.
+
+The visible failure is pasting. Terminals with paste protection prompt before
+pasting multi-line text into a session that appears to lack bracketed paste,
+and the paste then arrives unbracketed, so embedded newlines submit or execute
+immediately instead of arriving as one block. Arrow-key and mouse handling can
+be similarly skewed until the application re-asserts its modes.
+
+`0002-restore-input-modes-on-reattach.patch` appends the engine's tracked
+input-mode state (`input_mode_formatted()`, already maintained by the
+`shpool_vt100` engine) to the restore buffer in both vt100 restore paths
+(`screen` and `lines` modes).
+
+Limits: modes are replayed only when a restore buffer is emitted at all, so
+the `simple` restore mode and the vterm engine are unchanged. The build,
+activation, and rollback procedure is the same as for 0001, including the
+daemon-restart requirement.
+
+## Dead-shell kill patch (0003)
+
+`shpool kill` sends SIGHUP to the session's child and treats any signal
+error as fatal. If the child already exited on its own — a crash, a clean
+exit the daemon's bookkeeping missed, an external kill — the signal returns
+ESRCH, the kill handler aborts, and the session is never removed from the
+daemon's table. The result is a phantom session that `shpool list` keeps
+advertising, that cannot be attached, and that no kill can remove until the
+daemon itself restarts. Log signature:
+
+```text
+ERROR ... handling new connection: killing shell proc
+Caused by:
+    0: sending SIGHUP to child proc
+    1: ESRCH: No such process
+```
+
+`0003-kill-tolerates-an-already-dead-shell.patch` treats ESRCH as the state
+kill exists to reach: the kill succeeds and the session is removed. Both the
+SIGHUP and SIGKILL-escalation sites are guarded.
 
 ## License and upstream
 

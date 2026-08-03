@@ -76,6 +76,19 @@ sk_push_session_color() {
       || true ) &
 }
 
+assert_input_modes() {
+  # shpool's restore replays screen contents only, never the input modes the
+  # application enabled, so a freshly opened window loses bracketed paste on
+  # reattach: terminals flag multi-line pastes as unsafe and every newline
+  # submits early. Re-arm bracketed paste before handing the terminal to
+  # shpool; the restore buffer carries no mode resets, so this survives the
+  # replay. The optional shpool-patch/0002 makes the daemon replay the full
+  # tracked mode state itself.
+  if [[ -t 1 ]]; then
+    printf '\033[?2004h'
+  fi
+}
+
 attach_id() {
   local id=$1 cwd=${2:-} force=${3:-0}
   local -a args=(attach)
@@ -84,6 +97,7 @@ attach_id() {
   [[ -z $cwd ]] || args+=(--dir "$cwd")
   args+=("$id")
   sk_push_session_color "${SK_PROVIDER:-}" "${SK_UUID:-}"
+  assert_input_modes
   exec "$SK_SHPOOL" "${args[@]}"
 }
 
@@ -95,6 +109,7 @@ picker_attach_id() {
   [[ -z $cwd ]] || args+=(--dir "$cwd")
   args+=("$id")
   sk_push_session_color "${SK_PROOF_PROVIDER:-}" "${SK_PROOF_UUID:-}"
+  assert_input_modes
   if "$SK_SHPOOL" "${args[@]}"; then
     return 0
   fi
@@ -102,6 +117,7 @@ picker_attach_id() {
   # daemon's teardown of the previous client, and the action log shows those
   # first attempts failing regularly.
   sleep 0.7
+  assert_input_modes
   "$SK_SHPOOL" "${args[@]}"
 }
 

@@ -136,22 +136,27 @@ jobs:
           coverage report --skip-empty --fail-under=70
 
   shpool-patch:
-    name: Optional shpool patch applies and builds
+    name: Optional shpool patches apply and build
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - name: Check patch against shpool 0.11.0
+      - name: Check patches against shpool 0.11.0
         run: |
           git clone --branch v0.11.0 --depth 1 \
             https://github.com/shell-pool/shpool.git \
             "$RUNNER_TEMP/shpool"
           test "$(git -C "$RUNNER_TEMP/shpool" rev-parse HEAD)" = \
             fe2d11595ff255810523b0868159dec051e303f1
-          git -C "$RUNNER_TEMP/shpool" apply --check \
-            "$GITHUB_WORKSPACE/shpool-patch/0001-heartbeat-ack-timeout-is-not-fatal.patch"
-          git -C "$RUNNER_TEMP/shpool" apply \
-            "$GITHUB_WORKSPACE/shpool-patch/0001-heartbeat-ack-timeout-is-not-fatal.patch"
+          for patch in \
+            0001-heartbeat-ack-timeout-is-not-fatal.patch \
+            0002-restore-input-modes-on-reattach.patch \
+            0003-kill-tolerates-an-already-dead-shell.patch; do
+            git -C "$RUNNER_TEMP/shpool" apply --check \
+              "$GITHUB_WORKSPACE/shpool-patch/$patch"
+            git -C "$RUNNER_TEMP/shpool" apply \
+              "$GITHUB_WORKSPACE/shpool-patch/$patch"
+          done
           cargo build --locked --release --manifest-path \
             "$RUNNER_TEMP/shpool/Cargo.toml" --bin shpool
