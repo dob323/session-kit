@@ -2242,7 +2242,11 @@ def build_inventory(
 
     outside_agents: list[dict[str, Any]] = []
     for agent in claude_agents:
-        if agent["pid"] in mapped_claude or agent["kind"] not in {"", "interactive"}:
+        if (
+            agent["pid"] in mapped_claude
+            or agent["kind"] not in {"", "interactive"}
+            or agent["pid"] not in process_table
+        ):
             continue
         uuid = agent["uuid"]
         recovery = recovery_spec("claude", uuid, agent["cwd"] or None)

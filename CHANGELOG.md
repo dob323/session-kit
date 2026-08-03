@@ -6,6 +6,14 @@ Session Kit follows [Semantic Versioning](https://semver.org/).
 
 No changes yet.
 
+## [0.1.3] - 2026-08-03
+
+### Fixed
+
+- Ignored stale Claude agent records whose process no longer has a live Darwin
+  generation, so an exiting provider cannot block later guarded session
+  actions on macOS.
+
 ## [0.1.2] - 2026-08-03
 
 ### Fixed

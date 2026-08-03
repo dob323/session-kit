@@ -411,6 +411,24 @@ class InventoryIdentityTests(unittest.TestCase):
         self.assertEqual(outside_uuid, result["outside_agents"][0]["identity"]["uuid"])
         self.assertTrue(result["outside_agents"][0]["needs_you"])
 
+    def test_stale_claude_agent_without_live_process_is_not_outside(self) -> None:
+        fixture = list(inventory_fixture(1, providers=("codex",)))
+        fixture[1].append(
+            {
+                "pid": 9000,
+                "sessionId": uuid_for(9000),
+                "cwd": "/srv/exiting",
+                "kind": "interactive",
+                "name": "Exiting task",
+                "status": "idle",
+            }
+        )
+
+        result = inventory_core.build_inventory(*fixture, now=1_800_000_000)
+
+        self.assertEqual([], result["outside_agents"])
+        self.assertTrue(inventory_core.guard_live_inventory(result))
+
     def test_pid_loss_never_carries_an_old_identity_forward(self) -> None:
         fixture = list(inventory_fixture(1, providers=("codex",)))
         exact = inventory_core.build_inventory(*fixture, now=1_800_000_000)
