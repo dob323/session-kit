@@ -39,13 +39,13 @@ an explicit search when diagnosis requires exact identity.
 ## Install the beta release
 
 Download the archive, checksum, and provenance files attached to the
-[`v0.1.0` release](https://github.com/dob323/session-kit/releases/tag/v0.1.0).
+[`v0.1.1` release](https://github.com/dob323/session-kit/releases/tag/v0.1.1).
 With the GitHub CLI:
 
 ```bash
 mkdir session-kit-download
 cd session-kit-download
-gh release download v0.1.0 --repo dob323/session-kit
+gh release download v0.1.1 --repo dob323/session-kit
 if command -v sha256sum >/dev/null; then
   sha256sum --check session-kit-*.sha256
 else
