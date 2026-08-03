@@ -4,7 +4,18 @@ Session Kit follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-No changes yet.
+### Fixed
+
+- Preserved pipeline input through the cross-platform timeout wrapper so the
+  hidden Claude bootstrap receives its native `/color` command on Linux and
+  macOS.
+- Reconciled Claude transcript auto-titles with the provider's `agent-name`
+  record without replacing an explicit `/rename`.
+- Passed the hydrated Claude name through the native `--name` option when an
+  exited provider is reopened.
+- Kept the dashboard title state pending until the live Claude process reports
+  the same visible name; an already-running Claude TUI is never reported as
+  repainted by an external storage write.
 
 ## [0.1.0] - 2026-08-03
 

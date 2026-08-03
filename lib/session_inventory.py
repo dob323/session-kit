@@ -337,6 +337,7 @@ def _parse_claude_payload(payload: Any) -> list[dict[str, Any]]:
                 else None,
                 "title": clean_text(item.get("name"), 120),
                 "ai_title": clean_text(item.get("aiTitle"), 120),
+                "agent_name": clean_text(item.get("agentName"), 120),
                 "agent_color": item.get("agentColor")
                 if item.get("agentColor") in SESSION_COLORS
                 else "",
@@ -363,7 +364,7 @@ def read_claude_transcript_signals(
     head and tail; the last record of each kind wins. Any problem returns
     empty evidence.
     """
-    signals = {"ai_title": "", "agent_color": ""}
+    signals = {"ai_title": "", "agent_name": "", "agent_color": ""}
     exact_uuid = valid_uuid(uuid)
     if not exact_uuid:
         return signals
@@ -389,7 +390,10 @@ def read_claude_transcript_signals(
             continue
         for chunk in chunks:
             for line in chunk.split(b"\n"):
-                if b'"ai-title"' not in line and b'"agent-color"' not in line:
+                if not any(
+                    marker in line
+                    for marker in (b'"ai-title"', b'"agent-name"', b'"agent-color"')
+                ):
                     continue
                 try:
                     record = json.loads(line.decode("utf-8", "strict"))
@@ -404,6 +408,10 @@ def read_claude_transcript_signals(
                     candidate = clean_text(record.get("aiTitle"), 120)
                     if candidate:
                         signals["ai_title"] = candidate
+                elif record.get("type") == "agent-name":
+                    candidate = clean_text(record.get("agentName"), 120)
+                    if candidate:
+                        signals["agent_name"] = candidate
                 elif record.get("type") == "agent-color":
                     color = record.get("agentColor")
                     if isinstance(color, str) and color in SESSION_COLORS:
@@ -437,11 +445,14 @@ def _enrich_claude_payload(payload: Any) -> Any:
             except (OSError, ValueError):
                 pass
         needs_title = not item.get("aiTitle")
+        needs_name = not item.get("agentName")
         needs_color = item.get("agentColor") not in SESSION_COLORS
-        if needs_title or needs_color:
+        if needs_title or needs_name or needs_color:
             signals = read_claude_transcript_signals(uuid, home)
             if needs_title:
                 item["aiTitle"] = signals["ai_title"]
+            if needs_name:
+                item["agentName"] = signals["agent_name"]
             if needs_color:
                 item["agentColor"] = signals["agent_color"]
     return payload
@@ -1963,6 +1974,7 @@ def build_inventory(
         uuid: str | None
         starting_provider = None
         provider_title_is_explicit = True
+        provider_title_state = "ready"
         claude_color_evidence = ""
         if (
             len(claude_candidates) == 1
@@ -1980,6 +1992,11 @@ def build_inventory(
             # label; any explicit rename keeps outranking both.
             if agent.get("ai_title") and agent.get("name_source") == "derived":
                 native_title = agent["ai_title"]
+                # Transcript hydration prepares the next start, but only the
+                # live structured agent name proves this process rendered it.
+                # External writes cannot repaint an already-running TUI.
+                if agent.get("title") != native_title:
+                    provider_title_state = "pending"
             provider = "claude"
             cwd = agent["cwd"] or clean_text(process_table.get(pid, {}).get("cwd"), 4096)
             identity = _agent_identity(
@@ -2192,6 +2209,8 @@ def build_inventory(
         )
         if claude_color_evidence:
             sessions[-1]["_claude_agent_color"] = claude_color_evidence
+        if provider == "claude":
+            sessions[-1]["provider_title_state"] = provider_title_state
         if provider == "unknown" and starting_provider:
             # Display only. `provider` stays "unknown", so identity, mutation
             # and recovery decisions are completely unaffected.
@@ -2208,6 +2227,8 @@ def build_inventory(
             automatic_state = "not-applicable"
         elif not automatic_naming_enabled():
             automatic_state = "disabled"
+        elif provider == "claude" and provider_title_state == "pending":
+            automatic_state = "pending"
         elif title_source in {"alias", "native"}:
             automatic_state = "not-needed"
         elif title_source == "automatic":
@@ -3770,6 +3791,66 @@ def propagate_provider_title(
         "provider_title_pushes": pushed,
         "provider_title_warnings": warnings,
     }
+
+
+def claude_pending_native_hydrations(
+    config: dict[str, Any] | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    """Fill absent visible records for exact managed Claude sessions.
+
+    Claude's ai-title record names the conversation in inventory, but the
+    prompt bar and future resumes use agent-name. A missing native color has
+    the same next-start behavior. This bounded reconciliation never replaces
+    a provider-side rename or color.
+    """
+    env = environ if environ is not None else os.environ
+    naming_enabled = automatic_naming_enabled(env)
+    settings = config or load_config()
+    try:
+        live = snapshot(write_state=False, config=settings)
+    except CollectionError:
+        return []
+    if not guard_live_inventory(live):
+        return []
+    home_raw = env.get("HOME") or (
+        os.fspath(Path.home()) if environ is None else ""
+    )
+    if not home_raw:
+        return []
+    home = Path(home_raw)
+    colors = canonical_colors(settings)
+    hydrated: list[dict[str, Any]] = []
+    for item in live.get("sessions", ()):
+        if not isinstance(item, Mapping) or item.get("provider") != "claude":
+            continue
+        uuid = valid_uuid(str((item.get("identity") or {}).get("uuid") or ""))
+        if not uuid:
+            continue
+        signals = read_claude_transcript_signals(uuid, home)
+        pushes: list[str] = []
+        warnings: list[str] = []
+        title = signals["ai_title"]
+        if (
+            naming_enabled
+            and title
+            and not signals["agent_name"]
+            and item.get("native_title") == title
+            and item.get("provider_title_state") == "pending"
+        ):
+            result = propagate_provider_title("claude", uuid, title, environ=env)
+            pushes.extend(result["provider_title_pushes"])
+            warnings.extend(result["provider_title_warnings"])
+        color = session_color("claude", uuid, colors)
+        if color and not signals["agent_color"]:
+            result = propagate_provider_color("claude", uuid, color, environ=env)
+            pushes.extend(result["provider_color_pushes"])
+            warnings.extend(result["provider_color_warnings"])
+        if pushes or warnings:
+            hydrated.append(
+                {"uuid": uuid, "pushes": pushes, "warnings": warnings}
+            )
+    return hydrated
 
 
 # A conversation launched through the first-window color pre-bake opens as a
@@ -6948,6 +7029,9 @@ def _automatic_title_command(
     if args.automatic_title_action == "codex-pending":
         _json_print({"titled": codex_pending_auto_titles()})
         return 0
+    if args.automatic_title_action == "claude-pending":
+        _json_print({"hydrated": claude_pending_native_hydrations(config)})
+        return 0
     if args.automatic_title_action == "reset":
         _json_print(
             mutate_canonical_automatic_title(
@@ -7047,6 +7131,7 @@ def _parser() -> argparse.ArgumentParser:
     automatic_subparsers.add_parser("list")
     automatic_subparsers.add_parser("from-hook")
     automatic_subparsers.add_parser("codex-pending")
+    automatic_subparsers.add_parser("claude-pending")
     automatic_self = automatic_subparsers.add_parser("self-name")
     automatic_self.add_argument("title")
     automatic_reset = automatic_subparsers.add_parser("reset")
@@ -7212,6 +7297,11 @@ def _lifecycle_command(args: argparse.Namespace) -> int:
             )
             if theme_color:
                 argv[1:1] = ["-c", f'tui.theme="sk-{theme_color}"']
+        elif provider == "claude":
+            signals = read_claude_transcript_signals(uuid)
+            provider_name = signals["agent_name"] or signals["ai_title"]
+            if provider_name:
+                argv[1:1] = ["--name", provider_name]
         cwd = expected.get("cwd")
         if cwd is not None and (not os.path.isabs(cwd) or not os.path.isdir(cwd)):
             raise CollectionError(

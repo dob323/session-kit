@@ -17,6 +17,30 @@ BOOT_ID = "11111111-2222-3333-4444-555555555555"
 UUID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
 
 
+class TimeoutPipelineTests(unittest.TestCase):
+    def test_timeout_preserves_pipeline_stdin(self) -> None:
+        command = (
+            'source "$1"; printf "native-color-input\\n" | '
+            "sk_timeout 5 bash -c 'read -r value; printf \"%s\\n\" \"$value\"'"
+        )
+        completed = subprocess.run(
+            [
+                "bash",
+                "-c",
+                command,
+                "timeout-test",
+                str(REPO / "bin" / "session_kit_common"),
+            ],
+            cwd=REPO,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertEqual("native-color-input\n", completed.stdout)
+
+
 def write_executable(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
     path.chmod(0o755)

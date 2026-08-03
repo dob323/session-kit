@@ -346,6 +346,13 @@ class ClaudeAiTitleTests(unittest.TestCase):
             transcript = project / f"{exact}.jsonl"
             lines = [
                 json.dumps(
+                    {
+                        "type": "agent-name",
+                        "agentName": "Leap year audit",
+                        "sessionId": exact,
+                    }
+                ),
+                json.dumps(
                     {"type": "agent-color", "agentColor": "pink", "sessionId": exact}
                 ),
                 json.dumps(
@@ -370,7 +377,135 @@ class ClaudeAiTitleTests(unittest.TestCase):
             signals = inventory_core.read_claude_transcript_signals(exact, home)
             # Last valid record of each kind wins; junk colors never surface.
             self.assertEqual(
-                {"ai_title": "Count leap years", "agent_color": "green"}, signals
+                {
+                    "ai_title": "Count leap years",
+                    "agent_name": "Leap year audit",
+                    "agent_color": "green",
+                },
+                signals,
+            )
+
+    def test_pending_hydration_fills_only_absent_native_records(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            home = Path(raw)
+            exact = uuid_for(77)
+            project = home / ".claude" / "projects" / "-srv-app"
+            sessions = home / ".claude" / "sessions"
+            project.mkdir(parents=True, mode=0o700)
+            sessions.mkdir(parents=True, mode=0o700)
+            transcript = project / f"{exact}.jsonl"
+            transcript.write_text(
+                json.dumps(
+                    {
+                        "type": "ai-title",
+                        "aiTitle": "Visible Claude metadata",
+                        "sessionId": exact,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            live = {
+                "source": "live",
+                "stale": False,
+                "sessions": [
+                    {
+                        "provider": "claude",
+                        "identity": {"uuid": exact},
+                        "native_title": "Visible Claude metadata",
+                        "provider_title_state": "pending",
+                    }
+                ],
+            }
+            with (
+                mock.patch.object(inventory_core, "snapshot", return_value=live),
+                mock.patch.object(
+                    inventory_core, "guard_live_inventory", return_value=True
+                ),
+                mock.patch.object(inventory_core, "canonical_colors", return_value={}),
+            ):
+                result = inventory_core.claude_pending_native_hydrations(
+                    {"state_dir": str(home / "state")},
+                    environ={"HOME": os.fspath(home)},
+                )
+            self.assertEqual(exact, result[0]["uuid"])
+            signals = inventory_core.read_claude_transcript_signals(exact, home)
+            self.assertEqual("Visible Claude metadata", signals["agent_name"])
+            self.assertIn(signals["agent_color"], inventory_core.SESSION_COLORS)
+
+            # A second pass is self-terminating and preserves both records.
+            with (
+                mock.patch.object(inventory_core, "snapshot", return_value=live),
+                mock.patch.object(
+                    inventory_core, "guard_live_inventory", return_value=True
+                ),
+                mock.patch.object(inventory_core, "canonical_colors", return_value={}),
+            ):
+                repeated = inventory_core.claude_pending_native_hydrations(
+                    {"state_dir": str(home / "state")},
+                    environ={"HOME": os.fspath(home)},
+                )
+            self.assertEqual([], repeated)
+
+    def test_pending_hydration_never_replaces_native_explicit_name(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            home = Path(raw)
+            exact = uuid_for(78)
+            project = home / ".claude" / "projects" / "-srv-app"
+            (home / ".claude" / "sessions").mkdir(parents=True, mode=0o700)
+            project.mkdir(parents=True, mode=0o700)
+            transcript = project / f"{exact}.jsonl"
+            transcript.write_text(
+                "\n".join(
+                    (
+                        json.dumps(
+                            {
+                                "type": "ai-title",
+                                "aiTitle": "Generated title",
+                                "sessionId": exact,
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "agent-color",
+                                "agentColor": "pink",
+                                "sessionId": exact,
+                            }
+                        ),
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            live = {
+                "source": "live",
+                "stale": False,
+                "sessions": [
+                    {
+                        "provider": "claude",
+                        "identity": {"uuid": exact},
+                        "native_title": "Dan's explicit name",
+                        "provider_title_state": "ready",
+                    }
+                ],
+            }
+            with (
+                mock.patch.object(inventory_core, "snapshot", return_value=live),
+                mock.patch.object(
+                    inventory_core, "guard_live_inventory", return_value=True
+                ),
+                mock.patch.object(inventory_core, "canonical_colors", return_value={}),
+            ):
+                result = inventory_core.claude_pending_native_hydrations(
+                    {"state_dir": str(home / "state")},
+                    environ={"HOME": os.fspath(home)},
+                )
+            self.assertEqual([], result)
+            self.assertEqual(
+                "",
+                inventory_core.read_claude_transcript_signals(exact, home)[
+                    "agent_name"
+                ],
             )
 
     def test_parser_passes_title_evidence_and_derived_names_yield(self) -> None:
@@ -385,6 +520,7 @@ class ClaudeAiTitleTests(unittest.TestCase):
                     "name": "v2-b3",
                     "nameSource": "derived",
                     "aiTitle": "Find leap years this year",
+                    "agentName": "Find leap years this year",
                     "status": "idle",
                 }
             ]
@@ -394,6 +530,9 @@ class ClaudeAiTitleTests(unittest.TestCase):
             "Find leap years this year", parsed[0]["ai_title"]
         )
         self.assertEqual("derived", parsed[0]["name_source"])
+        self.assertEqual(
+            "Find leap years this year", parsed[0]["agent_name"]
+        )
 
 
 class DerivePromptTitleTests(unittest.TestCase):

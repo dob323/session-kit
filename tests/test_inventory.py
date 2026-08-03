@@ -3616,6 +3616,91 @@ class ProviderLifecycleStateTests(unittest.TestCase):
             assert retained is not None
             self.assertTrue(retained["user_input_after_exit"])
 
+    def test_claude_reopen_passes_hydrated_name_to_native_cli(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix=".lifecycle-claude-reopen-", dir=REPO
+        ) as raw:
+            base = Path(raw)
+            state_dir = base / "state"
+            home = base / "home"
+            transcript_dir = home / ".claude" / "projects" / "-srv-project"
+            state_dir.mkdir()
+            transcript_dir.mkdir(parents=True)
+            exact = uuid_for(3)
+            (transcript_dir / f"{exact}.jsonl").write_text(
+                json.dumps(
+                    {
+                        "type": "agent-name",
+                        "agentName": "Egypt Presidents",
+                        "sessionId": exact,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            boot_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+            lifecycle_state.record_provider_exit(
+                state_dir,
+                session_id="main3",
+                boot_id=boot_id,
+                shell_pid=123,
+                shell_start_ticks=456,
+                provider="claude",
+                exit_code=0,
+                input_tracking=True,
+                now_monotonic_ns=500,
+            )
+            recovery = inventory_core.recovery_spec(
+                "claude", exact, str(state_dir)
+            )
+            item = {
+                "provider": "shell",
+                "exited_provider": "claude",
+                "shpool_shell": {
+                    "pid": 123,
+                    "process_start_ticks": 456,
+                },
+                "recovery": recovery,
+            }
+            args = argparse.Namespace(lifecycle_action="reopen")
+            completed = subprocess.CompletedProcess(recovery["argv"], 0)
+            with (
+                mock.patch.dict(os.environ, {"HOME": os.fspath(home)}),
+                mock.patch.object(
+                    inventory_core,
+                    "_lifecycle_environment",
+                    return_value=(state_dir, "main3", boot_id, 123, 456),
+                ),
+                mock.patch.object(inventory_core, "_prove_lifecycle_caller"),
+                mock.patch.object(
+                    inventory_core, "load_config", return_value={"state_dir": state_dir}
+                ),
+                mock.patch.object(
+                    inventory_core, "snapshot", return_value={"sessions": [item]}
+                ),
+                mock.patch.object(
+                    inventory_core, "guard_live_inventory", return_value=True
+                ),
+                mock.patch.object(inventory_core, "lookup", return_value=item),
+                mock.patch.object(
+                    inventory_core.subprocess,
+                    "run",
+                    return_value=completed,
+                ) as launched,
+            ):
+                self.assertEqual(0, inventory_core._lifecycle_command(args))
+            launched.assert_called_once_with(
+                [
+                    "claude",
+                    "--name",
+                    "Egypt Presidents",
+                    "--resume",
+                    exact,
+                ],
+                cwd=str(state_dir),
+                check=False,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

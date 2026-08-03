@@ -91,6 +91,19 @@ refused unless the exact provider generation is idle, has no subagents, has a
 real stored title, and still matches a fresh proof. The shell and conversation
 remain the same.
 
+## Pending Claude prompt title
+
+Claude stores its conversation auto-title separately from the name and color
+shown in the prompt box. Session Kit fills absent native name and color records
+before each human-facing inventory. It never replaces an explicit `/rename` or
+`/color` choice.
+
+Claude does not repaint a running prompt box after another process updates its
+records. The dashboard therefore keeps `title pending` on that live generation.
+The stored title and color appear when the exact conversation next starts,
+including the normal `r` reopen path after Claude exits. New Claude sessions
+bootstrap their stable color before the first visible frame.
+
 ## Provider exited
 
 When Claude Code or Codex exits normally, the managed shpool terminal stays

@@ -7,6 +7,10 @@ CORE=${SESSION_KIT_INVENTORY_CORE:-"$SCRIPT_DIR/../lib/session_inventory.py"}
 
 case "${1:-}" in
   ""|--rows|--json|--lookup)
+    # Claude stores auto-titles separately from the prompt-bar name. Fill the
+    # absent native record before a human-facing inventory, without replacing
+    # an explicit /rename or /color choice.
+    python3 "$CORE" automatic-title claude-pending >/dev/null 2>&1 || true
     # Codex has no title hook, so pending threads are titled before every
     # fresh HUMAN-FACING inventory build — menu, tab, and bounce all see a
     # real name on the human's first look after an answer. Fail-open and

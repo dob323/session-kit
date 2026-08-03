@@ -40,6 +40,20 @@ identity before and after the write. Manual names take priority. Set
 `SESSION_KIT_AUTO_NAME=0` to stop new automatic naming without deleting retained
 titles.
 
+Claude keeps its generated `ai-title` and its visible prompt-bar `agent-name`
+as separate records. Before a human-facing inventory, Session Kit copies a
+missing auto-title into the native name record and leaves any explicit
+`/rename` unchanged. Claude does not repaint an already-running TUI after an
+external record update, so the row remains `title pending` until that exact
+conversation starts again. Reopening an exited Claude provider also passes the
+stored name through Claude's native `--name` option.
+
+New Claude sessions receive their stable color in a short hidden bootstrap
+before the visible provider starts. The timeout wrapper preserves the
+bootstrap's standard input on both Linux and macOS. If the bootstrap cannot be
+proved, creation fails open and Session Kit writes a missing native color for
+the next exact start without replacing a user's `/color` choice.
+
 ## Reply state
 
 Session Kit marks `needs your reply` only when structured provider state proves
@@ -78,7 +92,7 @@ The dashboard must not describe an exited provider as actively running.
 Exact resume forms are:
 
 ```text
-claude --resume <exact-uuid>
+claude [--name <stored-title>] --resume <exact-uuid>
 codex --no-alt-screen resume <exact-uuid>
 ```
 
