@@ -19,10 +19,14 @@ RELEASE_B = "2" * 40
 
 class InstallerTests(unittest.TestCase):
     def setUp(self) -> None:
+        # GitHub's macOS workspace carries an inherited ACL that denies
+        # renaming sealed 0555 directories. Real installs live under HOME, so
+        # keep Darwin fixtures in the normal per-user temporary directory.
+        temp_parent = None if sys.platform == "darwin" else REPO.parent
         self.temp = Path(
             tempfile.mkdtemp(
                 prefix="session-kit-install-test.",
-                dir=REPO.parent,
+                dir=temp_parent,
             )
         )
         self.home = self.temp / "home"

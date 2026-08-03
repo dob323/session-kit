@@ -1243,15 +1243,7 @@ install_release() {
   done
   find "$staging/bin" "$staging/deploy" -type f -exec chmod 0755 {} +
   write_release_manifest "$staging" "$release_id"
-  # BSD mv can refuse to rename a fully sealed 0555 tree on some APFS runner
-  # volumes. The parent is still owner-writable, so use the same atomic rename
-  # syscall directly without traversing or modifying the sealed source tree.
-  python3 - "$staging" "$release_dir" <<'PY'
-import os
-import sys
-
-os.rename(sys.argv[1], sys.argv[2])
-PY
+  mv "$staging" "$release_dir"
   verify_release "$release_dir" "$release_id"
 }
 
