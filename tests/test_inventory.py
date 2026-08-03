@@ -3540,9 +3540,15 @@ class ProviderLifecycleStateTests(unittest.TestCase):
                 ) as launched,
             ):
                 self.assertEqual(0, inventory_core._lifecycle_command(args))
+            # The session's launch theme rides on every reopen so the window
+            # keeps its color identity; the color is the stable identity hash
+            # for this uuid.
+            expected_theme = inventory_core.session_color("codex", uuid_for(2), {})
             launched.assert_called_once_with(
                 [
                     "codex",
+                    "-c",
+                    f'tui.theme="sk-{expected_theme}"',
                     "-c",
                     "check_for_update_on_startup=false",
                     "--no-alt-screen",

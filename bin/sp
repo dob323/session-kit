@@ -401,6 +401,13 @@ picker_close() {
     return 1
   fi
   sk_lock_release 9
+  # "Everything running inside it" must be TRUE: a provider wedged on a
+  # terminal write survives the shell's SIGHUP and lingers outside shpool,
+  # blocking any later reopen of the same conversation. Reap it under its
+  # exact pinned identity (identity-bound no-op when it exited normally).
+  sk_reap_session_leftovers \
+    "${SK_PROOF_PROVIDER_PID:-}" "${SK_PROOF_PROVIDER_START:-}" \
+    "${SK_PROOF_SHELL_PID:-}" "${SK_PROOF_SHELL_START:-}"
   picker_action_event picker_close closed
   printf 'Closed exact session %s\n' "$id"
 }
@@ -942,6 +949,11 @@ close_target() {
     sk_die "shpool refused to close the exact session"
     return 1
   fi
+  # Same guarantee as the picker path: nothing pinned to this session's
+  # exact identity may outlive the close.
+  sk_reap_session_leftovers \
+    "${provider_pid:-}" "${provider_start:-}" \
+    "${shell_pid:-}" "${shell_start:-}"
   printf 'Closed exact session %s\n' "$id"
 }
 

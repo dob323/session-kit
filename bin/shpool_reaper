@@ -200,6 +200,116 @@ fi
 
 expire_picker_temp_files
 
+# Immutable releases accumulate one per roll and only `current`, its recorded
+# predecessor, and whatever a STANDING window still runs are ever used again.
+# Prune the rest once they are old and provably unreferenced; keep the newest
+# three regardless, and never more than ten deletions per run.
+expire_stale_releases() {
+  [[ $MODE != verify && $DRY_RUN != 1 ]] || return 0
+  python3 - "$PROC_ROOT" <<'PY' || true
+import json
+import os
+import re
+import shutil
+import sys
+import time
+
+proc = os.path.abspath(sys.argv[1])
+home = os.path.expanduser("~")
+root = os.path.join(home, ".local", "lib", "session-kit")
+releases = os.path.join(root, "releases")
+if not os.path.isdir(releases):
+    raise SystemExit(0)
+uid = os.geteuid()
+
+keep: set[str] = set()
+try:
+    keep.add(os.path.basename(os.path.realpath(os.path.join(root, "current"))))
+except OSError:
+    raise SystemExit(0)
+try:
+    with open(
+        os.path.join(home, ".local", "state", "session-kit", "install.json"),
+        encoding="utf-8",
+    ) as handle:
+        recorded = json.load(handle)
+    for key in ("installed_release", "previous_release"):
+        value = recorded.get(key)
+        if isinstance(value, str):
+            keep.add(value)
+except (OSError, ValueError):
+    raise SystemExit(0)
+
+# Anything ANY live same-uid process references stays; an unreadable process
+# table means no proof, so nothing is deleted.
+try:
+    for name in os.listdir(proc):
+        if not name.isdigit():
+            continue
+        base = os.path.join(proc, name)
+        try:
+            if os.stat(base, follow_symlinks=False).st_uid != uid:
+                continue
+            evidence = []
+            with open(os.path.join(base, "cmdline"), "rb") as handle:
+                evidence.append(handle.read(65536))
+            with open(os.path.join(base, "environ"), "rb") as handle:
+                evidence.append(handle.read(131072))
+            try:
+                evidence.append(os.readlink(os.path.join(base, "cwd")).encode())
+            except OSError:
+                pass
+        except FileNotFoundError:
+            continue
+        except OSError:
+            raise SystemExit(0)
+        for blob in evidence:
+            for match in re.finditer(rb"releases/([0-9a-f]{40})", blob):
+                keep.add(match.group(1).decode())
+except OSError:
+    raise SystemExit(0)
+
+entries = []
+for name in os.listdir(releases):
+    if not re.fullmatch(r"[0-9a-f]{40}", name):
+        continue
+    path = os.path.join(releases, name)
+    if os.path.islink(path) or not os.path.isdir(path):
+        continue
+    try:
+        entries.append((os.lstat(path).st_mtime, name))
+    except OSError:
+        continue
+entries.sort(reverse=True)
+for _, name in entries[:3]:
+    keep.add(name)
+
+cutoff = time.time() - 14 * 86400
+removed = 0
+for mtime, name in reversed(entries):
+    if removed >= 10 or name in keep or mtime > cutoff:
+        continue
+    target = os.path.join(releases, name)
+    # Release dirs are installed read-only; restore owner-write so the
+    # removal itself cannot half-fail.
+    for directory, _, files in os.walk(target):
+        try:
+            os.chmod(directory, 0o700)
+            for entry in files:
+                os.chmod(os.path.join(directory, entry), 0o600)
+        except OSError:
+            break
+    try:
+        shutil.rmtree(target)
+        removed += 1
+    except OSError:
+        continue
+if removed:
+    print(f"release GC removed {removed} stale release(s)", file=sys.stderr)
+PY
+}
+expire_stale_releases
+
 json=$("$SHPOOL" list --json 2>/dev/null) || fail "shpool list error"
 daemon_pid=${SESSION_KIT_DAEMON_PID:-}
 if [[ -z $daemon_pid && $PROC_ROOT == /proc ]]; then

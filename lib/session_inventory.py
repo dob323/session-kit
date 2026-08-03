@@ -3072,7 +3072,9 @@ def codex_pending_auto_titles(
                 return []
             # Only human root threads: subagent threads inherit their task
             # prompt as first_user_message, and titling them replaces useful
-            # agent nicknames with near-duplicate task titles.
+            # agent nicknames with near-duplicate task titles. Non-interactive
+            # `codex exec` runs are one-shot jobs nobody reopens — titling
+            # them only fills the index with prompt fragments.
             root_filter = ""
             if "thread_source" in columns:
                 root_filter = (
@@ -3080,6 +3082,8 @@ def codex_pending_auto_titles(
                 )
             elif "agent_path" in columns:
                 root_filter = " AND (agent_path IS NULL OR agent_path = '')"
+            if "source" in columns:
+                root_filter += " AND (source IS NULL OR source != 'exec')"
             rows = connection.execute(
                 "SELECT id, title, first_user_message, updated_at"
                 " FROM threads"
@@ -6914,6 +6918,14 @@ def _lifecycle_command(args: argparse.Namespace) -> int:
         argv = list(expected["argv"])
         if provider == "codex":
             argv[1:1] = ["-c", "check_for_update_on_startup=false"]
+            # The session's theme rides on the launch command everywhere
+            # else; a reopen without it came back in the stock theme and
+            # lost the window's color identity.
+            theme_color = session_color(
+                "codex", uuid, canonical_colors(load_config())
+            )
+            if theme_color:
+                argv[1:1] = ["-c", f'tui.theme="sk-{theme_color}"']
         cwd = expected.get("cwd")
         if cwd is not None and (not os.path.isabs(cwd) or not os.path.isdir(cwd)):
             raise CollectionError(
