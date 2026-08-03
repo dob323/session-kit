@@ -5,7 +5,7 @@ repo=$(cd -- "$(dirname -- "$0")/.." && pwd)
 export PYTHONDONTWRITEBYTECODE=1
 
 if [[ ${GITHUB_ACTIONS:-} == true ]]; then
-  log=$(mktemp "${RUNNER_TEMP:-/tmp}/session-kit-tests.XXXXXX.log")
+  log=$(mktemp "${RUNNER_TEMP:-/tmp}/session-kit-tests.log.XXXXXX")
   set +e
   python3 -m unittest discover -s "$repo/tests" -t "$repo" -v 2>&1 |
     tee "$log"

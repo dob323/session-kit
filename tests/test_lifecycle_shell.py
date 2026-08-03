@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 import tempfile
@@ -39,6 +40,30 @@ class TimeoutPipelineTests(unittest.TestCase):
         )
         self.assertEqual(0, completed.returncode, completed.stderr)
         self.assertEqual("native-color-input\n", completed.stdout)
+
+
+class PortableMktempTests(unittest.TestCase):
+    def test_runtime_templates_end_with_replacement_characters(self) -> None:
+        template_pattern = re.compile(
+            r'mktemp(?:\s+-d)?\s+"([^"\n]*XXXXXX[^"\n]*)"'
+        )
+        runtime_files = [
+            path
+            for path in (REPO / "bin").iterdir()
+            if path.is_file()
+        ]
+        runtime_files.append(REPO / "tests" / "run")
+        invalid: list[str] = []
+        for path in runtime_files:
+            text = path.read_text(encoding="utf-8")
+            for line_number, line in enumerate(text.splitlines(), start=1):
+                for match in template_pattern.finditer(line):
+                    if not match.group(1).endswith("XXXXXX"):
+                        invalid.append(
+                            f"{path.relative_to(REPO)}:{line_number}:"
+                            f" {match.group(1)}"
+                        )
+        self.assertEqual([], invalid)
 
 
 def write_executable(path: Path, content: str) -> None:

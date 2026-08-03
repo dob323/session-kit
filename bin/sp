@@ -51,21 +51,21 @@ EOF
 make_snapshot() {
   sk_prepare_state || return 1
   [[ -z ${SNAPSHOT:-} || ! -f $SNAPSHOT ]] || command rm -- "$SNAPSHOT"
-  SNAPSHOT=$(mktemp "$SK_STATE_DIR/sp-snapshot.XXXXXX.json") || return 1
+  SNAPSHOT=$(mktemp "$SK_STATE_DIR/sp-snapshot.json.XXXXXX") || return 1
   sk_snapshot_file "$SNAPSHOT"
 }
 
 make_strict_snapshot() {
   sk_prepare_state || return 1
   [[ -z ${SNAPSHOT:-} || ! -f $SNAPSHOT ]] || command rm -- "$SNAPSHOT"
-  SNAPSHOT=$(mktemp "$SK_STATE_DIR/sp-strict.XXXXXX.json") || return 1
+  SNAPSHOT=$(mktemp "$SK_STATE_DIR/sp-strict.json.XXXXXX") || return 1
   sk_strict_snapshot_file "$SNAPSHOT"
 }
 
 make_guard_snapshot() {
   sk_prepare_state || return 1
   [[ -z ${SNAPSHOT:-} || ! -f $SNAPSHOT ]] || command rm -- "$SNAPSHOT"
-  SNAPSHOT=$(mktemp "$SK_STATE_DIR/sp-guard.XXXXXX.json") || return 1
+  SNAPSHOT=$(mktemp "$SK_STATE_DIR/sp-guard.json.XXXXXX") || return 1
   sk_guard_snapshot_file "$SNAPSHOT"
 }
 
@@ -249,7 +249,7 @@ PY
   # released; re-prove idleness on FRESH state immediately before the TERM,
   # or a turn that started meanwhile gets killed mid-work.
   local recheck
-  recheck=$(mktemp "$SK_STATE_DIR/bounce-recheck.XXXXXX.json") || {
+  recheck=$(mktemp "$SK_STATE_DIR/bounce-recheck.json.XXXXXX") || {
     command rm -f -- "$SK_STATE_DIR/provider-bounce/$id"
     return 1
   }
@@ -1037,7 +1037,7 @@ PY
   fi
   local index private_candidate
   for (( index=0; index<count; index++ )); do
-    private_candidate=$(mktemp "$SK_STATE_DIR/prune-candidate.XXXXXX.json") || return 1
+    private_candidate=$(mktemp "$SK_STATE_DIR/prune-candidate.json.XXXXXX") || return 1
     if ! python3 - "$candidate_file" "$index" > "$private_candidate" <<'PY'
 import json,re,sys
 rows=json.load(open(sys.argv[1])).get("candidates",[])

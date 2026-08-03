@@ -6,6 +6,19 @@ Session Kit follows [Semantic Versioning](https://semver.org/).
 
 No changes yet.
 
+## [0.1.2] - 2026-08-03
+
+### Fixed
+
+- Moved every runtime `mktemp` suffix before the replacement characters so
+  snapshots and proof files are unique on BSD `mktemp` as well as GNU
+  `mktemp`.
+- Restored macOS open, takeover, close, prune, reaper, watchdog, login, and
+  provider-proof paths that could otherwise reuse a literal `XXXXXX` filename
+  or fail after the first call.
+- Added a repository-wide regression that rejects any runtime `mktemp`
+  template with characters after its final `XXXXXX`.
+
 ## [0.1.1] - 2026-08-03
 
 ### Fixed

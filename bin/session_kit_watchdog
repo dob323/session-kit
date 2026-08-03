@@ -155,7 +155,7 @@ flagged_sessions() {
 # session was flagged, or the silence is past the long no-marker threshold.
 dead_sessions() {
   local flagged=$1 snapshot status=0
-  snapshot=$(mktemp "$SK_STATE_DIR/watchdog-snapshot.XXXXXX.json") || return 3
+  snapshot=$(mktemp "$SK_STATE_DIR/watchdog-snapshot.json.XXXXXX") || return 3
   if ! "$STATUS_CMD" --json > "$snapshot" 2>/dev/null; then
     command rm -f -- "$snapshot"
     return 3

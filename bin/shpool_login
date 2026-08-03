@@ -107,7 +107,7 @@ picker_read() {
 
 new_temp() {
   local label=$1 path
-  path=$(mktemp "$SK_STATE_DIR/${label}.XXXXXX.json") || return 1
+  path=$(mktemp "$SK_STATE_DIR/${label}.json.XXXXXX") || return 1
   chmod 600 "$path" || {
     command rm -- "$path"
     return 1

@@ -452,7 +452,7 @@ PY
   proof=
   trap '[[ -z ${proof:-} ]] || rm -f -- "$proof"' EXIT
   for (( candidate_index=0; candidate_index<candidate_count; candidate_index++ )); do
-    proof=$(mktemp "$STATE_DIR/auto-close-proof.XXXXXX.json") ||
+    proof=$(mktemp "$STATE_DIR/auto-close-proof.json.XXXXXX") ||
       fail "private candidate proof creation"
     chmod 600 "$proof" || fail "private candidate proof permissions"
     python3 - "$candidate_file" "$candidate_index" "$proof" <<'PY' ||
