@@ -28,7 +28,7 @@ class InstallerTests(unittest.TestCase):
                 prefix="session-kit-install-test.",
                 dir=temp_parent,
             )
-        )
+        ).resolve()
         self.home = self.temp / "home"
         self.home.mkdir()
         self.fake_bin = self.temp / "bin"
@@ -331,9 +331,12 @@ class InstallerTests(unittest.TestCase):
         shpool_plist = plistlib.loads(
             (templates / "com.session-kit.shpool.plist").read_bytes()
         )
+        expected_bash = shutil.which("bash", path=self.env["PATH"])
+        self.assertIsNotNone(expected_bash)
+        expected_config_bash = str(Path(expected_bash).resolve())
         self.assertEqual(
             shpool_plist["EnvironmentVariables"]["SHELL"],
-            shutil.which("bash", path=self.env["PATH"]),
+            expected_bash,
         )
         self.assertEqual(
             shpool_plist["ProgramArguments"],
@@ -361,7 +364,7 @@ class InstallerTests(unittest.TestCase):
         self.assertTrue((self.home / ".local/bin/kit").is_file())
         shpool_config = self.home / ".config/shpool/config.toml"
         self.assertIn(
-            f'shell = "{shutil.which("bash", path=self.env["PATH"])}"',
+            f'shell = "{expected_config_bash}"',
             shpool_config.read_text(encoding="utf-8"),
         )
 
