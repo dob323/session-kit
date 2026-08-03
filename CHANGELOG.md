@@ -4,6 +4,10 @@ Session Kit follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+No changes yet.
+
+## [0.1.1] - 2026-08-03
+
 ### Fixed
 
 - Preserved pipeline input through the cross-platform timeout wrapper so the

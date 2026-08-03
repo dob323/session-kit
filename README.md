@@ -1,7 +1,7 @@
 # Session Kit
 
 [![CI](https://github.com/dob323/session-kit/actions/workflows/ci.yml/badge.svg)](https://github.com/dob323/session-kit/actions/workflows/ci.yml)
-[![Latest release](https://img.shields.io/github/v/release/dob323/session-kit?include_prereleases)](https://github.com/dob323/session-kit/releases/tag/v0.1.0)
+[![Latest release](https://img.shields.io/github/v/release/dob323/session-kit?include_prereleases)](https://github.com/dob323/session-kit/releases/tag/v0.1.1)
 [![License](https://img.shields.io/github/license/dob323/session-kit)](LICENSE)
 
 A local status and safety layer for shpool sessions running Claude Code, Codex,
