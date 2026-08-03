@@ -101,6 +101,9 @@ jobs:
           python3 -m unittest -v \
             tests.test_macos_preview \
             tests.test_install.InstallerTests.test_macos_install_update_and_rollback_are_transactional \
+            tests.test_lifecycle_shell.TimeoutPipelineTests \
+            tests.test_provider_title_push.ClaudeAiTitleTests \
+            tests.test_inventory.ProviderLifecycleStateTests.test_claude_reopen_passes_hydrated_name_to_native_cli \
             tests.test_public_export \
             tests.test_release_artifact \
             tests.test_public_scan \
