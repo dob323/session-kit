@@ -336,8 +336,8 @@ class InstallerTests(unittest.TestCase):
         self.assertIsNotNone(expected_bash)
         expected_config_bash = str(Path(expected_bash).resolve())
         self.assertEqual(
-            shpool_plist["EnvironmentVariables"]["SHELL"],
-            expected_bash,
+            Path(shpool_plist["EnvironmentVariables"]["SHELL"]).resolve(),
+            Path(expected_bash).resolve(),
         )
         self.assertEqual(
             shpool_plist["ProgramArguments"],
