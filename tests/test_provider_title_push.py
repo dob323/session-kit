@@ -337,6 +337,42 @@ class ClaudeAiTitleTests(unittest.TestCase):
                 "", inventory_core.read_claude_ai_title("not-a-uuid", home)
             )
 
+    def test_transcript_signals_return_last_color_and_reject_junk(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            home = Path(raw)
+            project = home / ".claude" / "projects" / "-srv-app"
+            project.mkdir(parents=True, mode=0o700)
+            exact = uuid_for(76)
+            transcript = project / f"{exact}.jsonl"
+            lines = [
+                json.dumps(
+                    {"type": "agent-color", "agentColor": "pink", "sessionId": exact}
+                ),
+                json.dumps(
+                    {
+                        "type": "agent-color",
+                        "agentColor": "not-a-color",
+                        "sessionId": exact,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "ai-title",
+                        "aiTitle": "Count leap years",
+                        "sessionId": exact,
+                    }
+                ),
+                json.dumps(
+                    {"type": "agent-color", "agentColor": "green", "sessionId": exact}
+                ),
+            ]
+            transcript.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            signals = inventory_core.read_claude_transcript_signals(exact, home)
+            # Last valid record of each kind wins; junk colors never surface.
+            self.assertEqual(
+                {"ai_title": "Count leap years", "agent_color": "green"}, signals
+            )
+
     def test_parser_passes_title_evidence_and_derived_names_yield(self) -> None:
         exact = uuid_for(74)
         parsed = inventory_core._parse_claude_payload(
@@ -1001,6 +1037,73 @@ class CodexPendingAutoTitleTests(unittest.TestCase):
                 encoding="utf-8",
             )
             self.assertEqual([], self._run(base, codex))
+
+    def test_heals_database_title_from_curated_index_entry(self) -> None:
+        import sqlite3
+        import time
+
+        uuid = "00000000-0000-4000-8000-000000000056"
+        now = int(time.time())
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            codex = self._codex_root(
+                base,
+                [(uuid, "what is the capital of peru", "what is the capital of peru", now - 60)],
+            )
+            (codex / "session_index.jsonl").write_text(
+                json.dumps({"id": uuid, "thread_name": "prompt echo stub"})
+                + "\n"
+                + json.dumps({"id": uuid, "thread_name": "Peru Capital Check"})
+                + "\n",
+                encoding="utf-8",
+            )
+            # Not reported as a fresh title: the heal converges stores for a
+            # thread that already carries its deliberate name in the index.
+            self.assertEqual([], self._run(base, codex))
+            connection = sqlite3.connect(codex / "state_5.sqlite")
+            self.assertEqual(
+                ("Peru Capital Check",),
+                connection.execute(
+                    "SELECT title FROM threads WHERE id = ?", (uuid,)
+                ).fetchone(),
+            )
+            connection.close()
+            # The index itself is untouched by the heal (no new entries).
+            self.assertEqual(
+                2,
+                len(
+                    (codex / "session_index.jsonl")
+                    .read_text(encoding="utf-8")
+                    .splitlines()
+                ),
+            )
+
+    def test_heal_never_replaces_a_real_database_name(self) -> None:
+        import sqlite3
+        import time
+
+        uuid = "00000000-0000-4000-8000-000000000057"
+        now = int(time.time())
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            codex = self._codex_root(
+                base,
+                [(uuid, "Deliberate Db Name", "some first prompt", now - 60)],
+            )
+            (codex / "session_index.jsonl").write_text(
+                json.dumps({"id": uuid, "thread_name": "Different Index Name"})
+                + "\n",
+                encoding="utf-8",
+            )
+            self.assertEqual([], self._run(base, codex))
+            connection = sqlite3.connect(codex / "state_5.sqlite")
+            self.assertEqual(
+                ("Deliberate Db Name",),
+                connection.execute(
+                    "SELECT title FROM threads WHERE id = ?", (uuid,)
+                ).fetchone(),
+            )
+            connection.close()
 
     def test_kill_switch_disables_the_titler(self) -> None:
         import time

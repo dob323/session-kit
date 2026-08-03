@@ -444,16 +444,31 @@ fi
 
 unset __sk_state_root __sk_journal_root __sk_session_journal __sk_journal_ready __sk_script_rc
 
-# Auto-open the read-only picker only for interactive SSH terminals.
-# Escape hatch: touch ~/.no_shpool.
-if [[ $- == *i* && -n ${SSH_CONNECTION:-} && -z ${SHPOOL_SESSION_NAME:-} && -t 0 \
-      && ! -e $HOME/.no_shpool && -x $HOME/.local/bin/shpool_login ]]; then
-  "$HOME/.local/bin/shpool_login"
-  __sk_rc=$?
-  if [[ $__sk_rc -eq 0 ]]; then builtin exit; fi
-  if [[ $__sk_rc -ne 2 ]]; then
-    echo "[session picker unavailable; continuing in a plain shell]"
+# `kit` opens the session picker on demand (Dan 2026-08-02: SSH lands in a
+# regular shell; the picker only ever appears when typed). Works from any
+# plain terminal; inside a managed session it shows the read-only list
+# instead, because attaching from inside a session would nest shpool.
+kit() {
+  if [[ -n ${SHPOOL_SESSION_NAME:-} ]]; then
+    "$HOME/.local/bin/sp" list
+    printf '  (inside a managed session — open others from a new window, or bye to leave)\n'
+    return 0
   fi
-  unset __sk_rc
+  if [[ -t 0 && -t 1 && -x $HOME/.local/bin/shpool_login ]]; then
+    "$HOME/.local/bin/shpool_login"
+    local __kit_rc=$?
+    # 0 = a session was attached and ended; 2 = chose the terminal. Both are
+    # normal returns to this shell.
+    if (( __kit_rc != 0 && __kit_rc != 2 )); then
+      echo "[session picker unavailable; still in the plain shell]"
+    fi
+    return 0
+  fi
+  "$HOME/.local/bin/sp" list
+}
+
+# SSH lands in a regular shell; one dim static hint, no inventory cost.
+if [[ $- == *i* && -n ${SSH_CONNECTION:-} && -z ${SHPOOL_SESSION_NAME:-} && -t 0 ]]; then
+  printf '  kit: open sessions\n'
 fi
 # ---- end session-kit shpool integration -------------------------------------

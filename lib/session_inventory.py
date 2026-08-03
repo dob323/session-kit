@@ -347,6 +347,9 @@ def _parse_claude_payload(payload: Any) -> list[dict[str, Any]]:
                 else None,
                 "title": clean_text(item.get("name"), 120),
                 "ai_title": clean_text(item.get("aiTitle"), 120),
+                "agent_color": item.get("agentColor")
+                if item.get("agentColor") in SESSION_COLORS
+                else "",
                 "name_source": clean_text(item.get("nameSource"), 20),
                 "status": status or "unknown",
                 "needs_you": needs_you,
@@ -358,24 +361,28 @@ def _parse_claude_payload(payload: Any) -> list[dict[str, Any]]:
 MAX_CLAUDE_TITLE_SCAN_BYTES = 64 * 1024
 
 
-def read_claude_ai_title(uuid: str, home: Path | None = None) -> str:
-    """Return Claude's persisted conversation auto-title for one session.
+def read_claude_transcript_signals(
+    uuid: str, home: Path | None = None
+) -> dict[str, str]:
+    """Return Claude's persisted per-conversation title and color evidence.
 
-    The TUI stores it as an ``ai-title`` transcript record, not in the session
-    record, so the derived window label and the visible conversation title can
-    disagree. Reads are bounded to the transcript's head and tail; the last
-    record wins. Any problem returns an empty title.
+    The TUI stores its conversation auto-title as an ``ai-title`` transcript
+    record and its session color as an ``agent-color`` record — neither lives
+    in the session record, so the derived window label and the visible
+    conversation state can disagree. Reads are bounded to the transcript's
+    head and tail; the last record of each kind wins. Any problem returns
+    empty evidence.
     """
+    signals = {"ai_title": "", "agent_color": ""}
     exact_uuid = valid_uuid(uuid)
     if not exact_uuid:
-        return ""
+        return signals
     base = home if home is not None else Path(os.environ.get("HOME") or Path.home())
     projects = base / ".claude" / "projects"
     try:
         transcripts = sorted(projects.glob(f"*/{exact_uuid}.jsonl"))
     except OSError:
-        return ""
-    title = ""
+        return signals
     for transcript in transcripts[:4]:
         if transcript.is_symlink():
             continue
@@ -392,21 +399,31 @@ def read_claude_ai_title(uuid: str, home: Path | None = None) -> str:
             continue
         for chunk in chunks:
             for line in chunk.split(b"\n"):
-                if b'"ai-title"' not in line:
+                if b'"ai-title"' not in line and b'"agent-color"' not in line:
                     continue
                 try:
                     record = json.loads(line.decode("utf-8", "strict"))
                 except (UnicodeDecodeError, ValueError):
                     continue
                 if (
-                    isinstance(record, Mapping)
-                    and record.get("type") == "ai-title"
-                    and record.get("sessionId") == exact_uuid
+                    not isinstance(record, Mapping)
+                    or record.get("sessionId") != exact_uuid
                 ):
+                    continue
+                if record.get("type") == "ai-title":
                     candidate = clean_text(record.get("aiTitle"), 120)
                     if candidate:
-                        title = candidate
-    return title
+                        signals["ai_title"] = candidate
+                elif record.get("type") == "agent-color":
+                    color = record.get("agentColor")
+                    if isinstance(color, str) and color in SESSION_COLORS:
+                        signals["agent_color"] = color
+    return signals
+
+
+def read_claude_ai_title(uuid: str, home: Path | None = None) -> str:
+    """Compatibility wrapper: the auto-title half of the transcript signals."""
+    return read_claude_transcript_signals(uuid, home)["ai_title"]
 
 
 def _enrich_claude_payload(payload: Any) -> Any:
@@ -429,8 +446,14 @@ def _enrich_claude_payload(payload: Any) -> Any:
                     item["nameSource"] = record.get("nameSource")
             except (OSError, ValueError):
                 pass
-        if "aiTitle" not in item:
-            item["aiTitle"] = read_claude_ai_title(uuid, home)
+        needs_title = not item.get("aiTitle")
+        needs_color = item.get("agentColor") not in SESSION_COLORS
+        if needs_title or needs_color:
+            signals = read_claude_transcript_signals(uuid, home)
+            if needs_title:
+                item["aiTitle"] = signals["ai_title"]
+            if needs_color:
+                item["agentColor"] = signals["agent_color"]
     return payload
 
 
@@ -1864,11 +1887,13 @@ def build_inventory(
 
         starting_provider = None
         provider_title_is_explicit = True
+        claude_color_evidence = ""
         if len(claude_candidates) == 1 and not codex_candidates:
             pid = claude_candidates[0]
             agent = claude_by_pid[pid]
             uuid = agent["uuid"]
             native_title = agent["title"]
+            claude_color_evidence = agent.get("agent_color") or ""
             # Claude persists its conversation auto-title as a transcript
             # ai-title record while the session record keeps a derived window
             # label. The visible conversation title outranks the derived
@@ -2044,6 +2069,8 @@ def build_inventory(
                 ),
             )
         )
+        if claude_color_evidence:
+            sessions[-1]["_claude_agent_color"] = claude_color_evidence
         if provider == "unknown" and starting_provider:
             # Display only. `provider` stays "unknown", so identity, mutation
             # and recovery decisions are completely unaffected.
@@ -2115,6 +2142,8 @@ def build_inventory(
                 shpool_shell=None,
             )
         )
+        if agent.get("agent_color"):
+            outside_agents[-1]["_claude_agent_color"] = agent["agent_color"]
     for pid, metadata in codex_index.items():
         if pid in mapped_codex:
             continue
@@ -2192,11 +2221,27 @@ def build_inventory(
     color_overrides = _valid_colors(config.get("colors"))
     color_overrides = _adopt_launch_colors(config, sessions, color_overrides)
     for item in sessions + outside_agents:
-        item["display_color"] = session_color(
-            item.get("provider"),
-            (item.get("identity") or {}).get("uuid"),
-            color_overrides,
-        )
+        # A Claude session's transcript agent-color is what the session
+        # actually renders in its own prompt chip; it must beat the identity
+        # hash or the list shows a different color than the session itself
+        # (a stored pink rendered yellow, proven live 2026-08-02). Explicit
+        # config overrides still win over both.
+        uuid = (item.get("identity") or {}).get("uuid")
+        evidence = item.get("_claude_agent_color")
+        if (
+            item.get("provider") == "claude"
+            and uuid
+            and evidence in SESSION_COLORS
+            and f"claude:{valid_uuid(uuid) or ''}" not in color_overrides
+        ):
+            item["display_color"] = evidence
+        else:
+            item["display_color"] = session_color(
+                item.get("provider"),
+                uuid,
+                color_overrides,
+            )
+        item.pop("_claude_agent_color", None)
     return {
         "schema_version": SCHEMA_VERSION,
         "generated_at": _utc_now(current_time),
@@ -2556,6 +2601,7 @@ def mutate_canonical_automatic_title(
     title: str | None,
     *,
     overwrite: bool = False,
+    alias_owned_ok: bool = False,
     revalidate: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Atomically set/reset one automatic title without crossing alias provenance."""
@@ -2577,7 +2623,7 @@ def mutate_canonical_automatic_title(
             _private_alias_parent(path)
             document = _private_alias_document(path, allow_missing=True)
             aliases = dict(document["aliases"])
-            if clean_title is not None and key in aliases:
+            if clean_title is not None and key in aliases and not alias_owned_ok:
                 raise CollectionError("explicit local alias already owns this title")
             titles = _valid_automatic_titles(document.get("automatic_titles"))
             failures = _valid_automatic_title_failures(
@@ -3023,11 +3069,21 @@ def codex_pending_auto_titles(
             }
             if not {"id", "title", "first_user_message", "updated_at"} <= columns:
                 return []
+            # Only human root threads: subagent threads inherit their task
+            # prompt as first_user_message, and titling them replaces useful
+            # agent nicknames with near-duplicate task titles.
+            root_filter = ""
+            if "thread_source" in columns:
+                root_filter = (
+                    " AND (thread_source IS NULL OR thread_source = 'user')"
+                )
+            elif "agent_path" in columns:
+                root_filter = " AND (agent_path IS NULL OR agent_path = '')"
             rows = connection.execute(
                 "SELECT id, title, first_user_message, updated_at"
                 " FROM threads"
                 " WHERE first_user_message IS NOT NULL"
-                " AND first_user_message != ''"
+                " AND first_user_message != ''" + root_filter +
                 " ORDER BY updated_at DESC LIMIT 200"
             ).fetchall()
         finally:
@@ -3035,7 +3091,9 @@ def codex_pending_auto_titles(
     except sqlite3.Error:
         return []
     index = codex_root / "session_index.jsonl"
-    indexed: set[str] = set()
+    # Latest entry per id wins — the file is append-ordered and renames are
+    # appended, so later lines overwrite earlier ones here.
+    indexed: dict[str, str] = {}
     if index.is_file() and not index.is_symlink():
         try:
             if index.stat().st_size > MAX_CODEX_SESSION_INDEX_BYTES:
@@ -3046,16 +3104,38 @@ def codex_pending_auto_titles(
                 except ValueError:
                     continue
                 if isinstance(entry, Mapping) and entry.get("id"):
-                    indexed.add(str(entry["id"]))
+                    indexed[str(entry["id"])] = str(
+                        entry.get("thread_name") or ""
+                    ).strip()
         except OSError:
             # Unable to prove which threads already carry deliberate names;
             # titling anyway could overwrite one, so do nothing.
             return []
     cutoff = time.time() - 7 * 86400
     results: list[dict[str, str]] = []
+    healed = 0
     for uuid, raw_title, first_message, updated_at in rows:
         exact = valid_uuid(uuid)
-        if not exact or exact in indexed:
+        if not exact:
+            continue
+        if exact in indexed:
+            # Heal the database half of the dual write: the status bar reads
+            # threads.title, and a curated index name next to a prompt-echo
+            # (or empty) database title means the earlier UPDATE never landed
+            # or Codex re-stamped the seed over it. Re-assert, bounded and
+            # fail-open; each inventory build converges the two stores.
+            index_name = indexed[exact]
+            title = str(raw_title or "").strip()
+            first = str(first_message or "").strip()
+            if (
+                healed < 20
+                and index_name
+                and index_name != title
+                and not _codex_title_echoes_prompt(index_name, first)
+                and (not title or _codex_title_echoes_prompt(title, first))
+            ):
+                _push_codex_thread_title(codex_root, exact, index_name)
+                healed += 1
             continue
         if exact == "00000000-0000-0000-0000-000000000000":
             continue
@@ -6294,15 +6374,31 @@ def self_name_automatic_title(
         raise CollectionError(
             f"automatic title rejected ({reason}); {suffix}"
         ) from reason
+    # overwrite + alias_owned_ok: an agent may self-name repeatedly as its
+    # task evolves, and its own earlier self-name (now in the alias tier)
+    # must never block the update.
     result = mutate_canonical_automatic_title(
         config,
         str(evidence["provider"]),
         str(evidence["uuid"]),
         normalized,
+        overwrite=True,
+        alias_owned_ok=True,
         revalidate=revalidate,
     )
     result["caller"] = evidence
     result["automatic_name_state"] = "ready"
+    # A self-name is an explicit rename, not background bookkeeping: it also
+    # becomes the alias, the top display tier. In the automatic tier alone it
+    # lost to the provider's own ai-title, so the picker kept showing a stale
+    # native name after an agent explicitly renamed itself. `sp name reset`
+    # still demotes it like any alias.
+    result["aliases"] = mutate_canonical_alias(
+        config,
+        str(evidence["provider"]),
+        str(evidence["uuid"]),
+        normalized,
+    )
     result.update(
         propagate_provider_title(
             str(evidence["provider"]),

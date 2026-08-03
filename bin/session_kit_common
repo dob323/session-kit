@@ -1039,6 +1039,13 @@ PY
       return 0
     fi
     command rm -- "$fresh"
+    # A human is usually watching this wait, and it can run for minutes on a
+    # loaded box. Silence reads as a hang; say what is still being waited on.
+    # Attempts sleep 0.25s plus inventory time, so attempt/4 is a floor.
+    if [[ -t 1 ]] && (( attempt % 40 == 0 )); then
+      printf '  still waiting for %s to publish its identity (%ss+ elapsed)\n' \
+        "$expected_provider" "$(( attempt / 4 ))"
+    fi
     (( attempt == attempts )) || sleep 0.25
   done
   return 1
@@ -1059,7 +1066,9 @@ sk_confirm_exact() {
   # Humans type y-then-Enter. The single-character read leaves that Enter in
   # the terminal buffer, where the caller's next menu read would consume it
   # as an empty choice — which means "go to a regular terminal" and silently
-  # ended the picker after every kill. Drain the rest of the line.
+  # ended the picker after every kill. Drain the rest of the line. A human
+  # pausing longer than this window is covered by the picker's one-shot
+  # forgiveness of an empty choice right after a confirmed action.
   if [[ $answer != "" && $answer != $'\n' ]]; then
     local __sk_confirm_rest=""
     IFS= read -r -s -t 0.3 __sk_confirm_rest 2>/dev/null || true

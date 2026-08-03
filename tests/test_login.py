@@ -829,6 +829,10 @@ class LoginPickerTests(unittest.TestCase):
                 r"\x1b\[1m\x1b\[32m\s*7\x1b\[0m",
             )
             plain = strip_sgr(output)
+            # The startup screen clear (erase display + cursor home) is the
+            # one approved non-SGR sequence on capable terminals; nothing
+            # else may survive the strip.
+            plain = plain.replace("\x1b[2J", "").replace("\x1b[H", "")
             self.assertNotIn("\x1b", plain)
             self.assertIn("Unsafe [31m title ]0;bad", plain)
             self.assertIn("! needs your reply", plain)
@@ -1036,12 +1040,16 @@ class LoginPickerTests(unittest.TestCase):
                     )
                 )
                 try:
+                    # Two Enters after a kill: the first is forgiven once (a
+                    # late confirm Enter must not silently end the picker),
+                    # the second deliberately exits.
                     code, output = run_pty(
                         fixture,
-                        f"{command}\n\n".encode(),
+                        f"{command}\n\n\n".encode(),
                     )
                     self.assertEqual(2, code)
                     self.assertNotIn("Unknown choice", output)
+                    self.assertIn("Enter again for a regular terminal", output)
                     entries = fixture.sp_entries()
                     self.assertEqual(1, len(entries))
                     self.assertEqual("picker-close", entries[0]["args"][0])

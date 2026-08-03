@@ -1908,6 +1908,17 @@ class AutomaticTitleTests(unittest.TestCase):
                 self.assertEqual("ready", result["automatic_name_state"])
                 document = json.loads(config_path.read_text(encoding="utf-8"))
                 self.assertNotIn("automatic_title_failures", document)
+                # A self-name is an explicit rename: it must land in the alias
+                # tier too, or a provider's own ai-title keeps outranking it
+                # in every display.
+                self.assertEqual(
+                    "Session Kit Updates",
+                    result["aliases"][f"codex:{exact}"],
+                )
+                self.assertEqual(
+                    "Session Kit Updates",
+                    document["aliases"][f"codex:{exact}"],
+                )
 
                 bad_thread = dict(environment)
                 bad_thread["CODEX_THREAD_ID"] = uuid_for(99)

@@ -10,6 +10,17 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 # shellcheck source=session_kit_common
 source "$SCRIPT_DIR/session_kit_common"
 INVENTORY_CORE=${SESSION_KIT_INVENTORY_CORE:-"$SCRIPT_DIR/../lib/session_inventory.py"}
+# Background creates and restores run with no client terminal. The daemon
+# copies TERM from this environment into the new shell; with no TERM — or the
+# TERM=dumb that systemd/cron inject — every provider inside starts colorless
+# and stays that way for the life of the session (environment is fixed at
+# exec). Scoped to non-tty callers only: a human on a genuinely limited
+# terminal keeps the TERM they declared.
+if [[ ! -t 1 ]]; then
+  case "${TERM:-}" in
+    '' | dumb) export TERM=xterm-256color ;;
+  esac
+fi
 PICKER_REFUSED_STATUS=74
 PICKER_ATTACH_FAILED_STATUS=75
 
@@ -63,7 +74,12 @@ cleanup_snapshot() {
     command rm -- "$SNAPSHOT"
   fi
 }
-trap cleanup_snapshot EXIT HUP INT TERM
+trap cleanup_snapshot EXIT
+# Ctrl-C must actually stop sp. A trap that only cleaned up let bash resume
+# the script mid-flow with the snapshot deleted from under it, so no sp
+# operation could ever be interrupted. Held locks release with the process.
+trap 'cleanup_snapshot; trap - INT; kill -INT "$$"' INT
+trap 'cleanup_snapshot; exit 143' TERM HUP
 
 # Fire-and-forget provider color push at attach time. The transcript is
 # guaranteed to exist by now, unlike at creation proof, and the attach itself
@@ -331,7 +347,14 @@ picker_close() {
     picker_action_event picker_close state_changed
     return 1
   fi
-  if ! "$SK_SHPOOL" kill "$id"; then
+  sk_kill_status=0
+  timeout -k 5 20 "$SK_SHPOOL" kill "$id" || sk_kill_status=$?
+  if (( sk_kill_status == 124 || sk_kill_status == 137 )); then
+    sk_die "the close did not confirm within 20s — the session may or may not have ended; refresh the list before acting again"
+    sk_lock_release 9 2>/dev/null
+    return 1
+  fi
+  if (( sk_kill_status != 0 )); then
     sk_lock_release 9
     sk_die "shpool refused to close the exact displayed session"
     picker_action_event picker_close failed
@@ -437,7 +460,14 @@ picker_recover() {
     sk_lock_release 9
     return 1
   }
-  if ! "$SK_SHPOOL" kill "$id"; then
+  sk_kill_status=0
+  timeout -k 5 20 "$SK_SHPOOL" kill "$id" || sk_kill_status=$?
+  if (( sk_kill_status == 124 || sk_kill_status == 137 )); then
+    sk_die "the close did not confirm within 20s — the session may or may not have ended; refresh the list before acting again"
+    sk_lock_release 9 2>/dev/null
+    return 1
+  fi
+  if (( sk_kill_status != 0 )); then
     sk_lock_release 9
     sk_die "shpool refused to close the exact disconnected session; nothing changed"
     picker_action_event picker_recover failed
@@ -505,7 +535,14 @@ repair_target() {
     picker_action_event repair attached
     return 1
   fi
-  if ! "$SK_SHPOOL" kill "$id"; then
+  sk_kill_status=0
+  timeout -k 5 20 "$SK_SHPOOL" kill "$id" || sk_kill_status=$?
+  if (( sk_kill_status == 124 || sk_kill_status == 137 )); then
+    sk_die "the close did not confirm within 20s — the session may or may not have ended; refresh the list before acting again"
+    sk_lock_release 9 2>/dev/null
+    return 1
+  fi
+  if (( sk_kill_status != 0 )); then
     sk_lock_release 9
     sk_die "shpool refused to close the exact disconnected session; nothing changed"
     picker_action_event repair failed
@@ -533,6 +570,11 @@ sk_prebake_claude() {
     return 1
   command -v script >/dev/null 2>&1 || return 1
   command -v claude >/dev/null 2>&1 || return 1
+  # This runs BEFORE any other creation output and takes ~10s of deliberate
+  # silence otherwise — long enough that humans assume a hang and start
+  # pressing keys that queue into the next prompt. TTY-gated: background
+  # callers keep clean output.
+  [[ -t 1 ]] && printf 'Preparing a colored Claude session (~10s)...\n'
   local minted color transcript
   minted=$(python3 -c 'import uuid; print(uuid.uuid4())' 2>/dev/null) || return 1
   color=$(python3 "$INVENTORY_CORE" color effective claude "$minted" \
@@ -608,13 +650,17 @@ start_new() {
     sk_lock_release 9
     return 1
   }
-  if ! "$SK_SHPOOL" attach --background --dir "$cwd" "$id"; then
+  sk_attach_status=0
+  timeout -k 5 30 "$SK_SHPOOL" attach --background --dir "$cwd" "$id" || sk_attach_status=$?
+  if (( sk_attach_status != 0 && sk_attach_status != 124 && sk_attach_status != 137 )); then
     local quarantine
     quarantine=$(sk_quarantine_start_record "$id" attach-failed 2>/dev/null || true)
     sk_lock_release 9
     sk_die "shpool did not confirm session creation; launch record quarantined at ${quarantine:-$SK_START_DIR/failed}"
     return 1
   fi
+  # A timed-out reply (124/137) does not prove the session was NOT created —
+  # generation capture below settles it either way.
   if ! sk_capture_session_generation "$id" "$creation_floor_ms"; then
     local quarantine
     quarantine=$(sk_quarantine_start_record "$id" generation-unproven 2>/dev/null || true)
@@ -739,7 +785,9 @@ print("yes" if any(
   # already reads it from the transcript.
   python3 "$INVENTORY_CORE" color propagate "$provider" "$uuid" \
     >/dev/null 2>&1 || true
-  if ! "$SK_SHPOOL" attach --background --dir "$cwd" "$id"; then
+  sk_attach_status=0
+  timeout -k 5 30 "$SK_SHPOOL" attach --background --dir "$cwd" "$id" || sk_attach_status=$?
+  if (( sk_attach_status != 0 && sk_attach_status != 124 && sk_attach_status != 137 )); then
     local quarantine
     quarantine=$(sk_quarantine_start_record "$id" attach-failed 2>/dev/null || true)
     sk_lock_release 9
@@ -843,7 +891,14 @@ close_target() {
     sk_die "target changed while confirming; no action taken"
     return 1
   }
-  if ! "$SK_SHPOOL" kill "$id"; then
+  sk_kill_status=0
+  timeout -k 5 20 "$SK_SHPOOL" kill "$id" || sk_kill_status=$?
+  if (( sk_kill_status == 124 || sk_kill_status == 137 )); then
+    sk_die "the close did not confirm within 20s — the session may or may not have ended; refresh the list before acting again"
+    sk_lock_release 9 2>/dev/null
+    return 1
+  fi
+  if (( sk_kill_status != 0 )); then
     sk_die "shpool refused to close the exact session"
     return 1
   fi
@@ -943,7 +998,14 @@ prune_target() {
     sk_die "prune candidate changed or is no longer empty; no action taken"
     return 1
   }
-  if ! "$SK_SHPOOL" kill "$id"; then
+  sk_kill_status=0
+  timeout -k 5 20 "$SK_SHPOOL" kill "$id" || sk_kill_status=$?
+  if (( sk_kill_status == 124 || sk_kill_status == 137 )); then
+    sk_die "the close did not confirm within 20s — the session may or may not have ended; refresh the list before acting again"
+    sk_lock_release 9 2>/dev/null
+    return 1
+  fi
+  if (( sk_kill_status != 0 )); then
     sk_lock_release 9
     sk_die "shpool refused to kill exact verified candidate: $id"
     return 1
@@ -1159,7 +1221,7 @@ picker_fork() {
     sk_lock_release 9
     return 1
   }
-  if ! "$SK_SHPOOL" attach --background --dir "$cwd" "$id"; then
+  if ! timeout -k 5 30 "$SK_SHPOOL" attach --background --dir "$cwd" "$id"; then
     local quarantine
     quarantine=$(sk_quarantine_start_record "$id" attach-failed 2>/dev/null || true)
     sk_lock_release 9

@@ -11,6 +11,9 @@ STATUS_CMD=${SESSION_KIT_STATUS_CMD:-"$SCRIPT_DIR/shpool_status"}
 SP_CMD=${SESSION_KIT_SP_CMD:-"$SCRIPT_DIR/sp"}
 
 if [[ ! -t 0 || ! -t 1 || ${SESSION_KIT_NONINTERACTIVE:-0} == 1 ]]; then
+  # Still a picker exit: without a logged reason, a window that lands in a
+  # bare shell is undiagnosable from the action log.
+  sk_prepare_state >/dev/null 2>&1 && sk_log_action picker_exit noninteractive 2>/dev/null
   exit 2
 fi
 [[ -x $STATUS_CMD && -x $SP_CMD ]] || exit 1
@@ -70,6 +73,10 @@ trap cleanup EXIT
 # redraw the menu instead of killing the picker. Hangup and terminate still
 # end it, with the reason recorded for later diagnosis.
 PICKER_INTERRUPTED=0
+# Set after any confirmed destructive action: the next EMPTY menu choice is
+# forgiven once (re-prompt) instead of exiting to a terminal, because it is
+# far more likely a late Enter from the y-confirm than a deliberate exit.
+CONFIRM_FORGIVE=0
 trap 'PICKER_INTERRUPTED=1' INT
 trap 'sk_log_action picker_exit hangup || true; exit 2' HUP TERM
 
@@ -113,7 +120,10 @@ refresh_snapshot() {
   local fresh
   new_temp login-snapshot || return 1
   fresh=$NEW_TEMP
-  if ! "$STATUS_CMD" --json > "$fresh"; then
+  # Bounded: a jammed daemon must degrade to "previous view" messaging, not
+  # hang the login window before any menu appears. kill-after covers a child
+  # that ignores the TERM.
+  if ! timeout -k 5 "${SK_REFRESH_TIMEOUT:-30}" "$STATUS_CMD" --json > "$fresh"; then
     command rm -- "$fresh"
     return 1
   fi
@@ -121,6 +131,15 @@ refresh_snapshot() {
   QUERY=""
   PAGE=1
   build_view
+}
+
+# The attachment that just ended painted its own frames; without a clear the
+# menu overprints the dead session's screen and reads as corruption (seen
+# live at the 2026-08-02 daemon restart). Gated on the same test as color:
+# a dumb or capability-less terminal must never receive the escapes.
+picker_clear_screen() {
+  (( PICKER_STYLE )) && printf '\033[2J\033[H'
+  return 0
 }
 
 build_view() {
@@ -261,7 +280,10 @@ terminal_height() {
     height=$(tput lines 2>/dev/null || true)
   fi
   [[ $height =~ ^[0-9]+$ ]] || height=24
-  (( height >= 12 )) || height=12
+  # Respect genuinely short windows down to 8 rows: budgeting for 12 lines an
+  # 8-row split cannot show scrolled the summary and first sessions off-screen
+  # before the human could read them.
+  (( height >= 8 )) || height=8
   (( height <= 200 )) || height=200
   printf '%s\n' "$height"
 }
@@ -801,11 +823,32 @@ render_main() {
   unavailable_count=$(python3 -c 'import json,sys; print(int((json.load(open(sys.argv[1])).get("_picker") or {}).get("unavailable_total") or 0))' "$VIEW" 2>/dev/null || printf '0')
   [[ $unavailable_count =~ ^[0-9]+$ ]] || unavailable_count=0
   PAGE_SIZE=$(page_size "$pending" "$REPAIR_BANNER_LINES")
+  # A failed sizing helper must degrade to a usable page, never to a bash
+  # division-by-zero and a traceback in the login window.
+  [[ $PAGE_SIZE =~ ^[0-9]+$ && $PAGE_SIZE -ge 1 ]] || PAGE_SIZE=10
   clamp_page
   render_page
   show_repair_banner
   echo
   local more_total=$(( other_count + pending + unavailable_count ))
+  local cols=${COLUMNS:-}
+  [[ $cols =~ ^[0-9]+$ ]] || cols=$(tput cols 2>/dev/null || printf '80')
+  [[ $cols =~ ^[0-9]+$ ]] || cols=80
+  if (( cols < 60 )); then
+    # Narrow window: the full footers wrap, corrupting the line budget the
+    # pager computed. One compact line fits down to ~34 columns; 60 columns
+    # and up keep the full footer (existing rendering contract).
+    if (( more_total > 0 )); then
+      printf '  %s:open %s:new %s:kill %s:more %s:help\n' \
+        "$(picker_green '#')" "$(picker_green n)" "$(picker_green k)" \
+        "$(picker_green m)" "$(picker_green '?')"
+    else
+      printf '  %s:open %s:new %s:kill %s:help\n' \
+        "$(picker_green '#')" "$(picker_green n)" "$(picker_green k)" \
+        "$(picker_green '?')"
+    fi
+    return
+  fi
   printf '  Open: %s · New: %s · Kill: %s number\n' \
     "$(picker_green number)" "$(picker_green n)" "$(picker_green k)"
   if (( more_total > 0 )); then
@@ -822,13 +865,15 @@ render_main() {
 # unavailable records) lives here behind one key.
 show_more_menu() {
   local pending other_count unavailable_count
-  pending=$(recovery_count 2>/dev/null || printf '0')
-  [[ $pending =~ ^[0-9]+$ ]] || pending=0
-  other_count=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1])).get("outside_agents",[])))' "$VIEW" 2>/dev/null || printf '0')
-  [[ $other_count =~ ^[0-9]+$ ]] || other_count=0
-  unavailable_count=$(python3 -c 'import json,sys; print(int((json.load(open(sys.argv[1])).get("_picker") or {}).get("unavailable_total") or 0))' "$VIEW" 2>/dev/null || printf '0')
-  [[ $unavailable_count =~ ^[0-9]+$ ]] || unavailable_count=0
   while true; do
+    # Recomputed every pass: restoring recoveries from inside this menu must
+    # not leave it advertising counts that are no longer true.
+    pending=$(recovery_count 2>/dev/null || printf '0')
+    [[ $pending =~ ^[0-9]+$ ]] || pending=0
+    other_count=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1])).get("outside_agents",[])))' "$VIEW" 2>/dev/null || printf '0')
+    [[ $other_count =~ ^[0-9]+$ ]] || other_count=0
+    unavailable_count=$(python3 -c 'import json,sys; print(int((json.load(open(sys.argv[1])).get("_picker") or {}).get("unavailable_total") or 0))' "$VIEW" 2>/dev/null || printf '0')
+    [[ $unavailable_count =~ ^[0-9]+$ ]] || unavailable_count=0
     echo
     echo "  More"
     if (( other_count > 0 )); then
@@ -854,8 +899,23 @@ show_more_menu() {
     picker_read answer "  more ❯ " || return 0
     case "$answer" in
       "") return 0 ;;
-      o|O) (( other_count > 0 )) && show_other_provider_sessions || echo "  Nothing to show." ;;
-      u|U) (( pending > 0 )) && review_recovery || echo "  Nothing to review." ;;
+      o|O)
+        if (( other_count > 0 )); then
+          show_other_provider_sessions
+        else
+          echo "  Nothing to show."
+        fi
+        ;;
+      u|U)
+        # An if, not &&/||: review_recovery returning nonzero (Enter backout,
+        # a failed guard that already explained itself) must not append a
+        # contradictory "Nothing to review."
+        if (( pending > 0 )); then
+          review_recovery
+        else
+          echo "  Nothing to review."
+        fi
+        ;;
       *) echo "  Unknown choice. Use o, u, or Enter." ;;
     esac
   done
@@ -1165,6 +1225,9 @@ choose_number() {
     fi
     local open_status=0
     PROOF_ACTION_QUIET=1 run_proof_action picker-open "$number" || open_status=$?
+    # The attachment (or its failed attempt) owned the screen; start the
+    # menu from a clean frame.
+    picker_clear_screen
     case "$open_status" in
       0) ;;
       "$PICKER_REFUSED_STATUS")
@@ -1201,6 +1264,7 @@ choose_number() {
       "") return ;;
       1)
         run_proof_action picker-takeover "$number" || true
+        CONFIRM_FORGIVE=1
         refresh_after_action
         return
         ;;
@@ -1211,6 +1275,7 @@ choose_number() {
         ;;
       3)
         run_proof_action picker-close "$number" || true
+        CONFIRM_FORGIVE=1
         refresh_after_action
         return
         ;;
@@ -1227,6 +1292,7 @@ direct_close() {
     return
   }
   run_proof_action picker-close "$number" || true
+  CONFIRM_FORGIVE=1
   refresh_after_action
 }
 
@@ -1493,16 +1559,18 @@ PY
 }
 
 review_recovery() {
-  require_live_actions || return
+  # Every early exit returns 0: each path below already explains itself, and
+  # a nonzero status made the More menu stack "Nothing to review." on top.
+  require_live_actions || return 0
   recovery_list || {
     echo "  Recovery records are unavailable. Nothing changed."
-    return
+    return 0
   }
   local count
   count=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1])).get("entries",[])))' "$RECOVERY")
   if (( count == 0 )); then
     echo "  No conversations are waiting for recovery."
-    return
+    return 0
   fi
   echo
   echo "  Conversations available for exact recovery"
@@ -1526,7 +1594,7 @@ PY
   echo
   local answer selected
   picker_read answer "  recovery ❯ " || return 0
-  [[ -n $answer ]] || return
+  [[ -n $answer ]] || return 0
   selected=$(python3 - "$RECOVERY" "$answer" <<'PY'
 import json,sys
 entries=json.load(open(sys.argv[1])).get("entries",[])
@@ -1563,7 +1631,11 @@ PY
 
   local number encoded generation old_id provider uuid cwd launched attempt acknowledged active_target active_number
   local -a values=()
-  while IFS= read -r number; do
+  # The selection rides on fd 3 so the loop body keeps the terminal on stdin:
+  # with the selection on stdin, choose_number's menu read consumed the NEXT
+  # selected recovery number as its action (or hit EOF and killed the picker
+  # mid-recovery), and sp's attach saw a here-string instead of a tty.
+  while IFS= read -r -u 3 number; do
     [[ $number =~ ^[0-9]+$ ]] || continue
     encoded=$(python3 - "$RECOVERY" "$number" <<'PY'
 import base64,json,sys
@@ -1635,7 +1707,7 @@ PY
     else
       printf '  Could not restore %s; its recovery record was retained.\n' "$old_id" >&2
     fi
-  done <<<"$selected"
+  done 3<<<"$selected"
   refresh_after_action
 }
 
@@ -1656,7 +1728,7 @@ show_help() {
   echo "  fork <number> Start a separate fork of an exact Claude or Codex conversation"
   echo "  next / prev   Move between pages; only visible page numbers accept actions"
   echo "  Enter / EOF   Return to a regular terminal without a session action"
-  echo "  Ctrl-C        Return to a regular terminal without a session action"
+  echo "  Ctrl-C        Redraw this menu (never exits; use Enter for a terminal)"
   echo
   echo "  Inside a managed session: use bye to close it, or disconnect SSH to leave it running."
   echo "  Full raw terminal history is available from an open-session action menu."
@@ -1664,10 +1736,28 @@ show_help() {
 
 load_repair_banner
 
-refresh_snapshot || {
-  echo "  Live sessions could not be loaded. Returning to a regular terminal."
-  exit 2
-}
+# Start from a clean frame: after a daemon restart the previous attachment's
+# dead screen is still in the terminal, and menus painted over it read as
+# corruption. Then treat a briefly-unavailable manager as a wait, not a
+# failure — a planned restart takes a few seconds.
+picker_clear_screen
+if ! refresh_snapshot; then
+  echo "  The session manager is not responding — retrying for up to a minute (close the window for a plain terminal)."
+  SK_BOOT_OK=0
+  # Short per-try bound: five 10s-capped refreshes keep the whole retry
+  # window near one minute even against a fully jammed manager.
+  for _sk_boot_try in 1 2 3 4 5; do
+    sleep 2
+    if SK_REFRESH_TIMEOUT=10 refresh_snapshot; then
+      SK_BOOT_OK=1
+      break
+    fi
+  done
+  if (( SK_BOOT_OK == 0 )); then
+    echo "  Live sessions could not be loaded. Returning to a regular terminal."
+    picker_exit startup_refresh_failed
+  fi
+fi
 
 # A menu window can sit open across release rollovers, silently running old
 # code against new state — every fix ships and the standing windows never see
@@ -1688,8 +1778,16 @@ while true; do
   render_main
   choice=""
   picker_read choice "  $(picker_green '❯') " || continue
+  FORGIVE_EMPTY=$CONFIRM_FORGIVE
+  CONFIRM_FORGIVE=0
   case "$choice" in
-    "") picker_exit terminal_requested ;;
+    "")
+      if (( FORGIVE_EMPTY )); then
+        echo "  (Enter again for a regular terminal)"
+        continue
+      fi
+      picker_exit terminal_requested
+      ;;
     q|Q|p|P) picker_exit quit ;;
     r|R)
       refresh_snapshot || {
