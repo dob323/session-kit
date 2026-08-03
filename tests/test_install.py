@@ -7,6 +7,7 @@ from pathlib import Path
 import plistlib
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -47,6 +48,8 @@ class InstallerTests(unittest.TestCase):
                 "HOME": str(self.home),
                 "PATH": f"{self.fake_bin}:{self.env['PATH']}",
                 "SESSION_KIT_RELEASE_ID": RELEASE_A,
+                "XDG_CONFIG_HOME": str(self.home / ".config"),
+                "XDG_STATE_HOME": str(self.home / ".local/state"),
                 "SESSION_KIT_SYSTEMD_ROOT": str(self.temp / "systemd"),
                 "SESSION_KIT_TESTING": "1",
             }
@@ -301,6 +304,10 @@ class InstallerTests(unittest.TestCase):
         self.assertIn("refusing broad install root", result.stderr)
         self.assertEqual(list(self.home.iterdir()), [])
 
+    @unittest.skipIf(
+        sys.version_info < (3, 11),
+        "the supported macOS lifecycle requires Python 3.11 or newer",
+    )
     def test_macos_install_update_and_rollback_are_transactional(self) -> None:
         self.env["SESSION_KIT_TEST_PLATFORM"] = "macos"
         self.env["SESSION_KIT_SERVICE_ROOT"] = str(self.temp / "LaunchAgents")

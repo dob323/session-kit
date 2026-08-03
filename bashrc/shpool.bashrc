@@ -301,10 +301,10 @@ PY
                       >>"$__sk_app_dir/broker.log" 2>&1 &
                     __sk_broker_pid=$!
                   else
-                    [[ -n $__sk_app_server_pid ]] && \
+                    if [[ -n $__sk_app_server_pid ]]; then
                       kill "$__sk_app_server_pid" 2>/dev/null || true
-                    [[ -n $__sk_app_server_pid ]] && \
                       wait "$__sk_app_server_pid" 2>/dev/null || true
+                    fi
                     __sk_app_server_pid=
                     echo "[session-kit: Codex App Server unavailable; using direct TUI]" >&2
                   fi

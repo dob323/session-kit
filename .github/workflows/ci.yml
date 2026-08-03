@@ -85,6 +85,9 @@ jobs:
             test "$generation" -gt 0
             python3 lib/session_inventory.py platform process-is \
               $$ "$generation" bash
+            # Keep Bash from replacing itself with the final Python command;
+            # the process-is check must still observe the shell at this PID.
+            :
           '
       - name: Check supported Bash syntax
         run: |
