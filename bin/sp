@@ -1239,18 +1239,20 @@ name_target() {
   local selector=$1 action=$2 title=${3:-}
   resolve_target "$selector" || return 1
   sk_require_mutation_target || return 1
-  [[ $SK_PROVIDER == claude || $SK_PROVIDER == codex ]] || {
+  [[ $SK_CONVERSATION_PROVIDER == claude || $SK_CONVERSATION_PROVIDER == codex ]] || {
     sk_die "managed shell labels are derived and cannot be renamed"
     return 1
   }
-  local id=$SK_ID started=$SK_STARTED provider=$SK_PROVIDER uuid=$SK_UUID
+  local id=$SK_ID started=$SK_STARTED
+  local provider=$SK_CONVERSATION_PROVIDER uuid=$SK_CONVERSATION_UUID
+  local live_provider=$SK_PROVIDER live_uuid=$SK_UUID
   local shell_pid=$SK_SHELL_PID shell_start=$SK_SHELL_START
   local provider_pid=$SK_PROVIDER_PID provider_start=$SK_PROVIDER_START
   local daemon_pid=$SK_DAEMON_PID daemon_start=$SK_DAEMON_START
   picker_lock || return 1
-  sk_revalidate "$id" "$started" "$provider" "$uuid" \
+  sk_revalidate "$id" "$started" "$live_provider" "$live_uuid" \
     "$shell_pid" "$shell_start" "$provider_pid" "$provider_start" \
-    "$daemon_pid" "$daemon_start" || {
+    "$daemon_pid" "$daemon_start" "$provider" "$uuid" || {
       sk_lock_release 9
       sk_die "target changed before name update; nothing changed"
       return 1

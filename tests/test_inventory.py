@@ -512,6 +512,67 @@ class InventoryIdentityTests(unittest.TestCase):
         self.assertEqual("Exact menu name", codex["native_title"])
         self.assertEqual("native", codex["title_source"])
 
+    def test_completed_codex_child_is_retained_but_not_active(self) -> None:
+        with tempfile.TemporaryDirectory(prefix=".codex-child-", dir=REPO) as raw:
+            codex_home = Path(raw)
+            db = codex_home / "state_5.sqlite"
+            parent = uuid_for(1)
+            child = uuid_for(2)
+            rollout = codex_home / "sessions" / "rollout-child.jsonl"
+            rollout.parent.mkdir()
+            rollout.write_text(
+                "\n".join(
+                    (
+                        json.dumps(
+                            {
+                                "type": "event_msg",
+                                "payload": {"type": "task_started"},
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "event_msg",
+                                "payload": {"type": "task_complete"},
+                            }
+                        ),
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            connection = sqlite3.connect(db)
+            connection.execute(
+                "CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, cwd TEXT, "
+                "rollout_path TEXT, agent_nickname TEXT)"
+            )
+            connection.execute(
+                "CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, "
+                "child_thread_id TEXT, status TEXT)"
+            )
+            connection.executemany(
+                "INSERT INTO threads VALUES (?, ?, ?, ?, ?)",
+                (
+                    (parent, "Parent", "/srv/project-1", "", None),
+                    (child, "Child", "/srv/project-1", str(rollout), "Verifier"),
+                ),
+            )
+            connection.execute(
+                "INSERT INTO thread_spawn_edges VALUES (?, ?, ?)",
+                (parent, child, "open"),
+            )
+            connection.commit()
+            connection.close()
+
+            threads, edges = inventory_core.read_codex_db(db)
+
+        self.assertEqual("idle", edges[parent][0]["status"])
+        fixture = list(inventory_fixture(1, providers=("codex",)))
+        fixture[4] = (threads, edges)
+        result = inventory_core.build_inventory(*fixture, now=1_800_000_000)
+        row = result["sessions"][0]
+        self.assertEqual(1, len(row["subagents"]))
+        self.assertEqual(0, row["active_subagent_count"])
+
     def test_codex_database_prompt_never_outranks_automatic_or_context_title(
         self,
     ) -> None:
@@ -840,6 +901,77 @@ class InventoryIdentityTests(unittest.TestCase):
             self.assertEqual(uuid_for(55), metadata[0]["session_id"])
             self.assertEqual([proc_descriptor], opened_paths)
             self.assertGreaterEqual(fstat_spy.call_count, 2)
+
+    def test_app_server_open_rollout_is_exact_managed_codex_identity(self) -> None:
+        fixture = list(inventory_fixture(1, providers=("codex",)))
+        exact = uuid_for(1)
+        app_pid = 2001
+        fixture[2][app_pid]["cmdline"] = [
+            "/usr/bin/codex",
+            "-c",
+            "check_for_update_on_startup=false",
+            "app-server",
+            "--listen",
+            "unix:///run/user/1000/session-kit/app.sock",
+        ]
+        fixture[3][app_pid] = [
+            {
+                "source": "vscode",
+                "originator": "example_coordination_broker",
+                "id": exact,
+                "session_id": exact,
+                "_turn_state": "idle",
+            }
+        ]
+        fixture[4][0][exact]["title"] = "How deep is deepest ocean"
+        fixture[4][0][exact]["first_user_message"] = "how deep is deepest ocean"
+        fixture[4][0][exact]["session_index_name"] = "How deep is deepest ocean"
+        fixture[5]["colors"] = {f"codex:{exact}": "green"}
+
+        result = inventory_core.build_inventory(*fixture, now=1_800_000_000)
+
+        row = result["sessions"][0]
+        self.assertEqual("codex", row["provider"])
+        self.assertEqual(exact, row["identity"]["uuid"])
+        self.assertEqual(app_pid, row["identity"]["pid"])
+        self.assertEqual(
+            "native Codex PID open exact rollout",
+            row["identity"]["provenance"],
+        )
+        self.assertEqual("How deep is deepest ocean", row["title"])
+        self.assertEqual("green", row["display_color"])
+        self.assertEqual("idle", row["agent_status"])
+
+    def test_editor_rollout_requires_app_server_and_one_exact_thread(self) -> None:
+        fixture = list(inventory_fixture(1, providers=("codex",)))
+        exact = uuid_for(1)
+        app_pid = 2001
+        editor_meta = {
+            "source": "vscode",
+            "id": exact,
+            "session_id": exact,
+        }
+        fixture[3][app_pid] = [editor_meta]
+
+        direct = inventory_core.build_inventory(*fixture, now=1_800_000_000)
+        self.assertEqual("unknown", direct["sessions"][0]["provider"])
+        self.assertIsNone(direct["sessions"][0]["identity"]["uuid"])
+
+        fixture[2][app_pid]["cmdline"] = [
+            "/usr/bin/codex",
+            "app-server",
+            "--listen",
+            "unix:///run/user/1000/session-kit/app.sock",
+        ]
+        second = uuid_for(2)
+        fixture[3][app_pid].append(
+            {"source": "vscode", "id": second, "session_id": second}
+        )
+        ambiguous = inventory_core.build_inventory(
+            *fixture, now=1_800_000_000
+        )
+        self.assertEqual("unknown", ambiguous["sessions"][0]["provider"])
+        self.assertIsNone(ambiguous["sessions"][0]["identity"]["uuid"])
 
 
 class CodexTurnStateTests(unittest.TestCase):
@@ -2250,6 +2382,16 @@ class AutomaticTitleTests(unittest.TestCase):
                 "pending", live["sessions"][0]["provider_title_state"]
             )
             self.assertNotIn("provider_title_state", live["sessions"][1])
+
+            live["sessions"][0].update(
+                {"availability": "attached", "agent_status": "working"}
+            )
+            inventory_core.apply_provider_title_states(
+                live, {"state_dir": state}
+            )
+            self.assertEqual(
+                "deferred", live["sessions"][0]["provider_title_state"]
+            )
 
             (marker_root / "main2").unlink()
             (marker_root / "target").touch()

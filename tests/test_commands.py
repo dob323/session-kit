@@ -2556,6 +2556,55 @@ class PickerProofTests(unittest.TestCase):
         self.assertNotEqual(0, refused.returncode)
         self.assertIn("target changed", refused.stderr)
 
+    def test_public_name_uses_generation_bound_exited_provider_identity(self) -> None:
+        historical_uuid = "00000000-0000-4000-8000-000000000111"
+        row = session_row("main2", provider="shell", uuid="")
+        row.update(
+            {
+                "agent_status": "provider exited",
+                "display_provider": "claude",
+                "exited_provider": "claude",
+                "exited_identity": {
+                    "confidence": "historical-exact",
+                    "uuid": historical_uuid,
+                },
+                "recovery": {
+                    "available": True,
+                    "provider": "claude",
+                    "uuid": historical_uuid,
+                },
+            }
+        )
+        self._prime(row)
+        env = self.fixture.env()
+        named = run([SP, "name", "main2", "Exited Claude"], env=env)
+        self.assertIn("Named exact claude session main2", named.stdout)
+        stored = json.loads(self.fixture.config.read_text())
+        self.assertEqual(
+            "Exited Claude", stored["aliases"][f"claude:{historical_uuid}"]
+        )
+
+        changed_uuid = "00000000-0000-4000-8000-000000000222"
+        changed = json.loads(json.dumps(row))
+        changed["exited_identity"]["uuid"] = changed_uuid
+        changed["recovery"]["uuid"] = changed_uuid
+        changed_file = self.fixture.base / "changed-exited-name.json"
+        changed_file.write_text(
+            json.dumps(inventory_document(changed)), encoding="utf-8"
+        )
+        if self.fixture.snapshot_count.exists():
+            self.fixture.snapshot_count.unlink()
+        env["STUB_SECOND_INVENTORY"] = str(changed_file)
+        before = self.fixture.config.read_bytes()
+        refused = run(
+            [SP, "name", "main2", "Wrong exited target"],
+            env=env,
+            check=False,
+        )
+        self.assertNotEqual(0, refused.returncode)
+        self.assertIn("target changed", refused.stderr)
+        self.assertEqual(before, self.fixture.config.read_bytes())
+
     def test_public_numeric_selector_uses_terminal_number_not_internal_row(self) -> None:
         row = session_row("main2", row=1, provider="claude")
         row["terminal_number"] = 27

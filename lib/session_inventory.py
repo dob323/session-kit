@@ -3,8 +3,9 @@
 
 The collector takes one shpool JSON snapshot and one Claude agents JSON
 snapshot, then joins provider identities to a bounded native process table.
-Linux Codex identities come from a native Codex process's open root rollout;
-Darwin uses that exact process's ``CODEX_THREAD_ID``. It
+Linux Codex identities come from an open root rollout owned by the native
+Codex CLI or App Server process; Darwin uses that exact process's
+``CODEX_THREAD_ID``. It
 never selects a conversation by cwd or recency.
 """
 
@@ -897,6 +898,14 @@ def _is_native_codex(process: Mapping[str, Any]) -> bool:
     return executable == "codex" and process.get("comm") != "node"
 
 
+def _is_codex_app_server(process: Mapping[str, Any]) -> bool:
+    """Recognize the native Codex process that owns remote TUI threads."""
+    if not _is_native_codex(process):
+        return False
+    argv = list(process.get("cmdline") or [])
+    return "app-server" in argv[1:]
+
+
 def _is_native_claude(process: Mapping[str, Any]) -> bool:
     argv = process.get("cmdline") or []
     executable = Path(str(argv[0])).name if argv else ""
@@ -1096,6 +1105,39 @@ def codex_rollout_by_uuid(
         os.close(descriptor)
 
 
+def codex_rollout_state_by_path(codex_home: Path, rollout_path: object) -> str:
+    """Read one child thread's state from an owner-controlled Codex rollout."""
+    if not isinstance(rollout_path, str) or not rollout_path.startswith("/"):
+        return "state unavailable"
+    try:
+        root = codex_home.resolve(strict=True)
+        raw_path = Path(rollout_path)
+        pathname = raw_path.lstat()
+        resolved = raw_path.resolve(strict=True)
+        resolved.relative_to(root)
+        descriptor = os.open(
+            raw_path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except (OSError, ValueError):
+        return "state unavailable"
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not statmod.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or (metadata.st_dev, metadata.st_ino)
+            != (pathname.st_dev, pathname.st_ino)
+        ):
+            return "state unavailable"
+        return _rollout_turn_state(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def index_codex_processes(
     process_table: Mapping[int, Mapping[str, Any]], proc_root: Path, codex_home: Path
 ) -> dict[int, list[dict[str, Any]]]:
@@ -1116,12 +1158,27 @@ def index_codex_processes(
     }
 
 
-def _root_codex_uuid(metadata: Sequence[Mapping[str, Any]]) -> list[str]:
+def _root_codex_uuid(
+    process: Mapping[str, Any], metadata: Sequence[Mapping[str, Any]]
+) -> list[str]:
+    """Return exact root threads owned by one native Codex process.
+
+    Direct Codex writes ``source=cli``. A remote TUI delegates its thread to
+    the native ``codex app-server`` process, whose open rollout is currently
+    marked ``source=vscode``. Only that validated process type may claim the
+    second source; an ordinary Codex process cannot turn arbitrary editor
+    rollouts into managed-session identity evidence.
+    """
     identities: set[str] = set()
+    app_server = _is_codex_app_server(process)
     for meta in metadata:
         uuid = valid_uuid(meta.get("session_id"))
         event_id = valid_uuid(meta.get("id"))
-        if meta.get("source") == "cli" and uuid and event_id == uuid:
+        source = meta.get("source")
+        accepted_source = source == "cli" or (
+            app_server and source == "vscode"
+        )
+        if accepted_source and uuid and event_id == uuid:
             identities.add(uuid)
     return sorted(identities)
 
@@ -1133,7 +1190,7 @@ def _codex_turn_state(
     for meta in metadata:
         uuid = valid_uuid(meta.get("session_id"))
         event_id = valid_uuid(meta.get("id"))
-        if meta.get("source") == "cli" and uuid == wanted_uuid and event_id == uuid:
+        if uuid == wanted_uuid and event_id == uuid:
             state = meta.get("_turn_state")
             if state in {
                 "needs your reply",
@@ -1297,6 +1354,7 @@ def read_codex_db(
                 "agent_path",
                 "thread_source",
                 "first_user_message",
+                "rollout_path",
             )
             if name in columns
         ]
@@ -1323,6 +1381,13 @@ def read_codex_db(
                 "SELECT parent_thread_id, child_thread_id, status FROM thread_spawn_edges"
             ).fetchall():
                 child = threads.get(row["child_thread_id"], {})
+                edge_status = clean_text(row["status"], 40) or "unknown"
+                if edge_status.casefold() == "open":
+                    observed = codex_rollout_state_by_path(
+                        db_path.parent, child.get("rollout_path")
+                    )
+                    if observed != "state unavailable":
+                        edge_status = observed
                 edges.setdefault(row["parent_thread_id"], []).append(
                     {
                         "provider": "codex",
@@ -1337,7 +1402,7 @@ def read_codex_db(
                             80,
                         )
                         or str(row["child_thread_id"])[:8],
-                        "status": clean_text(row["status"], 40) or "unknown",
+                        "status": edge_status,
                     }
                 )
         for items in edges.values():
@@ -1572,6 +1637,21 @@ def _base_agent(
         "agent_status": clean_text(agent_status, 60) or "unknown",
         "needs_you": bool(needs_you),
         "subagents": subagents,
+        "active_subagent_count": sum(
+            1
+            for child in subagents
+            if str(child.get("status") or "").casefold()
+            not in {
+                "idle",
+                "complete",
+                "completed",
+                "closed",
+                "stopped",
+                "failed",
+                "cancelled",
+                "canceled",
+            }
+        ),
         "recovery": recovery,
         "diagnostics": diagnostics,
         "shpool_shell": shpool_shell,
@@ -1965,7 +2045,8 @@ def build_inventory(
         codex_candidates: list[tuple[int, str]] = []
         for candidate_pid in tree:
             for candidate_uuid in _root_codex_uuid(
-                codex_index.get(candidate_pid, ())
+                process_table.get(candidate_pid, {}),
+                codex_index.get(candidate_pid, ()),
             ):
                 codex_candidates.append((candidate_pid, candidate_uuid))
         codex_candidates = sorted(set(codex_candidates))
@@ -2076,7 +2157,7 @@ def build_inventory(
                 uuid=uuid,
                 pid=pid,
                 process_table=process_table,
-                provenance="native codex PID open source=cli rollout",
+                provenance="native Codex PID open exact rollout",
                 confidence="exact",
             )
             subagents = list(codex_edges.get(uuid, ()))
@@ -2293,7 +2374,7 @@ def build_inventory(
     for pid, metadata in codex_index.items():
         if pid in mapped_codex:
             continue
-        identities = _root_codex_uuid(metadata)
+        identities = _root_codex_uuid(process_table.get(pid, {}), metadata)
         if len(identities) != 1:
             continue
         uuid = identities[0]
@@ -2328,7 +2409,7 @@ def build_inventory(
                     uuid=uuid,
                     pid=pid,
                     process_table=process_table,
-                    provenance="native codex PID open source=cli rollout",
+                    provenance="native Codex PID open exact rollout",
                     confidence="exact",
                 ),
                 title=outside_title,
@@ -2423,11 +2504,18 @@ def apply_provider_title_states(
         except OSError:
             item["provider_title_state"] = "ready"
             continue
-        item["provider_title_state"] = (
-            "pending"
-            if statmod.S_ISREG(marker_stat.st_mode) and not marker.is_symlink()
-            else "ready"
+        pending = statmod.S_ISREG(marker_stat.st_mode) and not marker.is_symlink()
+        busy_or_attached = (
+            str(item.get("availability") or "").casefold() == "attached"
+            or str(item.get("agent_status") or "").casefold()
+            in {"running", "working", "needs your reply", "reply optional"}
         )
+        if pending and busy_or_attached:
+            item["provider_title_state"] = "deferred"
+        elif pending:
+            item["provider_title_state"] = "pending"
+        else:
+            item["provider_title_state"] = "ready"
 
 
 def _shpool_executable() -> str:
@@ -6263,7 +6351,9 @@ def render_inventory(inventory: Mapping[str, Any], rows_only: bool = False) -> s
                     status_parts.append(f"recent output {recent_output_age} ago")
                 if process_age:
                     status_parts.append(f"process age {process_age}")
-                agent_count = len(item.get("subagents", ()))
+                agent_count = int(
+                    item.get("active_subagent_count", len(item.get("subagents", ())))
+                )
                 if agent_count:
                     status_parts.append(
                         f"{agent_count} subagent{'s' if agent_count != 1 else ''}"
@@ -6296,7 +6386,9 @@ def render_inventory(inventory: Mapping[str, Any], rows_only: bool = False) -> s
         lines.append(f"  {bold}Outside shpool{reset}")
         for item in outside:
             uuid = item.get("identity", {}).get("uuid") or ""
-            agent_count = len(item.get("subagents", ()))
+            agent_count = int(
+                item.get("active_subagent_count", len(item.get("subagents", ())))
+            )
             prefix = f"      -  [{item.get('provider')}] "
             title = _display_title(
                 item.get("title"), max(1, width - _display_width(prefix))

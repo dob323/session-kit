@@ -800,6 +800,23 @@ class LoginPickerTests(unittest.TestCase):
         finally:
             fixture.close()
 
+    def test_deferred_provider_bar_title_is_not_shown_as_actionable(self) -> None:
+        deferred = row(
+            "title-deferred",
+            number=6,
+            provider="codex",
+            availability="attached",
+        )
+        deferred["provider_title_state"] = "deferred"
+        fixture = LoginFixture(inventory(deferred))
+        try:
+            code, output = run_pty(fixture, b"\n", columns=120)
+            self.assertEqual(2, code)
+            self.assertNotIn("title pending", output)
+            self.assertIn("working", output)
+        finally:
+            fixture.close()
+
     def test_open_elsewhere_pending_title_offers_proof_bound_refresh(self) -> None:
         pending = row(
             "title-pending",

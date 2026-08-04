@@ -4,7 +4,16 @@ Session Kit follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-No changes yet.
+### Fixed
+
+- Associated a managed Codex App Server's single open remote-TUI rollout with
+  its Session Kit terminal, restoring the exact thread title and launch color.
+- Kept editor rollouts ineligible for ordinary Codex processes and refused
+  ambiguous app servers with multiple open threads.
+- Deferred Codex in-window title refreshes while the exact provider is attached
+  or working instead of labeling an unsafe restart as immediately pending.
+- Derived Codex child-thread activity from each exact rollout so completed
+  subagents no longer inflate the active count.
 
 ## [0.1.3] - 2026-08-03
 

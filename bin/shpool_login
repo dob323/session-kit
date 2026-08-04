@@ -642,7 +642,9 @@ if selected:
                 if not detail.startswith("last output ")
             ]
         )
-        agents = len(row.get("subagents") or [])
+        agents = int(
+            row.get("active_subagent_count", len(row.get("subagents") or []))
+        )
         if agents:
             details.append(f"{agents} subagent{'s' if agents != 1 else ''}")
         # Narrow terminals drop the subagent count first and the spelled-out

@@ -52,7 +52,17 @@ process evidence can bind it immediately. A new Codex TUI has no conversation
 UUID until its first message. Before that message, the picker labels it
 `Codex started, no messages yet`; exact terminal open and close remain
 available, while UUID-dependent recovery, fork, name, and color actions wait
-for Codex to publish its thread identity.
+for Codex to publish its thread identity. When the optional Codex App Server
+integration is active, Session Kit also accepts an exact thread rollout held
+open by that managed app-server process. It refuses the association when the
+server has zero or multiple candidate threads.
+
+Codex saves a renamed thread immediately, but an already-running TUI cannot
+repaint its own status bar from outside the process. Session Kit defers that
+bar refresh while the exact session is attached or working and offers the
+proof-bound refresh only after it is detached and idle. Completed Codex
+subagent threads remain available in detail output but are not counted as
+active subagents in summary rows.
 
 ## List, inspect, and search
 

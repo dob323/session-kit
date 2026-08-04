@@ -344,6 +344,29 @@ if len(matches) != 1:
 row = matches[0]
 identity = row.get("identity") or {}
 daemon = data.get("daemon_generation") or {}
+conversation_provider = row.get("provider") or "unknown"
+conversation_uuid = identity.get("uuid") or ""
+if conversation_provider not in {"claude", "codex"} or not conversation_uuid:
+    exited_identity = row.get("exited_identity") or {}
+    recovery = row.get("recovery") or {}
+    exited_provider = row.get("exited_provider")
+    exited_uuid = exited_identity.get("uuid")
+    if (
+        row.get("provider") == "shell"
+        and row.get("agent_status") == "provider exited"
+        and exited_provider in {"claude", "codex"}
+        and row.get("display_provider") == exited_provider
+        and exited_identity.get("confidence") == "historical-exact"
+        and isinstance(exited_uuid, str)
+        and recovery.get("available") is True
+        and recovery.get("provider") == exited_provider
+        and recovery.get("uuid") == exited_uuid
+    ):
+        conversation_provider = exited_provider
+        conversation_uuid = exited_uuid
+    else:
+        conversation_provider = ""
+        conversation_uuid = ""
 raw_id = row.get("shpool_id_raw")
 if not isinstance(raw_id, str) or raw_id != row.get("shpool_id"):
     raise SystemExit(2)
@@ -364,6 +387,8 @@ values = [
     str(daemon.get("process_start_ticks") or ""),
     "true" if row.get("mutation_allowed") is True else "false",
     row.get("mutation_rejection_reason") or "",
+    conversation_provider,
+    conversation_uuid,
 ]
 for value in values:
     value = re.sub(r"[\t\r\n]+", " ", str(value))
@@ -375,7 +400,7 @@ sk_resolve() {
   local inventory=$1 selector=$2
   local -a fields=()
   while IFS= read -r field; do fields+=("$field"); done < <(sk_lookup_file "$inventory" "$selector") || return 2
-  [[ ${#fields[@]} -eq 16 ]] || return 2
+  [[ ${#fields[@]} -eq 18 ]] || return 2
   SK_ID=${fields[0]}
   SK_STARTED=${fields[1]}
   SK_STATUS=${fields[2]}
@@ -392,6 +417,8 @@ sk_resolve() {
   SK_DAEMON_START=${fields[13]}
   SK_MUTATION_ALLOWED=${fields[14]}
   SK_MUTATION_REASON=${fields[15]}
+  SK_CONVERSATION_PROVIDER=${fields[16]}
+  SK_CONVERSATION_UUID=${fields[17]}
 }
 
 sk_require_mutation_target() {
@@ -527,6 +554,8 @@ sk_revalidate() {
   local expected_shell_pid=$5 expected_shell_start=$6
   local expected_provider_pid=$7 expected_provider_start=$8
   local expected_daemon_pid=$9 expected_daemon_start=${10}
+  local expected_conversation_provider=${11:-}
+  local expected_conversation_uuid=${12:-}
   local fresh result=0
   fresh=$(mktemp "$SK_STATE_DIR/revalidate.json.XXXXXX") || return 1
   if ! sk_guard_snapshot_file "$fresh" || ! sk_resolve "$fresh" "$expected_id"; then
@@ -542,6 +571,10 @@ sk_revalidate() {
   elif [[ $SK_DAEMON_PID != "$expected_daemon_pid" || $SK_DAEMON_START != "$expected_daemon_start" ]]; then
     result=1
   elif [[ $SK_MUTATION_ALLOWED != true ]]; then
+    result=1
+  elif [[ -n $expected_conversation_provider ]] &&
+       [[ $SK_CONVERSATION_PROVIDER != "$expected_conversation_provider" ||
+          $SK_CONVERSATION_UUID != "$expected_conversation_uuid" ]]; then
     result=1
   fi
   command rm -- "$fresh"
