@@ -170,14 +170,15 @@ picker_revalidate_locked() {
 
 # One safe provider bounce: a new-mode Codex booted before its thread title
 # existed, so its status bar shows the conversation ID forever. When the human
-# opens such a session and a title now exists, terminate the idle provider —
+# opens such a session and a title now exists, terminate the exact idle TUI —
 # the session shell relaunches the SAME conversation immediately (marker
 # handshake with the bashrc), so the window opens named and themed. Guards,
 # all fail-open toward "no bounce": untitled-boot marker present (only
 # new-mode Codex sessions ever write one, so parked or pre-existing lanes are
 # structurally excluded), a title in Codex's thread store, no subagents, not
 # mid-turn, quiet for two minutes, and an exact PID+start-time match before
-# the signal.
+# the signal. App-server sessions keep the server and socket alive and restart
+# only their one generation-bound remote TUI.
 picker_bounce_codex() {
   local id=$1 mode=${2:-automatic}
   [[ $mode == automatic || $mode == explicit ]] || return 2
@@ -195,6 +196,12 @@ picker_bounce_codex() {
   (( marker_age <= 604800 )) || return 1
   local pid=${SK_PROOF_PROVIDER_PID:-} start=${SK_PROOF_PROVIDER_START:-}
   [[ $pid =~ ^[0-9]+$ && $start =~ ^[0-9]+$ ]] || return 1
+  local refresh_target refresh_pid refresh_start
+  refresh_target=$(python3 "$INVENTORY_CORE" platform codex-refresh-target \
+    "${SK_PROOF_SHELL_PID:-}" "${SK_PROOF_SHELL_START:-}" \
+    "$pid" "$start" 2>/dev/null) || return 1
+  IFS=$'\t' read -r refresh_pid refresh_start <<<"$refresh_target"
+  [[ $refresh_pid =~ ^[0-9]+$ && $refresh_start =~ ^[0-9]+$ ]] || return 1
   python3 - "$SNAPSHOT" "$id" "$uuid" "$pid" "$start" "$mode" <<'PY' || return 1
 import json, sys
 
@@ -232,7 +239,8 @@ if isinstance(age, int) and not isinstance(age, bool) and age < 120:
     raise SystemExit(1)
 raise SystemExit(0)
 PY
-  python3 "$INVENTORY_CORE" platform process-is "$pid" "$start" codex \
+  python3 "$INVENTORY_CORE" platform process-is \
+    "$refresh_pid" "$refresh_start" codex \
     >/dev/null 2>&1 || return 1
   # Only a real name is worth a restart: Codex seeds threads.title with the
   # raw first prompt, and bouncing on that echo burns the one-shot restart
@@ -285,13 +293,14 @@ PY
     command rm -f -- "$recheck" "$SK_STATE_DIR/provider-bounce/$id"
     return 1
   fi
-  if ! python3 "$INVENTORY_CORE" platform process-is "$pid" "$start" codex \
+  if ! python3 "$INVENTORY_CORE" platform process-is \
+    "$refresh_pid" "$refresh_start" codex \
     >/dev/null 2>&1; then
     command rm -f -- "$recheck" "$SK_STATE_DIR/provider-bounce/$id"
     return 1
   fi
   command rm -f -- "$recheck"
-  if kill -TERM "$pid" 2>/dev/null; then
+  if kill -TERM "$refresh_pid" 2>/dev/null; then
     command rm -f -- "$untitled"
     picker_action_event title_refresh provider_restarted
   else

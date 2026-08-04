@@ -62,6 +62,8 @@ repaint its own status bar from outside the process. Session Kit defers that
 bar refresh while the exact session is attached or working and offers the
 proof-bound refresh only after it is detached and idle. This maintenance state
 stays out of normal dashboard rows because the saved title is already correct.
+For App Server sessions the refresh restarts only the generation-bound remote
+TUI; the server, Unix socket, exact thread, and managed shell remain running.
 Completed Codex subagent threads remain available in detail output but are not
 counted as active subagents in summary rows.
 

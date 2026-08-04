@@ -942,6 +942,79 @@ class InventoryIdentityTests(unittest.TestCase):
         self.assertEqual("green", row["display_color"])
         self.assertEqual("idle", row["agent_status"])
 
+    def test_app_server_refresh_targets_one_matching_remote_tui(self) -> None:
+        socket = "unix:///run/user/1000/session-kit/app.sock"
+        table = {
+            100: process(100, 10, "bash"),
+            200: process(
+                200,
+                100,
+                "codex",
+                cmdline=["/usr/bin/codex", "app-server", "--listen", socket],
+            ),
+            300: process(
+                300,
+                100,
+                "codex",
+                cmdline=[
+                    "/usr/bin/codex",
+                    "--remote",
+                    socket,
+                    "--no-alt-screen",
+                ],
+            ),
+        }
+        self.assertEqual(
+            (300, 3000),
+            inventory_core.codex_refresh_target(table, 100, 1000, 200, 2000),
+        )
+
+        table[301] = process(
+            301,
+            100,
+            "codex",
+            cmdline=["/usr/bin/codex", "--remote", socket, "--no-alt-screen"],
+        )
+        with self.assertRaisesRegex(
+            inventory_core.CollectionError, "expected one remote Codex TUI"
+        ):
+            inventory_core.codex_refresh_target(table, 100, 1000, 200, 2000)
+
+    def test_direct_codex_refresh_targets_provider_generation(self) -> None:
+        table = {
+            100: process(100, 10, "bash"),
+            200: process(200, 100, "codex", cmdline=["/usr/bin/codex"]),
+        }
+        self.assertEqual(
+            (200, 2000),
+            inventory_core.codex_refresh_target(table, 100, 1000, 200, 2000),
+        )
+
+    def test_refresh_target_platform_command_has_no_single_pid_assumption(self) -> None:
+        table = {
+            100: process(100, 10, "bash"),
+            200: process(200, 100, "codex", cmdline=["/usr/bin/codex"]),
+        }
+        args = argparse.Namespace(
+            platform_action="codex-refresh-target",
+            shell_pid=100,
+            shell_generation=1000,
+            provider_pid=200,
+            provider_generation=2000,
+        )
+        output = io.StringIO()
+        with (
+            mock.patch.object(
+                inventory_core, "_require_supported_platform", return_value="linux"
+            ),
+            mock.patch.object(
+                inventory_core, "platform_process_table", return_value=table
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            self.assertEqual(0, inventory_core._platform_command(args))
+        self.assertEqual("200\t2000", output.getvalue().strip())
+
     def test_editor_rollout_requires_app_server_and_one_exact_thread(self) -> None:
         fixture = list(inventory_fixture(1, providers=("codex",)))
         exact = uuid_for(1)

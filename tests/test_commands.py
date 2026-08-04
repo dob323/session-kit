@@ -329,6 +329,12 @@ with lock.open("a+") as held:
             """#!/usr/bin/env python3
 import json, os, pathlib, sys, tempfile, unicodedata
 args=sys.argv[1:]
+if args[:2] == ["platform", "codex-refresh-target"] and len(args) == 6:
+    print("\t".join((
+        os.environ.get("STUB_REFRESH_PID", args[4]),
+        os.environ.get("STUB_REFRESH_START", args[5]),
+    )))
+    raise SystemExit(0)
 if args[:2] == ["platform", "process-is"] and len(args) == 5:
     pid=int(args[2]); generation=int(args[3]); executable=args[4]
     try:
@@ -2025,6 +2031,42 @@ class PickerProofTests(unittest.TestCase):
             if process.poll() is None:
                 process.terminate()
                 process.wait(timeout=2)
+
+    def test_app_server_title_refresh_restarts_only_remote_tui(self) -> None:
+        row, app_server = self._live_idle_codex("Attached")
+        executable = self.fixture.base / "codex"
+        remote_tui = subprocess.Popen([executable, "60"])
+        deadline = time.monotonic() + 2
+        remote_start = None
+        while time.monotonic() < deadline:
+            try:
+                stat_text = Path(f"/proc/{remote_tui.pid}/stat").read_text()
+                remote_start = int(stat_text.rsplit(")", 1)[1].split()[19])
+                break
+            except OSError:
+                time.sleep(0.01)
+        self.assertIsNotNone(remote_start)
+        proof = self._prime(row)
+        marker = self._mark_title_pending()
+        env = self.fixture.env()
+        env.update(
+            {
+                "STUB_CODEX_BOUNCE_TITLE": "Release Notes",
+                "STUB_REFRESH_PID": str(remote_tui.pid),
+                "STUB_REFRESH_START": str(remote_start),
+            }
+        )
+        try:
+            refreshed = run([SP, "picker-title-refresh", proof], env=env)
+            remote_tui.wait(timeout=2)
+            self.assertEqual(0, refreshed.returncode)
+            self.assertIsNone(app_server.poll())
+            self.assertFalse(marker.exists())
+        finally:
+            for process in (remote_tui, app_server):
+                if process.poll() is None:
+                    process.terminate()
+                    process.wait(timeout=2)
 
     def test_explicit_pending_title_refresh_refuses_working_provider(self) -> None:
         row, process = self._live_idle_codex("Attached")

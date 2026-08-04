@@ -16,6 +16,8 @@ Session Kit follows [Semantic Versioning](https://semver.org/).
   subagents no longer inflate the active count.
 - Kept the internal Codex bar-refresh marker out of normal dashboard rows when
   the saved session title is already correct.
+- Targeted an App Server title refresh at its exact remote TUI instead of the
+  server process, preserving the resume socket and managed thread.
 
 ## [0.1.3] - 2026-08-03
 

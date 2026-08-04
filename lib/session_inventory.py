@@ -906,6 +906,65 @@ def _is_codex_app_server(process: Mapping[str, Any]) -> bool:
     return "app-server" in argv[1:]
 
 
+def codex_refresh_target(
+    process_table: Mapping[int, Mapping[str, Any]],
+    shell_pid: int,
+    shell_generation: int,
+    provider_pid: int,
+    provider_generation: int,
+) -> tuple[int, int]:
+    """Prove the exact Codex process a title refresh may restart.
+
+    A direct CLI owns both the rollout and TUI. For a remote TUI the App
+    Server owns the rollout, but restarting it would destroy the resume socket;
+    select the one native TUI connected to that exact server instead.
+    """
+    shell = process_table.get(shell_pid, {})
+    provider = process_table.get(provider_pid, {})
+    if shell.get("start_ticks") != shell_generation:
+        raise CollectionError("managed shell generation changed")
+    if (
+        provider.get("start_ticks") != provider_generation
+        or not _is_native_codex(provider)
+    ):
+        raise CollectionError("Codex provider generation changed")
+    children = _children_index(process_table)
+    tree = descendants(
+        shell_pid,
+        children,
+        max_nodes=DEFAULT_MAX_PROC_NODES,
+        max_depth=32,
+    )
+    if provider_pid not in tree:
+        raise CollectionError("Codex provider is outside the managed shell")
+    if not _is_codex_app_server(provider):
+        return provider_pid, provider_generation
+    provider_argv = list(provider.get("cmdline") or [])
+    listen = _arg_value(provider_argv, "--listen")
+    if not listen.startswith("unix://"):
+        raise CollectionError("Codex App Server socket is unavailable")
+    candidates: list[tuple[int, int]] = []
+    for pid in tree:
+        if pid == provider_pid:
+            continue
+        process = process_table.get(pid, {})
+        if not _is_native_codex(process) or _is_codex_app_server(process):
+            continue
+        argv = list(process.get("cmdline") or [])
+        generation = process.get("start_ticks")
+        if (
+            _arg_value(argv, "--remote") == listen
+            and "--no-alt-screen" in argv
+            and isinstance(generation, int)
+        ):
+            candidates.append((pid, generation))
+    if len(candidates) != 1:
+        raise CollectionError(
+            f"expected one remote Codex TUI, found {len(candidates)}"
+        )
+    return candidates[0]
+
+
 def _is_native_claude(process: Mapping[str, Any]) -> bool:
     argv = process.get("cmdline") or []
     executable = Path(str(argv[0])).name if argv else ""
@@ -6986,6 +7045,16 @@ def _platform_command(args: argparse.Namespace) -> int:
         table = scan_darwin_process_table(1, pids=[args.pid])
     else:
         table = platform_process_table(root, DEFAULT_MAX_PROC_NODES)
+    if args.platform_action == "codex-refresh-target":
+        pid, generation = codex_refresh_target(
+            table,
+            args.shell_pid,
+            args.shell_generation,
+            args.provider_pid,
+            args.provider_generation,
+        )
+        print(f"{pid}\t{generation}")
+        return 0
     process = table.get(args.pid)
     if process is None:
         raise CollectionError("process generation is unavailable")
@@ -7185,6 +7254,11 @@ def _parser() -> argparse.ArgumentParser:
     platform_is.add_argument("pid", type=int)
     platform_is.add_argument("generation", type=int)
     platform_is.add_argument("executable")
+    platform_refresh = platform_subparsers.add_parser("codex-refresh-target")
+    platform_refresh.add_argument("shell_pid", type=int)
+    platform_refresh.add_argument("shell_generation", type=int)
+    platform_refresh.add_argument("provider_pid", type=int)
+    platform_refresh.add_argument("provider_generation", type=int)
     platform_provider = platform_subparsers.add_parser("provider-present")
     platform_provider.add_argument("pid", type=int)
     platform_provider.add_argument("generation", type=int)
