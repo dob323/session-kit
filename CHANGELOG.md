@@ -6,7 +6,7 @@ Session Kit follows [Semantic Versioning](https://semver.org/).
 
 No changes yet.
 
-## [0.1.4] - 2026-08-04
+## [0.1.4] - 2026-08-03
 
 ### Added
 
