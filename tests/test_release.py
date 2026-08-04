@@ -163,7 +163,7 @@ class ReleaseToolTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         metadata = json.loads((release / "RELEASE.json").read_text())
         self.assertEqual(metadata["commit"], self.sha1)
-        self.assertEqual(3, metadata["schema_version"])
+        self.assertEqual(4, metadata["schema_version"])
         self.assertEqual(file_mode(release), 0o555)
         self.assertTrue(
             (release / "lib/sessionkit_inventory/__init__.py").is_file()
@@ -171,6 +171,9 @@ class ReleaseToolTests(unittest.TestCase):
         self.assertTrue((release / "lib/sessionkit_inventory/common.py").is_file())
         self.assertTrue(
             (release / "lib/sessionkit_inventory/lifecycle.py").is_file()
+        )
+        self.assertTrue(
+            (release / "lib/sessionkit_inventory/projects.py").is_file()
         )
         self.assertTrue(
             (release / "lib/sessionkit_inventory/providers.py").is_file()
@@ -195,6 +198,7 @@ class ReleaseToolTests(unittest.TestCase):
             "lib/sessionkit_inventory/__init__.py",
             "lib/sessionkit_inventory/common.py",
             "lib/sessionkit_inventory/lifecycle.py",
+            "lib/sessionkit_inventory/projects.py",
             "lib/sessionkit_inventory/providers.py",
             "lib/sessionkit_inventory/state_io.py",
         ):
@@ -230,6 +234,7 @@ class ReleaseToolTests(unittest.TestCase):
             "lib/sessionkit_inventory/__init__.py",
             "lib/sessionkit_inventory/common.py",
             "lib/sessionkit_inventory/lifecycle.py",
+            "lib/sessionkit_inventory/projects.py",
             "lib/sessionkit_inventory/providers.py",
             "lib/sessionkit_inventory/state_io.py",
             "lib/session_inventory.py",
@@ -268,7 +273,7 @@ class ReleaseToolTests(unittest.TestCase):
         release = self.tree.build(self.repo, self.sha1)
         metadata_path = release / "RELEASE.json"
         original = metadata_path.read_bytes()
-        for schema in (0, 4, True, "1"):
+        for schema in (0, 5, True, "1"):
             with self.subTest(schema=repr(schema)):
                 metadata = json.loads(original)
                 metadata["schema_version"] = schema
@@ -432,6 +437,7 @@ class ReleaseToolTests(unittest.TestCase):
                 "lib/sessionkit_inventory/__init__.py",
                 "lib/sessionkit_inventory/common.py",
                 "lib/sessionkit_inventory/lifecycle.py",
+                "lib/sessionkit_inventory/projects.py",
                 "lib/sessionkit_inventory/providers.py",
                 "lib/sessionkit_inventory/state_io.py",
             ),

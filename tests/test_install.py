@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import plistlib
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -126,6 +127,7 @@ class InstallerTests(unittest.TestCase):
             "lib/sessionkit_inventory/__init__.py",
             "lib/sessionkit_inventory/common.py",
             "lib/sessionkit_inventory/lifecycle.py",
+            "lib/sessionkit_inventory/projects.py",
             "lib/sessionkit_inventory/providers.py",
             "lib/sessionkit_inventory/reaper.py",
             "lib/sessionkit_inventory/state_io.py",
@@ -170,6 +172,9 @@ class InstallerTests(unittest.TestCase):
             (current / "lib/sessionkit_inventory/lifecycle.py").is_file()
         )
         self.assertTrue(
+            (current / "lib/sessionkit_inventory/projects.py").is_file()
+        )
+        self.assertTrue(
             (current / "lib/sessionkit_inventory/providers.py").is_file()
         )
         self.assertTrue(
@@ -182,6 +187,77 @@ class InstallerTests(unittest.TestCase):
         service = (self.temp / "systemd/shpool.service").read_text(encoding="utf-8")
         self.assertIn(f"ExecStart={self.fake_bin / 'shpool'} daemon", service)
         self.assertNotIn("@SHPOOL@", service)
+
+    def test_initial_install_can_import_existing_provider_projects(self) -> None:
+        claude_project = self.home / "work/claude-project"
+        codex_project = self.home / "work/codex-project"
+        shared = self.home / "work/shared"
+        for path in (claude_project, codex_project, shared):
+            path.mkdir(parents=True)
+        claude_config = self.home / ".claude.json"
+        claude_config.write_text(
+            json.dumps({"projects": {str(claude_project): {}, str(shared): {}}}),
+            encoding="utf-8",
+        )
+        claude_config.chmod(0o600)
+        codex_home = self.home / ".codex"
+        codex_home.mkdir()
+        (codex_home / "config.toml").write_text(
+            f'[projects."{shared}"]\ntrust_level = "trusted"\n',
+            encoding="utf-8",
+        )
+        connection = sqlite3.connect(codex_home / "state_5.sqlite")
+        connection.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT)")
+        connection.execute(
+            "INSERT INTO threads VALUES (?, ?)",
+            ("00000000-0000-4000-8000-000000000001", str(codex_project)),
+        )
+        connection.commit()
+        connection.close()
+
+        result = self.run_installer("--non-interactive", "--import-projects")
+
+        self.assertIn("Imported 4 new project shortcut(s)", result.stdout)
+        projects_file = self.home / ".config/session-kit/projects.tsv"
+        rows = {
+            tuple(line.split("\t")[:3])
+            for line in projects_file.read_text(encoding="utf-8").splitlines()
+            if line and not line.startswith("#")
+        }
+        self.assertEqual(
+            rows,
+            {
+                ("claude-project", "claude", str(claude_project)),
+                ("codex-project", "codex", str(codex_project)),
+                ("shared-claude", "claude", str(shared)),
+                ("shared-codex", "codex", str(shared)),
+            },
+        )
+        listed = self.installed("projects", "list")
+        self.assertIn(f"shared-codex\tcodex\t{shared}", listed.stdout)
+
+    def test_noninteractive_install_defers_project_import_and_command_can_rerun_it(self) -> None:
+        project = self.home / "work/existing"
+        project.mkdir(parents=True)
+        config = self.home / ".claude.json"
+        config.write_text(
+            json.dumps({"projects": {str(project): {}}}), encoding="utf-8"
+        )
+        config.chmod(0o600)
+
+        installed = self.run_installer("--non-interactive")
+
+        self.assertIn("Project import skipped", installed.stdout)
+        projects_file = self.home / ".config/session-kit/projects.tsv"
+        self.assertFalse(
+            any(
+                line and not line.startswith("#")
+                for line in projects_file.read_text(encoding="utf-8").splitlines()
+            )
+        )
+        imported = self.installed("projects", "import")
+        self.assertIn("Imported 1 new project shortcut(s)", imported.stdout)
+        self.assertIn(f"existing\tclaude\t{project}", projects_file.read_text())
 
     def test_enable_disable_login_and_private_marker(self) -> None:
         self.run_installer("--enable-login", "--journal", "off")

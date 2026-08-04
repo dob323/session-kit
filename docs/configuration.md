@@ -51,6 +51,31 @@ fallback descriptions.
 
 ## Project aliases
 
+The initial interactive installer offers to import existing folders from both
+providers. Review the same bounded discovery at any time:
+
+```text
+session-kit projects discover
+session-kit projects import
+session-kit projects list
+session-kit projects add web claude /absolute/path/to/web
+session-kit projects add api codex /absolute/path/to/api
+```
+
+Discovery reads only provider-owned local records. For Claude Code, those are
+the project map in `~/.claude.json` and the project field in local history. For
+Codex, they are project entries in `~/.codex/config.toml` and distinct working
+directories in the newest local `state_*.sqlite` thread database. Missing
+directories and provider-configured temporary roots are ignored. Session Kit
+does not scan unrelated folders.
+
+When the same directory is recorded by both providers, import creates separate
+Claude and Codex shortcuts so either provider can be selected directly. Alias
+collisions are resolved with parent-folder or provider suffixes. Import is
+repeatable: existing provider/directory pairs and all hand-written lines are
+left unchanged. Before appending any new rows, Session Kit saves an owner-only
+backup under its state `backups` directory.
+
 The projects file is tab-separated:
 
 ```text

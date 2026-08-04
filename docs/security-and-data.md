@@ -7,6 +7,12 @@ telemetry. It reads local shpool state, provider metadata, configuration, and
 its own state. Process evidence comes from Linux `/proc` or native macOS
 process, start-time, and boot metadata.
 
+Optional project discovery reads only project paths already stored in Claude
+Code's local project map and history and Codex's local configuration and thread
+database. It keeps only existing directories, ignores configured temporary
+roots, and does not inspect directory contents or crawl the filesystem. Import
+writes only Session Kit's owner-only `projects.tsv` and its local backup.
+
 External notifications are optional and off by default.
 
 ## Trust boundary
@@ -28,6 +34,7 @@ Private state may include:
 - titles and working directories;
 - process IDs, start times, and generations;
 - recovery records, install receipts, and release receipts;
+- imported project aliases, provider names, and working directories;
 - service-definition receipts and launch records;
 - cleanup eligibility and health events;
 - short-lived action proofs;
@@ -124,7 +131,7 @@ remain.
 
 ## Backups
 
-Install, update, rollback, and login-integration operations create private
-backups before replacing host files. Backups may contain shell startup content,
-private paths, UUIDs, configuration, or earlier service definitions. Store them
-as private data and never commit them.
+Install, update, rollback, project import, and login-integration operations
+create private backups before replacing host files. Backups may contain shell
+startup content, private paths, UUIDs, configuration, or earlier service
+definitions. Store them as private data and never commit them.

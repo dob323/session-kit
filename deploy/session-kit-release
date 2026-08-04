@@ -28,7 +28,7 @@ import tempfile
 import uuid
 
 SCHEMA_VERSION = 1
-CURRENT_RELEASE_SCHEMA_VERSION = 3
+CURRENT_RELEASE_SCHEMA_VERSION = 4
 HELPERS = ("sp", "shpool_login", "shpool_status", "shpool_reaper", "codex_resume_here")
 LEGACY_REQUIRED_RELEASE_PAYLOAD = (
     "bin/session_kit_common",
@@ -50,6 +50,15 @@ REQUIRED_RELEASE_PAYLOAD_BY_SCHEMA = {
         "lib/sessionkit_inventory/__init__.py",
         "lib/sessionkit_inventory/common.py",
         "lib/sessionkit_inventory/lifecycle.py",
+        "lib/sessionkit_inventory/providers.py",
+        "lib/sessionkit_inventory/state_io.py",
+    ),
+    4: (
+        *LEGACY_REQUIRED_RELEASE_PAYLOAD,
+        "lib/sessionkit_inventory/__init__.py",
+        "lib/sessionkit_inventory/common.py",
+        "lib/sessionkit_inventory/lifecycle.py",
+        "lib/sessionkit_inventory/projects.py",
         "lib/sessionkit_inventory/providers.py",
         "lib/sessionkit_inventory/state_io.py",
     ),

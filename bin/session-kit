@@ -62,6 +62,7 @@ inventory_files=(
   lib/sessionkit_inventory/__init__.py
   lib/sessionkit_inventory/common.py
   lib/sessionkit_inventory/lifecycle.py
+  lib/sessionkit_inventory/projects.py
   lib/sessionkit_inventory/providers.py
   lib/sessionkit_inventory/reaper.py
   lib/sessionkit_inventory/state_io.py
@@ -76,6 +77,8 @@ usage() {
   cat <<'EOF'
 Usage:
   session-kit doctor [--json]
+  session-kit projects <discover|import|list>
+  session-kit projects add ALIAS <claude|codex|shell> /absolute/path
   session-kit update [--source PATH] [--enable-login|--disable-login] [--journal on|off]
   session-kit rollback [--to COMMIT]
   session-kit services <enable|disable|status>
@@ -86,6 +89,7 @@ Usage:
 From a cloned repository:
   ./install.sh --check
   ./install.sh [--enable-login|--disable-login] [--journal on|off]
+               [--import-projects|--no-import-projects]
 
 Session Kit keeps transcripts, journals, and status data on this machine. It
 does not send telemetry. Uninstalling never deletes journals or archives.
@@ -660,13 +664,17 @@ install_launchers() {
     "$bin_dir/session-kit"
 }
 
+projects_created=0
+
 install_defaults() {
   local release_id=$1
   mkdir -p "$config_root"
   chmod 700 "$config_root" 2>/dev/null || true
-  [[ -e $config_root/projects.tsv ]] ||
+  if [[ ! -e $config_root/projects.tsv ]]; then
     install -m 0600 "$install_root/releases/$release_id/config/projects.example.tsv" \
       "$config_root/projects.tsv"
+    projects_created=1
+  fi
   [[ -e $config_root/inventory.json ]] ||
     install -m 0600 "$install_root/releases/$release_id/config/session-inventory.example.json" \
       "$config_root/inventory.json"
@@ -688,6 +696,62 @@ install_defaults() {
       install -m 0600 "$theme_file" "$codex_theme_root/${theme_file##*/}"
     done
   fi
+}
+
+projects_tool() {
+  local release=${1:-$install_root/current}
+  shift || true
+  local tool=$release/lib/sessionkit_inventory/projects.py
+  [[ -f $tool && ! -L $tool ]] || die "project discovery tool is unavailable"
+  python3 "$tool" --projects-file "$config_root/projects.tsv" \
+    --state-dir "$state_root" "$@"
+}
+
+configure_initial_projects() {
+  local choice=$1 noninteractive=$2 answer count discovery
+  (( projects_created )) || return 0
+  if [[ $choice == import ]]; then
+    projects_tool "$install_root/current" import
+    return
+  fi
+  if [[ $choice == skip || $noninteractive == 1 || ! -t 0 ]]; then
+    printf 'Project import skipped. Run session-kit projects import whenever you are ready.\n'
+    return
+  fi
+  discovery=$(mktemp "$state_root/project-discovery.XXXXXX")
+  if ! projects_tool "$install_root/current" --json discover > "$discovery"; then
+    command rm -f -- "$discovery"
+    printf 'Project discovery was unavailable. Run session-kit projects import later.\n' >&2
+    return
+  fi
+  count=$(python3 - "$discovery" <<'PY'
+import json,sys
+value=json.load(open(sys.argv[1],encoding="utf-8"))
+print(len(value.get("projects",[])))
+for warning in value.get("warnings",[]):
+    print(f"Warning: {warning}",file=sys.stderr)
+PY
+)
+  if (( count == 0 )); then
+    command rm -f -- "$discovery"
+    printf 'No existing Claude Code or Codex project folders were found.\n'
+    printf 'Add one later with session-kit projects add.\n'
+    return
+  fi
+  python3 - "$discovery" <<'PY'
+import json,sys
+value=json.load(open(sys.argv[1],encoding="utf-8"))
+print(f"\nFound {len(value['projects'])} existing provider project folder(s):")
+for row in value["projects"]:
+    print(f"  {row['provider'].capitalize():6}  {row['cwd']}")
+PY
+  command rm -f -- "$discovery"
+  printf 'Import all of these as Session Kit project shortcuts? [Y/n] '
+  read -r answer
+  case ${answer:-y} in
+    [Nn]*) printf 'Project import skipped. Run session-kit projects import later.\n' ;;
+    *) projects_tool "$install_root/current" import ;;
+  esac
 }
 
 configure_macos_shpool_shell() {
@@ -1248,13 +1312,15 @@ install_release() {
 }
 
 install_command() {
-  local source= login=prompt journal=prompt answer noninteractive=0
+  local source= login=prompt journal=prompt projects=prompt answer noninteractive=0
   while (($#)); do
     case "$1" in
       --source) require_arg "$1" "${2:-}"; source=$2; shift 2 ;;
       --enable-login) login=enable; shift ;;
       --disable-login) login=disable; shift ;;
       --journal) require_arg "$1" "${2:-}"; journal=$2; shift 2 ;;
+      --import-projects) projects=import; shift ;;
+      --no-import-projects) projects=skip; shift ;;
       --non-interactive)
         noninteractive=1
         [[ $journal != prompt ]] || journal=off
@@ -1305,6 +1371,7 @@ install_command() {
   lifecycle_failpoint current
   install_launchers "$release_id"
   install_defaults "$release_id"
+  configure_initial_projects "$projects" "$noninteractive"
   install_platform_services "$release_id"
   set_journal_choice "$journal"
   if [[ $login == enable ]]; then enable_login; else disable_login; fi
@@ -1493,7 +1560,7 @@ PY
       login=disable
     fi
   fi
-  local args=(--source "$source" --journal "$journal" --non-interactive)
+  local args=(--source "$source" --journal "$journal" --non-interactive --no-import-projects)
   case "$login" in enable) args+=(--enable-login) ;; disable) args+=(--disable-login) ;; esac
   install_command "${args[@]}"
 }
@@ -1840,6 +1907,10 @@ case "$command_name" in
     ;;
   install) install_command "$@" ;;
   doctor) doctor_command "$@" ;;
+  projects)
+    [[ -L $install_root/current ]] || die "Session Kit is not installed"
+    projects_tool "$install_root/current" "$@"
+    ;;
   update) update_command "$@" ;;
   rollback) rollback_command "$@" ;;
   services) services_command "$@" ;;

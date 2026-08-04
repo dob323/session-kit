@@ -101,6 +101,7 @@ def write_runtime(repo: Path, version: str) -> str:
         "lib/sessionkit_inventory/__init__.py": "# fixture package\n",
         "lib/sessionkit_inventory/common.py": "# fixture common helpers\n",
         "lib/sessionkit_inventory/lifecycle.py": "# fixture lifecycle helpers\n",
+        "lib/sessionkit_inventory/projects.py": "# fixture project helpers\n",
         "lib/sessionkit_inventory/providers.py": "# fixture provider helpers\n",
         "lib/sessionkit_inventory/state_io.py": "# fixture state helpers\n",
         "bashrc/shpool.bashrc": "# fixture bashrc\n",

@@ -104,6 +104,7 @@ jobs:
             tests.test_lifecycle_shell.TimeoutPipelineTests \
             tests.test_provider_title_push.ClaudeAiTitleTests \
             tests.test_inventory.ProviderLifecycleStateTests.test_claude_reopen_passes_hydrated_name_to_native_cli \
+            tests.test_projects \
             tests.test_public_export \
             tests.test_release_artifact \
             tests.test_public_scan \
@@ -138,8 +139,10 @@ jobs:
             tools/check-doc-links tools/public-scan
           ruff format --check lib/sessionkit_inventory/__init__.py \
             lib/sessionkit_inventory/common.py \
+            lib/sessionkit_inventory/projects.py \
             lib/sessionkit_inventory/providers.py \
             tests/test_doc_links.py tests/test_facade.py \
+            tests/test_projects.py \
             tests/test_public_export.py tests/test_public_scan.py \
             tests/test_release_artifact.py tests/support.py
           ruff format --check tools/build-public-tree tools/build-release-artifact \

@@ -1,13 +1,13 @@
 # Install Session Kit
 
-Session Kit `v0.1.3` is a public beta for Linux with systemd and macOS 14 or
+Session Kit `v0.1.4` is a public beta for Linux with systemd and macOS 14 or
 newer. Install the accepted release artifact under a single-user account where
 provider conversations are recoverable.
 
 ```bash
 mkdir session-kit-download
 cd session-kit-download
-gh release download v0.1.3 --repo dob323/session-kit
+gh release download v0.1.4 --repo dob323/session-kit
 if command -v sha256sum >/dev/null; then
   sha256sum --check session-kit-*.sha256
 else
@@ -20,9 +20,26 @@ cd session-kit-*/
 session-kit doctor
 ```
 
+On the first interactive install, Session Kit reads the project paths already
+recorded by Claude Code and Codex, shows the existing directories it found,
+and offers to import all of them. Discovery reads Claude's local project map
+and history plus Codex's configured projects and stored thread directories. It
+does not walk the home directory or search the rest of the filesystem.
+
+For unattended installation, project import stays off unless it is requested:
+
+```bash
+./install.sh --non-interactive --import-projects
+```
+
+Use `--no-import-projects` to skip the interactive offer. The same discovery
+can be reviewed or rerun later with `session-kit projects discover` and
+`session-kit projects import`. An existing `projects.tsv` is never replaced by
+an install or update.
+
 Without the GitHub CLI, download the `.tar.gz`, `.sha256`, and
 `.provenance.json` assets from the
-[`v0.1.3` release](https://github.com/dob323/session-kit/releases/tag/v0.1.3),
+[`v0.1.4` release](https://github.com/dob323/session-kit/releases/tag/v0.1.4),
 and put them in one empty directory. The checksum file covers the archive. Use
 `sha256sum --check` on Linux or
 `shasum -a 256 --check` on macOS. The provenance file records the exact source

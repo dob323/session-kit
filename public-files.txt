@@ -37,6 +37,7 @@ tests/test_lifecycle_shell.py
 tests/test_login.py
 tests/test_macos_preview.py
 tests/test_provider_title_push.py
+tests/test_projects.py
 tests/test_public_export.py
 tests/test_public_scan.py
 tests/test_reaper_autoclose.py

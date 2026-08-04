@@ -1,7 +1,7 @@
 # Session Kit
 
 [![CI](https://github.com/dob323/session-kit/actions/workflows/ci.yml/badge.svg)](https://github.com/dob323/session-kit/actions/workflows/ci.yml)
-[![Latest release](https://img.shields.io/github/v/release/dob323/session-kit?include_prereleases)](https://github.com/dob323/session-kit/releases/tag/v0.1.3)
+[![Latest release](https://img.shields.io/github/v/release/dob323/session-kit?include_prereleases)](https://github.com/dob323/session-kit/releases/tag/v0.1.4)
 [![License](https://img.shields.io/github/license/dob323/session-kit)](LICENSE)
 
 A local status and safety layer for shpool sessions running Claude Code, Codex,
@@ -17,7 +17,7 @@ reply state, and exact provider identity. It keeps the terminal alive when a
 provider exits and refuses actions when live identity cannot be proved.
 
 > [!WARNING]
-> `v0.1.3` is a public beta for Linux with systemd and macOS 14 or newer.
+> `v0.1.4` is a public beta for Linux with systemd and macOS 14 or newer.
 > Start on a single-user account where Claude Code and Codex conversations can
 > be recovered. Session Kit is not a boundary against another process running
 > as the same Unix user.
@@ -25,6 +25,8 @@ provider exits and refuses actions when live identity cannot be proved.
 ## Highlights
 
 - One on-demand picker for Claude Code, Codex, and shell sessions.
+- First-install discovery of project folders already known to Claude Code and
+  Codex, with no filesystem-wide scan.
 - `needs your reply`, working, idle, quiet, provider-exited, and subagent state.
 - Exact open, move, close, reopen, fork, repair, and recovery checks.
 - Manual names plus guarded 2–5 word agent self-names.
@@ -39,13 +41,13 @@ an explicit search when diagnosis requires exact identity.
 ## Install the beta release
 
 Download the archive, checksum, and provenance files attached to the
-[`v0.1.3` release](https://github.com/dob323/session-kit/releases/tag/v0.1.3).
+[`v0.1.4` release](https://github.com/dob323/session-kit/releases/tag/v0.1.4).
 With the GitHub CLI:
 
 ```bash
 mkdir session-kit-download
 cd session-kit-download
-gh release download v0.1.3 --repo dob323/session-kit
+gh release download v0.1.4 --repo dob323/session-kit
 if command -v sha256sum >/dev/null; then
   sha256sum --check session-kit-*.sha256
 else
@@ -63,7 +65,9 @@ The preflight is read-only. Installation copies an immutable release and
 systemd or launchd definitions, but it does not start, stop, restart, or enable
 a service. Review the definitions before `services enable`. The guided
 installer can add the shell integration; journals remain off unless you
-explicitly enable them.
+explicitly enable them. On a new interactive installation, it also shows the
+existing project folders recorded by Claude Code and Codex and offers to import
+them as local Session Kit shortcuts.
 
 For requirements, manual asset download, and activation checks, read
 [Install Session Kit](docs/install.md). Use `main` only for development after
@@ -77,6 +81,9 @@ SSH opens a normal shell. Type `kit` when you want the session picker.
 kit
 sp list
 sp new [claude|codex|shell] [project-alias]
+session-kit projects discover
+session-kit projects import
+session-kit projects add <alias> <claude|codex|shell> /absolute/path
 sp go <terminal-number|shpool-id>
 sp takeover <terminal-number|shpool-id>
 sp name <terminal-number|shpool-id> <title>

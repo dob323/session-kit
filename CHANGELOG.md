@@ -4,6 +4,15 @@ Session Kit follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Added bounded first-install discovery and import of existing Claude Code and
+  Codex project folders, plus rerunnable `session-kit projects` commands.
+- Added collision-safe provider-specific aliases, owner-only backups, and
+  explicit noninteractive import control.
+
+## [0.1.4] - 2026-08-03
+
 ### Fixed
 
 - Associated a managed Codex App Server's single open remote-TUI rollout with
