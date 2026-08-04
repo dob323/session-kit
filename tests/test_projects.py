@@ -26,6 +26,7 @@ class ProjectDiscoveryTests(unittest.TestCase):
             {
                 "HOME": str(self.home),
                 "SESSION_KIT_CODEX_HOME": str(self.codex),
+                "TMPDIR": str(self.root.parent),
             },
             clear=False,
         )

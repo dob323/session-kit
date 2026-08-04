@@ -145,7 +145,9 @@ def _claude_paths(home: Path, warnings: list[str]) -> set[str]:
     ]
     tmpdir = os.environ.get("TMPDIR")
     if tmpdir and (temporary := _directory(tmpdir)):
-        excluded.append(Path(temporary))
+        temporary_root = Path(temporary)
+        if not home.is_relative_to(temporary_root):
+            excluded.append(temporary_root)
     settings = home / ".claude" / "settings.json"
     try:
         settings_payload = _read_owner_file(
