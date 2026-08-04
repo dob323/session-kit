@@ -14,6 +14,8 @@ Session Kit follows [Semantic Versioning](https://semver.org/).
   or working instead of labeling an unsafe restart as immediately pending.
 - Derived Codex child-thread activity from each exact rollout so completed
   subagents no longer inflate the active count.
+- Kept the internal Codex bar-refresh marker out of normal dashboard rows when
+  the saved session title is already correct.
 
 ## [0.1.3] - 2026-08-03
 

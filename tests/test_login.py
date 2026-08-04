@@ -784,7 +784,7 @@ class LoginPickerTests(unittest.TestCase):
         finally:
             fixture.close()
 
-    def test_pending_provider_bar_title_is_visible(self) -> None:
+    def test_pending_provider_bar_title_is_internal_in_normal_rows(self) -> None:
         pending = row(
             "title-pending",
             number=6,
@@ -796,7 +796,8 @@ class LoginPickerTests(unittest.TestCase):
         try:
             code, output = run_pty(fixture, b"\n", columns=120)
             self.assertEqual(2, code)
-            self.assertIn("working | title pending", output)
+            self.assertIn("working", output)
+            self.assertNotIn("title pending", output)
         finally:
             fixture.close()
 

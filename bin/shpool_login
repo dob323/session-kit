@@ -631,8 +631,6 @@ if selected:
                 details.insert(0, name_detail)
             if automatic_name_state == "failed":
                 warning_status = True
-        if str(row.get("provider_title_state") or "").casefold() == "pending":
-            details.append("title pending")
         status_details = (
             [primary_status]
             if needs_attention
