@@ -91,8 +91,9 @@ checksum, and provenance bytes.
 
 Release metadata schema 1 is the pre-package layout. Schema 2 adds the package
 marker and common helpers. Schema 3 also requires lifecycle, provider, and
-private-state modules. New builds emit schema 3; verification retains the
-bounded older schemas for installed rollback targets.
+private-state modules. Schema 4 adds provider project discovery and import.
+New builds emit schema 4; verification retains the bounded older schemas for
+installed rollback targets.
 
 ## Acceptance
 
