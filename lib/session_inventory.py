@@ -6575,12 +6575,12 @@ def _pending_preferred_entry(entries: Sequence[dict[str, Any]]) -> dict[str, Any
     primary = [item for item in entries if item.get("queue") == "primary"]
     if primary:
         return primary[0]
-    return max(
-        entries,
-        key=lambda item: item.get("queue_index")
-        if isinstance(item.get("queue_index"), int)
-        else -1,
-    )
+
+    def queue_index(item: dict[str, Any]) -> int:
+        value = item.get("queue_index")
+        return value if isinstance(value, int) else -1
+
+    return max(entries, key=queue_index)
 
 
 def flatten_pending(value: Any) -> dict[str, Any]:
