@@ -134,8 +134,10 @@ jobs:
         env:
           RUFF_CACHE_DIR: ${{ runner.temp }}/ruff-cache
         run: |
-          ruff check .
-          ruff check tools/build-public-tree tools/build-release-artifact \
+          ruff --version
+          ruff check --output-format github .
+          ruff check --output-format github \
+            tools/build-public-tree tools/build-release-artifact \
             tools/check-doc-links tools/public-scan
           ruff format --check lib/sessionkit_inventory/__init__.py \
             lib/sessionkit_inventory/common.py \
