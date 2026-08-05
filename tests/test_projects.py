@@ -112,7 +112,9 @@ class ProjectDiscoveryTests(unittest.TestCase):
             },
         )
 
-    def test_discovery_excludes_inaccessible_paths_but_keeps_shared_readable_repos(self) -> None:
+    def test_discovery_excludes_inaccessible_paths_but_keeps_shared_readable_repos(
+        self,
+    ) -> None:
         inaccessible = self.directory("private/root-copy")
         shared = self.directory("shared/team-repo")
         self.private_json(
@@ -190,7 +192,9 @@ class ProjectDiscoveryTests(unittest.TestCase):
 
     def test_import_never_adds_a_second_row_for_a_configured_directory(self) -> None:
         configured = self.directory("work/app")
-        self.private_json(self.home / ".claude.json", {"projects": {str(configured): {}}})
+        self.private_json(
+            self.home / ".claude.json", {"projects": {str(configured): {}}}
+        )
         (self.codex / "config.toml").write_text(
             f'[projects."{configured}"]\ntrust_level = "trusted"\n', encoding="utf-8"
         )
@@ -267,7 +271,10 @@ class ProjectDiscoveryTests(unittest.TestCase):
         # The directory that was not chosen stays a candidate rather than
         # being silently ignored for good.
         self.assertEqual(
-            [row["cwd"] for row in projects.project_candidates(projects_file)["candidates"]],
+            [
+                row["cwd"]
+                for row in projects.project_candidates(projects_file)["candidates"]
+            ],
             [str(skipped)],
         )
 
@@ -325,11 +332,10 @@ class ProjectDiscoveryTests(unittest.TestCase):
         result = projects.ignore_project(projects_file, state, str(ignored))
 
         self.assertEqual(
-            result["added"], [{"alias": "parent", "provider": "ignore", "cwd": str(ignored)}]
+            result["added"],
+            [{"alias": "parent", "provider": "ignore", "cwd": str(ignored)}],
         )
-        self.assertEqual(
-            [row["alias"] for row in result["removed"]], ["parent"]
-        )
+        self.assertEqual([row["alias"] for row in result["removed"]], ["parent"])
         self.assertEqual(
             projects._parse_projects(projects_file.read_bytes()),
             [
@@ -355,7 +361,9 @@ class ProjectDiscoveryTests(unittest.TestCase):
         projects_file.write_text("", encoding="utf-8")
         projects_file.chmod(0o600)
 
-        result = projects.ignore_project(projects_file, self.root / "state", str(target))
+        result = projects.ignore_project(
+            projects_file, self.root / "state", str(target)
+        )
 
         self.assertEqual(
             result["added"],
