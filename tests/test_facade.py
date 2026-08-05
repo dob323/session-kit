@@ -63,6 +63,7 @@ REQUIRED_SYMBOLS = {
     "build_inventory",
     "canonical_aliases",
     "canonical_automatic_titles",
+    "claude_bounce_prepare",
     "codex_bounce_prepare",
     "codex_refresh_target",
     "codex_pending_auto_titles",
@@ -145,6 +146,7 @@ EXPECTED_TOP_LEVEL_COMMANDS = (
     "lookup",
     "recovery-command",
     "codex-bounce-title",
+    "claude-bounce-title",
     "platform",
     "alias",
     "color",
@@ -180,7 +182,7 @@ def referenced_facade_symbols() -> set[str]:
 
 class InventoryFacadeTests(unittest.TestCase):
     def test_contract_matches_every_current_test_reference(self) -> None:
-        self.assertEqual(len(REQUIRED_SYMBOLS), 93)
+        self.assertEqual(len(REQUIRED_SYMBOLS), 94)
         self.assertEqual(REQUIRED_SYMBOLS, referenced_facade_symbols())
 
     def test_current_tested_symbols_remain_available(self) -> None:

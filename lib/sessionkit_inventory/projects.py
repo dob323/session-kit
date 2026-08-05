@@ -28,6 +28,11 @@ except ImportError:  # Python 3.10 is supported on Linux.
 
 
 PROVIDERS = ("claude", "codex")
+# A row kind of "ignore" keeps a directory out of the picker for good: it is
+# never launchable and never listed, and because import gives each directory
+# at most one row, discovery can never add a shortcut for it again.
+IGNORE_KIND = "ignore"
+ROW_KINDS = (*PROVIDERS, "shell", IGNORE_KIND)
 MAX_PROVIDER_CONFIG_BYTES = 32 * 1024 * 1024
 MAX_CLAUDE_HISTORY_BYTES = 64 * 1024 * 1024
 MAX_PROJECTS_FILE_BYTES = 4 * 1024 * 1024
@@ -112,7 +117,15 @@ def _directory(raw: object) -> str | None:
         resolved = Path(raw).resolve(strict=True)
     except OSError:
         return None
-    return os.fspath(resolved) if resolved.is_dir() else None
+    # A provider can retain a path copied from another account or host. It is
+    # not useful as a shortcut unless this user can both list and traverse it.
+    # Do not require ownership: group/shared repositories are valid when their
+    # permissions make them usable.
+    return (
+        os.fspath(resolved)
+        if resolved.is_dir() and os.access(resolved, os.R_OK | os.X_OK)
+        else None
+    )
 
 
 def _outside_roots(path: str | None, roots: Iterable[Path]) -> str | None:
@@ -278,7 +291,11 @@ def _codex_db_paths(database: Path, warnings: list[str]) -> set[str]:
 
 
 def _codex_paths(home: Path, warnings: list[str]) -> set[str]:
-    codex_home = Path(os.environ.get("SESSION_KIT_CODEX_HOME", home / ".codex"))
+    codex_home = Path(
+        os.environ.get("SESSION_KIT_CODEX_HOME")
+        or os.environ.get("CODEX_HOME")
+        or (home / ".codex")
+    )
     paths: set[str] = set()
     config = codex_home / "config.toml"
     try:
@@ -315,17 +332,24 @@ def discover_projects(home: Path | None = None) -> dict[str, Any]:
     return {"projects": records, "warnings": sorted(set(warnings))}
 
 
+def _row(line: str) -> dict[str, str] | None:
+    if not line.strip() or line.lstrip().startswith("#"):
+        return None
+    fields = line.split("\t")
+    if len(fields) < 3:
+        return None
+    alias, provider, cwd = fields[:3]
+    if not ALIAS_RE.fullmatch(alias) or provider not in ROW_KINDS:
+        return None
+    return {"alias": alias, "provider": provider, "cwd": cwd}
+
+
 def _parse_projects(payload: bytes) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     for line in payload.decode("utf-8", "strict").splitlines():
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        fields = line.split("\t")
-        if len(fields) < 3:
-            continue
-        alias, provider, cwd = fields[:3]
-        if ALIAS_RE.fullmatch(alias) and provider in (*PROVIDERS, "shell"):
-            rows.append({"alias": alias, "provider": provider, "cwd": cwd})
+        row = _row(line)
+        if row is not None:
+            rows.append(row)
     return rows
 
 
@@ -366,22 +390,23 @@ def _path_aliases(paths: Iterable[str]) -> dict[str, str]:
 def _new_rows(
     discovered: Sequence[Mapping[str, str]], existing: Sequence[Mapping[str, str]]
 ) -> list[dict[str, str]]:
-    existing_pairs = {(row["provider"], row["cwd"]) for row in existing}
+    # A directory gets at most one shortcut. Deduplicating on the
+    # (provider, directory) pair used to add a second row whenever the same
+    # path was also seen under the other provider, and the picker shows only
+    # the alias and directory, so those rows read as exact duplicates.
+    existing_paths = {row["cwd"] for row in existing}
     reserved = {row["alias"] for row in existing}
-    pending = [
-        {"provider": row["provider"], "cwd": row["cwd"]}
-        for row in discovered
-        if (row["provider"], row["cwd"]) not in existing_pairs
-    ]
+    pending: list[dict[str, str]] = []
+    pending_paths: set[str] = set()
+    for row in discovered:
+        if row["cwd"] in existing_paths or row["cwd"] in pending_paths:
+            continue
+        pending_paths.add(row["cwd"])
+        pending.append({"provider": row["provider"], "cwd": row["cwd"]})
     bases = _path_aliases(row["cwd"] for row in pending)
-    providers_by_path: dict[str, set[str]] = {}
-    for row in pending:
-        providers_by_path.setdefault(row["cwd"], set()).add(row["provider"])
     added: list[dict[str, str]] = []
     for row in pending:
         base = bases[row["cwd"]]
-        if len(providers_by_path[row["cwd"]]) > 1:
-            base = f"{base}-{row['provider']}"
         alias = base
         if alias in reserved:
             alias = f"{base}-{row['provider']}"
@@ -438,6 +463,7 @@ def _mutate_projects(
     projects_file: Path,
     state_dir: Path,
     mutate: Any,
+    drop: Any = None,
 ) -> dict[str, Any]:
     state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     lock_path = state_dir / "projects.lock"
@@ -456,9 +482,21 @@ def _mutate_projects(
         except (UnicodeDecodeError, ValueError) as exc:
             raise ProjectError("Session Kit projects file is not valid UTF-8") from exc
         added = mutate(existing)
-        if not added:
-            return {"added": [], "backup": None}
         payload = original
+        removed: list[dict[str, str]] = []
+        if drop is not None:
+            # Rewrite only the withdrawn rows so comments, blank lines, and
+            # every unrelated line survive byte for byte.
+            kept: list[str] = []
+            for line in original.decode("utf-8", "strict").splitlines(keepends=True):
+                row = _row(line.rstrip("\n"))
+                if row is not None and drop(row):
+                    removed.append(row)
+                    continue
+                kept.append(line)
+            payload = "".join(kept).encode("utf-8")
+        if not added and not removed:
+            return {"added": [], "removed": [], "backup": None}
         if payload and not payload.endswith(b"\n"):
             payload += b"\n"
         payload += "".join(
@@ -466,16 +504,87 @@ def _mutate_projects(
         ).encode("utf-8")
         backup = _backup(original, state_dir) if projects_file.exists() else None
         _atomic_write(projects_file, payload)
-        return {"added": added, "backup": backup}
+        return {"added": added, "removed": removed, "backup": backup}
     finally:
         os.close(lock_descriptor)
 
 
-def import_projects(projects_file: Path, state_dir: Path) -> dict[str, Any]:
+def suggest_alias(cwd: str, existing: Sequence[Mapping[str, str]]) -> str:
+    """The alias import would pick for a directory, free of collisions."""
+    reserved = {row["alias"] for row in existing}
+    alias = base = _path_aliases([cwd])[cwd]
+    counter = 2
+    while alias in reserved:
+        alias = f"{base}-{counter}"
+        counter += 1
+    return alias
+
+
+def select_rows(rows: Sequence[Mapping[str, str]], answer: str) -> list[dict[str, str]]:
+    """Resolve a "1,3-5" / "a" selection against a numbered list.
+
+    One implementation so the installer and the picker can never disagree
+    about what a range means.
+    """
+    answer = answer.strip().lower()
+    if not answer:
+        return []
+    if answer == "a":
+        return [dict(row) for row in rows]
+    picked: set[int] = set()
+    for part in answer.split(","):
+        part = part.strip()
+        if not part:
+            raise ProjectError("use numbers, ranges such as 2-4, or a for all")
+        if "-" in part:
+            first, _, last = part.partition("-")
+            if not first.isdigit() or not last.isdigit() or int(first) > int(last):
+                raise ProjectError("use numbers, ranges such as 2-4, or a for all")
+            picked.update(range(int(first), int(last) + 1))
+        elif part.isdigit():
+            picked.add(int(part))
+        else:
+            raise ProjectError("use numbers, ranges such as 2-4, or a for all")
+    if not picked or any(number < 1 or number > len(rows) for number in picked):
+        raise ProjectError(f"choose between 1 and {len(rows)}")
+    return [dict(rows[number - 1]) for number in sorted(picked)]
+
+
+def project_candidates(projects_file: Path) -> dict[str, Any]:
+    """Directories a provider has used that have no row yet, each with the
+    alias and provider import would give it. Nothing is written."""
     discovery = discover_projects()
+    payload = _read_owner_file(
+        projects_file,
+        label="Session Kit projects file",
+        max_bytes=MAX_PROJECTS_FILE_BYTES,
+    )
+    existing = _parse_projects(payload or b"")
+    candidates = [
+        {"alias": row["alias"], "provider": row["provider"], "cwd": row["cwd"]}
+        for row in _new_rows(discovery["projects"], existing)
+    ]
+    return {
+        "candidates": candidates,
+        "configured": [row for row in existing if row["provider"] != IGNORE_KIND],
+        "ignored": [row["cwd"] for row in existing if row["provider"] == IGNORE_KIND],
+        "warnings": discovery["warnings"],
+    }
+
+
+def import_projects(
+    projects_file: Path, state_dir: Path, only: Sequence[str] | None = None
+) -> dict[str, Any]:
+    """Import discovered directories. `only` limits the import to those exact
+    directories, so a first run never has to be all or nothing."""
+    discovery = discover_projects()
+    wanted = None if only is None else {os.fspath(Path(path)) for path in only}
 
     def merge(existing: Sequence[Mapping[str, str]]) -> list[dict[str, str]]:
-        return _new_rows(discovery["projects"], existing)
+        rows = _new_rows(discovery["projects"], existing)
+        if wanted is None:
+            return rows
+        return [row for row in rows if row["cwd"] in wanted]
 
     result = _mutate_projects(projects_file, state_dir, merge)
     return {**result, **discovery}
@@ -484,27 +593,74 @@ def import_projects(projects_file: Path, state_dir: Path) -> dict[str, Any]:
 def add_project(
     projects_file: Path,
     state_dir: Path,
-    alias: str,
+    alias: str | None,
     provider: str,
     cwd: str,
 ) -> dict[str, Any]:
-    if not ALIAS_RE.fullmatch(alias):
+    """Add a shortcut. An omitted alias is derived from the directory, and an
+    ignore on that directory is withdrawn so adding always reverses ignoring."""
+    if alias is not None and not ALIAS_RE.fullmatch(alias):
         raise ProjectError("alias must use lowercase letters, numbers, _ or -")
-    if provider not in (*PROVIDERS, "shell"):
-        raise ProjectError("provider must be claude, codex, or shell")
+    if provider not in ROW_KINDS:
+        raise ProjectError("provider must be claude, codex, shell, or ignore")
     directory = _directory(cwd)
     if directory is None:
         raise ProjectError("project directory must be an existing absolute directory")
 
     def add(existing: Sequence[Mapping[str, str]]) -> list[dict[str, str]]:
-        for row in existing:
-            if row["alias"] == alias:
+        live = [
+            row
+            for row in existing
+            if not (row["provider"] == IGNORE_KIND and row["cwd"] == directory)
+        ]
+        chosen = alias if alias is not None else suggest_alias(directory, live)
+        for row in live:
+            if row["alias"] == chosen:
                 if row["provider"] == provider and row["cwd"] == directory:
                     return []
-                raise ProjectError(f"project alias already exists: {alias}")
-        return [{"alias": alias, "provider": provider, "cwd": directory}]
+                raise ProjectError(f"project alias already exists: {chosen}")
+        return [{"alias": chosen, "provider": provider, "cwd": directory}]
 
-    return _mutate_projects(projects_file, state_dir, add)
+    return _mutate_projects(
+        projects_file,
+        state_dir,
+        add,
+        drop=lambda row: row["provider"] == IGNORE_KIND and row["cwd"] == directory,
+    )
+
+
+def ignore_project(projects_file: Path, state_dir: Path, cwd: str) -> dict[str, Any]:
+    """Keep a directory out of the picker and withdraw any shortcut it has."""
+    directory = _directory(cwd)
+    if directory is None:
+        raise ProjectError("project directory must be an existing absolute directory")
+    unchanged = False
+
+    def ignore(existing: Sequence[Mapping[str, str]]) -> list[dict[str, str]]:
+        nonlocal unchanged
+        current = [row for row in existing if row["cwd"] == directory]
+        if len(current) == 1 and current[0]["provider"] == IGNORE_KIND:
+            unchanged = True
+            return []
+        if current:
+            # Reuse the alias of the shortcut being withdrawn so the row stays
+            # recognisable in the file.
+            alias = current[0]["alias"]
+        else:
+            reserved = {row["alias"] for row in existing}
+            alias = base = _path_aliases([directory])[directory]
+            counter = 2
+            while alias in reserved:
+                alias = f"{base}-{counter}"
+                counter += 1
+        return [{"alias": alias, "provider": IGNORE_KIND, "cwd": directory}]
+
+    return _mutate_projects(
+        projects_file,
+        state_dir,
+        ignore,
+        drop=lambda row: not unchanged and row["cwd"] == directory,
+    )
 
 
 def _human_discovery(value: Mapping[str, Any]) -> None:
@@ -526,11 +682,35 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--json", action="store_true")
     subparsers = parser.add_subparsers(dest="action", required=True)
     subparsers.add_parser("discover")
-    subparsers.add_parser("import")
+    candidates = subparsers.add_parser("candidates")
+    candidates.add_argument(
+        "--select",
+        metavar="CHOICE",
+        help='resolve "1,3-4" or "a" against the candidate list and print those directories',
+    )
+    importer = subparsers.add_parser("import")
+    importer.add_argument(
+        "--only",
+        action="append",
+        metavar="DIRECTORY",
+        help="import just this directory; repeat for more",
+    )
+    importer.add_argument(
+        "--select",
+        metavar="CHOICE",
+        help='import the candidates named by "1,3-4" or "a"',
+    )
     add = subparsers.add_parser("add")
     add.add_argument("alias")
     add.add_argument("provider")
     add.add_argument("cwd")
+    here = subparsers.add_parser("here")
+    here.add_argument("alias", nargs="?")
+    here.add_argument("--provider", default="claude")
+    suggest = subparsers.add_parser("suggest")
+    suggest.add_argument("cwd")
+    ignore = subparsers.add_parser("ignore")
+    ignore.add_argument("cwd")
     subparsers.add_parser("list")
     return parser
 
@@ -556,12 +736,50 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.action == "discover":
             value = discover_projects()
+        elif args.action == "candidates":
+            value = project_candidates(projects_file)
+            if args.select is not None:
+                value = {
+                    **value,
+                    "selected": select_rows(value["candidates"], args.select),
+                }
         elif args.action == "import":
-            value = import_projects(projects_file, state_dir)
+            only = list(args.only or [])
+            if args.select is not None:
+                only.extend(
+                    row["cwd"]
+                    for row in select_rows(
+                        project_candidates(projects_file)["candidates"], args.select
+                    )
+                )
+                if not only:
+                    raise ProjectError("nothing was selected")
+            value = import_projects(projects_file, state_dir, only=only or None)
         elif args.action == "add":
             value = add_project(
                 projects_file, state_dir, args.alias, args.provider, args.cwd
             )
+        elif args.action == "here":
+            value = add_project(
+                projects_file, state_dir, args.alias, args.provider, os.getcwd()
+            )
+        elif args.action == "suggest":
+            directory = _directory(args.cwd)
+            if directory is None:
+                raise ProjectError(
+                    "project directory must be an existing absolute directory"
+                )
+            payload = _read_owner_file(
+                projects_file,
+                label="Session Kit projects file",
+                max_bytes=MAX_PROJECTS_FILE_BYTES,
+            )
+            value = {
+                "alias": suggest_alias(directory, _parse_projects(payload or b"")),
+                "cwd": directory,
+            }
+        elif args.action == "ignore":
+            value = ignore_project(projects_file, state_dir, args.cwd)
         else:
             payload = _read_owner_file(
                 projects_file,
@@ -579,12 +797,41 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"Imported {len(value['added'])} new project shortcut(s).")
             if value.get("backup"):
                 print(f"Previous projects file backed up to {value['backup']}")
-        elif args.action == "add":
+        elif args.action == "suggest":
+            print(value["alias"])
+        elif args.action == "candidates" and args.select is not None:
+            for row in value["selected"]:
+                print(row["cwd"])
+        elif args.action == "candidates":
+            if not value["candidates"]:
+                print("Every directory your providers use already has a decision.")
+            else:
+                print(f"{len(value['candidates'])} directory(s) with no shortcut yet:")
+                for row in value["candidates"]:
+                    print(f"  {row['alias']}\t{row['provider']}\t{row['cwd']}")
+            for warning in value["warnings"]:
+                print(f"Warning: {warning}")
+        elif args.action in ("add", "here"):
             if value["added"]:
                 row = value["added"][0]
+                if value["removed"]:
+                    print(f"No longer ignoring {row['cwd']}.")
                 print(f"Added {row['alias']}: {row['provider']} in {row['cwd']}")
             else:
                 print("That project shortcut is already configured.")
+        elif args.action == "ignore":
+            if value["added"]:
+                row = value["added"][0]
+                withdrawn = [
+                    other
+                    for other in value["removed"]
+                    if other["provider"] != IGNORE_KIND
+                ]
+                if withdrawn:
+                    print(f"Withdrew the {withdrawn[0]['alias']} shortcut.")
+                print(f"Ignoring {row['cwd']}. It stays out of the project list.")
+            else:
+                print("That directory is already ignored.")
         else:
             for row in value["projects"]:
                 print(f"{row['alias']}\t{row['provider']}\t{row['cwd']}")

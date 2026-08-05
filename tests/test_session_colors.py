@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -196,6 +197,111 @@ class SessionColorTests(unittest.TestCase):
         self.assertIn(first, inventory_core.SESSION_COLORS)
         self.assertIsNone(inventory_core.record_launch_color({}, "../evil"))
         self.assertIsNone(inventory_core.record_launch_color({}, ""))
+
+    def test_launch_reservations_serialize_and_fall_back_after_eight(self) -> None:
+        with tempfile.TemporaryDirectory(prefix=".color-race-", dir=REPO) as raw:
+            state = Path(raw)
+            state.chmod(0o700)
+            config = {"state_dir": state}
+            barrier = threading.Barrier(2)
+            colors: list[str | None] = []
+
+            def reserve(name: str) -> None:
+                barrier.wait()
+                colors.append(inventory_core.record_launch_color(config, name))
+
+            threads = [
+                threading.Thread(target=reserve, args=("new-one",)),
+                threading.Thread(target=reserve, args=("new-two",)),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=3)
+            self.assertTrue(all(not thread.is_alive() for thread in threads))
+            self.assertEqual(2, len(set(colors)))
+            first = inventory_core.record_launch_color(config, "repeat", {"red"})
+            repeated = inventory_core.record_launch_color(
+                config, "repeat", inventory_core.SESSION_COLORS
+            )
+            self.assertEqual(first, repeated)
+            preferred = inventory_core.launch_color_for("full-palette")
+            self.assertEqual(
+                preferred,
+                inventory_core.launch_color_for(
+                    "full-palette", inventory_core.SESSION_COLORS
+                ),
+            )
+
+    def test_conversation_pick_persists_the_prebaked_claude_override(self) -> None:
+        with tempfile.TemporaryDirectory(prefix=".conversation-color-", dir=REPO) as raw:
+            base = Path(raw)
+            state = base / "state"
+            state.mkdir(mode=0o700)
+            config_file = base / "inventory.json"
+            config_file.write_text('{"schema_version":1,"aliases":{}}\n')
+            config_file.chmod(0o600)
+            config = {"state_dir": state}
+            exact = uuid_for(72)
+            live = {"source": "live", "stale": False, "sessions": [], "outside_agents": []}
+            with (
+                mock.patch.dict(os.environ, {"SESSION_KIT_CONFIG": str(config_file)}),
+                mock.patch.object(inventory_core, "snapshot", return_value=live),
+                contextlib.redirect_stdout(io.StringIO()) as output,
+            ):
+                code = inventory_core._color_command(
+                    argparse.Namespace(
+                        color_action="conversation-pick",
+                        provider="claude",
+                        uuid=exact,
+                    ),
+                    config,
+                )
+            payload = json.loads(output.getvalue())
+            document = json.loads(config_file.read_text())
+            self.assertEqual(0, code)
+            self.assertEqual(payload["color"], document["colors"][f"claude:{exact}"])
+
+            with (
+                mock.patch.dict(os.environ, {"SESSION_KIT_CONFIG": str(config_file)}),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                mismatch = inventory_core._color_command(
+                    argparse.Namespace(
+                        color_action="conversation-release",
+                        provider="claude",
+                        uuid=exact,
+                        color=next(
+                            item
+                            for item in inventory_core.SESSION_COLORS
+                            if item != payload["color"]
+                        ),
+                    ),
+                    config,
+                )
+            self.assertEqual(1, mismatch)
+            self.assertEqual(
+                payload["color"],
+                json.loads(config_file.read_text())["colors"][f"claude:{exact}"],
+            )
+            with (
+                mock.patch.dict(os.environ, {"SESSION_KIT_CONFIG": str(config_file)}),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                released = inventory_core._color_command(
+                    argparse.Namespace(
+                        color_action="conversation-release",
+                        provider="claude",
+                        uuid=exact,
+                        color=payload["color"],
+                    ),
+                    config,
+                )
+            self.assertEqual(0, released)
+            self.assertNotIn(
+                f"claude:{exact}",
+                json.loads(config_file.read_text()).get("colors", {}),
+            )
 
     def test_launch_color_marker_is_adopted_into_override(self) -> None:
         with tempfile.TemporaryDirectory(prefix=".launch-", dir=REPO) as raw:

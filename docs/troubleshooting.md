@@ -11,6 +11,39 @@ sp list
 Before sharing output, remove titles, UUIDs, working directories, process
 details, service logs, and journal content.
 
+`session-kit doctor` also audits provider version output, all eight installed
+Codex theme files, the user-level self-name instructions, Claude title-hook
+coverage, active kill switches, and the private
+`release-acceptance.json` record. These migration checks are warnings: they do
+not alter provider state or make an otherwise healthy installation fail.
+Kill-switch findings print supported variable or sentinel names only, never
+their values.
+
+The owner-only acceptance record uses this exact schema. Provider values are
+the exact recognized `--version` output, or `null` when that provider is not
+installed. Evidence values are short local references or notes, not secrets.
+
+```json
+{
+  "schema_version": 1,
+  "release_id": "40-character-release-commit",
+  "platform": "linux",
+  "provider_versions": {
+    "claude": "2.1.221 (Claude Code)",
+    "codex": "codex-cli 0.145.0"
+  },
+  "accepted_on": "2026-08-04",
+  "evidence": {
+    "unique_colors": "local acceptance step or evidence reference",
+    "thread_titles": "local acceptance step or evidence reference",
+    "resume_roundtrip": "local acceptance step or evidence reference"
+  }
+}
+```
+
+Doctor accepts the record only when its release, platform, installed provider
+versions, date, and all three evidence fields match the current installation.
+
 ## `kit` does not open
 
 The dashboard is opened on demand with `kit`. Login integration adds the

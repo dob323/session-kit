@@ -183,9 +183,35 @@ bash --noprofile --norc -ic '
         self.assertEqual(0o600, stat.S_IMODE(candidates[0].stat().st_mode))
         return json.loads(candidates[0].read_text(encoding="utf-8"))
 
+    def keep_exit_menu(self) -> None:
+        """Opt this terminal back into the recovery menu on a clean exit."""
+        (self.home / ".sk_keep_exit_menu").write_text("", encoding="utf-8")
+
+    def test_clean_provider_exit_closes_without_a_menu_or_a_keypress(self) -> None:
+        # Typing /exit should land straight back on the picker.
+        completed = self.launch("")
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertNotIn("Provider exited:", completed.stdout)
+        self.assertNotIn("exited with status", completed.stdout)
+        # The shell closed rather than returning to the sourcing caller.
+        self.assertNotIn("SOURCE_RETURNED", completed.stdout)
+        state = self.lifecycle_document()
+        self.assertTrue(state["user_input_after_exit"])
+
+    def test_crashed_provider_still_stops_at_the_recovery_menu(self) -> None:
+        write_executable(
+            self.bin / "codex",
+            '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$PROVIDER_LOG"\nexit 3\n',
+        )
+        completed = self.launch("c\n")
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertIn("Codex exited with status 3", completed.stdout)
+        self.assertIn("Provider exited: [r] reopen conversation", completed.stdout)
+
     def test_provider_exit_stays_in_controlled_menu_until_input_is_recorded(
         self,
     ) -> None:
+        self.keep_exit_menu()
         completed = self.launch("s\nexit\n")
         self.assertEqual(0, completed.returncode, completed.stderr)
         self.assertIn("Codex exited with status 0", completed.stdout)
@@ -207,6 +233,7 @@ bash --noprofile --norc -ic '
         self.assertFalse((self.start / "main2.expected").exists())
 
     def test_unknown_choice_is_permanent_input_before_close(self) -> None:
+        self.keep_exit_menu()
         completed = self.launch("not-a-choice\nc\n")
         self.assertEqual(0, completed.returncode, completed.stderr)
         self.assertIn("Unknown choice", completed.stdout)

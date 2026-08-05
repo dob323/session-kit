@@ -15,6 +15,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import threading
 import unittest
 from unittest import mock
@@ -127,6 +128,28 @@ def inventory_fixture(
 
 
 class InventoryScaleTests(unittest.TestCase):
+    def test_claude_agent_name_outranks_generated_native_title(self) -> None:
+        fixture = list(inventory_fixture(1, providers=("claude",)))
+        fixture[1][0].update(
+            {
+                "name": "Verify disposable session kit",
+                "nameSource": "derived",
+                "aiTitle": "Verify disposable session kit",
+                "agentName": "Disposable Claude Proof",
+            }
+        )
+
+        result = inventory_core.build_inventory(
+            *fixture, now=1_800_000_000
+        )
+
+        row = result["sessions"][0]
+        self.assertEqual("Disposable Claude Proof", row["native_title"])
+        self.assertEqual("Disposable Claude Proof", row["title"])
+        self.assertEqual("native", row["title_source"])
+        self.assertEqual("ready", row["provider_title_state"])
+        self.assertEqual("not-needed", row["automatic_name_state"])
+
     def test_zero_one_and_100_plus_counts_have_no_ceiling(self) -> None:
         for count in (0, 1, 9, 10, 99, 125, 250):
             with self.subTest(count=count):
@@ -2320,7 +2343,10 @@ class AutomaticTitleTests(unittest.TestCase):
                     environ=environment,
                     current_pid=current_pid,
                 )
-                self.assertEqual("ready", result["automatic_name_state"])
+                self.assertEqual("pending", result["automatic_name_state"])
+                self.assertTrue(result["provider_title_warnings"])
+                retry = config["state_dir"] / "provider-title-retries.json"
+                self.assertTrue(retry.is_file())
                 document = json.loads(config_path.read_text(encoding="utf-8"))
                 self.assertNotIn("automatic_title_failures", document)
                 # A self-name is an explicit rename: it must land in the alias
@@ -2434,7 +2460,8 @@ class AutomaticTitleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix=".title-state-", dir=REPO) as raw:
             state = Path(raw)
             marker_root = state / "provider-untitled"
-            marker_root.mkdir()
+            marker_root.mkdir(mode=0o700)
+            marker_root.chmod(0o700)
             live = {
                 "sessions": [
                     {
@@ -2475,6 +2502,56 @@ class AutomaticTitleTests(unittest.TestCase):
             self.assertEqual(
                 "ready", live["sessions"][0]["provider_title_state"]
             )
+
+            old_active = marker_root / "main"
+            old_active.touch()
+            old_orphan = marker_root / "gone"
+            old_orphan.touch()
+            old = time.time() - 8 * 86400
+            os.utime(old_active, (old, old))
+            os.utime(old_orphan, (old, old))
+            exact_live = inventory_core.build_inventory(
+                *inventory_fixture(1, providers=("codex",)),
+                now=1_800_000_000,
+            )
+            with (
+                mock.patch.object(inventory_core, "collect_live", return_value=exact_live),
+                mock.patch.object(inventory_core, "_boot_id", return_value="boot-a"),
+            ):
+                result = inventory_core.snapshot(
+                    write_state=True,
+                    config={"state_dir": state, "max_proc_nodes": 8192, "max_proc_depth": 32},
+                )
+            self.assertTrue(old_active.exists())
+            self.assertFalse(old_orphan.exists())
+            self.assertEqual("gone", result["provider_untitled_quarantine"][0]["marker"])
+            self.assertTrue(Path(result["provider_untitled_quarantine"][0]["quarantine"]).is_file())
+            exact_live.pop("provider_untitled_quarantine", None)
+
+            unsafe_state = state / "unsafe-state"
+            unsafe_state.mkdir(mode=0o700)
+            external = state / "external-markers"
+            external.mkdir(mode=0o700)
+            external_marker = external / "foreign"
+            external_marker.touch()
+            os.utime(external_marker, (old, old))
+            (unsafe_state / "provider-untitled").symlink_to(
+                external, target_is_directory=True
+            )
+            with (
+                mock.patch.object(inventory_core, "collect_live", return_value=exact_live),
+                mock.patch.object(inventory_core, "_boot_id", return_value="boot-a"),
+            ):
+                unsafe_result = inventory_core.snapshot(
+                    write_state=True,
+                    config={
+                        "state_dir": unsafe_state,
+                        "max_proc_nodes": 8192,
+                        "max_proc_depth": 32,
+                    },
+                )
+            self.assertTrue(external_marker.exists())
+            self.assertNotIn("provider_untitled_quarantine", unsafe_result)
 
     def test_retained_titles_audit_and_dry_run_token_gate_prune(self) -> None:
         with tempfile.TemporaryDirectory(prefix=".automatic-prune-", dir=REPO) as raw:

@@ -4,7 +4,24 @@ Session Kit follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-No changes yet.
+### Fixed
+
+- Allowed read-only install and doctor probes to reach the current user's
+  systemd manager through its documented local-machine transport when the
+  direct private socket is unavailable, while reporting the degraded socket as
+  a warning and leaving service-control commands fail-closed.
+- Made Claude's persisted `agent-name` record outrank its later generated
+  window label, so an exact `sp self-name` converges to ready instead of
+  remaining pending after a successful native write.
+- Reserved and persisted an exact live-palette color after a failed Claude
+  pre-bake, before the detached session can be attached, instead of falling
+  back to a collision-prone identity hash.
+- Added warning-only migration audits for bounded provider versions, private
+  Codex themes, naming instructions and hooks, active kill switches, and the
+  private release acceptance record.
+- Excluded inaccessible provider project paths while retaining readable shared
+  repositories, and honored `CODEX_HOME` consistently during discovery and
+  theme installation.
 
 ## [0.1.4] - 2026-08-03
 

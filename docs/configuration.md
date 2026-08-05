@@ -56,11 +56,24 @@ providers. Review the same bounded discovery at any time:
 
 ```text
 session-kit projects discover
+session-kit projects candidates
 session-kit projects import
+session-kit projects import --select 1,3-4
 session-kit projects list
 session-kit projects add web claude /absolute/path/to/web
 session-kit projects add api codex /absolute/path/to/api
+session-kit projects here
+session-kit projects ignore /absolute/path/to/scratch
 ```
+
+`candidates` answers "what would import add, and under what name" without
+writing anything. `import --select` takes only the entries you name, so a
+first run is never all or nothing. `here` adds the current directory under a
+derived short name. `ignore` keeps a directory out of the picker for good.
+
+The picker offers the same choices without any of these commands: press `m`
+for More, then `p` for Projects, to add a directory, review the ones your
+providers use that are not listed yet, or drop one.
 
 Discovery reads only provider-owned local records. For Claude Code, those are
 the project map in `~/.claude.json` and the project field in local history. For
@@ -69,12 +82,18 @@ directories in the newest local `state_*.sqlite` thread database. Missing
 directories and provider-configured temporary roots are ignored. Session Kit
 does not scan unrelated folders.
 
-When the same directory is recorded by both providers, import creates separate
-Claude and Codex shortcuts so either provider can be selected directly. Alias
-collisions are resolved with parent-folder or provider suffixes. Import is
-repeatable: existing provider/directory pairs and all hand-written lines are
-left unchanged. Before appending any new rows, Session Kit saves an owner-only
-backup under its state `backups` directory.
+Every directory gets at most one shortcut, whichever providers recorded it:
+the provider is already chosen before the project list appears, so a second
+row for one directory would read as a duplicate. Alias collisions are resolved
+with parent-folder or provider suffixes. Import is repeatable: directories
+that already have a row — including an `ignore` row — and all hand-written
+lines are left unchanged. Before appending any new rows, Session Kit saves an
+owner-only backup under its state `backups` directory.
+
+A row whose provider is `ignore` is a decision, not a shortcut. It is never
+listed in the picker, never resolves as a launch target, and because import
+gives each directory at most one row, discovery can never offer that
+directory again. Adding the directory back withdraws the ignore.
 
 The projects file is tab-separated:
 

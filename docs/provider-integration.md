@@ -35,6 +35,12 @@ this command from a child agent.
 Review the current provider documentation before changing its instruction
 files.
 
+The read-only doctor check reports when either provider instruction file omits
+`sp self-name`. For Claude it also verifies that the owner-controlled
+`nameintent_title.sh` hook is executable and registered for `SessionStart`,
+`UserPromptSubmit`, and `Stop`. Session Kit reports missing coverage but does
+not edit user-level provider instructions or hooks.
+
 `sp self-name` accepts a 2–5 word Title Case name and verifies the managed root
 identity before and after the write. Manual names take priority. Set
 `SESSION_KIT_AUTO_NAME=0` to stop new automatic naming without deleting retained

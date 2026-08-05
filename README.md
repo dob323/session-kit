@@ -83,7 +83,11 @@ sp list
 sp new [claude|codex|shell] [project-alias]
 session-kit projects discover
 session-kit projects import
+session-kit projects candidates
+session-kit projects import --select 1,3-4
 session-kit projects add <alias> <claude|codex|shell> /absolute/path
+session-kit projects here
+session-kit projects ignore /absolute/path
 sp go <terminal-number|shpool-id>
 sp takeover <terminal-number|shpool-id>
 sp name <terminal-number|shpool-id> <title>

@@ -102,6 +102,90 @@ class PendingRecoveryTests(unittest.TestCase):
             {entry["old_shpool_id"] for entry in entries},
         )
 
+    def test_duplicate_exact_identity_prefers_primary_and_acknowledges_all_evidence(self) -> None:
+        document = pending_document()
+        duplicate = pending_session("claude", uuid_for(1), "Newer title")
+        document["queued_generations"].append(
+            {
+                "source_boot_id": "boot-newest",
+                "source_daemon_generation": {"pid": 40, "process_start_ticks": 400},
+                "sessions": {"newer-claude": duplicate},
+            }
+        )
+        self.pending_path.write_text(json.dumps(document), encoding="utf-8")
+        entries = inventory_core.list_pending(self.config)["entries"]
+        claude = next(entry for entry in entries if entry["uuid"] == uuid_for(1))
+        self.assertEqual("primary", claude["queue"])
+        self.assertEqual(1, claude["duplicate_count"])
+        self.assertEqual(2, len(claude["evidence"]))
+        self.assertEqual([], claude["conflict_fields"])
+        self.assertTrue(claude["actionable"])
+        live = inventory_core.build_inventory(*inventory_fixture(2), now=1_800_000_000)
+        result = inventory_core.acknowledge_pending(
+            self.config,
+            claude["source_generation_key"],
+            claude["old_shpool_id"],
+            claude["uuid"],
+            collector=lambda _: json.loads(json.dumps(live)),
+        )
+        self.assertNotIn(uuid_for(1), {item["uuid"] for item in result["remaining"]["entries"]})
+        stored = json.loads(self.pending_path.read_text())
+        self.assertNotIn("old-claude", stored["sessions"])
+        self.assertEqual(1, len(stored["queued_generations"]))
+
+    def test_duplicate_queued_identity_prefers_newest_generation(self) -> None:
+        duplicate_uuid = uuid_for(44)
+        document = pending_document()
+        document["sessions"] = {}
+        document["queued_generations"] = [
+            {
+                "source_boot_id": "boot-older",
+                "source_daemon_generation": {"pid": 30, "process_start_ticks": 300},
+                "sessions": {"older": pending_session("codex", duplicate_uuid, "Older title")},
+            },
+            {
+                "source_boot_id": "boot-newer",
+                "source_daemon_generation": {"pid": 40, "process_start_ticks": 400},
+                "sessions": {"newer": pending_session("codex", duplicate_uuid, "Newer title")},
+            },
+        ]
+        self.pending_path.write_text(json.dumps(document), encoding="utf-8")
+        entries = inventory_core.list_pending(self.config)["entries"]
+        self.assertEqual(1, len(entries))
+        self.assertEqual("newer", entries[0]["old_shpool_id"])
+        self.assertEqual("Newer title", entries[0]["title"])
+        self.assertEqual(1, entries[0]["queue_index"])
+        self.assertEqual(1, entries[0]["duplicate_count"])
+
+    def test_conflicting_duplicate_metadata_is_visible_but_not_actionable(self) -> None:
+        document = pending_document()
+        conflicting = pending_session("claude", uuid_for(1), "Moved title")
+        conflicting["cwd"] = "/srv/other-project"
+        document["queued_generations"].append(
+            {
+                "source_boot_id": "boot-conflict",
+                "source_daemon_generation": {"pid": 40, "process_start_ticks": 400},
+                "sessions": {"moved-claude": conflicting},
+            }
+        )
+        self.pending_path.write_text(json.dumps(document), encoding="utf-8")
+        before = self.pending_path.read_bytes()
+        target = next(
+            item for item in inventory_core.list_pending(self.config)["entries"]
+            if item["uuid"] == uuid_for(1)
+        )
+        self.assertFalse(target["actionable"])
+        self.assertIn("cwd", target["conflict_fields"])
+        with self.assertRaises(inventory_core.CollectionError):
+            inventory_core.acknowledge_pending(
+                self.config,
+                target["source_generation_key"],
+                target["old_shpool_id"],
+                target["uuid"],
+                collector=lambda _: {},
+            )
+        self.assertEqual(before, self.pending_path.read_bytes())
+
     def test_wrong_provider_or_non_live_collector_leaves_pending_bytes_unchanged(self) -> None:
         before = self.pending_path.read_bytes()
         key = inventory_core.source_generation_key(

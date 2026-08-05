@@ -10,6 +10,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 
@@ -34,7 +35,7 @@ class InstallerTests(unittest.TestCase):
         self.home.mkdir()
         self.fake_bin = self.temp / "bin"
         self.fake_bin.mkdir()
-        for command in ("shpool", "codex", "launchctl", "plutil", "sw_vers"):
+        for command in ("shpool", "claude", "codex", "launchctl", "plutil", "sw_vers"):
             executable = self.fake_bin / command
             body = "#!/usr/bin/env bash\nexit 0\n"
             if command == "shpool":
@@ -43,6 +44,10 @@ class InstallerTests(unittest.TestCase):
                     "if [[ ${1:-} == version ]]; then echo 'shpool 0.11.0'; fi\n"
                     "exit 0\n"
                 )
+            elif command == "claude":
+                body = "#!/usr/bin/env bash\necho '2.1.221 (Claude Code)'\n"
+            elif command == "codex":
+                body = "#!/usr/bin/env bash\necho 'codex-cli 0.145.0'\n"
             executable.write_text(
                 body, encoding="utf-8"
             )
@@ -104,10 +109,102 @@ class InstallerTests(unittest.TestCase):
             )
         return result
 
+    def clean_source_fixture(self) -> Path:
+        source = self.temp / "clean-source"
+        shutil.copytree(
+            REPO,
+            source,
+            ignore=shutil.ignore_patterns(
+                ".git",
+                ".mypy_cache",
+                ".ruff_cache",
+                "__pycache__",
+                "*.pyc",
+            ),
+        )
+        subprocess.run(["git", "init", "-q", source], check=True)
+        subprocess.run(["git", "-C", source, "add", "."], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                source,
+                "-c",
+                "user.name=Session Kit Tests",
+                "-c",
+                "user.email=session-kit-tests@invalid.example",
+                "commit",
+                "-q",
+                "-m",
+                "fixture",
+            ],
+            check=True,
+        )
+        return source
+
+    def write_systemctl_probe_fixture(self) -> Path:
+        log = self.temp / "systemctl-probes.log"
+        systemctl = self.fake_bin / "systemctl"
+        systemctl.write_text(
+            "#!/usr/bin/env bash\n"
+            "printf '%s\\n' \"$*\" >> \"$SESSION_KIT_SYSTEMCTL_LOG\"\n"
+            "case \"$*\" in\n"
+            "  '--user show-environment') exit \"${SESSION_KIT_DIRECT_RC:-0}\" ;;\n"
+            "  '--user --machine=@.host show-environment') exit \"${SESSION_KIT_MACHINE_RC:-1}\" ;;\n"
+            "  *) exit 64 ;;\n"
+            "esac\n",
+            encoding="utf-8",
+        )
+        systemctl.chmod(0o755)
+        return log
+
     def test_check_is_read_only(self) -> None:
         result = self.run_installer("--check")
         self.assertIn("OK    source: installable", result.stdout)
         self.assertEqual(list(self.home.iterdir()), [])
+
+    def test_check_reports_direct_and_fallback_systemd_transports(self) -> None:
+        source = self.clean_source_fixture()
+        log = self.write_systemctl_probe_fixture()
+        env = self.env.copy()
+        env.pop("SESSION_KIT_TESTING")
+        env.pop("SESSION_KIT_RELEASE_ID")
+        env["SESSION_KIT_SYSTEMCTL_LOG"] = str(log)
+
+        cases = (
+            ("0", "1", 0, "OK    user service manager: systemd", ["--user show-environment"]),
+            (
+                "1",
+                "0",
+                0,
+                "WARN  user service manager: available through local-machine transport; direct user socket is unavailable",
+                ["--user show-environment", "--user --machine=@.host show-environment"],
+            ),
+            (
+                "1",
+                "1",
+                1,
+                "FAIL  systemd user manager is unavailable",
+                ["--user show-environment", "--user --machine=@.host show-environment"],
+            ),
+        )
+        for direct_rc, machine_rc, expected_rc, message, calls in cases:
+            with self.subTest(direct_rc=direct_rc, machine_rc=machine_rc):
+                log.unlink(missing_ok=True)
+                env["SESSION_KIT_DIRECT_RC"] = direct_rc
+                env["SESSION_KIT_MACHINE_RC"] = machine_rc
+                result = subprocess.run(
+                    [str(source / "install.sh"), "--check"],
+                    cwd=source,
+                    env=env,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, expected_rc, result.stdout + result.stderr)
+                self.assertIn(message, result.stdout)
+                self.assertEqual(log.read_text(encoding="utf-8").splitlines(), calls)
 
     def test_check_rejects_partial_inventory_package(self) -> None:
         source = self.temp / "source"
@@ -217,7 +314,9 @@ class InstallerTests(unittest.TestCase):
 
         result = self.run_installer("--non-interactive", "--import-projects")
 
-        self.assertIn("Imported 4 new project shortcut(s)", result.stdout)
+        # The shared directory is discovered under both providers and still
+        # earns exactly one shortcut.
+        self.assertIn("Imported 3 new project shortcut(s)", result.stdout)
         projects_file = self.home / ".config/session-kit/projects.tsv"
         rows = {
             tuple(line.split("\t")[:3])
@@ -229,12 +328,11 @@ class InstallerTests(unittest.TestCase):
             {
                 ("claude-project", "claude", str(claude_project)),
                 ("codex-project", "codex", str(codex_project)),
-                ("shared-claude", "claude", str(shared)),
-                ("shared-codex", "codex", str(shared)),
+                ("shared", "claude", str(shared)),
             },
         )
         listed = self.installed("projects", "list")
-        self.assertIn(f"shared-codex\tcodex\t{shared}", listed.stdout)
+        self.assertIn(f"shared\tclaude\t{shared}", listed.stdout)
 
     def test_noninteractive_install_defers_project_import_and_command_can_rerun_it(self) -> None:
         project = self.home / "work/existing"
@@ -508,6 +606,427 @@ class InstallerTests(unittest.TestCase):
         names = {row["name"]: row for row in payload["checks"]}
         self.assertEqual(names["release"]["detail"], RELEASE_A)
         self.assertEqual(names["login"]["status"], "ok")
+        self.assertEqual(names["codex-themes"]["status"], "ok")
+        self.assertEqual(names["acceptance"]["status"], "warn")
+
+    def test_doctor_warns_when_only_systemd_machine_transport_works(self) -> None:
+        self.run_installer("--non-interactive")
+        log = self.write_systemctl_probe_fixture()
+        env = self.env.copy()
+        env.pop("SESSION_KIT_TESTING")
+        env.pop("SESSION_KIT_RELEASE_ID")
+        env.update(
+            {
+                "SESSION_KIT_SYSTEMCTL_LOG": str(log),
+                "SESSION_KIT_DIRECT_RC": "1",
+                "SESSION_KIT_MACHINE_RC": "0",
+            }
+        )
+
+        result = subprocess.run(
+            [str(self.home / ".local/bin/session-kit"), "doctor", "--json"],
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        names = {row["name"]: row for row in json.loads(result.stdout)["checks"]}
+        self.assertEqual(names["services"]["status"], "warn")
+        self.assertEqual(
+            names["services"]["detail"],
+            "systemd user manager is available through local-machine transport; direct user socket is unavailable",
+        )
+        self.assertEqual(
+            log.read_text(encoding="utf-8").splitlines(),
+            ["--user show-environment", "--user --machine=@.host show-environment"],
+        )
+
+    def test_doctor_audits_naming_and_redacts_kill_switch_values(self) -> None:
+        self.run_installer("--enable-login")
+        codex = self.home / ".codex"
+        claude = self.home / ".claude"
+        (codex / "AGENTS.md").write_text("run sp self-name once\n", encoding="utf-8")
+        claude.mkdir(exist_ok=True)
+        (claude / "CLAUDE.md").write_text("run sp self-name once\n", encoding="utf-8")
+        hooks = claude / "hooks"
+        hooks.mkdir()
+        title_hook = hooks / "nameintent_title.sh"
+        title_hook.write_text(
+            "#!/bin/sh\n"
+            "cat >/dev/null\n"
+            "printf '%s\\n' '{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"sessionTitle\":\"Session Kit Doctor Fixture\"}}'\n",
+            encoding="utf-8",
+        )
+        title_hook.chmod(0o700)
+        hook = {
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": "~/.claude/hooks/nameintent_title.sh",
+                }
+            ]
+        }
+        (claude / "settings.json").write_text(
+            json.dumps(
+                {
+                    "hooks": {
+                        event: [hook]
+                        for event in ("SessionStart", "UserPromptSubmit", "Stop")
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        acceptance = self.home / ".config/session-kit/release-acceptance.json"
+        acceptance.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "release_id": RELEASE_A,
+                    "platform": "linux" if sys.platform != "darwin" else "macos",
+                    "provider_versions": {
+                        "claude": "2.1.221 (Claude Code)",
+                        "codex": "codex-cli 0.145.0",
+                    },
+                    "accepted_on": "2026-08-04",
+                    "evidence": {
+                        "unique_colors": "fixture-colors",
+                        "thread_titles": "fixture-titles",
+                        "resume_roundtrip": "fixture-resume",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        acceptance.chmod(0o600)
+        self.env["SESSION_KIT_NO_COLOR"] = "secret-color-value"
+
+        result = self.installed("doctor", "--json")
+
+        self.assertNotIn("secret-color-value", result.stdout)
+        names = {row["name"]: row for row in json.loads(result.stdout)["checks"]}
+        self.assertEqual(names["naming-instructions"]["status"], "ok")
+        self.assertEqual(names["naming-hook"]["status"], "ok")
+        self.assertEqual(names["acceptance"]["status"], "ok")
+        self.assertEqual(names["kill-switches"]["status"], "warn")
+        self.assertIn("SESSION_KIT_NO_COLOR", names["kill-switches"]["detail"])
+
+        stale = json.loads(acceptance.read_text(encoding="utf-8"))
+        stale["release_id"] = RELEASE_B
+        acceptance.write_text(json.dumps(stale), encoding="utf-8")
+        acceptance.chmod(0o600)
+        stale_result = self.installed("doctor", "--json")
+        stale_names = {
+            row["name"]: row for row in json.loads(stale_result.stdout)["checks"]
+        }
+        self.assertEqual(stale_names["acceptance"]["status"], "warn")
+
+    def test_doctor_requires_exact_typed_title_hook_command(self) -> None:
+        self.run_installer("--non-interactive")
+        claude = self.home / ".claude"
+        hooks = claude / "hooks"
+        hooks.mkdir(parents=True)
+        title_hook = hooks / "nameintent_title.sh"
+        title_hook.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        title_hook.chmod(0o700)
+        bad_hook = {
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": "sh ~/.claude/hooks/nameintent_title.sh",
+                }
+            ]
+        }
+        (claude / "settings.json").write_text(
+            json.dumps(
+                {
+                    "hooks": {
+                        "SessionStart": [bad_hook],
+                        "UserPromptSubmit": {"hooks": []},
+                        "Stop": [bad_hook],
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = self.installed("doctor", "--json")
+
+        names = {row["name"]: row for row in json.loads(result.stdout)["checks"]}
+        self.assertEqual(names["naming-hook"]["status"], "warn")
+        self.assertIn("SessionStart", names["naming-hook"]["detail"])
+        self.assertIn("UserPromptSubmit", names["naming-hook"]["detail"])
+
+    def test_doctor_uses_custom_codex_home_for_themes_and_instructions(self) -> None:
+        codex_home = self.temp / "private-codex"
+        codex_home.mkdir(mode=0o700)
+        self.env["CODEX_HOME"] = str(codex_home)
+        self.run_installer("--non-interactive")
+        (codex_home / "AGENTS.md").write_text(
+            "run sp self-name once\n", encoding="utf-8"
+        )
+        claude = self.home / ".claude"
+        claude.mkdir()
+        (claude / "CLAUDE.md").write_text(
+            "run sp self-name once\n", encoding="utf-8"
+        )
+
+        result = self.installed("doctor", "--json")
+
+        names = {row["name"]: row for row in json.loads(result.stdout)["checks"]}
+        self.assertEqual(names["codex-themes"]["status"], "ok")
+        self.assertEqual(names["naming-instructions"]["status"], "ok")
+        self.assertFalse((self.home / ".codex").exists())
+
+    def test_doctor_warns_for_unsafe_theme_without_failing(self) -> None:
+        self.run_installer("--non-interactive")
+        theme = self.home / ".codex/themes/sk-red.tmTheme"
+        theme.chmod(0o644)
+
+        result = self.installed("doctor", "--json")
+
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["ok"])
+        names = {row["name"]: row for row in payload["checks"]}
+        self.assertEqual(names["codex-themes"]["status"], "warn")
+        self.assertIn("red", names["codex-themes"]["detail"])
+
+    def test_doctor_bounds_provider_version_output(self) -> None:
+        self.run_installer("--non-interactive")
+        codex = self.fake_bin / "codex"
+        codex.write_text(
+            "#!/usr/bin/env bash\nprintf '%0300d' 0\n",
+            encoding="utf-8",
+        )
+        codex.chmod(0o755)
+
+        result = self.installed("doctor", "--json")
+
+        self.assertNotIn("0" * 257, result.stdout)
+        names = {row["name"]: row for row in json.loads(result.stdout)["checks"]}
+        self.assertEqual(names["codex-version"]["status"], "warn")
+        self.assertEqual(
+            names["codex-version"]["detail"],
+            "codex --version exceeded 256 bytes",
+        )
+
+    def test_doctor_never_echoes_unrecognized_provider_stderr(self) -> None:
+        self.run_installer("--non-interactive")
+        codex = self.fake_bin / "codex"
+        codex.write_text(
+            "#!/usr/bin/env bash\nprintf 'provider-secret-value\\n' >&2\n",
+            encoding="utf-8",
+        )
+        codex.chmod(0o755)
+
+        result = self.installed("doctor", "--json")
+
+        self.assertNotIn("provider-secret-value", result.stdout)
+        names = {row["name"]: row for row in json.loads(result.stdout)["checks"]}
+        self.assertEqual(names["codex-version"]["status"], "warn")
+        self.assertEqual(
+            names["codex-version"]["detail"],
+            "codex reported an unrecognized version",
+        )
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "uses Linux /proc")
+    def test_doctor_kills_provider_group_after_leader_exits(self) -> None:
+        self.run_installer("--non-interactive")
+        descendant_pid = self.temp / "provider-descendant.pid"
+        codex = self.fake_bin / "codex"
+        codex.write_text(
+            "#!/usr/bin/env bash\n"
+            "( trap '' TERM; while :; do sleep 1; done ) &\n"
+            f"printf '%s\\n' \"$!\" > {descendant_pid!s}\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        codex.chmod(0o755)
+
+        self.installed("doctor", "--json")
+
+        pid = int(descendant_pid.read_text(encoding="utf-8"))
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            status = Path(f"/proc/{pid}/stat")
+            if not status.exists() or status.read_text().split()[2] == "Z":
+                break
+            time.sleep(0.02)
+        else:
+            self.fail(f"provider descendant {pid} survived doctor cleanup")
+
+    def test_install_rejects_relative_or_symlinked_custom_codex_home(self) -> None:
+        self.env["CODEX_HOME"] = "relative-codex-home"
+        relative = self.run_installer("--non-interactive", check=False)
+        self.assertNotEqual(relative.returncode, 0)
+        self.assertIn("absolute normalized path", relative.stderr)
+        self.assertFalse((self.home / ".local/lib/session-kit").exists())
+
+        target = self.temp / "codex-target"
+        target.mkdir(mode=0o700)
+        link = self.temp / "codex-link"
+        link.symlink_to(target, target_is_directory=True)
+        self.env["CODEX_HOME"] = str(link)
+        linked = self.run_installer("--non-interactive", check=False)
+        self.assertNotEqual(linked.returncode, 0)
+        self.assertIn("unsafe Codex path ancestor", linked.stderr)
+        self.assertFalse((target / "themes").exists())
+
+    def test_install_and_doctor_reject_unsafe_codex_ancestors(self) -> None:
+        unsafe = self.home / "unsafe"
+        unsafe.mkdir(mode=0o700)
+        codex_home = unsafe / "codex"
+        codex_home.mkdir(mode=0o700)
+        unsafe.chmod(0o777)
+        self.env["CODEX_HOME"] = str(codex_home)
+
+        rejected = self.run_installer("--non-interactive", check=False)
+
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("unsafe Codex path ancestor", rejected.stderr)
+        self.assertFalse((codex_home / "themes").exists())
+
+        self.env.pop("CODEX_HOME")
+        unsafe.chmod(0o700)
+        self.run_installer("--non-interactive")
+        installed_root = self.home / ".codex"
+        installed_root.chmod(0o777)
+        result = self.installed("doctor", "--json")
+        names = {row["name"]: row for row in json.loads(result.stdout)["checks"]}
+        self.assertEqual(names["codex-themes"]["status"], "warn")
+        self.assertEqual(names["naming-instructions"]["status"], "warn")
+
+    def test_empty_codex_home_uses_runtime_default(self) -> None:
+        self.env["CODEX_HOME"] = ""
+
+        self.run_installer("--non-interactive")
+
+        self.assertTrue((self.home / ".codex/themes/sk-red.tmTheme").is_file())
+
+    def test_theme_recovery_uses_recorded_home_when_environment_changes(self) -> None:
+        codex_a = self.home / "codex-a"
+        codex_a.mkdir(mode=0o700)
+        self.env["CODEX_HOME"] = str(codex_a)
+        self.run_installer("--non-interactive")
+        red = codex_a / "themes/sk-red.tmTheme"
+        red.write_text("recorded-a\n", encoding="utf-8")
+        red.chmod(0o600)
+        self.env["SESSION_KIT_RELEASE_ID"] = RELEASE_B
+
+        for changed_home in ("", str(self.home / "unsafe-b")):
+            self.env["CODEX_HOME"] = str(codex_a)
+            self.env["SESSION_KIT_TEST_FAILPOINT"] = "themes"
+            interrupted = self.installed(
+                "update", "--source", str(REPO), check=False
+            )
+            self.assertNotEqual(interrupted.returncode, 0)
+            self.env.pop("SESSION_KIT_TEST_FAILPOINT")
+            if changed_home:
+                unsafe_b = Path(changed_home)
+                unsafe_b.mkdir(mode=0o700)
+                unsafe_b.chmod(0o777)
+            self.env["CODEX_HOME"] = changed_home
+
+            recovered = self.installed(
+                "update", "--source", str(self.temp / "missing-source"), check=False
+            )
+
+            self.assertNotEqual(recovered.returncode, 0)
+            self.assertIn("Recovered interrupted Session Kit", recovered.stdout)
+            self.assertEqual(red.read_text(encoding="utf-8"), "recorded-a\n")
+            if changed_home:
+                Path(changed_home).chmod(0o700)
+
+    def test_no_theme_release_removes_only_captured_kit_themes(self) -> None:
+        source = self.temp / "pre-theme-source"
+        shutil.copytree(
+            REPO,
+            source,
+            ignore=shutil.ignore_patterns(".git", "__pycache__", "*.pyc"),
+        )
+        shutil.rmtree(source / "config/codex-themes")
+        subprocess.run(["git", "init", "-q", source], check=True)
+        subprocess.run(["git", "-C", source, "add", "."], check=True)
+        subprocess.run(
+            [
+                "git", "-C", source, "-c", "user.name=Fixture",
+                "-c", "user.email=fixture@example.invalid", "commit", "-qm", "fixture",
+            ],
+            check=True,
+        )
+        self.run_installer("--source", str(source), "--non-interactive")
+        self.env["SESSION_KIT_RELEASE_ID"] = RELEASE_B
+        self.installed("update", "--source", str(REPO))
+        themes = self.home / ".codex/themes"
+        unrelated = themes / "personal.tmTheme"
+        unrelated.write_text("personal\n", encoding="utf-8")
+
+        self.installed("rollback", "--to", RELEASE_A)
+
+        self.assertTrue(unrelated.is_file())
+        for color in (
+            "red", "blue", "green", "yellow", "purple", "orange", "pink", "cyan"
+        ):
+            self.assertFalse((themes / f"sk-{color}.tmTheme").exists())
+
+    def test_mid_copy_failure_cleans_theme_temporary(self) -> None:
+        self.run_installer("--non-interactive")
+        themes = self.home / ".codex/themes"
+        red_before = (themes / "sk-red.tmTheme").read_bytes()
+        self.env["SESSION_KIT_RELEASE_ID"] = RELEASE_B
+        self.env["SESSION_KIT_TEST_FAILPOINT"] = "theme-copy"
+
+        interrupted = self.installed(
+            "update", "--source", str(REPO), check=False
+        )
+
+        self.assertNotEqual(interrupted.returncode, 0)
+        self.assertEqual(list(themes.glob(".sk-*.tmTheme.*")), [])
+        self.assertEqual((themes / "sk-red.tmTheme").read_bytes(), red_before)
+
+    def test_theme_targets_recover_after_interrupted_update(self) -> None:
+        self.run_installer("--non-interactive")
+        themes = self.home / ".codex/themes"
+        red = themes / "sk-red.tmTheme"
+        red.write_text("pre-update-theme\n", encoding="utf-8")
+        red.chmod(0o600)
+        self.env["SESSION_KIT_RELEASE_ID"] = RELEASE_B
+        self.env["SESSION_KIT_TEST_FAILPOINT"] = "themes"
+
+        interrupted = self.installed(
+            "update", "--source", str(REPO), check=False
+        )
+
+        self.assertNotEqual(interrupted.returncode, 0)
+        transaction = json.loads(
+            (self.home / ".local/state/session-kit/lifecycle-transaction.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        captured = {entry["path"] for entry in transaction["entries"]}
+        expected = {
+            str(themes / f"sk-{color}.tmTheme")
+            for color in (
+                "red", "blue", "green", "yellow", "purple", "orange", "pink", "cyan"
+            )
+        }
+        self.assertTrue(expected.issubset(captured))
+        self.assertNotEqual(red.read_text(encoding="utf-8"), "pre-update-theme\n")
+
+        self.env.pop("SESSION_KIT_TEST_FAILPOINT")
+        recovered = self.installed(
+            "update", "--source", str(self.temp / "missing-source"), check=False
+        )
+
+        self.assertNotEqual(recovered.returncode, 0)
+        self.assertIn("Recovered interrupted Session Kit", recovered.stdout)
+        self.assertEqual(red.read_text(encoding="utf-8"), "pre-update-theme\n")
+        self.assertFalse(
+            (self.home / ".local/state/session-kit/lifecycle-transaction.json").exists()
+        )
 
     def test_doctor_rejects_partial_inventory_package(self) -> None:
         self.run_installer("--non-interactive")

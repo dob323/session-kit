@@ -276,6 +276,7 @@ def run_pty(
     send_signal: int | None = None,
     post_signal_bytes: bytes = b"",
     env_updates: dict[str, str | None] | None = None,
+    deferred: tuple[str, bytes] | None = None,
 ) -> tuple[int, str]:
     environment = fixture.env(
         lines=lines, columns=columns, sp_exit=sp_exit
@@ -313,6 +314,32 @@ def run_pty(
     try:
         if input_bytes:
             os.write(descriptor, input_bytes)
+        if deferred is not None:
+            # Type only once the picker has painted something on its own,
+            # so an unattended repaint can be observed before any keystroke.
+            marker, payload = deferred
+            marker_deadline = min(deadline, time.monotonic() + 8)
+            while marker.encode() not in output and time.monotonic() < marker_deadline:
+                ready, _, _ = select.select([descriptor], [], [], 0.05)
+                if not ready:
+                    continue
+                try:
+                    chunk = os.read(descriptor, 65536)
+                except OSError as exc:
+                    if exc.errno != errno.EIO:
+                        raise
+                    break
+                if not chunk:
+                    break
+                output.extend(chunk)
+            if marker.encode() not in output:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+                raise AssertionError(
+                    f"picker never rendered {marker!r} on its own; "
+                    f"output={output.decode(errors='replace')!r}"
+                )
+            os.write(descriptor, payload)
         if send_signal is not None:
             prompt = "❯ ".encode()
             signal_deadline = min(deadline, time.monotonic() + 5)
@@ -1482,6 +1509,158 @@ class LoginPickerTests(unittest.TestCase):
         finally:
             fixture.close()
 
+    def test_guided_new_lists_a_directory_once_across_providers(self) -> None:
+        fixture = LoginFixture(inventory())
+        try:
+            # The provider is chosen before the project list, so a second row
+            # for the same directory would render as a duplicate line.
+            fixture.projects.write_text(
+                f"main\tclaude\t{fixture.primary_project}\n"
+                f"main-codex\tcodex\t{fixture.primary_project}\n"
+                f"other\tcodex\t{fixture.other}\n",
+                encoding="utf-8",
+            )
+            code, output = run_pty(fixture, b"n\n2\n\n\n")
+            self.assertEqual(2, code)
+            self.assertNotIn("main-codex:", output)
+            self.assertIn(f"   1  main: {fixture.primary_project}", output)
+            self.assertIn(f"   2  other: {fixture.other}", output)
+            self.assertEqual(
+                [["new", "codex", "main"]],
+                [entry["args"] for entry in fixture.sp_entries()],
+            )
+        finally:
+            fixture.close()
+
+    def test_projects_screen_adds_a_directory_with_a_suggested_name(self) -> None:
+        fixture = LoginFixture(inventory(row("alpha", number=1)))
+        try:
+            target = fixture.base / "newsite"
+            target.mkdir()
+            # More, Projects, Add, the directory, accept the suggested short
+            # name and provider, back out, quit.
+            code, output = run_pty(
+                fixture,
+                f"m\np\na\n{target}\n\n\n\n\nq\n".encode(),
+                env_updates={"SESSION_KIT_PICKER_REFRESH_SECONDS": "0"},
+            )
+            self.assertEqual(2, code)
+            self.assertIn("Projects", output)
+            self.assertIn(f"main: {fixture.primary_project}", output)
+            self.assertIn("Short name [newsite]", output)
+            self.assertIn(f"Added newsite: claude in {target}", output)
+            self.assertIn(
+                f"newsite\tclaude\t{target}",
+                fixture.projects.read_text(encoding="utf-8"),
+            )
+        finally:
+            fixture.close()
+
+    def test_projects_screen_drops_a_directory_for_good(self) -> None:
+        fixture = LoginFixture(inventory(row("alpha", number=1)))
+        try:
+            code, output = run_pty(
+                fixture,
+                b"m\np\nd 2\n\n\nq\n",
+                env_updates={"SESSION_KIT_PICKER_REFRESH_SECONDS": "0"},
+            )
+            self.assertEqual(2, code)
+            self.assertIn("stays out of the project list", output)
+            contents = fixture.projects.read_text(encoding="utf-8")
+            self.assertIn(f"other\tignore\t{fixture.other}", contents)
+            self.assertIn(f"main\tclaude\t{fixture.primary_project}", contents)
+        finally:
+            fixture.close()
+
+    def test_idle_menu_repaints_itself_when_the_estate_changes(self) -> None:
+        first = row("alpha", number=1)
+        second = row("bravo", number=2)
+        fixture = LoginFixture(
+            inventory(first), refreshed_document=inventory(first, second)
+        )
+        try:
+            code, output = run_pty(
+                fixture,
+                env_updates={
+                    "SESSION_KIT_PICKER_REFRESH_SECONDS": "2",
+                    # A repaint replaces the menu with an escape sequence, so
+                    # it only runs on a terminal that accepts them.
+                    "SESSION_KIT_NO_COLOR": None,
+                },
+                deferred=("Codex bravo", b"q\n"),
+            )
+            # No key was pressed until the second session appeared by itself.
+            self.assertIn("Codex alpha", output)
+            self.assertIn("Codex bravo", output)
+            self.assertEqual(2, code)
+            # A repaint REPLACES the menu. Without the clear, every refresh
+            # would stack another copy of the list down the screen.
+            before_repaint = output.index("Codex bravo")
+            self.assertIn("\033[2J", output[:before_repaint])
+            self.assertEqual(1, output.count("Codex bravo"))
+        finally:
+            fixture.close()
+
+    def test_a_terminal_without_escapes_never_auto_repaints(self) -> None:
+        first = row("alpha", number=1)
+        second = row("bravo", number=2)
+        fixture = LoginFixture(
+            inventory(first), refreshed_document=inventory(first, second)
+        )
+        try:
+            # The menu cannot be cleared here, so repainting would stack
+            # copies down the screen. It stays static instead.
+            code, output = run_pty(
+                fixture,
+                b"q\n",
+                env_updates={
+                    "SESSION_KIT_PICKER_REFRESH_SECONDS": "2",
+                    "TERM": "dumb",
+                },
+            )
+            self.assertIn("Codex alpha", output)
+            self.assertNotIn("Codex bravo", output)
+            self.assertEqual(2, code)
+        finally:
+            fixture.close()
+
+    def test_refresh_off_leaves_the_menu_exactly_as_drawn(self) -> None:
+        first = row("alpha", number=1)
+        second = row("bravo", number=2)
+        fixture = LoginFixture(
+            inventory(first), refreshed_document=inventory(first, second)
+        )
+        try:
+            code, output = run_pty(
+                fixture,
+                b"q\n",
+                env_updates={"SESSION_KIT_PICKER_REFRESH_SECONDS": "0"},
+            )
+            self.assertIn("Codex alpha", output)
+            self.assertNotIn("Codex bravo", output)
+            self.assertEqual(2, code)
+        finally:
+            fixture.close()
+
+    def test_guided_new_never_lists_an_ignored_directory(self) -> None:
+        fixture = LoginFixture(inventory())
+        try:
+            fixture.projects.write_text(
+                f"main\tclaude\t{fixture.primary_project}\n"
+                f"other\tignore\t{fixture.other}\n",
+                encoding="utf-8",
+            )
+            code, output = run_pty(fixture, b"n\n2\n\n\n")
+            self.assertEqual(2, code)
+            self.assertNotIn("other:", output)
+            self.assertIn(f"   1  main: {fixture.primary_project}", output)
+            self.assertEqual(
+                [["new", "codex", "main"]],
+                [entry["args"] for entry in fixture.sp_entries()],
+            )
+        finally:
+            fixture.close()
+
     def test_recovery_open_and_empty_input_do_not_ack_or_restore(self) -> None:
         pending = {
             "schema_version": 1,
@@ -1698,6 +1877,46 @@ class LoginPickerTests(unittest.TestCase):
             code, output = run_pty(fixture, b"u\na\n\n")
             self.assertEqual(2, code)
             self.assertIn("Recovery record 1 is incomplete; it was retained.", output)
+            self.assertEqual([], fixture.sp_entries())
+            self.assertFalse(
+                any(
+                    entry and entry[0] == "--recovery-pending-ack"
+                    for entry in fixture.status_entries()
+                )
+            )
+            self.assertEqual([], fixture.picker_temps())
+        finally:
+            fixture.close()
+
+    def test_conflicting_duplicate_recovery_is_retained_for_manual_review(self) -> None:
+        pending = {
+            "schema_version": 1,
+            "entries": [
+                {
+                    "source_generation_key": "generation",
+                    "old_shpool_id": "old1",
+                    "display_old_shpool_id": "old1",
+                    "provider": "codex",
+                    "uuid": "11111111-1111-4111-8111-111111111111",
+                    "cwd": "/srv/project",
+                    "title": "Conflicting evidence",
+                    "actionable": False,
+                    "conflict_fields": ["cwd", "command"],
+                }
+            ],
+        }
+        fixture = LoginFixture(inventory(), pending=pending)
+        try:
+            code, output = run_pty(fixture, b"u\na\n\n")
+            self.assertEqual(2, code)
+            self.assertIn(
+                "review required: conflicting cwd, command", output
+            )
+            self.assertIn(
+                "Recovery record 1 has conflicting launch metadata "
+                "(cwd, command); it requires manual review and was retained.",
+                output,
+            )
             self.assertEqual([], fixture.sp_entries())
             self.assertFalse(
                 any(

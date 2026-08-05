@@ -567,6 +567,309 @@ class DerivePromptTitleTests(unittest.TestCase):
 
 
 class AutoTitleFromHookTests(unittest.TestCase):
+    def test_codex_title_push_uses_one_override_precedence_for_all_writes(self) -> None:
+        import sqlite3
+
+        uuid = "00000000-0000-4000-8000-000000000033"
+        with tempfile.TemporaryDirectory() as base:
+            home = Path(base) / "home"
+            provider_home = Path(base) / "provider"
+            kit_home = Path(base) / "kit"
+            home.mkdir()
+            for root in (provider_home, kit_home):
+                root.mkdir()
+                connection = sqlite3.connect(root / "state_5.sqlite")
+                connection.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT)")
+                connection.execute("INSERT INTO threads VALUES (?, NULL)", (uuid,))
+                connection.commit()
+                connection.close()
+            result = inventory_core.propagate_provider_title(
+                "codex",
+                uuid,
+                "Override Title",
+                environ={
+                    "HOME": str(home),
+                    "CODEX_HOME": str(provider_home),
+                    "SESSION_KIT_CODEX_HOME": str(kit_home),
+                },
+            )
+            self.assertIn("codex-thread-title", result["provider_title_pushes"])
+            for root, expected in ((kit_home, "Override Title"), (provider_home, None)):
+                connection = sqlite3.connect(root / "state_5.sqlite")
+                actual = connection.execute(
+                    "SELECT title FROM threads WHERE id = ?", (uuid,)
+                ).fetchone()[0]
+                connection.close()
+                self.assertEqual(expected, actual)
+
+    def test_codex_title_push_live_renames_app_server_threads(self) -> None:
+        import base64
+        import hashlib
+        import socket as socketmod
+        import sqlite3
+        import struct
+        import threading
+
+        uuid = "00000000-0000-4000-8000-000000000044"
+        with tempfile.TemporaryDirectory() as base:
+            home = Path(base) / "home"
+            codex = Path(base) / "codex"
+            home.mkdir()
+            codex.mkdir()
+            connection = sqlite3.connect(codex / "state_5.sqlite")
+            connection.execute(
+                "CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT)"
+            )
+            connection.execute("INSERT INTO threads VALUES (?, NULL)", (uuid,))
+            connection.commit()
+            connection.close()
+            app_dir = (
+                home / ".local" / "state" / "session-kit" / "app-server" / "s1"
+            )
+            app_dir.mkdir(parents=True)
+            socket_path = app_dir / "app.sock"
+            server = socketmod.socket(socketmod.AF_UNIX, socketmod.SOCK_STREAM)
+            server.bind(os.fspath(socket_path))
+            server.listen(1)
+            server.settimeout(5)
+            seen: list[dict] = []
+
+            def recv_client_frame(link: socketmod.socket) -> dict:
+                def read_exact(count: int) -> bytes:
+                    data = b""
+                    while len(data) < count:
+                        chunk = link.recv(count - len(data))
+                        if not chunk:
+                            raise OSError("client closed")
+                        data += chunk
+                    return data
+
+                while True:
+                    first, second = read_exact(2)
+                    length = second & 0x7F
+                    if length == 126:
+                        length = struct.unpack("!H", read_exact(2))[0]
+                    mask = read_exact(4) if second & 0x80 else b""
+                    payload = read_exact(length)
+                    if mask:
+                        payload = bytes(
+                            value ^ mask[index % 4]
+                            for index, value in enumerate(payload)
+                        )
+                    if first & 0x0F != 1:
+                        continue
+                    return json.loads(payload)
+
+            def serve() -> None:
+                link, _ = server.accept()
+                link.settimeout(5)
+                request = b""
+                while not request.endswith(b"\r\n\r\n"):
+                    request += link.recv(1)
+                key = next(
+                    line.split(b":", 1)[1].strip()
+                    for line in request.split(b"\r\n")
+                    if line.lower().startswith(b"sec-websocket-key:")
+                )
+                accept = base64.b64encode(
+                    hashlib.sha1(
+                        key + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+                    ).digest()
+                )
+                link.sendall(
+                    b"HTTP/1.1 101 Switching Protocols\r\n"
+                    b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                    b"Sec-WebSocket-Accept: " + accept + b"\r\n\r\n"
+                )
+                while True:
+                    message = recv_client_frame(link)
+                    seen.append(message)
+                    if message.get("id") is not None:
+                        reply = json.dumps(
+                            {"id": message["id"], "result": {}},
+                            separators=(",", ":"),
+                        ).encode()
+                        link.sendall(
+                            bytes([0x81, len(reply)]) + reply
+                        )
+                    if message.get("method") == "thread/name/set":
+                        break
+                link.close()
+
+            worker = threading.Thread(target=serve, daemon=True)
+            worker.start()
+            try:
+                result = inventory_core.propagate_provider_title(
+                    "codex",
+                    uuid,
+                    "Live Rename",
+                    environ={
+                        "HOME": str(home),
+                        "SESSION_KIT_CODEX_HOME": str(codex),
+                    },
+                )
+            finally:
+                worker.join(timeout=5)
+                server.close()
+            self.assertIn(
+                "codex-live-rename", result["provider_title_pushes"]
+            )
+            renamed = next(
+                message
+                for message in seen
+                if message.get("method") == "thread/name/set"
+            )
+            self.assertEqual(
+                {"threadId": uuid, "name": "Live Rename"},
+                renamed.get("params"),
+            )
+
+    def test_codex_live_rename_kill_switch_and_absent_sockets_fail_open(self) -> None:
+        import sqlite3
+
+        uuid = "00000000-0000-4000-8000-000000000045"
+        with tempfile.TemporaryDirectory() as base:
+            home = Path(base) / "home"
+            codex = Path(base) / "codex"
+            home.mkdir()
+            codex.mkdir()
+            connection = sqlite3.connect(codex / "state_5.sqlite")
+            connection.execute(
+                "CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT)"
+            )
+            connection.execute("INSERT INTO threads VALUES (?, NULL)", (uuid,))
+            connection.commit()
+            connection.close()
+            for extra in (
+                {},
+                {"SESSION_KIT_CODEX_LIVE_RENAME": "0"},
+            ):
+                result = inventory_core.propagate_provider_title(
+                    "codex",
+                    uuid,
+                    "Quiet Title",
+                    environ={
+                        "HOME": str(home),
+                        "SESSION_KIT_CODEX_HOME": str(codex),
+                        **extra,
+                    },
+                )
+                self.assertIn(
+                    "codex-thread-title", result["provider_title_pushes"]
+                )
+                self.assertNotIn(
+                    "codex-live-rename", result["provider_title_pushes"]
+                )
+                self.assertEqual([], result["provider_title_warnings"])
+
+    def test_app_server_logs_are_private_precreated_and_symlink_refused(self) -> None:
+        shell = (REPO / "bashrc" / "shpool.bashrc").read_text(encoding="utf-8")
+        app_definition = shell.index('__sk_app_log="$__sk_app_dir/app-server.log"')
+        broker_definition = shell.index('__sk_broker_log="$__sk_app_dir/broker.log"')
+        first_redirect = shell.index('>>"$__sk_app_log"')
+        self.assertLess(app_definition, first_redirect)
+        self.assertLess(broker_definition, first_redirect)
+        self.assertIn("O_NOFOLLOW", shell[app_definition:first_redirect])
+        self.assertIn("os.fchmod(descriptor, 0o600)", shell[app_definition:first_redirect])
+        self.assertIn("[[ -L $__sk_app_log || -L $__sk_broker_log ]]", shell)
+
+    def test_app_server_directory_chain_is_private_real_and_owner_controlled(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            state = base / "state"
+            state.mkdir(mode=0o700)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = inventory_core._platform_command(
+                    argparse.Namespace(
+                        platform_action="app-server-dir",
+                        state_root=str(state),
+                        session_id="main",
+                    )
+                )
+            self.assertEqual(0, code)
+            created = Path(output.getvalue().strip())
+            self.assertEqual(state / "session-kit" / "app-server" / "main", created)
+            for path in (state / "session-kit", state / "session-kit" / "app-server", created):
+                self.assertFalse(path.is_symlink())
+                self.assertEqual(0o700, path.stat().st_mode & 0o777)
+
+            unsafe = base / "unsafe-state"
+            unsafe.mkdir(mode=0o700)
+            external = base / "external"
+            external.mkdir(mode=0o700)
+            (unsafe / "session-kit").symlink_to(external, target_is_directory=True)
+            with self.assertRaises(inventory_core.CollectionError):
+                inventory_core._platform_command(
+                    argparse.Namespace(
+                        platform_action="app-server-dir",
+                        state_root=str(unsafe),
+                        session_id="main",
+                    )
+                )
+            weak = base / "weak-state"
+            weak.mkdir(mode=0o755)
+            weak.chmod(0o755)
+            with self.assertRaises(inventory_core.CollectionError):
+                inventory_core._platform_command(
+                    argparse.Namespace(
+                        platform_action="app-server-dir",
+                        state_root=str(weak),
+                        session_id="main",
+                    )
+                )
+
+    def test_pending_self_name_yields_to_native_claude_rename(self) -> None:
+        uuid = "00000000-0000-4000-8000-000000000034"
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            state = base / "state"
+            state.mkdir(mode=0o700)
+            home = base / "home"
+            transcript_root = home / ".claude" / "projects" / "-srv-project"
+            transcript_root.mkdir(parents=True)
+            transcript = transcript_root / f"{uuid}.jsonl"
+            transcript.write_text(
+                json.dumps(
+                    {
+                        "type": "agent-name",
+                        "agentName": "Manual Native Name",
+                        "sessionId": uuid,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            retry = state / "provider-title-retries.json"
+            retry.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "entries": {
+                            f"claude:{uuid}": {
+                                "provider": "claude",
+                                "uuid": uuid,
+                                "title": "Old Kit Name",
+                                "attempts": 0,
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            retry.chmod(0o600)
+            before = transcript.read_bytes()
+            with mock.patch.object(
+                inventory_core,
+                "snapshot",
+                side_effect=inventory_core.CollectionError("no live inventory"),
+            ):
+                result = inventory_core.claude_pending_native_hydrations(
+                    {"state_dir": state}, {"HOME": str(home)}
+                )
+            self.assertEqual("superseded", result[0]["status"])
+            self.assertEqual(before, transcript.read_bytes())
+            self.assertEqual({}, json.loads(retry.read_text())["entries"])
     UUID = "00000000-0000-4000-8000-000000000077"
 
     def _prebaked_home(self, base: Path) -> tuple[Path, Path]:
@@ -1079,6 +1382,69 @@ class AutoTitleFromHookTests(unittest.TestCase):
             self.assertEqual("Fix the nginx 502 errors please", result["title"])
 
 
+class ClaudeBouncePrepareTests(unittest.TestCase):
+    def _home(
+        self,
+        base: Path,
+        uuid: str,
+        intent: str | None,
+        prompt_offset: float,
+    ) -> Path:
+        import datetime as dt
+
+        home = base / "home"
+        sessions = home / ".claude" / "sessions"
+        project = home / ".claude" / "projects" / "-srv-project"
+        sessions.mkdir(parents=True)
+        project.mkdir(parents=True)
+        intent_path = sessions / f"{uuid}.nameintent"
+        if intent is not None:
+            intent_path.write_text(intent + "\n", encoding="utf-8")
+        intent_mtime = (
+            intent_path.stat().st_mtime if intent is not None else 1_700_000_000
+        )
+        stamp = dt.datetime.fromtimestamp(
+            intent_mtime + prompt_offset, dt.timezone.utc
+        ).isoformat().replace("+00:00", "Z")
+        records = [
+            {"type": "user", "isMeta": True, "message": {"role": "user", "content": "meta"}, "timestamp": stamp},
+            {"type": "user", "message": {"role": "user", "content": ["tool result"]}, "timestamp": stamp},
+            {"type": "user", "message": {"role": "user", "content": "who are the last three headliners"}, "timestamp": stamp},
+        ]
+        (project / f"{uuid}.jsonl").write_text(
+            "\n".join(json.dumps(record) for record in records) + "\n",
+            encoding="utf-8",
+        )
+        return home
+
+    def test_bounces_when_the_name_arrived_after_the_last_prompt(self) -> None:
+        uuid = "00000000-0000-4000-8000-000000000061"
+        with tempfile.TemporaryDirectory() as raw:
+            home = self._home(Path(raw), uuid, "Headliner Question", -120)
+            self.assertEqual(
+                ("Headliner Question", False),
+                inventory_core.claude_bounce_prepare(uuid, home=home),
+            )
+
+    def test_clears_when_a_real_prompt_followed_the_intent(self) -> None:
+        uuid = "00000000-0000-4000-8000-000000000062"
+        with tempfile.TemporaryDirectory() as raw:
+            home = self._home(Path(raw), uuid, "Headliner Question", 120)
+            self.assertEqual(
+                ("", True),
+                inventory_core.claude_bounce_prepare(uuid, home=home),
+            )
+
+    def test_defers_without_an_intent_and_ignores_meta_and_tool_records(self) -> None:
+        uuid = "00000000-0000-4000-8000-000000000063"
+        with tempfile.TemporaryDirectory() as raw:
+            home = self._home(Path(raw), uuid, None, 0)
+            self.assertEqual(
+                ("", False),
+                inventory_core.claude_bounce_prepare(uuid, home=home),
+            )
+
+
 class CodexPendingAutoTitleTests(unittest.TestCase):
     def _codex_root(self, base: Path, rows: list[tuple]) -> Path:
         import sqlite3
@@ -1107,6 +1473,57 @@ class CodexPendingAutoTitleTests(unittest.TestCase):
             return inventory_core.codex_pending_auto_titles(
                 environ={"HOME": str(base)}
             )
+
+    def test_auto_title_offers_live_rename_from_the_caller_sandbox(self) -> None:
+        import time
+
+        uuid = "00000000-0000-4000-8000-000000000058"
+        now = int(time.time())
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            codex = self._codex_root(
+                base,
+                [(uuid, "trace the cdn purge failure", "trace the cdn purge failure", now - 60)],
+            )
+            with mock.patch.object(
+                inventory_core, "_push_codex_live_rename", return_value=([], [])
+            ) as live:
+                titled = self._run(base, codex)
+            self.assertEqual(1, len(titled))
+            live.assert_called_once_with(
+                Path(base) / ".local" / "state" / "session-kit",
+                uuid,
+                titled[0]["title"],
+            )
+
+    def test_auto_title_live_rename_honors_kill_switch(self) -> None:
+        import time
+
+        uuid = "00000000-0000-4000-8000-000000000059"
+        now = int(time.time())
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            codex = self._codex_root(
+                base,
+                [(uuid, "trace the cdn purge failure", "trace the cdn purge failure", now - 60)],
+            )
+            with mock.patch.dict(
+                os.environ,
+                {"SESSION_KIT_CODEX_HOME": str(codex)},
+                clear=False,
+            ):
+                os.environ.pop("SESSION_KIT_CODEX_DB", None)
+                with mock.patch.object(
+                    inventory_core, "_push_codex_live_rename", return_value=([], [])
+                ) as live:
+                    titled = inventory_core.codex_pending_auto_titles(
+                        environ={
+                            "HOME": str(base),
+                            "SESSION_KIT_CODEX_LIVE_RENAME": "0",
+                        }
+                    )
+            self.assertEqual(1, len(titled))
+            live.assert_not_called()
 
     def test_titles_a_recent_echo_thread_into_both_stores(self) -> None:
         import sqlite3

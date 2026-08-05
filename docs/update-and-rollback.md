@@ -50,7 +50,10 @@ shpool.
 
 On Linux, update refreshes the installed user-service definitions but does not
 run `systemctl --user daemon-reload` or start or restart a unit. Review service
-state and activate a definition change separately.
+state and activate a definition change separately. The read-only source and
+doctor probes can use systemd's local-machine transport when the direct user
+socket is unavailable, but they report that state as a warning. Service-control
+commands continue to require the normal direct user socket.
 
 On macOS, update regenerates private LaunchAgent templates. Any jobs already
 loaded by launchd continue using their active definitions. To apply a changed

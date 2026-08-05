@@ -745,8 +745,9 @@ sk_picker_proof_matches() {
 sk_project_lookup() {
   local alias=$1
   [[ -r $SK_PROJECTS_FILE ]] || return 1
+  # An ignore row is not a shortcut, so it never resolves as a launch target.
   awk -F '\t' -v wanted="$alias" '
-    $0 !~ /^[[:space:]]*#/ && NF >= 3 && $1 == wanted {
+    $0 !~ /^[[:space:]]*#/ && NF >= 3 && $1 == wanted && $2 != "ignore" {
       if ($2 !~ /^(claude|codex|shell)$/ || $3 !~ /^\//) exit 2
       print $1 "\t" $2 "\t" $3
       found=1

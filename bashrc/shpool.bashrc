@@ -203,11 +203,46 @@ PY
               __sk_new_claude_uuid=$(python3 -c 'import uuid; print(uuid.uuid4())'); then
             command rm -- "$__sk_start" "$__sk_expected"
             __sk_provider_launched=1
-            case "$__sk_launch_mode" in
-              new) claude --session-id "$__sk_new_claude_uuid"; __sk_provider_rc=$? ;;
-              resume) claude --resume "$__sk_uuid"; __sk_provider_rc=$? ;;
-              fork) claude --resume "$__sk_uuid" --fork-session; __sk_provider_rc=$? ;;
-            esac
+            # A Claude window renames only through its SessionStart/prompt
+            # hooks, so a session that boots before its name intent exists
+            # (fresh uuid, or a pre-baked resume) shows a stale title until
+            # the provider restarts. The marker lets the picker request one
+            # safe bounce once a name exists — same contract as Codex.
+            __sk_claude_intent_uuid=$__sk_uuid
+            [[ $__sk_launch_mode == new ]] && __sk_claude_intent_uuid=$__sk_new_claude_uuid
+            if [[ -n $__sk_claude_intent_uuid && \
+                  ! -f "$HOME/.claude/sessions/$__sk_claude_intent_uuid.nameintent" ]]; then
+              ( umask 077
+                mkdir -p "$__sk_state_root/session-kit/provider-untitled" &&
+                  : > "$__sk_state_root/session-kit/provider-untitled/$SHPOOL_SESSION_NAME"
+              ) 2>/dev/null || true
+            fi
+            unset __sk_claude_intent_uuid
+            while :; do
+              case "$__sk_launch_mode" in
+                new) claude --session-id "$__sk_new_claude_uuid"; __sk_provider_rc=$? ;;
+                resume) claude --resume "$__sk_uuid"; __sk_provider_rc=$? ;;
+                fork) claude --resume "$__sk_uuid" --fork-session; __sk_provider_rc=$? ;;
+              esac
+              # A kit-requested bounce relaunches the SAME conversation once,
+              # so the fresh process boots through SessionStart with its name
+              # intent applied. Any other exit falls through to the normal
+              # provider-exit handling.
+              __sk_bounce="$__sk_state_root/session-kit/provider-bounce/$SHPOOL_SESSION_NAME"
+              if [[ -f $__sk_bounce && ! -L $__sk_bounce ]]; then
+                __sk_bounce_uuid=$(command head -c 64 -- "$__sk_bounce" 2>/dev/null | tr -cd '0-9a-fA-F-')
+                command rm -f -- "$__sk_bounce"
+                if [[ $__sk_bounce_uuid =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]]; then
+                  __sk_uuid=$__sk_bounce_uuid
+                  __sk_launch_mode=resume
+                  unset __sk_bounce_uuid __sk_bounce
+                  continue
+                fi
+                unset __sk_bounce_uuid
+              fi
+              unset __sk_bounce
+              break
+            done
           else
             echo "[session-kit: Claude session identity could not be allocated; launch record retained for retry]" >&2
           fi
@@ -272,11 +307,38 @@ PY
             __sk_broker_pid=
             __sk_app_socket=
             if [[ -n $__sk_coord_broker ]]; then
-              __sk_app_dir="$__sk_state_root/session-kit/app-server/$SHPOOL_SESSION_NAME"
-              if mkdir -p -- "$__sk_app_dir" && chmod 700 -- "$__sk_app_dir"; then
+              __sk_app_dir=$(python3 "$__sk_inventory_core" platform app-server-dir \
+                "$__sk_state_root" "$SHPOOL_SESSION_NAME" 2>/dev/null || true)
+              if [[ -n $__sk_app_dir ]]; then
                 __sk_app_socket="$__sk_app_dir/app.sock"
                 __sk_app_log="$__sk_app_dir/app-server.log"
-                if [[ ! -e $__sk_app_socket ]]; then
+                __sk_broker_log="$__sk_app_dir/broker.log"
+                if [[ -L $__sk_app_log || -L $__sk_broker_log ]]; then
+                  echo "[session-kit: refusing symlinked App Server log]" >&2
+                elif ( umask 077
+                  python3 - "$__sk_app_log" "$__sk_broker_log" <<'PY'
+import os, stat, sys
+
+for path in sys.argv[1:]:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+        ):
+            raise OSError("unsafe App Server log")
+        os.fchmod(descriptor, 0o600)
+    finally:
+        os.close(descriptor)
+PY
+                ) && [[ ! -L $__sk_app_log && ! -L $__sk_broker_log ]] &&
+                   [[ -f $__sk_app_log && -f $__sk_broker_log ]] &&
+                   chmod 600 -- "$__sk_app_log" "$__sk_broker_log" &&
+                   [[ ! -e $__sk_app_socket ]]; then
                   codex "${__sk_codex_no_update[@]}" app-server \
                     --listen "unix://$__sk_app_socket" \
                     >>"$__sk_app_log" 2>&1 &
@@ -298,7 +360,7 @@ PY
                     [[ $__sk_launch_mode == resume && -n $__sk_uuid ]] && \
                       __sk_broker_args+=(--thread "$__sk_uuid")
                     python3 "$__sk_coord_broker" "${__sk_broker_args[@]}" \
-                      >>"$__sk_app_dir/broker.log" 2>&1 &
+                      >>"$__sk_broker_log" 2>&1 &
                     __sk_broker_pid=$!
                   else
                     if [[ -n $__sk_app_server_pid ]]; then
@@ -343,9 +405,11 @@ PY
               fi
               case "$__sk_theme_color" in
                 red|blue|green|yellow|purple|orange|pink|cyan)
-                  if [[ -r ${CODEX_HOME:-$HOME/.codex}/themes/sk-$__sk_theme_color.tmTheme ]]; then
+                  __sk_codex_home=${SESSION_KIT_CODEX_HOME:-${CODEX_HOME:-$HOME/.codex}}
+                  if [[ -r $__sk_codex_home/themes/sk-$__sk_theme_color.tmTheme ]]; then
                     __sk_codex_theme=(-c "tui.theme=\"sk-$__sk_theme_color\"")
                   fi
+                  unset __sk_codex_home
                   ;;
               esac
               unset __sk_theme_color
@@ -404,8 +468,7 @@ PY
              python3 "$__sk_lifecycle_core" lifecycle provider-exited >/dev/null
           then
             __sk_provider_exited=1
-            printf '\n%s exited with status %s. This terminal is still open.\n' \
-              "${__sk_provider^}" "$__sk_provider_rc"
+            __sk_provider_exit_code=$__sk_provider_rc
           else
             echo "[session-kit: provider exited; lifecycle proof is unavailable, so automatic cleanup is blocked]" >&2
           fi
@@ -514,10 +577,21 @@ PY
     done
   }
 
+  # Typing /exit is a decision, not an incident. A clean provider exit closes
+  # the terminal immediately so the session picker is the very next thing on
+  # screen — no status line to read, no key to press. A non-zero exit is a
+  # crash and still stops at the recovery menu, where reopening the
+  # conversation is the whole point. Touch ~/.sk_keep_exit_menu to always stop.
   if [[ ${__sk_provider_exited:-0} == 1 ]]; then
+    if (( ${__sk_provider_exit_code:-1} == 0 )) && [[ ! -e $HOME/.sk_keep_exit_menu ]]; then
+      __sk_lifecycle_event user-input >/dev/null 2>&1 || true
+      builtin exit
+    fi
+    printf '\n%s exited with status %s. This terminal is still open.\n' \
+      "${__sk_lifecycle_provider^}" "${__sk_provider_exit_code:-unknown}"
     __sk_provider_exit_menu
   fi
-  unset __sk_provider_exited
+  unset __sk_provider_exited __sk_provider_exit_code
 
   # Local, scoped Needs-you marker. The renderer caches safely and never sends
   # an external notification.

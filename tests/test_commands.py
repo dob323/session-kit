@@ -351,6 +351,14 @@ if args[:1] == ["codex-bounce-title"] and len(args) == 2:
         print(title)
         raise SystemExit(0)
     raise SystemExit(1)
+if args[:1] == ["claude-bounce-title"] and len(args) == 2:
+    if os.environ.get("STUB_CLAUDE_BOUNCE_CLEAR") == "1":
+        raise SystemExit(3)
+    title=os.environ.get("STUB_CLAUDE_BOUNCE_TITLE", "")
+    if title:
+        print(title)
+        raise SystemExit(0)
+    raise SystemExit(1)
 if args[:2] == ["automatic-title", "self-name"] and len(args) == 3:
     print(json.dumps({
         "schema_version":1,
@@ -399,6 +407,20 @@ if args[:2] == ["alias", "set"] or args[:2] == ["alias", "delete"]:
         with pathlib.Path(alias_log).open("a",encoding="utf-8") as handle:
             handle.write(json.dumps(args)+"\\n")
     print(json.dumps({"schema_version":1,"aliases":aliases},sort_keys=True))
+    raise SystemExit(0)
+if args[:2] == ["color", "conversation-pick"] and len(args) == 4:
+    color_log=os.environ.get("STUB_COLOR_LOG")
+    if color_log:
+        with pathlib.Path(color_log).open("a",encoding="utf-8") as handle:
+            handle.write(json.dumps(args)+"\\n")
+    print(json.dumps({"schema_version":1,"color":"orange"},sort_keys=True))
+    raise SystemExit(0)
+if args[:2] == ["color", "propagate"] and len(args) == 4:
+    color_log=os.environ.get("STUB_COLOR_LOG")
+    if color_log:
+        with pathlib.Path(color_log).open("a",encoding="utf-8") as handle:
+            handle.write(json.dumps(args)+"\\n")
+    print(json.dumps({"schema_version":1,"provider_color_pushes":[],"provider_color_warnings":[]},sort_keys=True))
     raise SystemExit(0)
 if args and args[0] == "snapshot":
     dynamic_provider=os.environ.get("STUB_DYNAMIC_PROVIDER")
@@ -697,6 +719,23 @@ class CommandTests(unittest.TestCase):
         self.assertIn("validated for this release", refused.stderr)
         self.assertFalse(self.fixture.shpool_log.exists())
 
+    def test_ignored_directory_is_never_a_launch_target(self) -> None:
+        self.fixture.projects.write_text(
+            f"fixture\tignore\t{self.fixture.project}\n", encoding="utf-8"
+        )
+        env = self.fixture.env()
+        env.update(
+            {
+                "SESSION_KIT_BACKGROUND": "1",
+                "STUB_DYNAMIC_PROVIDER": "shell",
+                "STUB_DYNAMIC_CWD": str(self.fixture.project),
+            }
+        )
+        refused = run([SP, "new", "shell", "fixture"], env=env, check=False)
+        self.assertNotEqual(0, refused.returncode)
+        self.assertIn("unknown or invalid project alias", refused.stderr)
+        self.assertFalse(self.fixture.shpool_log.exists())
+
     def test_ai_startup_proof_failure_keeps_session_and_record_without_kill(self) -> None:
         env = self.fixture.env()
         env.update(
@@ -924,6 +963,36 @@ class CommandTests(unittest.TestCase):
         # A proven launch clears both records.
         self.assertFalse((self.fixture.start / shpool_id).exists())
         self.assertFalse((self.fixture.start / f"{shpool_id}.expected").exists())
+
+    def test_new_claude_fallback_reserves_exact_color_before_propagation(self) -> None:
+        exact_uuid = "00000000-0000-4000-8000-000000000019"
+        color_log = self.fixture.base / "color.log"
+        env = self.fixture.env()
+        env.update(
+            {
+                "SESSION_KIT_BACKGROUND": "1",
+                "SESSION_KIT_NO_PREBAKE": "1",
+                "SESSION_KIT_PROVIDER_PROOF_ATTEMPTS": "2",
+                "STUB_DYNAMIC_PROVIDER": "claude",
+                "STUB_DYNAMIC_UUID": exact_uuid,
+                "STUB_DYNAMIC_CWD": str(self.fixture.project),
+                "STUB_COLOR_LOG": str(color_log),
+            }
+        )
+
+        started = run([SP, "new", "claude"], env=env, cwd=self.fixture.project)
+
+        self.assertRegex(
+            started.stdout.strip().splitlines()[-1],
+            r"^s[0-9]{8}-[0-9]{6}-[0-9]+$",
+        )
+        self.assertEqual(
+            [
+                ["color", "conversation-pick", "claude", exact_uuid],
+                ["color", "propagate", "claude", exact_uuid],
+            ],
+            [json.loads(line) for line in color_log.read_text().splitlines()],
+        )
 
     def test_new_session_is_refused_when_the_provider_never_started(self) -> None:
         """Relaxing the identity check must not accept an empty shell."""
@@ -2031,6 +2100,96 @@ class PickerProofTests(unittest.TestCase):
             if process.poll() is None:
                 process.terminate()
                 process.wait(timeout=2)
+
+    def test_explicit_pending_title_refresh_restarts_awaiting_reply_codex(self) -> None:
+        # "needs your reply" is a stable between-turn wait state: research
+        # sessions spend their whole life in it, so an idle-only rule left
+        # their bars unnamed forever. The bounce must treat it as TERM-safe.
+        row, process = self._live_idle_codex("Attached")
+        row["agent_status"] = "needs your reply"
+        proof = self._prime(row)
+        marker = self._mark_title_pending()
+        env = self.fixture.env()
+        env["STUB_CODEX_BOUNCE_TITLE"] = "Release Notes"
+        try:
+            refreshed = run([SP, "picker-title-refresh", proof], env=env)
+            process.wait(timeout=2)
+            self.assertEqual(0, refreshed.returncode)
+            self.assertFalse(marker.exists())
+            bounce = self.fixture.state / "provider-bounce" / "main2"
+            self.assertEqual(row["identity"]["uuid"], bounce.read_text().strip())
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=2)
+
+    def _live_named_provider(
+        self, executable: str, status: str
+    ) -> tuple[dict, subprocess.Popen]:
+        binary = self.fixture.base / executable
+        binary.symlink_to("/bin/sleep")
+        process = subprocess.Popen([binary, "60"])
+        deadline = time.monotonic() + 2
+        stat_text = ""
+        while time.monotonic() < deadline:
+            try:
+                stat_text = Path(f"/proc/{process.pid}/stat").read_text()
+                break
+            except OSError:
+                time.sleep(0.01)
+        self.assertTrue(stat_text)
+        start = int(stat_text.rsplit(")", 1)[1].split()[19])
+        live = session_row("main2", provider=executable, status=status)
+        live["identity"]["pid"] = process.pid
+        live["identity"]["process_start_ticks"] = start
+        live["agent_status"] = "idle"
+        live["recent_output_age_seconds"] = 300
+        return live, process
+
+    def test_explicit_pending_title_refresh_restarts_named_claude(self) -> None:
+        # The Claude window renames only at SessionStart or the next prompt;
+        # a session named after boot with no prompt since can only take its
+        # name through a restart-as-resume.
+        row, process = self._live_named_provider("claude", "Attached")
+        proof = self._prime(row)
+        marker = self._mark_title_pending()
+        env = self.fixture.env()
+        env["STUB_CLAUDE_BOUNCE_TITLE"] = "Headliner Question"
+        try:
+            refreshed = run([SP, "picker-title-refresh", proof], env=env)
+            process.wait(timeout=2)
+            self.assertEqual(0, refreshed.returncode)
+            self.assertIn("Claude provider", refreshed.stdout)
+            self.assertFalse(marker.exists())
+            bounce = self.fixture.state / "provider-bounce" / "main2"
+            self.assertEqual(row["identity"]["uuid"], bounce.read_text().strip())
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=2)
+
+    def test_claude_bounce_clear_verdict_drops_marker_without_restart(self) -> None:
+        # Exit 3 from claude-bounce-title = a prompt followed the intent, so
+        # the live window already renamed; the marker is dropped and the
+        # provider is never touched.
+        row, process = self._live_named_provider("claude", "Attached")
+        proof = self._prime(row)
+        marker = self._mark_title_pending()
+        env = self.fixture.env()
+        env["STUB_CLAUDE_BOUNCE_CLEAR"] = "1"
+        try:
+            refused = run(
+                [SP, "picker-title-refresh", proof], env=env, check=False
+            )
+            self.assertEqual(74, refused.returncode)
+            self.assertIsNone(process.poll())
+            self.assertFalse(marker.exists())
+            self.assertFalse(
+                (self.fixture.state / "provider-bounce" / "main2").exists()
+            )
+        finally:
+            process.terminate()
+            process.wait(timeout=2)
 
     def test_app_server_title_refresh_restarts_only_remote_tui(self) -> None:
         row, app_server = self._live_idle_codex("Attached")

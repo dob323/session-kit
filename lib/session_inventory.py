@@ -1262,10 +1262,21 @@ def _codex_turn_state(
     return "state unavailable"
 
 
-def _codex_paths() -> tuple[Path, Path]:
-    codex_home = Path(
-        os.environ.get("SESSION_KIT_CODEX_HOME", str(_home() / ".codex"))
+def _codex_home(
+    environ: Mapping[str, str] | None = None, *, default_home: Path | None = None
+) -> Path:
+    """Resolve one Codex home consistently for reads and writes."""
+    env = environ if environ is not None else os.environ
+    base = default_home if default_home is not None else _home()
+    return Path(
+        env.get("SESSION_KIT_CODEX_HOME")
+        or env.get("CODEX_HOME")
+        or (base / ".codex")
     ).expanduser()
+
+
+def _codex_paths() -> tuple[Path, Path]:
+    codex_home = _codex_home()
     db_override = os.environ.get("SESSION_KIT_CODEX_DB")
     if db_override:
         return codex_home, Path(db_override).expanduser()
@@ -2130,7 +2141,9 @@ def build_inventory(
             # ai-title record while the session record keeps a derived window
             # label. The visible conversation title outranks the derived
             # label; any explicit rename keeps outranking both.
-            if agent.get("ai_title") and agent.get("name_source") == "derived":
+            if agent.get("agent_name"):
+                native_title = agent["agent_name"]
+            elif agent.get("ai_title") and agent.get("name_source") == "derived":
                 native_title = agent["ai_title"]
                 # Transcript hydration prepares the next start, but only the
                 # live structured agent name proves this process rendered it.
@@ -2577,6 +2590,73 @@ def apply_provider_title_states(
             item["provider_title_state"] = "ready"
 
 
+def _quarantine_orphaned_provider_untitled_markers(
+    config: Mapping[str, Any], inventory: Mapping[str, Any], *, now: float | None = None
+) -> list[dict[str, str]]:
+    """Quarantine old markers only after fresh inventory proves absence."""
+    if inventory.get("source") != "live" or inventory.get("stale") is not False:
+        return []
+    active_ids = {
+        str(item.get("shpool_id_raw") or "")
+        for item in inventory.get("sessions", ())
+        if isinstance(item, Mapping)
+    }
+    paths = _state_paths(config)
+    marker_root = paths["root"] / "provider-untitled"
+    try:
+        root_metadata = marker_root.lstat()
+        if (
+            not statmod.S_ISDIR(root_metadata.st_mode)
+            or marker_root.is_symlink()
+            or root_metadata.st_uid != os.geteuid()
+            or statmod.S_IMODE(root_metadata.st_mode) != 0o700
+        ):
+            return []
+        markers = sorted(marker_root.iterdir(), key=lambda item: item.name)
+    except OSError:
+        return []
+    current = time.time() if now is None else now
+    moved: list[dict[str, str]] = []
+    for marker in markers:
+        try:
+            metadata = marker.lstat()
+            if (
+                marker.name in active_ids
+                or current - metadata.st_mtime <= 7 * 86400
+                or not statmod.S_ISREG(metadata.st_mode)
+                or marker.is_symlink()
+                or metadata.st_uid != os.geteuid()
+                or metadata.st_nlink != 1
+            ):
+                continue
+            quarantine = paths["provider_untitled_quarantine"]
+            quarantine.mkdir(mode=0o700, parents=True, exist_ok=True)
+            qstat = quarantine.lstat()
+            if (
+                not statmod.S_ISDIR(qstat.st_mode)
+                or statmod.S_IMODE(qstat.st_mode) != 0o700
+                or qstat.st_uid != os.geteuid()
+            ):
+                continue
+            fingerprint = hashlib.sha256(
+                f"{marker.name}:{metadata.st_ino}:{metadata.st_mtime_ns}".encode()
+            ).hexdigest()[:12]
+            destination = quarantine / f"{int(current)}-{fingerprint}-{marker.name}"
+            if destination.exists() or destination.is_symlink():
+                continue
+            os.replace(marker, destination)
+            moved.append(
+                {
+                    "marker": marker.name,
+                    "quarantine": os.fspath(destination),
+                    "reason": "fresh inventory proved session absent after 7 days",
+                }
+            )
+        except OSError:
+            continue
+    return moved
+
+
 def _shpool_executable() -> str:
     """Resolve shpool for contexts (systemd user services) whose PATH omits it."""
     found = shutil.which("shpool")
@@ -2707,6 +2787,9 @@ def _state_paths(config: Mapping[str, Any]) -> dict[str, Path]:
         "terminal_numbers": root / "terminal-numbers.json",
         "terminal_numbers_epoch": root / "terminal-numbers.initialized.json",
         "terminal_numbers_retired": root / "terminal-numbers-retired.json",
+        "color_reservations": root / "color-reservations.json",
+        "provider_title_retries": root / "provider-title-retries.json",
+        "provider_untitled_quarantine": root / "provider-untitled-quarantine",
         "config_lock": root / "config.lock",
         "lock": root / "inventory.lock",
     }
@@ -3317,11 +3400,7 @@ def codex_bounce_prepare(
     import sqlite3
 
     if codex_root is None:
-        codex_root = Path(
-            os.environ.get("CODEX_HOME")
-            or os.environ.get("SESSION_KIT_CODEX_HOME")
-            or (_home() / ".codex")
-        ).expanduser()
+        codex_root = _codex_home()
     title = ""
     first_message = ""
     has_split_prompt_schema = False
@@ -3417,6 +3496,82 @@ def codex_bounce_prepare(
     return chosen
 
 
+def claude_bounce_prepare(
+    uuid: str, home: Path | None = None, now: float | None = None
+) -> tuple[str, bool]:
+    """Decide whether a Claude window can only be named by a restart.
+
+    Claude applies a kit name intent through its SessionStart and prompt
+    hooks — a living window renames at the next prompt, and a fresh boot
+    renames immediately. A session whose name arrived AFTER boot and that
+    never saw another prompt (ask, read, close) therefore shows its stale
+    title until the provider restarts. Returns (title, clear):
+    title != "" — bounce is warranted; "" with clear=True — the live window
+    already renamed (a real prompt followed the intent), so the caller
+    should drop its untitled marker; "" with clear=False — defer, a name
+    may still arrive.
+    """
+    if home is None:
+        home = Path.home()
+    intent = home / ".claude" / "sessions" / f"{uuid}.nameintent"
+    try:
+        if intent.is_symlink() or not intent.is_file():
+            return "", False
+        intent_mtime = intent.stat().st_mtime
+        title = intent.read_text(encoding="utf-8").splitlines()[0].strip()[:64]
+    except (OSError, IndexError):
+        return "", False
+    if not title:
+        return "", False
+    try:
+        transcripts = sorted(
+            (home / ".claude" / "projects").glob(f"*/{uuid}.jsonl"),
+            key=lambda path: path.stat().st_mtime,
+        )
+    except OSError:
+        transcripts = []
+    if not transcripts:
+        return "", False
+    last_prompt = 0.0
+    try:
+        with open(transcripts[-1], encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(record, Mapping) or record.get("type") != "user":
+                    continue
+                if record.get("isMeta"):
+                    continue
+                message = record.get("message")
+                if not isinstance(message, Mapping):
+                    continue
+                content = message.get("content")
+                # Real prompts are strings; tool results arrive as lists.
+                # The synthesized resume-mount pair is not a human prompt.
+                if not isinstance(content, str):
+                    continue
+                if content.startswith("Continue from where you left off."):
+                    continue
+                stamp = record.get("timestamp")
+                if not isinstance(stamp, str):
+                    continue
+                try:
+                    parsed = dt.datetime.fromisoformat(
+                        stamp.replace("Z", "+00:00")
+                    ).timestamp()
+                except ValueError:
+                    continue
+                last_prompt = max(last_prompt, parsed)
+    except OSError:
+        return "", False
+    if last_prompt > intent_mtime + 1:
+        # The hook applied the name at that prompt; the window is current.
+        return "", True
+    return title, False
+
+
 def codex_pending_auto_titles(
     environ: Mapping[str, str] | None = None,
 ) -> list[dict[str, str]]:
@@ -3435,18 +3590,19 @@ def codex_pending_auto_titles(
     import sqlite3
 
     env = environ if environ is not None else os.environ
+    reconciled = _reconcile_pending_provider_titles(load_config(), "codex", env)
     if not automatic_naming_enabled(env):
-        return []
+        return reconciled
     if str(env.get("SESSION_KIT_CODEX_AUTOTITLE", "")).strip().casefold() in {
         "0",
         "false",
         "no",
         "off",
     }:
-        return []
+        return reconciled
     codex_root, database = _codex_paths()
     if not database.is_file():
-        return []
+        return reconciled
     try:
         connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
         try:
@@ -3455,7 +3611,7 @@ def codex_pending_auto_titles(
                 for row in connection.execute("PRAGMA table_info(threads)")
             }
             if not {"id", "title", "first_user_message", "updated_at"} <= columns:
-                return []
+                return reconciled
             # Only human root threads: subagent threads inherit their task
             # prompt as first_user_message, and titling them replaces useful
             # agent nicknames with near-duplicate task titles. Non-interactive
@@ -3480,7 +3636,7 @@ def codex_pending_auto_titles(
         finally:
             connection.close()
     except sqlite3.Error:
-        return []
+        return reconciled
     index = codex_root / "session_index.jsonl"
     # Latest entry per id wins — the file is append-ordered and renames are
     # appended, so later lines overwrite earlier ones here.
@@ -3488,7 +3644,7 @@ def codex_pending_auto_titles(
     if index.is_file() and not index.is_symlink():
         try:
             if index.stat().st_size > MAX_CODEX_SESSION_INDEX_BYTES:
-                return []
+                return reconciled
             for line in index.read_text(encoding="utf-8").splitlines():
                 try:
                     entry = json.loads(line)
@@ -3501,9 +3657,20 @@ def codex_pending_auto_titles(
         except OSError:
             # Unable to prove which threads already carry deliberate names;
             # titling anyway could overwrite one, so do nothing.
-            return []
+            return reconciled
     cutoff = time.time() - 7 * 86400
-    results: list[dict[str, str]] = []
+    results: list[dict[str, str]] = [
+        {"uuid": str(item["uuid"]), "title": str(item["title"])}
+        for item in reconciled
+    ]
+    # Live app-server windows repaint from a socket rename; derive the
+    # socket root from the caller's exact environment (no real-home
+    # fallback) so sandboxed runs stay inert.
+    live_state_dir: Path | None = None
+    if env.get("SESSION_KIT_CODEX_LIVE_RENAME") != "0":
+        live_home = env.get("HOME")
+        if live_home:
+            live_state_dir = _session_kit_state_dir(env, Path(live_home))
     healed = 0
     for uuid, raw_title, first_message, updated_at in rows:
         exact = valid_uuid(uuid)
@@ -3526,6 +3693,8 @@ def codex_pending_auto_titles(
                 and (not title or _codex_title_echoes_prompt(title, first))
             ):
                 _push_codex_thread_title(codex_root, exact, index_name)
+                if live_state_dir is not None:
+                    _push_codex_live_rename(live_state_dir, exact, index_name)
                 healed += 1
             continue
         if exact == "00000000-0000-0000-0000-000000000000":
@@ -3552,6 +3721,8 @@ def codex_pending_auto_titles(
         except OSError:
             continue
         _push_codex_thread_title(codex_root, exact, derived)
+        if live_state_dir is not None:
+            _push_codex_live_rename(live_state_dir, exact, derived)
         results.append({"uuid": exact, "title": derived})
         if len(results) >= 20:
             break
@@ -3609,8 +3780,203 @@ def _push_codex_thread_title(
         return [], [f"Codex thread title not set: {exc}"]
 
 
-def _push_codex_title(home: Path, uuid: str, title: str) -> tuple[list[str], list[str]]:
-    codex_root = home / ".codex"
+MAX_CODEX_LIVE_RENAME_SOCKETS = 8
+MAX_CODEX_LIVE_RENAME_FRAME = 1024 * 1024
+
+
+def _session_kit_state_dir(env: Mapping[str, str], home: Path) -> Path:
+    """The session-kit state directory under the caller's exact sandbox.
+
+    Same precedence as the shell helpers: SESSION_KIT_STATE_DIR names the
+    kit directory itself; otherwise it lives under XDG_STATE_HOME or the
+    sandbox home. Never falls back to the real home — an explicit
+    environment IS the caller's sandbox.
+    """
+    explicit = env.get("SESSION_KIT_STATE_DIR")
+    if explicit:
+        return Path(explicit)
+    xdg = env.get("XDG_STATE_HOME")
+    if xdg:
+        return Path(xdg) / "session-kit"
+    return home / ".local" / "state" / "session-kit"
+
+
+def _ws_send_frame(connection: Any, payload: bytes, opcode: int = 1) -> None:
+    import struct
+
+    header = bytes([0x80 | opcode])
+    length = len(payload)
+    if length < 126:
+        header += bytes([length | 0x80])
+    elif length < 65536:
+        header += bytes([126 | 0x80]) + struct.pack("!H", length)
+    else:
+        header += bytes([127 | 0x80]) + struct.pack("!Q", length)
+    mask = os.urandom(4)
+    masked = bytes(
+        value ^ mask[index % 4] for index, value in enumerate(payload)
+    )
+    connection.sendall(header + mask + masked)
+
+
+def _ws_recv_frame(connection: Any) -> tuple[int, bytes]:
+    import struct
+
+    def read_exact(count: int) -> bytes:
+        data = b""
+        while len(data) < count:
+            chunk = connection.recv(count - len(data))
+            if not chunk:
+                raise OSError("WebSocket closed mid-frame")
+            data += chunk
+        return data
+
+    first, second = read_exact(2)
+    opcode = first & 0x0F
+    length = second & 0x7F
+    if length == 126:
+        length = struct.unpack("!H", read_exact(2))[0]
+    elif length == 127:
+        length = struct.unpack("!Q", read_exact(8))[0]
+    if length > MAX_CODEX_LIVE_RENAME_FRAME:
+        raise OSError("oversized WebSocket frame")
+    mask = read_exact(4) if second & 0x80 else b""
+    payload = read_exact(length)
+    if mask:
+        payload = bytes(
+            value ^ mask[index % 4] for index, value in enumerate(payload)
+        )
+    return opcode, payload
+
+
+def _ws_request(
+    connection: Any, request_id: int, method: str, params: dict[str, Any]
+) -> None:
+    _ws_send_frame(
+        connection,
+        json.dumps(
+            {"method": method, "id": request_id, "params": params},
+            separators=(",", ":"),
+        ).encode(),
+    )
+    while True:
+        opcode, payload = _ws_recv_frame(connection)
+        if opcode == 8:
+            raise OSError("WebSocket closed by server")
+        if opcode == 9:
+            _ws_send_frame(connection, payload, opcode=10)
+            continue
+        if opcode != 1:
+            continue
+        try:
+            message = json.loads(payload)
+        except ValueError:
+            continue
+        if not isinstance(message, dict) or message.get("id") != request_id:
+            continue
+        if message.get("error") is not None:
+            raise OSError(f"app-server {method} refused: {message['error']}")
+        return
+
+
+def _push_codex_live_rename(
+    kit_state_dir: Path, uuid: str, title: str
+) -> tuple[list[str], list[str]]:
+    """Repaint live app-server-backed Codex windows with the new name.
+
+    A direct-TUI Codex bar repaints only at process start, but a remote TUI
+    attached to a kit app-server repaints its thread-title item from the
+    thread/name/updated broadcast — so a rename through the socket names a
+    LIVE window with no provider restart. Every kit app-server shares one
+    thread store, so the rename is offered to each live socket; a server
+    not hosting the thread writes the same value the direct push already
+    wrote, harmlessly. Entirely fail-open: absent, dead, or refusing
+    sockets never block the store push and never warn — most sessions are
+    direct TUIs with no socket at all.
+    """
+    import base64
+    import socket as socketmod
+
+    app_root = kit_state_dir / "app-server"
+    try:
+        candidates = sorted(app_root.iterdir())[:MAX_CODEX_LIVE_RENAME_SOCKETS]
+    except OSError:
+        return [], []
+    delivered = False
+    for directory in candidates:
+        socket_path = directory / "app.sock"
+        try:
+            if socket_path.is_symlink() or not statmod.S_ISSOCK(
+                os.stat(socket_path).st_mode
+            ):
+                continue
+        except OSError:
+            continue
+        connection = socketmod.socket(socketmod.AF_UNIX, socketmod.SOCK_STREAM)
+        connection.settimeout(2.0)
+        try:
+            connection.connect(os.fspath(socket_path))
+            key = base64.b64encode(os.urandom(16)).decode()
+            connection.sendall(
+                (
+                    "GET / HTTP/1.1\r\nHost: localhost\r\n"
+                    "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                    f"Sec-WebSocket-Key: {key}\r\n"
+                    "Sec-WebSocket-Version: 13\r\n\r\n"
+                ).encode()
+            )
+            response = b""
+            while not response.endswith(b"\r\n\r\n"):
+                if len(response) > 65536:
+                    raise OSError("oversized upgrade response")
+                byte = connection.recv(1)
+                if not byte:
+                    raise OSError("app-server closed during upgrade")
+                response += byte
+            if b" 101 " not in response.split(b"\r\n", 1)[0]:
+                raise OSError("WebSocket upgrade refused")
+            _ws_request(
+                connection,
+                1,
+                "initialize",
+                {
+                    "clientInfo": {
+                        "name": "session-kit-live-rename",
+                        "title": "Session Kit live rename",
+                        "version": "1.0",
+                    }
+                },
+            )
+            _ws_send_frame(
+                connection,
+                json.dumps(
+                    {"method": "initialized", "params": {}},
+                    separators=(",", ":"),
+                ).encode(),
+            )
+            _ws_request(
+                connection,
+                2,
+                "thread/name/set",
+                {"threadId": uuid, "name": title},
+            )
+            delivered = True
+        except (OSError, ValueError):
+            continue
+        finally:
+            with contextlib.suppress(OSError):
+                connection.close()
+    if delivered:
+        return ["codex-live-rename"], []
+    return [], []
+
+
+def _push_codex_title(
+    codex_root: Path,
+    uuid: str,
+    title: str,
+    kit_state_dir: Path | None = None,
+) -> tuple[list[str], list[str]]:
     if not codex_root.is_dir():
         return [], ["Codex home unavailable; title not pushed"]
     index = codex_root / "session_index.jsonl"
@@ -3625,7 +3991,13 @@ def _push_codex_title(home: Path, uuid: str, title: str) -> tuple[list[str], lis
     thread_pushes, thread_warnings = _push_codex_thread_title(
         codex_root, uuid, title
     )
-    return ["codex-session-index", *thread_pushes], thread_warnings
+    live_pushes: list[str] = []
+    if kit_state_dir is not None:
+        live_pushes, _ = _push_codex_live_rename(kit_state_dir, uuid, title)
+    return (
+        ["codex-session-index", *thread_pushes, *live_pushes],
+        thread_warnings,
+    )
 
 
 SESSION_COLORS = (
@@ -3690,9 +4062,18 @@ def session_color(
 LAUNCH_COLOR_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 
 
-def launch_color_for(shpool_id: str) -> str:
+COLOR_RESERVATION_MAX_AGE_SECONDS = 10 * 60
+
+
+def launch_color_for(shpool_id: str, occupied_colors: Iterable[str] = ()) -> str:
     digest = hashlib.sha256(f"launch:{shpool_id}".encode("utf-8")).digest()
-    return SESSION_COLORS[digest[0] % len(SESSION_COLORS)]
+    start = digest[0] % len(SESSION_COLORS)
+    occupied = {color for color in occupied_colors if color in SESSION_COLORS}
+    for offset in range(len(SESSION_COLORS)):
+        candidate = SESSION_COLORS[(start + offset) % len(SESSION_COLORS)]
+        if candidate not in occupied:
+            return candidate
+    return SESSION_COLORS[start]
 
 
 def _launch_color_dir(config: Mapping[str, Any]) -> Path | None:
@@ -3702,8 +4083,23 @@ def _launch_color_dir(config: Mapping[str, Any]) -> Path | None:
     return Path(state_dir) / "launch-color"
 
 
+def _active_color_reservations(path: Path, now: float) -> dict[str, dict[str, Any]]:
+    raw = _read_state_json(path)
+    entries = raw.get("entries", {}) if isinstance(raw, Mapping) else {}
+    return {
+        key: {"color": item["color"], "created_at": float(item["created_at"])}
+        for key, item in entries.items()
+        if isinstance(key, str)
+        and isinstance(item, Mapping)
+        and item.get("color") in SESSION_COLORS
+        and isinstance(item.get("created_at"), (int, float))
+        and not isinstance(item.get("created_at"), bool)
+        and 0 <= now - float(item["created_at"]) <= COLOR_RESERVATION_MAX_AGE_SECONDS
+    }
+
+
 def record_launch_color(
-    config: Mapping[str, Any], shpool_id: str
+    config: Mapping[str, Any], shpool_id: str, occupied_colors: Iterable[str] = ()
 ) -> str | None:
     """Pick and persist a launch color for a session with no conversation ID."""
     if (
@@ -3713,11 +4109,22 @@ def record_launch_color(
         or len(shpool_id) > 128
     ):
         return None
-    color = launch_color_for(shpool_id)
     directory = _launch_color_dir(config)
     if directory is None:
-        return color
-    try:
+        return launch_color_for(shpool_id, occupied_colors)
+    paths = _state_paths(config)
+    with StateLock(paths["root"], paths["lock"]):
+        now = time.time()
+        reservations = _active_color_reservations(paths["color_reservations"], now)
+        reservation_key = f"launch:{shpool_id}"
+        existing = reservations.get(reservation_key)
+        if existing:
+            color = str(existing["color"])
+        else:
+            occupied = set(occupied_colors)
+            occupied.update(item["color"] for item in reservations.values())
+            color = launch_color_for(shpool_id, occupied)
+            reservations[reservation_key] = {"color": color, "created_at": now}
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
         if hasattr(os, "O_NOFOLLOW"):
@@ -3725,10 +4132,91 @@ def record_launch_color(
         descriptor = os.open(directory / shpool_id, flags, 0o600)
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             handle.write(color + "\n")
-    except OSError:
-        # The theme still applies this boot; only later adoption is lost.
-        pass
-    return color
+            handle.flush()
+            os.fsync(handle.fileno())
+        atomic_write_json(
+            paths["color_reservations"],
+            {"schema_version": SCHEMA_VERSION, "entries": reservations},
+        )
+        return color
+
+
+def _reserve_conversation_color(
+    config: Mapping[str, Any],
+    provider: str,
+    uuid: str,
+    occupied_colors: Iterable[str],
+) -> str:
+    exact_uuid = valid_uuid(uuid)
+    if provider not in PROVIDERS or not exact_uuid:
+        raise CollectionError("conversation color requires an exact provider UUID")
+    paths = _state_paths(config)
+    path = config_path()
+    key = f"{provider}:{exact_uuid}"
+    with StateLock(paths["root"], paths["config_lock"]):
+        with StateLock(paths["root"], paths["lock"]):
+            now = time.time()
+            reservations = _active_color_reservations(paths["color_reservations"], now)
+            occupied = set(occupied_colors)
+            occupied.update(item["color"] for item in reservations.values())
+            preferred = session_color(provider, exact_uuid)
+            assert preferred is not None
+            start = SESSION_COLORS.index(preferred)
+            color = next(
+                (
+                    SESSION_COLORS[(start + offset) % len(SESSION_COLORS)]
+                    for offset in range(len(SESSION_COLORS))
+                    if SESSION_COLORS[(start + offset) % len(SESSION_COLORS)] not in occupied
+                ),
+                preferred,
+            )
+            _private_alias_parent(path)
+            document = _private_alias_document(path, allow_missing=True)
+            colors = _valid_colors(document.get("colors"))
+            colors[key] = color
+            document["colors"] = dict(sorted(colors.items()))
+            atomic_write_json(path, document)
+            reservations[f"conversation:{key}"] = {"color": color, "created_at": now}
+            atomic_write_json(
+                paths["color_reservations"],
+                {"schema_version": SCHEMA_VERSION, "entries": reservations},
+            )
+            return color
+
+
+def _release_conversation_color(
+    config: Mapping[str, Any], provider: str, uuid: str, color: str
+) -> bool:
+    """Roll back one failed pre-bake only when reservation and override match."""
+    exact_uuid = valid_uuid(uuid)
+    if provider not in PROVIDERS or not exact_uuid or color not in SESSION_COLORS:
+        return False
+    paths = _state_paths(config)
+    path = config_path()
+    key = f"{provider}:{exact_uuid}"
+    reservation_key = f"conversation:{key}"
+    with StateLock(paths["root"], paths["config_lock"]):
+        with StateLock(paths["root"], paths["lock"]):
+            reservations = _active_color_reservations(
+                paths["color_reservations"], time.time()
+            )
+            reserved = reservations.get(reservation_key)
+            document = _private_alias_document(path, allow_missing=True)
+            colors = _valid_colors(document.get("colors"))
+            if not reserved or reserved.get("color") != color or colors.get(key) != color:
+                return False
+            reservations.pop(reservation_key, None)
+            colors.pop(key, None)
+            if colors:
+                document["colors"] = dict(sorted(colors.items()))
+            else:
+                document.pop("colors", None)
+            atomic_write_json(path, document)
+            atomic_write_json(
+                paths["color_reservations"],
+                {"schema_version": SCHEMA_VERSION, "entries": reservations},
+            )
+            return True
 
 
 def _adopt_launch_colors(
@@ -3935,13 +4423,194 @@ def propagate_provider_title(
     if provider == "claude":
         pushed, warnings = _push_claude_title(home, exact_uuid, clean_title)
     else:
-        pushed, warnings = _push_codex_title(home, exact_uuid, clean_title)
+        live_state_dir: Path | None = _session_kit_state_dir(env, home)
+        if env.get("SESSION_KIT_CODEX_LIVE_RENAME") == "0":
+            live_state_dir = None
+        pushed, warnings = _push_codex_title(
+            _codex_home(env, default_home=home),
+            exact_uuid,
+            clean_title,
+            kit_state_dir=live_state_dir,
+        )
     for warning in warnings:
         print(f"session inventory: {warning}", file=sys.stderr)
     return {
         "provider_title_pushes": pushed,
         "provider_title_warnings": warnings,
     }
+
+
+def _record_provider_title_retry(
+    config: Mapping[str, Any], provider: str, uuid: str, title: str
+) -> None:
+    paths = _state_paths(config)
+    key = f"{provider}:{uuid}"
+    with StateLock(paths["root"], paths["lock"]):
+        raw = _read_state_json(paths["provider_title_retries"])
+        entries = dict(raw.get("entries", {})) if isinstance(raw, Mapping) else {}
+        entries[key] = {
+            "provider": provider,
+            "uuid": uuid,
+            "title": title,
+            "attempts": 0,
+            "updated_at": _utc_now(),
+        }
+        atomic_write_json(
+            paths["provider_title_retries"],
+            {"schema_version": SCHEMA_VERSION, "entries": entries},
+        )
+
+
+def _provider_title_retry_disposition(
+    provider: str, uuid: str, title: str, environ: Mapping[str, str]
+) -> str:
+    """Return retry, satisfied, superseded, or defer from native evidence."""
+    home_raw = environ.get("HOME")
+    if provider == "claude":
+        if not home_raw:
+            return "defer"
+        home = Path(home_raw)
+        try:
+            transcripts = [
+                path
+                for path in (home / ".claude" / "projects").glob(f"*/{uuid}.jsonl")
+                if path.is_file() and not path.is_symlink()
+            ]
+        except OSError:
+            return "defer"
+        if not transcripts:
+            return "defer"
+        native = read_claude_transcript_signals(uuid, home)["agent_name"]
+        if native == title:
+            return "satisfied"
+        if native:
+            return "superseded"
+        return "retry"
+
+    codex_root = _codex_home(environ, default_home=Path(home_raw) if home_raw else _home())
+    try:
+        indexed = read_codex_session_index(codex_root / "session_index.jsonl")
+    except CollectionError:
+        return "defer"
+    index_title = indexed.get(uuid, "")
+    if index_title and index_title != title:
+        return "superseded"
+    databases = _codex_state_databases(codex_root)
+    if not databases:
+        return "defer"
+    try:
+        connection = sqlite3.connect(f"file:{databases[-1]}?mode=ro", uri=True)
+        try:
+            columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(threads)")
+            }
+            if "title" not in columns:
+                return "defer"
+            first_column = "first_user_message" if "first_user_message" in columns else "NULL"
+            row = connection.execute(
+                f"SELECT title, {first_column} FROM threads WHERE id = ?", (uuid,)
+            ).fetchone()
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        return "defer"
+    if row is None:
+        return "defer"
+    native_title = clean_text(row[0], 120)
+    first_message = clean_text(row[1], 8192)
+    if native_title == title and index_title == title:
+        return "satisfied"
+    if (
+        native_title
+        and native_title != title
+        and not _codex_title_echoes_prompt(native_title, first_message)
+    ):
+        return "superseded"
+    return "retry"
+
+
+def _reconcile_pending_provider_titles(
+    config: Mapping[str, Any], provider: str, environ: Mapping[str, str], limit: int = 4
+) -> list[dict[str, Any]]:
+    """Retry a bounded number of exact failed self-name provider pushes."""
+    paths = _state_paths(config)
+    with StateLock(paths["root"], paths["lock"]):
+        raw = _read_state_json(paths["provider_title_retries"])
+    entries = dict(raw.get("entries", {})) if isinstance(raw, Mapping) else {}
+    candidates = [
+        (key, item)
+        for key, item in sorted(entries.items())
+        if isinstance(item, Mapping)
+        and item.get("provider") == provider
+        and valid_uuid(item.get("uuid"))
+        and clean_text(item.get("title"), 100)
+        and isinstance(item.get("attempts"), int)
+        and item.get("attempts", 0) < 3
+    ][:limit]
+    results: list[dict[str, Any]] = []
+    for key, item in candidates:
+        disposition = _provider_title_retry_disposition(
+            provider, str(item["uuid"]), str(item["title"]), environ
+        )
+        if disposition in {"satisfied", "superseded"}:
+            with StateLock(paths["root"], paths["lock"]):
+                current = _read_state_json(paths["provider_title_retries"])
+                current_entries = (
+                    dict(current.get("entries", {}))
+                    if isinstance(current, Mapping)
+                    else {}
+                )
+                stored = current_entries.get(key)
+                if isinstance(stored, Mapping) and stored.get("title") == item.get("title"):
+                    current_entries.pop(key, None)
+                    atomic_write_json(
+                        paths["provider_title_retries"],
+                        {"schema_version": SCHEMA_VERSION, "entries": current_entries},
+                    )
+            results.append(
+                {"uuid": str(item["uuid"]), "title": str(item["title"]), "status": disposition}
+            )
+            continue
+        if disposition == "defer":
+            results.append(
+                {"uuid": str(item["uuid"]), "title": str(item["title"]), "status": "deferred"}
+            )
+            continue
+        result = propagate_provider_title(
+            provider,
+            str(item["uuid"]),
+            str(item["title"]),
+            environ=environ,
+        )
+        with StateLock(paths["root"], paths["lock"]):
+            current = _read_state_json(paths["provider_title_retries"])
+            current_entries = (
+                dict(current.get("entries", {}))
+                if isinstance(current, Mapping)
+                else {}
+            )
+            stored = current_entries.get(key)
+            if not isinstance(stored, Mapping) or stored.get("title") != item.get("title"):
+                continue
+            if result.get("provider_title_warnings"):
+                updated = dict(stored)
+                updated["attempts"] = min(3, int(stored.get("attempts", 0)) + 1)
+                updated["updated_at"] = _utc_now()
+                current_entries[key] = updated
+            else:
+                current_entries.pop(key, None)
+            atomic_write_json(
+                paths["provider_title_retries"],
+                {"schema_version": SCHEMA_VERSION, "entries": current_entries},
+            )
+        results.append(
+            {
+                "uuid": str(item["uuid"]),
+                "title": str(item["title"]),
+                **result,
+            }
+        )
+    return results
 
 
 def claude_pending_native_hydrations(
@@ -3958,20 +4627,22 @@ def claude_pending_native_hydrations(
     env = environ if environ is not None else os.environ
     naming_enabled = automatic_naming_enabled(env)
     settings = config or load_config()
+    hydrated: list[dict[str, Any]] = _reconcile_pending_provider_titles(
+        settings, "claude", env
+    )
     try:
         live = snapshot(write_state=False, config=settings)
     except CollectionError:
-        return []
+        return hydrated
     if not guard_live_inventory(live):
-        return []
+        return hydrated
     home_raw = env.get("HOME") or (
         os.fspath(Path.home()) if environ is None else ""
     )
     if not home_raw:
-        return []
+        return hydrated
     home = Path(home_raw)
     colors = canonical_colors(settings)
-    hydrated: list[dict[str, Any]] = []
     for item in live.get("sessions", ()):
         if not isinstance(item, Mapping) or item.get("provider") != "claude":
             continue
@@ -5881,8 +6552,39 @@ def source_generation_key(boot_id: Any, generation: Any) -> str | None:
     return f"{exact[0]}:{exact[1]}:{exact[2]}"
 
 
+def _pending_evidence(entry: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "source_generation_key": entry.get("source_generation_key"),
+        "queue": entry.get("queue"),
+        "queue_index": entry.get("queue_index"),
+        "scope": entry.get("scope"),
+        "old_shpool_id": entry.get("old_shpool_id"),
+    }
+
+
+def _pending_conflict_fields(entries: Sequence[Mapping[str, Any]]) -> list[str]:
+    fields = ("scope", "cwd", "argv", "command")
+    return [
+        field
+        for field in fields
+        if len({json.dumps(item.get(field), sort_keys=True) for item in entries}) > 1
+    ]
+
+
+def _pending_preferred_entry(entries: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    primary = [item for item in entries if item.get("queue") == "primary"]
+    if primary:
+        return primary[0]
+    return max(
+        entries,
+        key=lambda item: item.get("queue_index")
+        if isinstance(item.get("queue_index"), int)
+        else -1,
+    )
+
+
 def flatten_pending(value: Any) -> dict[str, Any]:
-    """Return all pending generations as stable, directly actionable entries."""
+    """Return one safe recovery candidate per exact provider conversation."""
     entries: list[dict[str, Any]] = []
     if not _valid_recovery_state(value):
         return {
@@ -5974,12 +6676,45 @@ def flatten_pending(value: Any) -> dict[str, Any]:
             item["uuid"] or "",
         )
     )
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    ungrouped: list[dict[str, Any]] = []
+    for entry in entries:
+        provider = entry.get("provider")
+        uuid = entry.get("uuid")
+        if provider in PROVIDERS and isinstance(uuid, str):
+            grouped.setdefault((provider, uuid), []).append(entry)
+        else:
+            ungrouped.append(entry)
+    deduplicated: list[dict[str, Any]] = []
+    for duplicates in grouped.values():
+        preferred = dict(_pending_preferred_entry(duplicates))
+        conflicts = _pending_conflict_fields(duplicates)
+        preferred["duplicate_count"] = len(duplicates) - 1
+        preferred["evidence"] = [_pending_evidence(item) for item in duplicates]
+        preferred["conflict_fields"] = conflicts
+        preferred["actionable"] = bool(preferred["actionable"] and not conflicts)
+        deduplicated.append(preferred)
+    for entry in ungrouped:
+        retained = dict(entry)
+        retained.update(
+            duplicate_count=0,
+            evidence=[_pending_evidence(entry)],
+            conflict_fields=[],
+        )
+        deduplicated.append(retained)
+    deduplicated.sort(
+        key=lambda item: (
+            item["source_generation_key"] or "",
+            natural_name_key(item["old_shpool_id"]),
+            item["uuid"] or "",
+        )
+    )
     return {
         "schema_version": SCHEMA_VERSION,
         "generated_at": value.get("generated_at"),
         "detected_boot_id": value.get("detected_boot_id"),
         "detected_daemon_generation": value.get("detected_daemon_generation"),
-        "entries": entries,
+        "entries": deduplicated,
     }
 
 
@@ -6069,13 +6804,26 @@ def acknowledge_pending(
             raise CollectionError(
                 "exact pending provider UUID is not uniquely active; pending entry was not acknowledged"
             )
-        _remove_pending_entry(
-            pending,
-            queue=target["queue"],
-            queue_index=target["queue_index"],
-            scope=target["scope"],
-            old_shpool_id=old_shpool_id,
+        evidence = target.get("evidence")
+        if not isinstance(evidence, list) or not evidence:
+            raise CollectionError("pending recovery evidence is incomplete")
+        ordered_evidence = sorted(
+            evidence,
+            key=lambda item: (
+                item.get("queue") == "primary",
+                -(item.get("queue_index") if isinstance(item.get("queue_index"), int) else -1),
+            ),
         )
+        for source in ordered_evidence:
+            if not isinstance(source, Mapping):
+                raise CollectionError("pending recovery evidence is malformed")
+            _remove_pending_entry(
+                pending,
+                queue=str(source.get("queue") or ""),
+                queue_index=source.get("queue_index"),
+                scope=str(source.get("scope") or ""),
+                old_shpool_id=str(source.get("old_shpool_id") or ""),
+            )
         pending["updated_at"] = _utc_now()
         atomic_write_json(paths["pending"], pending)
         return {
@@ -6175,6 +6923,11 @@ def snapshot(*, write_state: bool = True, config: dict[str, Any] | None = None) 
                             "boot_id": boot_id,
                         },
                     )
+                    quarantined_markers = _quarantine_orphaned_provider_untitled_markers(
+                        settings, result
+                    )
+                    if quarantined_markers:
+                        result["provider_untitled_quarantine"] = quarantined_markers
                     atomic_write_json(paths["inventory"], result)
                     update_recovery_state(paths, result)
                     _lifecycle.prune_inactive_state(
@@ -6967,20 +7720,28 @@ def self_name_automatic_title(
         revalidate=revalidate,
     )
     result["caller"] = evidence
-    result["automatic_name_state"] = "ready"
     # A self-name is an explicit rename, not background bookkeeping: it also
     # becomes the alias, the top display tier. In the automatic tier alone it
     # lost to the provider's own ai-title, so the picker kept showing a stale
     # native name after an agent explicitly renamed itself. `sp name reset`
     # still demotes it like any alias.
-    result.update(
-        propagate_provider_title(
+    native_push = propagate_provider_title(
+        str(evidence["provider"]),
+        str(evidence["uuid"]),
+        normalized,
+        environ=caller_environ,
+    )
+    result.update(native_push)
+    if native_push.get("provider_title_warnings"):
+        _record_provider_title_retry(
+            config,
             str(evidence["provider"]),
             str(evidence["uuid"]),
             normalized,
-            environ=caller_environ,
         )
-    )
+        result["automatic_name_state"] = "pending"
+    else:
+        result["automatic_name_state"] = "ready"
     effective_color = session_color(
         str(evidence["provider"]),
         str(evidence["uuid"]),
@@ -7004,6 +7765,9 @@ def _json_print(value: Any) -> None:
 
 
 def _platform_command(args: argparse.Namespace) -> int:
+    if args.platform_action == "app-server-dir":
+        print(_private_app_server_dir(Path(args.state_root), args.session_id))
+        return 0
     platform = _require_supported_platform()
     if args.platform_action == "timeout":
         if not 0 < args.seconds <= 3600:
@@ -7119,12 +7883,93 @@ def _alias_command(args: argparse.Namespace, config: dict[str, Any]) -> int:
     return 0
 
 
+def _private_app_server_dir(state_root: Path, session_id: str) -> Path:
+    """Create an App Server directory through an owner-private real-dir chain."""
+    if (
+        not session_id
+        or "/" in session_id
+        or session_id.startswith(".")
+        or len(session_id) > 128
+    ):
+        raise CollectionError("unsafe App Server session ID")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(state_root, flags)
+    except OSError as exc:
+        raise CollectionError("App Server state root is unavailable") from exc
+    current = state_root
+    try:
+        root_metadata = os.fstat(descriptor)
+        if (
+            not statmod.S_ISDIR(root_metadata.st_mode)
+            or root_metadata.st_uid != os.geteuid()
+            or statmod.S_IMODE(root_metadata.st_mode) != 0o700
+        ):
+            raise CollectionError("App Server state root must be owner mode-0700")
+        for component in ("session-kit", "app-server", session_id):
+            parent = descriptor
+            try:
+                os.mkdir(component, 0o700, dir_fd=parent)
+            except FileExistsError:
+                pass
+            try:
+                descriptor = os.open(component, flags, dir_fd=parent)
+            except OSError as exc:
+                raise CollectionError("unsafe App Server directory chain") from exc
+            finally:
+                os.close(parent)
+            metadata = os.fstat(descriptor)
+            if (
+                not statmod.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or statmod.S_IMODE(metadata.st_mode) != 0o700
+            ):
+                raise CollectionError("App Server directory chain must be owner mode-0700")
+            current /= component
+        return current
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
+
+
 def _color_command(args: argparse.Namespace, config: dict[str, Any]) -> int:
+    def occupied_live_colors() -> set[str] | None:
+        try:
+            live = snapshot(write_state=False, config=config)
+        except CollectionError:
+            return None
+        if live.get("source") != "live" or live.get("stale") is not False:
+            return None
+        return {
+            str(item.get("display_color"))
+            for item in [*live.get("sessions", ()), *live.get("outside_agents", ())]
+            if isinstance(item, Mapping) and item.get("display_color") in SESSION_COLORS
+        }
+
+    if args.color_action == "conversation-release":
+        released = _release_conversation_color(
+            config, args.provider, args.uuid, args.color
+        )
+        _json_print({"schema_version": SCHEMA_VERSION, "released": released})
+        return 0 if released else 1
     if args.color_action == "launch-pick":
-        color = record_launch_color(config, args.shpool_id)
+        occupied = occupied_live_colors()
+        if occupied is None:
+            return 1
+        color = record_launch_color(config, args.shpool_id, occupied)
         if not color:
             return 1
         print(color)
+        return 0
+    if args.color_action == "conversation-pick":
+        occupied = occupied_live_colors()
+        if occupied is None:
+            return 1
+        color = _reserve_conversation_color(
+            config, args.provider, args.uuid, occupied
+        )
+        _json_print({"schema_version": SCHEMA_VERSION, "color": color})
         return 0
     if args.color_action == "propagate":
         effective = session_color(
@@ -7236,12 +8081,17 @@ def _parser() -> argparse.ArgumentParser:
     recovery_parser.add_argument("--cwd")
     bounce_parser = subparsers.add_parser("codex-bounce-title")
     bounce_parser.add_argument("uuid")
+    claude_bounce_parser = subparsers.add_parser("claude-bounce-title")
+    claude_bounce_parser.add_argument("uuid")
     platform_parser = subparsers.add_parser("platform")
     platform_subparsers = platform_parser.add_subparsers(
         dest="platform_action", required=True
     )
     platform_subparsers.add_parser("boot-id")
     platform_subparsers.add_parser("process-table")
+    platform_app_dir = platform_subparsers.add_parser("app-server-dir")
+    platform_app_dir.add_argument("state_root")
+    platform_app_dir.add_argument("session_id")
     platform_timeout = platform_subparsers.add_parser("timeout")
     platform_timeout.add_argument("seconds", type=float)
     platform_timeout.add_argument("argv", nargs=argparse.REMAINDER)
@@ -7294,6 +8144,13 @@ def _parser() -> argparse.ArgumentParser:
     color_propagate.add_argument("uuid")
     color_launch = color_subparsers.add_parser("launch-pick")
     color_launch.add_argument("shpool_id")
+    color_conversation = color_subparsers.add_parser("conversation-pick")
+    color_conversation.add_argument("provider", choices=PROVIDERS)
+    color_conversation.add_argument("uuid")
+    color_release = color_subparsers.add_parser("conversation-release")
+    color_release.add_argument("provider", choices=PROVIDERS)
+    color_release.add_argument("uuid")
+    color_release.add_argument("color", choices=SESSION_COLORS)
     automatic_parser = subparsers.add_parser("automatic-title")
     automatic_subparsers = automatic_parser.add_subparsers(
         dest="automatic_title_action", required=True
@@ -7520,6 +8377,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 1
             print(bounce_title)
             return 0
+        if args.command == "claude-bounce-title":
+            bounce_title, clear_marker = claude_bounce_prepare(args.uuid)
+            if bounce_title:
+                print(bounce_title)
+                return 0
+            return 3 if clear_marker else 1
         if args.command == "alias":
             return _alias_command(args, config)
         if args.command == "color":

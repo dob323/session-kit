@@ -79,6 +79,7 @@ Usage:
   session-kit doctor [--json]
   session-kit projects <discover|import|list>
   session-kit projects add ALIAS <claude|codex|shell> /absolute/path
+  session-kit projects ignore /absolute/path
   session-kit update [--source PATH] [--enable-login|--disable-login] [--journal on|off]
   session-kit rollback [--to COMMIT]
   session-kit services <enable|disable|status>
@@ -112,6 +113,19 @@ platform() {
     Darwin) printf 'macos\n' ;;
     *) printf 'unsupported\n' ;;
   esac
+}
+
+systemd_user_manager_transport() {
+  if systemctl --user show-environment >/dev/null 2>&1; then
+    printf '%s\n' direct
+    return 0
+  fi
+  if systemctl --user --machine=@.host show-environment \
+      >/dev/null 2>&1; then
+    printf '%s\n' machine
+    return 0
+  fi
+  return 1
 }
 
 validate_roots() {
@@ -270,9 +284,15 @@ check_source() {
     else
       printf 'OK    process adapter: Linux /proc\n'
     fi
-    if [[ ${SESSION_KIT_TESTING:-0} == 1 ]] ||
-        systemctl --user show-environment >/dev/null 2>&1; then
+    local manager_transport=
+    if [[ ${SESSION_KIT_TESTING:-0} == 1 ]]; then
       printf 'OK    user service manager: systemd\n'
+    elif manager_transport=$(systemd_user_manager_transport); then
+      if [[ $manager_transport == direct ]]; then
+        printf 'OK    user service manager: systemd\n'
+      else
+        printf 'WARN  user service manager: available through local-machine transport; direct user socket is unavailable\n'
+      fi
     else
       printf 'FAIL  systemd user manager is unavailable\n'
       failed=1
@@ -365,6 +385,104 @@ PY
 }
 
 transaction_path=$state_root/lifecycle-transaction.json
+codex_theme_names=(red blue green yellow purple orange pink cyan)
+
+codex_theme_layout() {
+  local action=$1 custom=0
+  if [[ -n ${SESSION_KIT_CODEX_HOME:-} || -n ${CODEX_HOME:-} ]]; then
+    custom=1
+  fi
+  python3 - "$action" "$HOME" \
+    "${SESSION_KIT_CODEX_HOME:-${CODEX_HOME:-$HOME/.codex}}" \
+    "$custom" "${codex_theme_names[@]}" <<'PY'
+import os
+import pathlib
+import stat
+import sys
+
+action, home_raw, root_raw, custom, *colors = sys.argv[1:]
+home = pathlib.Path(home_raw)
+root = pathlib.Path(root_raw)
+default_root = home / ".codex"
+
+if not root.is_absolute() or ".." in root.parts:
+    raise SystemExit("session-kit: Codex home must be an absolute normalized path")
+
+
+def directory_info(path: pathlib.Path):
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    if not (
+        stat.S_ISDIR(info.st_mode)
+        and not stat.S_ISLNK(info.st_mode)
+        and info.st_uid in {0, os.geteuid()}
+        and stat.S_IMODE(info.st_mode) & 0o022 == 0
+    ):
+        raise SystemExit(f"session-kit: unsafe Codex path ancestor: {path}")
+    return info
+
+
+def validate_chain(path: pathlib.Path) -> None:
+    try:
+        relative = path.relative_to(home)
+    except ValueError:
+        base = pathlib.Path(path.anchor)
+        relative = path.relative_to(base)
+    else:
+        base_info = directory_info(home)
+        if base_info is None or base_info.st_uid != os.geteuid():
+            raise SystemExit("session-kit: HOME is not an owner-controlled directory")
+        base = home
+    if base == pathlib.Path(path.anchor) and directory_info(base) is None:
+        raise SystemExit("session-kit: Codex path root is unavailable")
+    current = base
+    for part in relative.parts:
+        current = current / part
+        if directory_info(current) is None:
+            break
+
+
+validate_chain(root)
+root_info = directory_info(root)
+if root_info is None:
+    if custom == "1" or root != default_root:
+        raise SystemExit(
+            "session-kit: custom Codex home must already be an owner-controlled directory"
+        )
+    if directory_info(root.parent) is None:
+        raise SystemExit("session-kit: Codex home parent is unsafe")
+    if action == "create":
+        root.mkdir(mode=0o700)
+
+if directory_info(root) is not None and root.lstat().st_uid != os.geteuid():
+    raise SystemExit("session-kit: Codex home must be owned by the current user")
+
+themes = root / "themes"
+validate_chain(themes)
+themes_info = directory_info(themes)
+if themes_info is None:
+    if action == "create":
+        themes.mkdir(mode=0o700)
+elif themes_info.st_uid != os.geteuid():
+    raise SystemExit("session-kit: Codex themes must be owned by the current user")
+
+if action == "create":
+    if directory_info(themes) is None:
+        raise SystemExit("session-kit: Codex themes directory could not be secured")
+    print(themes)
+elif action == "validate":
+    pass
+elif action == "targets":
+    for color in colors:
+        print(themes / f"sk-{color}.tmTheme")
+elif action == "root":
+    print(root)
+else:
+    raise SystemExit("session-kit: invalid Codex theme layout action")
+PY
+}
 
 lifecycle_transaction() {
   python3 - "$@" <<'PY'
@@ -476,8 +594,40 @@ elif operation == "recover":
     entries = payload.get("entries")
     if not isinstance(entries, list):
         raise SystemExit("session-kit: invalid lifecycle transaction entries")
-    if [entry.get("path") for entry in entries if isinstance(entry, dict)] != values:
+    paths = [entry.get("path") for entry in entries if isinstance(entry, dict)]
+    if len(paths) != len(entries) or paths[:len(values)] != values:
         raise SystemExit("session-kit: lifecycle transaction targets do not match this installation")
+    theme_entries = entries[len(values):]
+    expected_themes = [
+        f"sk-{color}.tmTheme"
+        for color in ("red", "blue", "green", "yellow", "purple", "orange", "pink", "cyan")
+    ]
+    if theme_entries:
+        if len(theme_entries) != len(expected_themes):
+            raise SystemExit("session-kit: invalid recorded theme transaction targets")
+        theme_paths = [pathlib.Path(entry["path"]) for entry in theme_entries]
+        parents = {path.parent for path in theme_paths}
+        if (
+            [path.name for path in theme_paths] != expected_themes
+            or len(parents) != 1
+            or next(iter(parents)).name != "themes"
+        ):
+            raise SystemExit("session-kit: invalid recorded theme transaction targets")
+        parent = next(iter(parents))
+        current = pathlib.Path(parent.anchor)
+        for part in parent.relative_to(current).parts:
+            current = current / part
+            try:
+                ancestor = current.lstat()
+            except FileNotFoundError:
+                raise SystemExit(f"session-kit: recorded theme ancestor is missing: {current}")
+            if (
+                not stat.S_ISDIR(ancestor.st_mode)
+                or stat.S_ISLNK(ancestor.st_mode)
+                or ancestor.st_uid not in {0, os.geteuid()}
+                or stat.S_IMODE(ancestor.st_mode) & 0o022
+            ):
+                raise SystemExit(f"session-kit: unsafe recorded theme ancestor: {current}")
     for entry in reversed(entries):
         if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
             raise SystemExit("session-kit: invalid lifecycle transaction entry")
@@ -508,11 +658,11 @@ PY
 recover_pending_transaction() {
   validate_roots
   local -a targets=()
-  mapfile -t targets < <(transaction_targets)
+  mapfile -t targets < <(transaction_core_targets)
   lifecycle_transaction recover "$transaction_path" "${targets[@]}"
 }
 
-transaction_targets() {
+transaction_core_targets() {
   local unit helper
   printf '%s\n' \
     "$install_root/current" \
@@ -537,12 +687,18 @@ transaction_targets() {
   fi
 }
 
+transaction_targets() {
+  transaction_core_targets
+  codex_theme_layout targets
+}
+
 begin_transaction() {
   local action=$1
   shift
   umask 077
   mkdir -p "$state_root"
   chmod 700 "$state_root" 2>/dev/null || true
+  codex_theme_layout validate
   local -a targets=()
   mapfile -t targets < <(transaction_targets)
   lifecycle_transaction begin "$transaction_path" "$action" "${targets[@]}" "$@"
@@ -666,6 +822,40 @@ install_launchers() {
 
 projects_created=0
 
+install_codex_themes() {
+  local release_id=$1 codex_theme_root color theme_file destination temporary
+  if [[ ! -d $install_root/releases/$release_id/config/codex-themes ]]; then
+    local -a obsolete_themes=()
+    mapfile -t obsolete_themes < <(codex_theme_layout targets)
+    for destination in "${obsolete_themes[@]}"; do
+      [[ ! -d $destination || -L $destination ]] ||
+        die "refusing to replace theme directory: $destination"
+      rm -f -- "$destination"
+    done
+    return 0
+  fi
+  codex_theme_root=$(codex_theme_layout create)
+  for color in "${codex_theme_names[@]}"; do
+    theme_file=$install_root/releases/$release_id/config/codex-themes/sk-$color.tmTheme
+    [[ -f $theme_file && ! -L $theme_file ]] ||
+      die "release Codex theme is missing or unsafe: sk-$color.tmTheme"
+    destination=$codex_theme_root/${theme_file##*/}
+    temporary=$(mktemp "$codex_theme_root/.${theme_file##*/}.XXXXXX")
+    if ! install -m 0600 "$theme_file" "$temporary"; then
+      rm -f -- "$temporary"
+      return 1
+    fi
+    if [[ ${SESSION_KIT_TEST_FAILPOINT:-} == theme-copy ]]; then
+      rm -f -- "$temporary"
+      die "isolated test failpoint during theme copy"
+    fi
+    if ! mv -f -- "$temporary" "$destination"; then
+      rm -f -- "$temporary"
+      return 1
+    fi
+  done
+}
+
 install_defaults() {
   local release_id=$1
   mkdir -p "$config_root"
@@ -686,16 +876,8 @@ install_defaults() {
   if [[ $(platform) == macos ]]; then
     configure_macos_shpool_shell
   fi
-  # Session-color Codex themes. Kit-owned sk-*.tmTheme files track the
-  # release; anything else in the themes directory is left alone.
-  if [[ -d $install_root/releases/$release_id/config/codex-themes ]]; then
-    local codex_theme_root=${CODEX_HOME:-"$HOME/.codex"}/themes theme_file
-    mkdir -p "$codex_theme_root"
-    for theme_file in "$install_root/releases/$release_id"/config/codex-themes/sk-*.tmTheme; do
-      [[ -f $theme_file ]] || continue
-      install -m 0600 "$theme_file" "$codex_theme_root/${theme_file##*/}"
-    done
-  fi
+  # Kit-owned sk-*.tmTheme files track the release. Other themes are untouched.
+  install_codex_themes "$release_id"
 }
 
 projects_tool() {
@@ -719,7 +901,7 @@ configure_initial_projects() {
     return
   fi
   discovery=$(mktemp "$state_root/project-discovery.XXXXXX")
-  if ! projects_tool "$install_root/current" --json discover > "$discovery"; then
+  if ! projects_tool "$install_root/current" --json candidates > "$discovery"; then
     command rm -f -- "$discovery"
     printf 'Project discovery was unavailable. Run session-kit projects import later.\n' >&2
     return
@@ -727,7 +909,7 @@ configure_initial_projects() {
   count=$(python3 - "$discovery" <<'PY'
 import json,sys
 value=json.load(open(sys.argv[1],encoding="utf-8"))
-print(len(value.get("projects",[])))
+print(len(value.get("candidates",[])))
 for warning in value.get("warnings",[]):
     print(f"Warning: {warning}",file=sys.stderr)
 PY
@@ -738,20 +920,28 @@ PY
     printf 'Add one later with session-kit projects add.\n'
     return
   fi
+  # Never all-or-nothing. Every directory a provider has ever run in is
+  # offered by number, with the short name it would get, and only the chosen
+  # ones are written.
   python3 - "$discovery" <<'PY'
 import json,sys
 value=json.load(open(sys.argv[1],encoding="utf-8"))
-print(f"\nFound {len(value['projects'])} existing provider project folder(s):")
-for row in value["projects"]:
-    print(f"  {row['provider'].capitalize():6}  {row['cwd']}")
+rows=value["candidates"]
+print(f"\nFound {len(rows)} directory(s) your providers have used:")
+for number,row in enumerate(rows,1):
+    print(f"  {number:2}  [{row['provider'].capitalize():6}] {row['cwd']}  →  {row['alias']}")
 PY
   command rm -f -- "$discovery"
-  printf 'Import all of these as Session Kit project shortcuts? [Y/n] '
+  printf '\nWhich should the picker offer? numbers/ranges, a for all, Enter for none: '
   read -r answer
-  case ${answer:-y} in
-    [Nn]*) printf 'Project import skipped. Run session-kit projects import later.\n' ;;
-    *) projects_tool "$install_root/current" import ;;
-  esac
+  if [[ -z $answer ]]; then
+    printf 'None added. Run session-kit projects import whenever you are ready.\n'
+    return
+  fi
+  projects_tool "$install_root/current" import --select "$answer" || {
+    printf 'Nothing added. Run session-kit projects import later.\n' >&2
+    return
+  }
 }
 
 configure_macos_shpool_shell() {
@@ -1371,6 +1561,7 @@ install_command() {
   lifecycle_failpoint current
   install_launchers "$release_id"
   install_defaults "$release_id"
+  lifecycle_failpoint themes
   configure_initial_projects "$projects" "$noninteractive"
   install_platform_services "$release_id"
   set_journal_choice "$journal"
@@ -1438,9 +1629,15 @@ doctor_command() {
     else
       add_check fail process "/proc is unavailable"
     fi
-    if [[ ${SESSION_KIT_TESTING:-0} == 1 ]] ||
-        systemctl --user show-environment >/dev/null 2>&1; then
+    local manager_transport=
+    if [[ ${SESSION_KIT_TESTING:-0} == 1 ]]; then
       add_check ok services "systemd user manager is available"
+    elif manager_transport=$(systemd_user_manager_transport); then
+      if [[ $manager_transport == direct ]]; then
+        add_check ok services "systemd user manager is available"
+      else
+        add_check warn services "systemd user manager is available through local-machine transport; direct user socket is unavailable"
+      fi
     else
       add_check fail services "systemd user manager is unavailable"
     fi
@@ -1477,6 +1674,455 @@ doctor_command() {
   else
     add_check fail provider "install Claude Code, Codex, or both"
   fi
+  local audit_output audit_ok=1 audit_name
+  local -a audit_names=(
+    claude-version codex-version codex-themes naming-instructions naming-hook
+    kill-switches acceptance
+  )
+  declare -A audit_expected=() audit_seen=()
+  for audit_name in "${audit_names[@]}"; do audit_expected[$audit_name]=1; done
+  if audit_output=$(python3 - "$HOME" "$config_root" \
+    "${SESSION_KIT_CODEX_HOME:-${CODEX_HOME:-$HOME/.codex}}" \
+    "$release_id" "$current_platform" <<'PY'
+import datetime
+import json
+import os
+from pathlib import Path
+import re
+import select
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+home, config_root, codex_home = map(Path, sys.argv[1:4])
+active_release, active_platform = sys.argv[4:6]
+
+
+def emit(status: str, name: str, detail: str) -> None:
+    safe = " ".join(str(detail).replace("\t", " ").split())[:500]
+    print(status, name, safe, sep="\t")
+
+
+def terminate_group(child: subprocess.Popen[bytes]) -> bool:
+    cleanup_failed = False
+    try:
+        os.killpg(child.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        cleanup_failed = True
+    try:
+        child.wait(timeout=0.25)
+    except subprocess.TimeoutExpired:
+        pass
+    except OSError:
+        cleanup_failed = True
+    time.sleep(0.05)
+    try:
+        os.killpg(child.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        cleanup_failed = True
+    if child.poll() is None:
+        try:
+            child.wait(timeout=0.5)
+        except (subprocess.TimeoutExpired, OSError):
+            cleanup_failed = True
+    return not cleanup_failed
+
+
+def provider_version(command: str) -> tuple[str, str]:
+    executable = shutil.which(command)
+    if not executable:
+        return "ok", f"{command} is not installed"
+    try:
+        child = subprocess.Popen(
+            [executable, "--version"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    except OSError:
+        return "warn", f"{command} version could not be read"
+    payload = bytearray()
+    deadline = time.monotonic() + 3.0
+    overflow = timed_out = read_failed = False
+    cleanup_ok = True
+    try:
+        assert child.stdout is not None
+        descriptor = child.stdout.fileno()
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select([descriptor], [], [], 0.1)
+            if ready:
+                block = os.read(descriptor, 257 - len(payload))
+                if not block:
+                    break
+                payload.extend(block)
+                if len(payload) > 256:
+                    overflow = True
+                    break
+            elif child.poll() is not None:
+                break
+        else:
+            timed_out = True
+    except (OSError, ValueError):
+        read_failed = True
+    finally:
+        cleanup_ok = terminate_group(child)
+        if child.stdout is not None:
+            child.stdout.close()
+    if not cleanup_ok:
+        return "warn", f"{command} version process could not be reaped"
+    if read_failed:
+        return "warn", f"{command} version could not be read"
+    if timed_out:
+        return "warn", f"{command} --version exceeded 3 seconds"
+    if overflow:
+        return "warn", f"{command} --version exceeded 256 bytes"
+    try:
+        text = " ".join(payload.decode("utf-8", "strict").split())
+    except UnicodeError:
+        return "warn", f"{command} reported an unrecognized version"
+    if child.returncode != 0 or not text:
+        return "warn", f"{command} version was unavailable"
+    patterns = {
+        "claude": r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+._A-Za-z0-9]*)? \(Claude Code\)$",
+        "codex": r"^codex-cli [0-9]+\.[0-9]+\.[0-9]+(?:[-+._A-Za-z0-9]*)?$",
+    }
+    if re.fullmatch(patterns[command], text) is None:
+        return "warn", f"{command} reported an unrecognized version"
+    return "ok", text
+
+
+provider_observed = {}
+provider_ready = {}
+for provider in ("claude", "codex"):
+    installed = shutil.which(provider) is not None
+    status, detail = provider_version(provider)
+    emit(status, f"{provider}-version", detail)
+    provider_ready[provider] = not installed or status == "ok"
+    provider_observed[provider] = detail if installed and status == "ok" else None
+
+theme_names = (
+    "red", "blue", "green", "yellow", "purple", "orange", "pink", "cyan"
+)
+def secure_regular_bytes(
+    path: Path,
+    limit: int,
+    *,
+    exact_mode: int | None = None,
+    executable: bool = False,
+) -> bytes | None:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        before = os.fstat(descriptor)
+        mode = stat.S_IMODE(before.st_mode)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or before.st_nlink != 1
+            or before.st_size > limit
+            or (exact_mode is not None and mode != exact_mode)
+            or (executable and mode & 0o111 == 0)
+        ):
+            return None
+        current = os.lstat(path)
+        if (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino):
+            return None
+        payload = bytearray()
+        while len(payload) <= limit:
+            block = os.read(descriptor, min(65_536, limit + 1 - len(payload)))
+            if not block:
+                break
+            payload.extend(block)
+        after = os.fstat(descriptor)
+        if (
+            len(payload) > limit
+            or (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+        ):
+            return None
+        return bytes(payload)
+    except OSError:
+        return None
+    finally:
+        os.close(descriptor)
+
+
+def bounded_text(path: Path, limit: int = 1_048_576) -> str | None:
+    payload = secure_regular_bytes(path, limit)
+    if payload is None:
+        return None
+    try:
+        return payload.decode("utf-8", "strict")
+    except UnicodeError:
+        return None
+
+
+def safe_directory_chain(path: Path, *, final_owner: bool = False) -> bool:
+    if not path.is_absolute() or ".." in path.parts:
+        return False
+    try:
+        relative = path.relative_to(home)
+    except ValueError:
+        current = Path(path.anchor)
+        relative = path.relative_to(current)
+    else:
+        current = home
+    components = [current]
+    for part in relative.parts:
+        current = current / part
+        components.append(current)
+    try:
+        for index, component in enumerate(components):
+            info = component.lstat()
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or stat.S_ISLNK(info.st_mode)
+                or info.st_uid not in {0, os.geteuid()}
+                or stat.S_IMODE(info.st_mode) & 0o022
+                or (index == len(components) - 1 and final_owner and info.st_uid != os.geteuid())
+            ):
+                return False
+        return True
+    except OSError:
+        return False
+
+
+theme_errors = []
+codex_root_safe = safe_directory_chain(codex_home, final_owner=True)
+themes_root = codex_home / "themes"
+themes_layout_safe = codex_root_safe and safe_directory_chain(
+    themes_root, final_owner=True
+)
+for color in theme_names:
+    path = themes_root / f"sk-{color}.tmTheme"
+    if not themes_layout_safe or secure_regular_bytes(
+        path, 1_048_576, exact_mode=0o600
+    ) is None:
+        theme_errors.append(color)
+if theme_errors:
+    emit("warn", "codex-themes", "missing or unsafe themes: " + ", ".join(theme_errors))
+else:
+    emit("ok", "codex-themes", "all 8 themes are private regular readable files")
+
+instruction_errors = []
+for label, path in (
+    ("Codex", codex_home / "AGENTS.md"),
+    ("Claude", home / ".claude" / "CLAUDE.md"),
+):
+    text = None if label == "Codex" and not codex_root_safe else bounded_text(path)
+    if text is None or "sp self-name" not in text:
+        instruction_errors.append(label)
+if instruction_errors:
+    emit("warn", "naming-instructions", "self-name instruction missing for: " + ", ".join(instruction_errors))
+else:
+    emit("ok", "naming-instructions", "Codex and Claude self-name instructions are present")
+
+hook_errors = []
+hook_path = home / ".claude" / "hooks" / "nameintent_title.sh"
+hook_payload = secure_regular_bytes(hook_path, 1_048_576, executable=True)
+if hook_payload is None:
+    hook_errors.append("hook file")
+settings_text = bounded_text(home / ".claude" / "settings.json")
+try:
+    settings = json.loads(settings_text or "")
+except ValueError:
+    settings = None
+hooks = settings.get("hooks") if isinstance(settings, dict) else None
+expected_commands = {
+    "~/.claude/hooks/nameintent_title.sh",
+    str(hook_path),
+}
+for event in ("SessionStart", "UserPromptSubmit", "Stop"):
+    entries = hooks.get(event) if isinstance(hooks, dict) else None
+    valid = isinstance(entries, list)
+    covered = False
+    if valid:
+        for group in entries:
+            if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+                valid = False
+                break
+            for hook in group["hooks"]:
+                if not isinstance(hook, dict):
+                    valid = False
+                    break
+                if (
+                    hook.get("type") == "command"
+                    and isinstance(hook.get("command"), str)
+                    and hook["command"] in expected_commands
+                ):
+                    covered = True
+            if not valid:
+                break
+    if not valid or not covered:
+        hook_errors.append(event)
+
+
+def hook_fixture_ok() -> bool:
+    if hook_payload is None:
+        return False
+    fixture_input = json.dumps(
+        {"session_id": "doctor-fixture", "hook_event_name": "SessionStart"}
+    ).encode()
+    with tempfile.TemporaryDirectory(prefix="session-kit-hook-doctor.") as temporary:
+        fixture_home = Path(temporary)
+        sessions = fixture_home / ".claude" / "sessions"
+        sessions.mkdir(parents=True, mode=0o700)
+        (sessions / "doctor-fixture.nameintent").write_text(
+            "Session Kit Doctor Fixture\n", encoding="utf-8"
+        )
+        child = None
+        payload = bytearray()
+        failed = False
+        try:
+            child = subprocess.Popen(
+                [str(hook_path)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                env={
+                    "HOME": str(fixture_home),
+                    "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                    "SESSION_KIT_AUTO_NAME": "0",
+                },
+                start_new_session=True,
+            )
+            assert child.stdin is not None and child.stdout is not None
+            child.stdin.write(fixture_input)
+            child.stdin.close()
+            descriptor = child.stdout.fileno()
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                ready, _, _ = select.select([descriptor], [], [], 0.1)
+                if ready:
+                    block = os.read(descriptor, 4097 - len(payload))
+                    if not block:
+                        break
+                    payload.extend(block)
+                    if len(payload) > 4096:
+                        failed = True
+                        break
+                elif child.poll() is not None:
+                    break
+            else:
+                failed = True
+        except (OSError, ValueError):
+            failed = True
+        finally:
+            if child is not None:
+                failed = not terminate_group(child) or failed
+                if child.stdout is not None:
+                    child.stdout.close()
+        if failed or child is None or child.returncode != 0:
+            return False
+        try:
+            record = json.loads(payload.decode("utf-8", "strict"))
+        except (UnicodeError, ValueError):
+            return False
+        return record == {
+            "hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "sessionTitle": "Session Kit Doctor Fixture",
+            }
+        }
+
+
+if not hook_fixture_ok():
+    hook_errors.append("functional fixture")
+if hook_errors:
+    emit("warn", "naming-hook", "Claude title hook coverage missing: " + ", ".join(hook_errors))
+else:
+    emit("ok", "naming-hook", "Claude title hook covers SessionStart, UserPromptSubmit, and Stop")
+
+active = []
+if os.environ.get("SESSION_KIT_AUTO_NAME", "").strip().casefold() in {"0", "false", "no", "off"}:
+    active.append("SESSION_KIT_AUTO_NAME")
+for name in ("SESSION_KIT_NO_COLOR", "NO_COLOR"):
+    if name in os.environ:
+        active.append(name)
+for name in (".no_shpool_reaper", ".no_shpool_watchdog"):
+    if (home / name).exists() or (home / name).is_symlink():
+        active.append(name)
+if active:
+    emit("warn", "kill-switches", "active: " + ", ".join(active))
+else:
+    emit("ok", "kill-switches", "no supported kill switch is active")
+
+acceptance = config_root / "release-acceptance.json"
+try:
+    acceptance_payload = secure_regular_bytes(acceptance, 16_384, exact_mode=0o600)
+    if acceptance_payload is None:
+        raise ValueError
+    record = json.loads(acceptance_payload.decode("utf-8", "strict"))
+    if not isinstance(record, dict) or set(record) != {
+        "schema_version",
+        "release_id",
+        "platform",
+        "provider_versions",
+        "accepted_on",
+        "evidence",
+    }:
+        raise ValueError
+    versions = record.get("provider_versions")
+    evidence = record.get("evidence")
+    accepted_on = record.get("accepted_on")
+    if (
+        record.get("schema_version") != 1
+        or record.get("release_id") != active_release
+        or record.get("platform") != active_platform
+        or not isinstance(versions, dict)
+        or set(versions) != {"claude", "codex"}
+        or not all(provider_ready.values())
+        or versions != provider_observed
+        or not isinstance(accepted_on, str)
+        or not isinstance(evidence, dict)
+        or set(evidence) != {"unique_colors", "thread_titles", "resume_roundtrip"}
+        or not all(
+            isinstance(value, str)
+            and 1 <= len(value) <= 256
+            and "\n" not in value
+            and "\r" not in value
+            for value in evidence.values()
+        )
+    ):
+        raise ValueError
+    accepted_date = datetime.date.fromisoformat(accepted_on)
+    if accepted_date > datetime.date.today():
+        raise ValueError
+except (OSError, UnicodeError, ValueError):
+    emit("warn", "acceptance", "private release-acceptance.json record is missing or invalid")
+else:
+    emit("ok", "acceptance", "private release acceptance record is present")
+PY
+  ); then
+    while IFS=$'\t' read -r status name detail; do
+      if [[ ${audit_expected[$name]:-0} == 1 && -z ${audit_seen[$name]:-} &&
+            $status =~ ^(ok|warn)$ && -n $detail ]]; then
+        add_check "$status" "$name" "$detail"
+        audit_seen[$name]=1
+      elif [[ -n $status || -n $name || -n $detail ]]; then
+        audit_ok=0
+      fi
+    done <<< "$audit_output"
+    for audit_name in "${audit_names[@]}"; do
+      [[ ${audit_seen[$audit_name]:-0} == 1 ]] || audit_ok=0
+    done
+  else
+    audit_ok=0
+  fi
+  (( audit_ok == 1 )) || add_check warn migration-audit \
+    "extended read-only audit failed or returned an incomplete check set"
   for helper in "${helpers[@]}"; do
     if [[ -x $bin_dir/$helper ]]; then
       add_check ok "$helper" "$bin_dir/$helper"
@@ -1619,6 +2265,8 @@ PY
   atomic_symlink "$install_root/releases/$target" "$install_root/current"
   lifecycle_failpoint current
   install_launchers "$target"
+  install_codex_themes "$target"
+  lifecycle_failpoint themes
   install_platform_services "$target"
   if [[ -f $integration_marker && ! -L $integration_marker ]]; then
     printf 'session-kit-integration-v1 %s\n' "$target" > "$integration_marker"

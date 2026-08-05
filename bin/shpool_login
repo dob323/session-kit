@@ -9,6 +9,7 @@ source "$SCRIPT_DIR/session_kit_common"
 
 STATUS_CMD=${SESSION_KIT_STATUS_CMD:-"$SCRIPT_DIR/shpool_status"}
 SP_CMD=${SESSION_KIT_SP_CMD:-"$SCRIPT_DIR/sp"}
+PROJECTS_TOOL=${SESSION_KIT_PROJECTS_TOOL:-"$SCRIPT_DIR/../lib/sessionkit_inventory/projects.py"}
 
 if [[ ! -t 0 || ! -t 1 || ${SESSION_KIT_NONINTERACTIVE:-0} == 1 ]]; then
   # Still a picker exit: without a logged reason, a window that lands in a
@@ -89,6 +90,143 @@ picker_exit() {
 }
 
 # Shared read wrapper: interrupt = redraw (rc 1), end-of-input = picker ends.
+# ---- live menu ---------------------------------------------------------
+# The list used to be a photograph: whatever was true when the window opened,
+# until a key was pressed. A snapshot costs ~1.5s, so it is collected in the
+# background and adopted only when it changes something on screen.
+LIVE_PID=
+LIVE_FILE=
+LIVE_DONE=
+LIVE_FINGERPRINT=
+
+picker_live_seconds() {
+  local seconds=${SESSION_KIT_PICKER_REFRESH_SECONDS:-5}
+  [[ $seconds =~ ^[0-9]+$ ]] || seconds=0
+  # A repaint REPLACES the menu. A terminal that cannot be cleared would
+  # stack copies down the screen instead, so it stays static.
+  (( PICKER_STYLE )) || seconds=0
+  # Never poll faster than a snapshot takes to collect.
+  (( seconds == 0 || seconds >= 2 )) || seconds=2
+  printf '%s' "$seconds"
+}
+
+# Redrawing under a half-typed line would scrub the echo of characters that
+# are still queued in the terminal. Ask the terminal whether anything is
+# waiting; treat "cannot tell" as waiting, because a wrong redraw is worse
+# than a late one.
+picker_input_pending() {
+  python3 -c '
+import array, fcntl, sys, termios
+
+pending = array.array("i", [0])
+try:
+    fcntl.ioctl(sys.stdin, termios.FIONREAD, pending, True)
+except (OSError, ValueError):
+    raise SystemExit(0)
+raise SystemExit(0 if pending[0] else 1)
+' 2>/dev/null
+}
+
+# What the menu actually shows. Collection timestamps are deliberately absent
+# so an unchanged estate never repaints.
+picker_view_fingerprint() {
+  python3 - "$VIEW" "$PAGE" "$QUERY" <<'PY' 2>/dev/null || printf 'unknown'
+import hashlib
+import json
+import sys
+
+path, page, query = sys.argv[1:4]
+try:
+    with open(path, encoding="utf-8") as handle:
+        data = json.load(handle)
+except (OSError, ValueError):
+    print("unreadable")
+    raise SystemExit(0)
+fields = (
+    "display_shpool_id",
+    "display_provider",
+    "display_title",
+    "display_color",
+    "agent_status",
+    "availability",
+    "active_subagent_count",
+    "automatic_name_state",
+    "terminal_number",
+)
+rows = [
+    [row.get(name) for name in fields]
+    for row in data.get("sessions", [])
+    if isinstance(row, dict)
+]
+picker = data.get("_picker") or {}
+shape = {
+    "rows": rows,
+    "outside": len(data.get("outside_agents", [])),
+    "unavailable": picker.get("unavailable_total"),
+    "stale": data.get("stale"),
+    "page": page,
+    "query": query,
+}
+digest = hashlib.sha256(
+    json.dumps(shape, sort_keys=True, default=str).encode("utf-8")
+).hexdigest()
+print(digest)
+PY
+}
+
+picker_live_start() {
+  [[ -z $LIVE_PID ]] || return 0
+  new_temp login-live || return 1
+  LIVE_FILE=$NEW_TEMP
+  new_temp login-live-done || return 1
+  LIVE_DONE=$NEW_TEMP
+  : > "$LIVE_DONE"
+  # An exited-but-unreaped child still answers `kill -0`, so completion is
+  # published explicitly instead of inferred from the process table.
+  {
+    sk_timeout "${SK_REFRESH_TIMEOUT:-30}" "$STATUS_CMD" --json \
+      > "$LIVE_FILE" 2>/dev/null
+    printf '%s\n' "$?" > "$LIVE_DONE"
+  } &
+  LIVE_PID=$!
+}
+
+picker_live_ready() {
+  [[ -n $LIVE_PID && -n $LIVE_DONE && -s $LIVE_DONE ]]
+}
+
+# 0 only when a fresh snapshot was adopted AND it changes the visible list.
+# The active search and page are preserved: silently resetting a filter the
+# human is reading would be worse than the staleness this replaces.
+picker_live_collect() {
+  picker_live_ready || return 1
+  local status
+  status=$(command cat -- "$LIVE_DONE" 2>/dev/null) || status=1
+  [[ $status =~ ^[0-9]+$ ]] || status=1
+  wait "$LIVE_PID" 2>/dev/null || true
+  LIVE_PID=
+  LIVE_DONE=
+  if (( status != 0 )) || [[ ! -s $LIVE_FILE ]]; then
+    LIVE_FILE=
+    return 1
+  fi
+  local previous_snapshot=$SNAPSHOT previous_view=$VIEW
+  SNAPSHOT=$LIVE_FILE
+  LIVE_FILE=
+  if ! build_view; then
+    SNAPSHOT=$previous_snapshot
+    VIEW=$previous_view
+    return 1
+  fi
+  clamp_page
+  refresh_pending_cache
+  local fingerprint
+  fingerprint=$(picker_view_fingerprint)
+  [[ $fingerprint != "$LIVE_FINGERPRINT" ]] || return 1
+  LIVE_FINGERPRINT=$fingerprint
+  return 0
+}
+
 picker_read() {
   local __sk_read_var=$1 __sk_read_prompt=$2
   PICKER_INTERRUPTED=0
@@ -103,6 +241,54 @@ picker_read() {
     return 1
   fi
   picker_exit input_closed
+}
+
+# The main prompt, kept live. Identical to picker_read from the keyboard's
+# point of view: a read that times out consumes nothing, and a line that is
+# still being typed stays queued in the terminal untouched.
+# Returns 3 when the estate changed and the caller should repaint.
+PICKER_LIVE_STATUS=0
+picker_read_live() {
+  local __sk_live_var=$1 __sk_live_prompt=$2
+  local seconds waited=0
+  seconds=$(picker_live_seconds)
+  if (( seconds == 0 )) || [[ ! -t 0 ]]; then
+    picker_read "$__sk_live_var" "$__sk_live_prompt"
+    return
+  fi
+  PICKER_INTERRUPTED=0
+  LIVE_FINGERPRINT=$(picker_view_fingerprint)
+  printf '%s' "$__sk_live_prompt"
+  while true; do
+    # The status MUST be captured inside the else: after a bare `if` with no
+    # else clause, $? is the status of the `if` statement itself, which is 0.
+    # shellcheck disable=SC2229
+    if IFS= read -r -t 1 "$__sk_live_var"; then
+      return 0
+    else
+      PICKER_LIVE_STATUS=$?
+    fi
+    if (( PICKER_LIVE_STATUS <= 128 )); then
+      if (( PICKER_INTERRUPTED )); then
+        PICKER_INTERRUPTED=0
+        echo
+        return 1
+      fi
+      picker_exit input_closed
+    fi
+    # A finished snapshot is adopted only when nothing is queued at the
+    # prompt. Swapping the list out from under a half-typed command would
+    # change what its number means.
+    if picker_live_ready && ! picker_input_pending && picker_live_collect; then
+      echo
+      return 3
+    fi
+    waited=$(( waited + 1 ))
+    if (( waited >= seconds )); then
+      waited=0
+      picker_live_start || true
+    fi
+  done
 }
 
 new_temp() {
@@ -909,8 +1095,10 @@ show_more_menu() {
         "$unavailable_count" \
         "$([[ $unavailable_count == 1 ]] && printf '' || printf 's')"
     fi
+    printf '  %s  Projects: add, review, or drop the directories new sessions offer\n' \
+      "$(picker_green p)"
     if (( other_count == 0 && pending == 0 && unavailable_count == 0 )); then
-      echo "  Nothing extra right now."
+      echo "  Nothing else right now."
     fi
     echo "  Enter  Back"
     echo
@@ -935,9 +1123,172 @@ show_more_menu() {
           echo "  Nothing to review."
         fi
         ;;
-      *) echo "  Unknown choice. Use o, u, or Enter." ;;
+      p|P)
+        show_projects_menu
+        ;;
+      *) echo "  Unknown choice. Use o, u, p, or Enter." ;;
     esac
   done
+}
+
+# ---- projects ----------------------------------------------------------
+# Adding a project used to mean knowing an alias, a provider keyword, and an
+# absolute path — none of which the picker ever offered. It lives here rather
+# than on the main screen because you add a project a few times a year.
+projects_tool() {
+  [[ -f $PROJECTS_TOOL ]] || return 1
+  python3 "$PROJECTS_TOOL" "$@"
+}
+
+show_projects_menu() {
+  local snapshot answer
+  while true; do
+    new_temp login-projects-state || return 0
+    snapshot=$NEW_TEMP
+    if ! projects_tool --json candidates > "$snapshot" 2>/dev/null; then
+      echo "  The project list is unavailable."
+      return 0
+    fi
+    echo
+    python3 - "$snapshot" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    data = json.load(handle)
+configured = [row for row in data.get("configured", []) if row.get("provider") != "ignore"]
+candidates = data.get("candidates", [])
+ignored = data.get("ignored", [])
+print("  Projects")
+if configured:
+    for number, row in enumerate(configured, 1):
+        print(f"  {number:2}  {row['alias']}: {row['cwd']}")
+else:
+    print("     None yet.")
+if candidates:
+    print(
+        f"     {len(candidates)} directory(s) your providers use "
+        "are not on this list."
+    )
+if ignored:
+    print(f"     {len(ignored)} kept off it for good.")
+PY
+    echo
+    if python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))["candidates"] else 1)' \
+        "$snapshot" 2>/dev/null; then
+      echo "  a  Add a directory · i  Review the ones not listed · d  Drop number · Enter  Back"
+    else
+      echo "  a  Add a directory · d  Drop number · Enter  Back"
+    fi
+    echo
+    picker_read answer "  projects ❯ " || return 0
+    case "$answer" in
+      "") return 0 ;;
+      a|A) projects_add ;;
+      i|I) projects_review "$snapshot" ;;
+      d|D) echo "  Use d followed by a number, such as d 2." ;;
+      d\ *|D\ *) projects_drop "${answer#* }" "$snapshot" ;;
+      *) echo "  Unknown choice. Use a, i, d number, or Enter." ;;
+    esac
+  done
+}
+
+projects_add() {
+  local directory alias provider suggestion
+  echo
+  echo "  Add a project"
+  picker_read directory "  Directory (Enter for $PWD) ❯ " || return 0
+  [[ -n $directory ]] || directory=$PWD
+  if [[ $directory != /* ]]; then
+    echo "  Use an absolute path. Nothing added."
+    return 0
+  fi
+  if [[ ! -d $directory ]]; then
+    echo "  That directory does not exist. Nothing added."
+    return 0
+  fi
+  suggestion=$(projects_tool --json suggest "$directory" 2>/dev/null |
+    python3 -c 'import json,sys; print(json.load(sys.stdin)["alias"])' 2>/dev/null) ||
+    suggestion=""
+  if [[ -n $suggestion ]]; then
+    picker_read alias "  Short name [$suggestion] ❯ " || return 0
+    [[ -n $alias ]] || alias=$suggestion
+  else
+    picker_read alias "  Short name ❯ " || return 0
+    [[ -n $alias ]] || { echo "  A short name is required. Nothing added."; return 0; }
+  fi
+  picker_read provider "  Opens as [claude] ❯ " || return 0
+  [[ -n $provider ]] || provider=claude
+  case "$provider" in
+    claude|codex|shell) ;;
+    *) echo "  Choose claude, codex, or shell. Nothing added."; return 0 ;;
+  esac
+  if projects_tool add "$alias" "$provider" "$directory"; then
+    sk_log_action projects_add added || true
+  fi
+}
+
+projects_review() {
+  local snapshot=$1 answer chosen
+  echo
+  python3 - "$snapshot" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    candidates = json.load(handle).get("candidates", [])
+print("  Not on your list")
+for number, row in enumerate(candidates, 1):
+    print(f"  {number:2}  [{row['provider'].title():6}] {row['cwd']}  →  {row['alias']}")
+PY
+  echo
+  echo "  numbers/ranges: add those · a: add all · x: never list them · Enter: Back"
+  echo
+  picker_read answer "  review ❯ " || return 0
+  [[ -n $answer ]] || return 0
+  if [[ ${answer,,} != x ]]; then
+    projects_tool import --select "$answer" || true
+    return 0
+  fi
+  # x means all of them, permanently.
+  chosen=$(projects_tool candidates --select a 2>/dev/null) || {
+    echo "  The list is unavailable. Nothing changed."
+    return 0
+  }
+  local -a directories=()
+  mapfile -t directories <<<"$chosen"
+  local directory count=0
+  for directory in "${directories[@]}"; do
+    [[ -n $directory ]] || continue
+    projects_tool ignore "$directory" >/dev/null || continue
+    count=$(( count + 1 ))
+  done
+  echo "  Kept $count directory(s) off the list for good."
+}
+
+projects_drop() {
+  local number=$1 snapshot=$2 directory
+  [[ $number =~ ^[0-9]+$ ]] || {
+    echo "  Use d followed by a number, such as d 2."
+    return 0
+  }
+  directory=$(python3 - "$snapshot" "$number" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    data = json.load(handle)
+rows = [row for row in data.get("configured", []) if row.get("provider") != "ignore"]
+index = int(sys.argv[2])
+if index < 1 or index > len(rows):
+    raise SystemExit(2)
+print(rows[index - 1]["cwd"])
+PY
+) || {
+    echo "  Choose a number shown here. Nothing changed."
+    return 0
+  }
+  projects_tool ignore "$directory" || true
 }
 
 show_other_provider_sessions() {
@@ -1459,6 +1810,10 @@ import unicodedata
 
 source, destination = map(Path, sys.argv[1:3])
 projects = []
+# The provider is already chosen before this list is shown, so two configured
+# rows that differ only by provider would render as identical lines. Keep the
+# first row for each directory and show it under its configured alias.
+listed = set()
 if source.is_file() and not source.is_symlink():
     for line in source.read_text(encoding="utf-8").splitlines():
         if not line.strip() or line.lstrip().startswith("#"):
@@ -1477,6 +1832,13 @@ if source.is_file() and not source.is_symlink():
             )
             and os.path.isdir(cwd)
         ):
+            try:
+                key = os.path.realpath(cwd)
+            except OSError:
+                key = cwd
+            if key in listed:
+                continue
+            listed.add(key)
             projects.append({"alias": alias, "cwd": cwd})
 default = next((index for index, row in enumerate(projects, 1) if row["alias"] == "sl"), 1 if projects else None)
 with destination.open("w", encoding="utf-8") as handle:
@@ -1656,7 +2018,9 @@ for number,row in enumerate(json.load(open(sys.argv[1])).get("entries",[]),1):
     )
     title=clean(row.get("title"))
     old_id=clean(row.get("display_old_shpool_id"))
-    print(f"  {number:2}  [{provider}] {title} [{old_id}]")
+    conflicts=", ".join(clean(value) for value in row.get("conflict_fields",[]))
+    suffix=f" [review required: conflicting {conflicts}]" if conflicts else ""
+    print(f"  {number:2}  [{provider}] {title} [{old_id}]{suffix}")
 PY
   echo
   echo "  numbers/ranges: restore selected | a: restore all"
@@ -1699,7 +2063,7 @@ PY
     return
   }
 
-  local number encoded generation old_id provider uuid cwd launched attempt acknowledged active_target active_number
+  local number encoded generation old_id provider uuid cwd actionable conflicts launched attempt acknowledged active_target active_number
   local -a values=()
   # The selection rides on fd 3 so the loop body keeps the terminal on stdin:
   # with the selection on stdin, choose_number's menu read consumed the NEXT
@@ -1712,10 +2076,14 @@ import base64,json,sys
 row=json.load(open(sys.argv[1])).get("entries",[])[int(sys.argv[2])-1]
 for key in ("source_generation_key","old_shpool_id","provider","uuid","cwd"):
     print(base64.b64encode(str(row.get(key) or "").encode()).decode())
+print(base64.b64encode(", ".join(map(str,row.get("conflict_fields",[]))).encode()).decode())
+# Keep the nonempty actionable flag last. Bash command substitution strips
+# trailing blank lines, so an empty conflicts field cannot safely be last.
+print(base64.b64encode(str(row.get("actionable",True)).lower().encode()).decode())
 PY
 )
     mapfile -t values <<<"$encoded"
-    if (( ${#values[@]} != 5 )); then
+    if (( ${#values[@]} != 7 )); then
       printf '  Recovery record %s is incomplete; it was retained.\n' "$number" >&2
       continue
     fi
@@ -1724,6 +2092,17 @@ PY
     provider=$(decode64 "${values[2]}")
     uuid=$(decode64 "${values[3]}")
     cwd=$(decode64 "${values[4]}")
+    conflicts=$(decode64 "${values[5]}")
+    actionable=$(decode64 "${values[6]}")
+    if [[ -z $generation || -z $old_id || -z $provider || -z $uuid || -z $cwd ]]; then
+      printf '  Recovery record %s is incomplete; it was retained.\n' "$number" >&2
+      continue
+    fi
+    if [[ $actionable != true ]]; then
+      printf '  Recovery record %s has conflicting launch metadata (%s); it requires manual review and was retained.\n' \
+        "$number" "${conflicts:-unknown fields}" >&2
+      continue
+    fi
     active_target=$(active_target_for_uuid "$provider" "$uuid") || active_target=ambiguous
     case "$active_target" in
       managed:*)
@@ -1848,7 +2227,16 @@ while true; do
   picker_self_upgrade
   render_main
   choice=""
-  picker_read choice "  $(picker_green '❯') " || continue
+  picker_read_live choice "  $(picker_green '❯') "
+  live_status=$?
+  if (( live_status == 3 )); then
+    # The estate changed while the prompt sat idle. This REPLACES the menu:
+    # without the clear, every repaint would stack another copy down the
+    # screen.
+    picker_clear_screen
+    continue
+  fi
+  (( live_status == 0 )) || continue
   FORGIVE_EMPTY=$CONFIRM_FORGIVE
   CONFIRM_FORGIVE=0
   case "$choice" in

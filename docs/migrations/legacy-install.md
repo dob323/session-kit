@@ -26,20 +26,34 @@ terminal data and must never enter the public repository.
 
 ## Safe sequence
 
-1. Disable automatic picker, cleanup, watchdog, and new journals.
-2. Verify the backup.
-3. Build and verify the target immutable release.
-4. Dry-run stable launcher installation.
-5. Convert host configuration without changing active sessions.
-6. Replace shell integration with one guarded source block.
-7. Convert names under the private configuration lock.
-8. Plan recovery-state conversion from frozen and current identity evidence.
-9. Review each affected conversation before applying the plan.
-10. Take a strict live inventory and compare generations.
-11. Publish the target integration marker only after checks pass.
-12. Verify listing and a new login without moving, killing, repairing, or
+1. Disable automatic picker, cleanup, watchdog, new journals, and every other
+   process that can write the mutable source state. Verify that those writers
+   are stopped before copying anything.
+2. Capture a second frozen shpool list and exact provider inventory. Stop if
+   either the daemon generation or managed-session set changed since the first
+   frozen evidence.
+3. Verify the backup.
+4. Build and verify the target immutable release without starting its services.
+5. Dry-run stable launcher installation.
+6. Copy mutable configuration and state once from the frozen source. Verify the
+   copied bytes, checksums, file types, modes, and owners before activation.
+7. Convert host configuration without changing active sessions.
+8. Replace shell integration with one guarded source block.
+9. Convert names under the private configuration lock.
+10. Plan recovery-state conversion from frozen and current identity evidence.
+11. Review each affected conversation before applying the plan.
+12. Take a strict live inventory and compare generations.
+13. Publish the target integration marker and start target services only after
+    the copy, conversion, and verification checks all pass.
+14. Verify listing and a new login without moving, killing, repairing, or
     recovering an active session.
-13. Keep the rollback material until an independent rollback check passes.
+15. Keep the rollback material until an independent rollback check passes.
+
+Never copy or synchronize mutable state over a target whose Session Kit
+services are already running. If a target writer was started too early, stop
+it with the required operational approval, freeze the source again, and repeat
+the copy and verification from the beginning. Do not treat a later overwrite
+as equivalent evidence.
 
 Stop on a changed daemon generation, ambiguous provider identity, unsafe file,
 unexpected state shape, missing backup, or configuration mismatch.

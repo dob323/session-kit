@@ -14,8 +14,10 @@ k <numbers>     close displayed sessions: k 5 · k 5, 6, 8 · k 4-7
 x <numbers>     compatibility alias for k
 /text           search names, providers, projects, and exact IDs
 r               refresh live state and clear search
+m               more: outside roots, recovery, and projects
 o               show provider roots outside shpool, read-only
 u               review exact recovery records
+p               add, review, or drop projects (under m)
 name <number>   set a local provider title
 name reset #    remove the local title
 fork <number>   create an independent provider conversation
@@ -26,6 +28,19 @@ Enter           return to a regular terminal
 
 Selecting a session already open elsewhere shows a move menu. Session Kit
 never moves it without a separate, explicit choice.
+
+An idle picker keeps itself current. It collects a snapshot in the background
+every few seconds and repaints only when something visible changes, so it
+never runs in front of the prompt and never repaints while a command is
+half-typed — the number you are looking at cannot change under you. The
+active search and page survive a repaint. Set
+`SESSION_KIT_PICKER_REFRESH_SECONDS=0` to switch it off, or to a number of
+seconds (minimum 2) to change the pace.
+
+Leaving a conversation with `/exit` closes that terminal and returns to the
+picker. A provider that exits non-zero has crashed, so it stops at a menu
+offering to reopen the conversation, keep the terminal, open a shell, or
+close. Touch `~/.sk_keep_exit_menu` to get that menu on every exit.
 
 Normal rows omit shpool IDs and provider UUIDs. Use `sp detail`, JSON, or an
 explicit search for exact identity. Colors identify provider, availability,
