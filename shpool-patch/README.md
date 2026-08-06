@@ -1,15 +1,36 @@
 # Optional shpool 0.11.0 patches
 
 Session Kit uses official shpool 0.11.0 by default. This directory contains
-optional one-file source patches: `0001` for a heartbeat failure confirmed in
-daemon logs, `0002` for input-mode loss on reattach, and `0003` for sessions
-that become unkillable once their shell dies on its own. Apply them in
-numeric order; `0002` touches a different file and is independent of the
-other two.
+optional one-file source patches: `0001` for a heartbeat failure, `0002` for
+input-mode loss on reattach, `0003` for sessions that become unkillable once
+their shell dies on its own, and `0004` for a daemon-wide deadlock in the
+detach handler. Apply them in numeric order; `0002`, `0003` and `0004` each
+touch an independent region and apply cleanly to pristine `v0.11.0` on their
+own.
+
+**Start with `0004`.** It is the only patch here backed by a reproduced
+production outage, and it is the only one whose failure mode is daemon-wide
+rather than confined to a single session. See
+[Detach deadlock patch (0004)](#detach-deadlock-patch-0004).
 
 The patches are not installed, built, selected, or activated by Session Kit.
 
-## Problem
+## Heartbeat ack patch (0001)
+
+> **Field correction, 2026-08-06.** A daemon-wide freeze that looked like this
+> patch's territory — sessions listed but unopenable, `attaching new client
+> stream to shell->client thread` in the log — was **not** caused by the
+> heartbeat path. The `waiting for heartbeat ack` / `timed out waiting on
+> receive operation` lines below never appeared in that daemon's log at all;
+> the only heartbeat error on record was a benign `sending heartbeat ack` on a
+> disconnected channel during a normal kill teardown. The real cause was the
+> unbounded detach handshake described in
+> [Detach deadlock patch (0004)](#detach-deadlock-patch-0004).
+>
+> The "do not apply without the matching acknowledgement evidence" rule below
+> held up: applying `0001` on the strength of the attach-failure line alone
+> would have shipped a change that fixed nothing. Check for the ack lines
+> specifically, and rule out `0004` first.
 
 In shpool 0.11.0, the heartbeat sender treats a send timeout as a busy handler
 and continues. The acknowledgement receiver can treat the same timeout as
@@ -134,6 +155,90 @@ Caused by:
 `0003-kill-tolerates-an-already-dead-shell.patch` treats ESRCH as the state
 kill exists to reach: the kill succeeds and the session is removed. Both the
 SIGHUP and SIGKILL-escalation sites are guarded.
+
+## Detach deadlock patch (0004)
+
+This is the one patch here with a confirmed production outage behind it
+(2026-08-06: ten sessions unreachable for nineteen minutes).
+
+`handle_detach` in `libshpool/src/daemon/server.rs` holds the **global session
+table lock** across an unbounded control-channel handshake:
+
+```rust
+let shells = self.shells.lock();                  // global lock HELD
+    let shell_to_client_ctl = s.shell_to_client_ctl.lock();
+    shell_to_client_ctl.client_connection
+        .send(shell::ClientConnectionMsg::Disconnect)   // unbounded send
+    let status = shell_to_client_ctl.client_connection_ack
+        .recv()                                         // unbounded recv, no timeout
+```
+
+`client_connection` and `client_connection_ack` are both created as
+`crossbeam_channel::bounded(0)` — **rendezvous** channels. Neither half
+completes unless the session's shell→client thread is sitting in its `select!`
+loop ready to receive.
+
+A client whose socket has stopped draining — a stalled ssh window, a suspended
+laptop, a terminal tab that went away without closing cleanly — leaves that
+thread blocked in `write()` to the client socket instead. The detach then waits
+forever while holding the global lock, and every `list`, `attach`, `detach` and
+`kill` in the daemon queues behind it. The daemon still accepts connections
+(its main thread stays healthy in `accept()`), which is what makes this look
+like a hang rather than a crash.
+
+**One unresponsive client window takes down every session in the daemon.**
+
+Log signature — a `handle_detach` span that opens and never closes, followed by
+`handle_list` spans that all stop at the same place:
+
+```text
+handle_conn{cid=N}:handle_detach:lock(shells): new
+handle_conn{cid=N}:handle_detach:lock(shells):lock(shell_to_client_ctl){s="..."}: new
+... no matching close, ever ...
+handle_conn{cid=M}:handle_list:lock(shells): new
+... no matching close, ever ...
+```
+
+Confirm with a bounded probe: `timeout 30 shpool list` exiting 124 while the
+daemon process is alive and its main thread is in `accept()`.
+
+### Change
+
+`0004-detach-must-not-hold-the-shells-lock.patch` restructures `handle_detach`
+into three phases:
+
+1. resolve the requested names to `Arc` control handles under the shells lock,
+   then **drop the lock**;
+2. run the handshake with the global lock released and both halves bounded by
+   `SESSION_MSG_TIMEOUT`;
+3. re-take the shells lock briefly for the `last_disconnected_at` bookkeeping.
+
+This is not a new design — it is the pattern upstream already uses for the
+session-message detach in the same file (`SessionMessageRequestPayload::Detach`),
+and every other user of that control channel is bounded too
+(`SHELL_TO_CLIENT_CTL_TIMEOUT` at the attach and disconnect sites).
+`handle_detach` was the single call site that was neither scoped nor bounded.
+
+A session that cannot complete the handshake in time is reported as
+`not_attached` instead of stalling the daemon. Both callers handle that
+correctly already: the background detach behind a takeover treats it as a
+non-fatal `debug!` and continues, and an explicit `shpool detach` surfaces it
+as an error, which is the accurate signal that the detach did not happen.
+
+Worst case after the patch is one unreachable session, never a daemon-wide
+outage.
+
+### Limits
+
+The patch bounds the wait; it does not explain why a shell→client thread
+stopped servicing its control channel in the first place. That remains
+uninvestigated — the containment is deliberate, because no single-session fault
+should be able to take the daemon down regardless of its cause.
+
+Build, activation and rollback are the same as for `0001`, including the
+daemon-restart requirement. Because a restart ends every managed terminal
+process, capture exact provider recovery identities first — after the restart
+they are recoverable only through the login chooser's recovery review.
 
 ## License and upstream
 

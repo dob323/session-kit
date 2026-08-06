@@ -124,6 +124,16 @@ PY
 # critical and wake a phone. The picker banner is the guaranteed record.
 notify() {
   local subject=$1 body=$2
+  # An unset notifier is a configuration gap, not a broken path. Reporting it
+  # as "'' is not executable" reads like a permissions problem and hides the
+  # fact that NOTHING is wired up: on 2026-08-06 the watchdog correctly
+  # detected a daemon-wide freeze and the alert went nowhere, because
+  # SESSION_KIT_WATCHDOG_NOTIFY had never been set. Name the two cases apart so
+  # the log says which one it is.
+  if [[ -z $NOTIFY_CMD ]]; then
+    log "notify skipped: SESSION_KIT_WATCHDOG_NOTIFY is not set, so no alert is delivered anywhere"
+    return 0
+  fi
   if [[ ! -x $NOTIFY_CMD ]]; then
     log "notify skipped: $NOTIFY_CMD is not executable"
     return 0

@@ -168,6 +168,32 @@ processes if the proof is wrong, and depend on provider-native recovery being
 available. Quiet output alone never qualifies. Review the owner-only watchdog
 log and test manual `sp repair` before enabling this mode.
 
+## Watchdog alerts
+
+`SESSION_KIT_WATCHDOG_NOTIFY` is **unset by default, so the watchdog raises no
+alert anywhere.** It detects and logs conditions either way, but without a
+notifier the only record is the owner-only watchdog log and the picker banner —
+nobody is told. Set it to an executable that accepts:
+
+```text
+--type=<id> --severity=warning --title=<subject> --body=<text>
+```
+
+`SESSION_KIT_WATCHDOG_ALERT_TYPE` sets the `--type` value and defaults to
+`session-kit.watchdog`. Severity is always `warning`; an automatic repair must
+never fire a critical.
+
+Wire this up if you rely on the watchdog at all. A real 2026-08-06 daemon-wide
+freeze was detected correctly and reported nowhere, because the notifier had
+never been configured — the operator found out by trying to open a session.
+Prefer a systemd drop-in over editing the unit, so a reinstall cannot drop it:
+
+```ini
+# ~/.config/systemd/user/session-kit-watchdog.service.d/notify.conf
+[Service]
+Environment=SESSION_KIT_WATCHDOG_NOTIFY=/path/to/your/notifier
+```
+
 ## Color
 
 The picker uses color only when output is an interactive, supported terminal.
