@@ -26,7 +26,7 @@ install_launchers() {
 }
 
 install_codex_themes() {
-  local release_id=$1 codex_theme_root color theme_file destination temporary
+  local release_id=$1 codex_theme_root theme_name theme_file destination temporary
   if [[ ! -d $install_root/releases/$release_id/config/codex-themes ]]; then
     local -a obsolete_themes=()
     mapfile -t obsolete_themes < <(codex_theme_layout targets)
@@ -38,19 +38,25 @@ install_codex_themes() {
     return 0
   fi
   codex_theme_root=$(codex_theme_layout create)
-  for color in "${codex_theme_names[@]}"; do
-    theme_file=$install_root/releases/$release_id/config/codex-themes/sk-$color.tmTheme
-    # A release ships themes for the palette it assigns, and this list is the
-    # union across releases. Rolling back to a release with a smaller palette
-    # must not fail because the code performing the rollback knows names that
-    # release never shipped, so an absent theme is skipped rather than fatal.
-    # An unsafe one still aborts: absence is a smaller palette, a symlink or a
-    # non-regular file is a tampered release.
-    if [[ ! -e $theme_file && ! -L $theme_file ]]; then
-      continue
-    fi
+  # Install the themes THIS release ships, rather than the names this program
+  # happens to know. Those are not the same list, in both directions. An update
+  # runs under the PREVIOUS launcher, so a release that adds a colour would
+  # install the older, smaller set and leave the new windows untinted until a
+  # second update. A rollback has the mirror problem: the release being
+  # restored predates names the running code knows, and requiring them refuses
+  # the rollback outright.
+  for theme_file in \
+    "$install_root/releases/$release_id/config/codex-themes"/sk-*.tmTheme; do
+    [[ -e $theme_file || -L $theme_file ]] || continue
+    theme_name=${theme_file##*/}
+    # The release directory is trusted only as far as its shape: install
+    # nothing whose name is not exactly a kit theme, and nothing that is not a
+    # plain file. Absence means a smaller palette; a symlink means a tampered
+    # release.
+    [[ $theme_name =~ ^sk-[a-z]+\.tmTheme$ ]] ||
+      die "release Codex theme name is unsafe: $theme_name"
     [[ -f $theme_file && ! -L $theme_file ]] ||
-      die "release Codex theme is unsafe: sk-$color.tmTheme"
+      die "release Codex theme is unsafe: $theme_name"
     destination=$codex_theme_root/${theme_file##*/}
     temporary=$(mktemp "$codex_theme_root/.${theme_file##*/}.XXXXXX")
     if ! install -m 0600 "$theme_file" "$temporary"; then
