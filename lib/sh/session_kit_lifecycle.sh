@@ -253,12 +253,28 @@ elif operation == "recover":
         )
     ]
     if theme_entries:
-        if len(theme_entries) != len(expected_themes):
-            raise SystemExit("session-kit: invalid recorded theme transaction targets")
         theme_paths = [pathlib.Path(entry["path"]) for entry in theme_entries]
+        recorded_names = [path.name for path in theme_paths]
+        # A transaction records the themes the release it ran for actually
+        # shipped, and this list is the union across releases. Requiring the
+        # whole list would refuse to recover a transaction written by a release
+        # with a smaller palette, so require the recorded names to appear in
+        # canonical order without gaps in meaning -- a subsequence -- and to be
+        # distinct. An unknown or reordered name still fails.
+        remaining = list(expected_themes)
+        ordered = True
+        for name in recorded_names:
+            while remaining and remaining[0] != name:
+                remaining.pop(0)
+            if not remaining:
+                ordered = False
+                break
+            remaining.pop(0)
         parents = {path.parent for path in theme_paths}
         if (
-            [path.name for path in theme_paths] != expected_themes
+            not ordered
+            or not recorded_names
+            or len(set(recorded_names)) != len(recorded_names)
             or len(parents) != 1
             or next(iter(parents)).name != "themes"
         ):

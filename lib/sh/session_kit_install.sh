@@ -40,8 +40,17 @@ install_codex_themes() {
   codex_theme_root=$(codex_theme_layout create)
   for color in "${codex_theme_names[@]}"; do
     theme_file=$install_root/releases/$release_id/config/codex-themes/sk-$color.tmTheme
+    # A release ships themes for the palette it assigns, and this list is the
+    # union across releases. Rolling back to a release with a smaller palette
+    # must not fail because the code performing the rollback knows names that
+    # release never shipped, so an absent theme is skipped rather than fatal.
+    # An unsafe one still aborts: absence is a smaller palette, a symlink or a
+    # non-regular file is a tampered release.
+    if [[ ! -e $theme_file && ! -L $theme_file ]]; then
+      continue
+    fi
     [[ -f $theme_file && ! -L $theme_file ]] ||
-      die "release Codex theme is missing or unsafe: sk-$color.tmTheme"
+      die "release Codex theme is unsafe: sk-$color.tmTheme"
     destination=$codex_theme_root/${theme_file##*/}
     temporary=$(mktemp "$codex_theme_root/.${theme_file##*/}.XXXXXX")
     if ! install -m 0600 "$theme_file" "$temporary"; then
