@@ -85,6 +85,48 @@ own source record.
 Other init systems, macOS before 14, and a missing process view stop before
 installation. There is no preview switch that bypasses these checks.
 
+### Linux prerequisites
+
+A minimal server image usually lacks several tools the preflight requires. On
+Debian or Ubuntu:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y python3 procps diffutils findutils util-linux \
+  bsdextrautils coreutils curl
+```
+
+`procps` supplies `ps` and `pgrep`, `diffutils` supplies `cmp`, and `script` and
+`flock` come from the util-linux packages. The preflight names anything still
+missing rather than failing part-way through an install.
+
+shpool is not packaged by any distribution, so build it with a current Rust
+toolchain:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
+cargo install shpool --version 0.11.0 --locked
+```
+
+Read the [shpool](#shpool) section below before running that on a machine you
+intend to rely on.
+
+#### Keep user services running after you log out
+
+Session Kit's services belong to your user's systemd manager, which by default
+stops when your last session ends. On a headless machine reached only over SSH,
+that means the watchdog and the cleanup timer stop the moment you disconnect,
+and managed sessions lose their supervision:
+
+```bash
+loginctl enable-linger "$USER"
+loginctl show-user "$USER" --property=Linger
+```
+
+The second command must report `Linger=yes`. Enable this before
+`session-kit services enable`, not after.
+
 ### macOS prerequisites
 
 Install the supported toolchain if the commands are not already available:
@@ -101,9 +143,20 @@ silently replaced. The system Apple Bash is not used for managed sessions.
 
 ## shpool
 
-Use official shpool 0.11.0 by default. Session Kit includes an optional source
-patch for one heartbeat acknowledgement timeout. It is not installed
-automatically. Review [the patch guide](../shpool-patch/README.md).
+Use official shpool 0.11.0 by default. Session Kit ships four optional source
+patches against that release and installs none of them automatically. Review
+[the patch guide](../shpool-patch/README.md) before deciding.
+
+Read about `0004` first. Stock 0.11.0 can deadlock on detach and make every
+managed session unreachable at once — the daemon stays alive and accepting
+connections while every list, attach, and detach blocks forever, and it does not
+recover on its own. One stalled SSH window is enough to trigger it. The other
+three patches address narrower problems.
+
+If you apply a patch, record the resulting binary's fingerprint as the last step
+of the rebuild. The patch guide gives the exact command. Skipping it leaves the
+watchdog reporting a changed binary on every pass for a change you made
+deliberately, and `session-kit doctor` will tell you so.
 
 With a current Rust toolchain:
 
