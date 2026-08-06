@@ -192,9 +192,7 @@ def record_provider_exit(
         "shell_start_ticks": shell_start_ticks,
         "provider": provider,
         "provider_exited_at_monotonic_ns": (
-            time.monotonic_ns()
-            if now_monotonic_ns is None
-            else now_monotonic_ns
+            time.monotonic_ns() if now_monotonic_ns is None else now_monotonic_ns
         ),
         "exit_code": exit_code,
         "input_tracking": input_tracking,
@@ -412,10 +410,7 @@ def persist_last_exact(
             continue
         document = None
         prior = prior_by_id.get(item.get("shpool_id_raw"))
-        if (
-            isinstance(prior, Mapping)
-            and _same_shell_generation(item, prior)
-        ):
+        if isinstance(prior, Mapping) and _same_shell_generation(item, prior):
             document = _last_exact_document(
                 prior,
                 state_dir=state_dir,
@@ -544,8 +539,7 @@ def apply_provider_exit_states(
             lifecycle is None
             or lifecycle["boot_id"] != boot_id
             or lifecycle["shell_pid"] != shell.get("pid")
-            or lifecycle["shell_start_ticks"]
-            != shell.get("process_start_ticks")
+            or lifecycle["shell_start_ticks"] != shell.get("process_start_ticks")
         ):
             continue
         provider = lifecycle["provider"]
@@ -584,9 +578,7 @@ def apply_provider_exit_states(
         ]
         item["provider_exit_code"] = lifecycle["exit_code"]
         item["provider_exit_input_tracking"] = lifecycle["input_tracking"]
-        item["user_input_after_provider_exit"] = lifecycle[
-            "user_input_after_exit"
-        ]
+        item["user_input_after_provider_exit"] = lifecycle["user_input_after_exit"]
         item["provider_exit_keep"] = lifecycle["keep"]
         if identity_hint is not None:
             item["_terminal_identity_hint"] = identity_hint

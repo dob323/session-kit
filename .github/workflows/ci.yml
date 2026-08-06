@@ -147,6 +147,7 @@ jobs:
             lib/sessionkit_inventory/collector.py \
             lib/sessionkit_inventory/colors.py \
             lib/sessionkit_inventory/common.py \
+            lib/sessionkit_inventory/lifecycle.py \
             lib/sessionkit_inventory/migration.py \
             lib/sessionkit_inventory/model.py \
             lib/sessionkit_inventory/names.py \
@@ -156,6 +157,7 @@ jobs:
             lib/sessionkit_inventory/providers.py \
             lib/sessionkit_inventory/providers_claude.py \
             lib/sessionkit_inventory/providers_codex.py \
+            lib/sessionkit_inventory/reaper.py \
             lib/sessionkit_inventory/recovery.py \
             lib/sessionkit_inventory/render.py \
             lib/sessionkit_inventory/self_name.py \

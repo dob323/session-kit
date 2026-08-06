@@ -18,9 +18,7 @@ from .state_io import atomic_write_private_json, read_private_json
 AUTO_CLOSE_SCHEMA_VERSION = 1
 DEFAULT_AUTO_CLOSE_HOURS = 72
 MAX_AUTO_CLOSE_HOURS = 24 * 365
-GENERATED_SESSION_RE = re.compile(
-    r"s[0-9]{8}-[0-9]{6}-[1-9][0-9]*(?:-[1-9][0-9]*)?"
-)
+GENERATED_SESSION_RE = re.compile(r"s[0-9]{8}-[0-9]{6}-[1-9][0-9]*(?:-[1-9][0-9]*)?")
 
 
 def _positive_int(value: Any) -> bool:
@@ -71,8 +69,11 @@ def scan_shell_facts(
             continue
         try:
             comm = (entry / "comm").read_text(encoding="utf-8").strip()
-            cmdline = (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode(
-                "utf-8", "replace"
+            cmdline = (
+                (entry / "cmdline")
+                .read_bytes()
+                .replace(b"\0", b" ")
+                .decode("utf-8", "replace")
             )
             environ = (entry / "environ").read_bytes().split(b"\0")
         except OSError:
@@ -164,9 +165,7 @@ def _safe_candidate(
     session_id = row.get("name")
     shell = item.get("shpool_shell") if isinstance(item, Mapping) else None
     recovery = item.get("recovery") if isinstance(item, Mapping) else None
-    exited_identity = (
-        item.get("exited_identity") if isinstance(item, Mapping) else None
-    )
+    exited_identity = item.get("exited_identity") if isinstance(item, Mapping) else None
     provider = item.get("exited_provider") if isinstance(item, Mapping) else None
     exit_ns = (
         item.get("provider_exited_at_monotonic_ns")
@@ -176,11 +175,7 @@ def _safe_candidate(
     if not _positive_int(exit_ns):
         return None
     assert isinstance(exit_ns, int)
-    uuid = (
-        valid_uuid(recovery.get("uuid"))
-        if isinstance(recovery, Mapping)
-        else None
-    )
+    uuid = valid_uuid(recovery.get("uuid")) if isinstance(recovery, Mapping) else None
     if (
         not isinstance(session_id, str)
         or not GENERATED_SESSION_RE.fullmatch(session_id)
@@ -401,9 +396,7 @@ def plan_from_environment(
             try:
                 now_monotonic_ns = int(raw_test_clock)
             except ValueError as exc:
-                raise CollectionError(
-                    "auto-close test clock is invalid"
-                ) from exc
+                raise CollectionError("auto-close test clock is invalid") from exc
             if not _positive_int(now_monotonic_ns):
                 raise CollectionError("auto-close test clock is invalid")
     observation_path = state_dir / "auto-close-observations.json"
@@ -441,12 +434,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.command == "plan":
-            _, candidates = plan_from_environment(
-                write_state=not args.no_write
-            )
-            print(
-                f"auto_candidates={len(candidates['candidates'])} actions=0"
-            )
+            _, candidates = plan_from_environment(write_state=not args.no_write)
+            print(f"auto_candidates={len(candidates['candidates'])} actions=0")
             return 0
         candidate = read_private_json(
             Path(args.candidate),
@@ -455,15 +444,9 @@ def main(argv: list[str] | None = None) -> int:
         if not isinstance(candidate, Mapping):
             raise CollectionError("auto-close candidate is malformed")
         _, current = plan_from_environment(write_state=False)
-        matches = [
-            item
-            for item in current["candidates"]
-            if item == candidate
-        ]
+        matches = [item for item in current["candidates"] if item == candidate]
         if len(matches) != 1:
-            raise CollectionError(
-                "auto-close candidate changed or is no longer safe"
-            )
+            raise CollectionError("auto-close candidate changed or is no longer safe")
         print("auto-close candidate verified")
         return 0
     except (CollectionError, OSError) as exc:
