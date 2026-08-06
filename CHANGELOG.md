@@ -4,6 +4,30 @@ Session Kit follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-08-06
+
+### Fixed
+
+- Added optional shpool patch `0004`, which fixes a detach deadlock in shpool
+  0.11.0 that can make every managed session unreachable at once. Upstream
+  `handle_detach` holds the global session-table lock across an unbounded send
+  and receive on two rendezvous channels, so one client whose socket has stopped
+  draining parks the lock for every other session. The patch resolves under the
+  lock, drops it, performs a bounded handshake, then re-locks briefly for
+  bookkeeping, matching the pattern upstream already uses elsewhere in the same
+  file. It applies to pristine `v0.11.0` independently of patches `0001`-`0003`.
+
+### Changed
+
+- Corrected the write-up for patch `0001`. It addresses heartbeat acknowledgement
+  timeouts and would not have prevented the detach deadlock; the notes now say so
+  and point readers at `0004` first.
+- The watchdog now distinguishes an unset notifier from a broken one. With
+  `SESSION_KIT_WATCHDOG_NOTIFY` unset it logged that the empty string was not
+  executable, which reads like a misconfigured path rather than an absent
+  configuration. Documented the variable, including that leaving it unset means
+  no alert reaches anyone.
+
 ## [0.1.5] - 2026-08-05
 
 ### Changed
