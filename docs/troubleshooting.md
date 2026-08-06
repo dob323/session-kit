@@ -216,10 +216,36 @@ Repair ends the unreachable managed terminal and resumes the exact provider
 conversation in a new one. It refuses attached, ambiguous, or UUID-less
 targets.
 
+## Every session is unreachable at once
+
+The daemon is alive and still accepting connections, but every `sp` command,
+attach, and detach blocks forever. Nothing times out and it does not recover on
+its own.
+
+This is not Session Kit state, and no Session Kit command can clear it: the
+commands block for the same reason everything else does. `sp repair` will not
+help.
+
+The cause is a detach deadlock in shpool 0.11.0. Upstream `handle_detach` holds
+the global session-table lock across an unbounded send and receive on two
+rendezvous channels, so a single client whose socket has stopped draining parks
+the lock for every session. One stalled SSH window is enough.
+
+The fix is the optional `0004` patch, which requires rebuilding the shpool
+binary and restarting the daemon. Read
+[the patch notes](../shpool-patch/README.md) first.
+
+After any daemon restart, conversations are not lost. Open a new terminal, start
+the picker, and press `u` to review exact conversation recovery; opening that
+view changes nothing on its own. An inventory that looks empty immediately after
+a restart is a stale read, not deleted work.
+
 ## Changed shpool binary report
 
 A package or Cargo update may have replaced the binary used by the running
-daemon. Do not restart the daemon as a diagnostic step. Compare the running
+daemon. This is easy to miss, because a rebuilt shpool silently discards any
+patch you had applied, and the failure only appears later as the deadlock
+above. Do not restart the daemon as a diagnostic step. Compare the running
 binary, prior binary, active sessions, and optional patch choice first.
 
 ## Report a problem
