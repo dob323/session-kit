@@ -3,9 +3,9 @@
 Session Kit welcomes focused bug reports, feature requests, documentation
 fixes, and pull requests.
 
-The project is preparing a Linux and macOS `v0.1.0` beta. Reports about
-provider compatibility, lifecycle safety, privacy, and clean installation are
-especially useful.
+The project ships Linux and macOS public betas (see the latest release on
+GitHub). Reports about provider compatibility, lifecycle safety, privacy, and
+clean installation are especially useful.
 
 ## Before opening an issue
 

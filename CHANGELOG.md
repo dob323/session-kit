@@ -4,8 +4,21 @@ Session Kit follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-08-05
+
+### Changed
+
+- Ran the full picker and provider-exit test suites on macOS CI through the
+  native Darwin process adapter, replacing a Linux-only harness that read
+  process generations straight from `/proc`; the one test that genuinely
+  needs `/proc` now skips on Darwin instead of failing.
+
 ### Fixed
 
+- Removed a picker repaint guard that conditioned redraws on a terminal input
+  probe which always reports an empty queue in canonical mode; repaints never
+  consume queued characters, so a half-typed search now survives a live menu
+  repaint on Linux and macOS alike.
 - Allowed read-only install and doctor probes to reach the current user's
   systemd manager through its documented local-machine transport when the
   direct private socket is unavailable, while reporting the degraded socket as
