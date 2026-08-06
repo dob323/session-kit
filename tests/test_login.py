@@ -1601,6 +1601,34 @@ class LoginPickerTests(unittest.TestCase):
         finally:
             fixture.close()
 
+    def test_a_half_typed_command_survives_an_automatic_repaint(self) -> None:
+        first = row("alpha", number=1)
+        second = row("bravo", number=2)
+        fixture = LoginFixture(
+            inventory(first), refreshed_document=inventory(first, second)
+        )
+        try:
+            # "/alp" is typed and left unsent. The repaint clears the screen
+            # underneath it; the search must still run on the whole word.
+            code, output = run_pty(
+                fixture,
+                b"/alp",
+                env_updates={
+                    "SESSION_KIT_PICKER_REFRESH_SECONDS": "2",
+                    "SESSION_KIT_NO_COLOR": None,
+                },
+                deferred=("Codex bravo", b"ha\nq\n"),
+            )
+            self.assertEqual(2, code)
+            # A repaint clears the screen under the queued characters, but it
+            # must never consume them: the finished search still runs on the
+            # whole word and hides the row it excludes.
+            trailing = output[output.rindex("Codex bravo") :]
+            self.assertIn("Codex alpha", trailing)
+            self.assertNotIn("Unknown choice", trailing)
+        finally:
+            fixture.close()
+
     def test_a_terminal_without_escapes_never_auto_repaints(self) -> None:
         first = row("alpha", number=1)
         second = row("bravo", number=2)

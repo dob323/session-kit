@@ -31,9 +31,16 @@ never moves it without a separate, explicit choice.
 
 An idle picker keeps itself current. It collects a snapshot in the background
 every few seconds and repaints only when something visible changes, so it
-never runs in front of the prompt and never repaints while a command is
-half-typed — the number you are looking at cannot change under you. The
-active search and page survive a repaint. Set
+never runs in front of the prompt. Terminal numbers are stable, so a repaint
+never changes what a number means. The active search and page survive one
+too.
+
+A repaint clears the screen. Characters typed without pressing Enter live in
+the terminal's own input queue, which this process cannot inspect — in
+canonical mode the kernel reports an incomplete line as no input at all, on
+both Linux and macOS. A repaint that lands mid-command therefore erases the
+echo of what you typed while the characters themselves stay queued and
+intact: press Enter and the command you started still runs. Set
 `SESSION_KIT_PICKER_REFRESH_SECONDS=0` to switch it off, or to a number of
 seconds (minimum 2) to change the pace.
 

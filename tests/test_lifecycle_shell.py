@@ -139,16 +139,26 @@ class ProviderExitShellTests(unittest.TestCase):
             f"codex\t{self.project}\t{UUID}\tresume\n",
             encoding="utf-8",
         )
+        # The generation of a process is read from /proc on Linux and from the
+        # native adapter on Darwin, exactly as the bashrc itself does, so this
+        # harness exercises the real launch path on both platforms.
         command = r"""
 bash --noprofile --norc -ic '
-  shell_start=$(awk "{print \$22}" /proc/$$/stat)
-  parent_start=$(awk "{print \$22}" /proc/$PPID/stat)
+  start_ticks() {
+    if [ -r "/proc/$1/stat" ]; then
+      awk "{print \$22}" "/proc/$1/stat"
+    else
+      python3 "$6" platform process-info "$1" | cut -f2
+    fi
+  }
+  shell_start=$(start_ticks $$)
+  parent_start=$(start_ticks $PPID)
   printf "%s\t%s\t%s\t1\t%s\t%s\t%s\t%s\t%s\tresume\n" \
     codex "$2" "$4" "$$" "$shell_start" "$PPID" "$parent_start" "$5" \
     > "$3/main2.expected"
   source "$1"
   printf "SOURCE_RETURNED\n"
-' lifecycle-inner "$1" "$2" "$3" "$4" "$5"
+' lifecycle-inner "$1" "$2" "$3" "$4" "$5" "$6"
 """
         return subprocess.run(
             [
@@ -161,6 +171,7 @@ bash --noprofile --norc -ic '
                 str(self.start),
                 BOOT_ID,
                 UUID,
+                str(CORE),
             ],
             cwd=REPO,
             env=self.environment(),
@@ -242,6 +253,9 @@ bash --noprofile --norc -ic '
             self.lifecycle_document()["user_input_after_exit"]
         )
 
+    @unittest.skipUnless(
+        Path("/proc/1/stat").exists(), "reads a foreign process generation from /proc"
+    )
     def test_unrelated_process_cannot_forge_lifecycle_generation(self) -> None:
         pid_one_fields = Path("/proc/1/stat").read_text(encoding="utf-8")
         pid_one_start = int(pid_one_fields[pid_one_fields.rfind(")") + 2 :].split()[19])

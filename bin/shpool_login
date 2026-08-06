@@ -110,22 +110,12 @@ picker_live_seconds() {
   printf '%s' "$seconds"
 }
 
-# Redrawing under a half-typed line would scrub the echo of characters that
-# are still queued in the terminal. Ask the terminal whether anything is
-# waiting; treat "cannot tell" as waiting, because a wrong redraw is worse
-# than a late one.
-picker_input_pending() {
-  python3 -c '
-import array, fcntl, sys, termios
-
-pending = array.array("i", [0])
-try:
-    fcntl.ioctl(sys.stdin, termios.FIONREAD, pending, True)
-except (OSError, ValueError):
-    raise SystemExit(0)
-raise SystemExit(0 if pending[0] else 1)
-' 2>/dev/null
-}
+# A half-typed line lives in the terminal's own input queue, where this
+# process cannot see it: in canonical mode FIONREAD reports 0 until Enter is
+# pressed, on both Linux and macOS. So a repaint cannot be conditional on
+# "is anything typed" — instead the prompt reads through readline, which
+# re-echoes whatever is still queued after the screen is cleared. Nothing is
+# lost and nothing needs an ioctl.
 
 # What the menu actually shows. Collection timestamps are deliberately absent
 # so an unchanged estate never repaints.
@@ -201,7 +191,7 @@ picker_live_ready() {
 picker_live_collect() {
   picker_live_ready || return 1
   local status
-  status=$(command cat -- "$LIVE_DONE" 2>/dev/null) || status=1
+  IFS= read -r status < "$LIVE_DONE" 2>/dev/null || status=1
   [[ $status =~ ^[0-9]+$ ]] || status=1
   wait "$LIVE_PID" 2>/dev/null || true
   LIVE_PID=
@@ -262,6 +252,10 @@ picker_read_live() {
   while true; do
     # The status MUST be captured inside the else: after a bare `if` with no
     # else clause, $? is the status of the `if` statement itself, which is 0.
+    # Plain, NOT -e: readline would pull a half-typed line into its own
+    # buffer and drop it when the read times out. A canonical read leaves
+    # those characters in the terminal queue, where the next read collects
+    # them intact.
     # shellcheck disable=SC2229
     if IFS= read -r -t 1 "$__sk_live_var"; then
       return 0
@@ -276,10 +270,7 @@ picker_read_live() {
       fi
       picker_exit input_closed
     fi
-    # A finished snapshot is adopted only when nothing is queued at the
-    # prompt. Swapping the list out from under a half-typed command would
-    # change what its number means.
-    if picker_live_ready && ! picker_input_pending && picker_live_collect; then
+    if picker_live_ready && picker_live_collect; then
       echo
       return 3
     fi
