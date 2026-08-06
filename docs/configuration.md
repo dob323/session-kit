@@ -196,11 +196,23 @@ Environment=SESSION_KIT_WATCHDOG_NOTIFY=/path/to/your/notifier
 
 ## Color
 
-The picker uses color only when output is an interactive, supported terminal.
-Provider, availability, attention, danger, and secondary text each have one
-consistent category. Labels and symbols preserve the meaning without color.
+Session Kit uses color in two unrelated ways, and only one of them is
+configurable here.
 
-Disable color with either variable:
+**Semantic color** marks provider, availability, attention, danger, and
+secondary text, each with one consistent category. The picker applies it only
+when output is an interactive, supported terminal, and labels and symbols carry
+the same meaning without it.
+
+**Session color** gives each Claude Code and Codex session its own identity
+color, so two rows on screen do not look alike. It is derived from the
+conversation's identity, and the two providers draw from separate palettes.
+There is nothing to configure: the palettes are fixed, because Claude Code
+accepts only its own eight color names. See
+[Session colors](usage.md#session-colors) for the behavior and
+`sp color reconcile` for settling sessions that already share one.
+
+Disable color entirely with either variable:
 
 ```bash
 export NO_COLOR=1
@@ -223,6 +235,10 @@ SESSION_KIT_BOOT_ID_FILE
 SESSION_KIT_AUTO_NAME
 SESSION_KIT_NO_COLOR
 SESSION_KIT_NONINTERACTIVE
+SESSION_KIT_PICKER_REFRESH_SECONDS
+SESSION_KIT_WATCHDOG_NOTIFY
+SESSION_KIT_WATCHDOG_ALERT_TYPE
+SESSION_KIT_WATCHDOG_MODE
 ```
 
 Other environment names in the source are internal test or release hooks and
