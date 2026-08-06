@@ -35,6 +35,7 @@ Usage:
       Claude: red|blue|green|yellow|purple|orange|pink|cyan
       Codex:  lime|magenta|silver|sand|sky|sea
   sp color reset <terminal-number|shpool-id>
+  sp color reconcile
   sp self-name <2-5-word-title>
   sp go <terminal-number|shpool-id>
   sp takeover <terminal-number|shpool-id>
@@ -100,7 +101,10 @@ case "$command" in
     exec python3 "$INVENTORY_CORE" automatic-title self-name "$2"
     ;;
   color)
-    if [[ ${2:-} == reset ]]; then
+    if [[ ${2:-} == reconcile ]]; then
+      [[ $# -eq 2 ]] || { usage >&2; exit 2; }
+      color_reconcile
+    elif [[ ${2:-} == reset ]]; then
       [[ $# -eq 3 ]] || { usage >&2; exit 2; }
       color_target "$3" delete
     else

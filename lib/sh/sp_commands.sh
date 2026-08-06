@@ -266,6 +266,37 @@ color_target() {
   printf 'Claude sessions show the color natively from their next start or resume.\n'
 }
 
+# Settle every live same-provider color collision at once, instead of waiting
+# for each session to relaunch. Safe to repeat: a second run finds nothing to
+# move. No target lock is taken because nothing here depends on one session
+# staying put; the core takes the config lock for the write itself.
+color_reconcile() {
+  local payload
+  payload=$(python3 "$INVENTORY_CORE" color reconcile) || {
+    sk_die "could not reconcile session colors; nothing changed"
+    return 1
+  }
+  printf '%s' "$payload" | python3 -c '
+import json
+import sys
+
+result = json.load(sys.stdin)
+moved = result.get("moved") or {}
+dropped = result.get("dropped") or []
+for key, color in moved.items():
+    provider, _, uuid = key.partition(":")
+    print(f"Recolored exact {provider} session {uuid}: {color}")
+if dropped:
+    print(f"Dropped {len(dropped)} stored color(s) outside the in-force palette.")
+if not moved and not dropped:
+    print("Every live session already has its own color; nothing changed.")
+elif moved:
+    print(
+        "Claude sessions show the color natively from their next start or resume."
+    )
+'
+}
+
 update_ai_alias() {
   local action=$1 provider=$2 uuid=$3 title=${4:-}
   case "$action" in

@@ -1392,6 +1392,27 @@ def _reserve_conversation_color(
     )
 
 
+def reconcile_session_colors(
+    config: Mapping[str, Any],
+    sessions: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Settle every live same-provider colour collision in one idempotent pass."""
+    return _colors.reconcile_conversation_colors(
+        config,
+        sessions,
+        config_path=config_path,
+        state_paths=_state_paths,
+        state_lock=StateLock,
+        private_alias_parent=_private_alias_parent,
+        private_alias_document=_private_alias_document,
+        valid_colors=_valid_colors,
+        atomic_write_json=atomic_write_json,
+        color_for_session=session_color,
+        free_color=first_free_color,
+        palette_for=palette_for_provider,
+    )
+
+
 def _release_conversation_color(
     config: Mapping[str, Any], provider: str, uuid: str, color: str
 ) -> bool:
@@ -2393,6 +2414,37 @@ def _color_command(args: argparse.Namespace, config: dict[str, Any]) -> int:
             if isinstance(item, Mapping) and item.get("display_color") in SESSION_COLORS
         }
 
+    if args.color_action == "reconcile":
+        live = snapshot(write_state=False, config=config)
+        if live.get("source") != "live" or live.get("stale") is not False:
+            print(
+                "session inventory: refusing to reconcile from a stale inventory",
+                file=sys.stderr,
+            )
+            return 1
+        result = reconcile_session_colors(
+            config,
+            [*live.get("sessions", ()), *live.get("outside_agents", ())],
+        )
+        # Push each moved color the way `set` does, so a window that is already
+        # open shows the new one at its next start or resume instead of waiting
+        # for something else to touch it.
+        pushes: list[str] = []
+        warnings: list[str] = []
+        for key, color in result["moved"].items():
+            provider, _, uuid = key.partition(":")
+            pushed = propagate_provider_color(provider, uuid, color)
+            pushes.extend(pushed["provider_color_pushes"])
+            warnings.extend(pushed["provider_color_warnings"])
+        _json_print(
+            {
+                "schema_version": SCHEMA_VERSION,
+                **result,
+                "provider_color_pushes": pushes,
+                "provider_color_warnings": warnings,
+            }
+        )
+        return 0
     if args.color_action == "conversation-release":
         released = _release_conversation_color(
             config, args.provider, args.uuid, args.color
@@ -2575,6 +2627,7 @@ def _parser() -> argparse.ArgumentParser:
         dest="color_action", required=True
     )
     color_subparsers.add_parser("list")
+    color_subparsers.add_parser("reconcile")
     color_set = color_subparsers.add_parser("set")
     color_set.add_argument("provider", choices=PROVIDERS)
     color_set.add_argument("uuid")

@@ -139,6 +139,18 @@ session can never share a color:
   theme file from disk and applies no allow-list, so Session Kit ships one theme
   per color.
 
+Sessions that were already running when a palette changed keep whatever they
+had until each one next starts. To settle all of them at once instead:
+
+```bash
+sp color reconcile
+```
+
+It gives every live session of a provider its own color, moving only the ones
+that have to move, and prints what changed. Running it again changes nothing,
+so it is safe to repeat. A Claude session shows a color it was moved to from
+its next start or resume.
+
 This is separate from the semantic coloring of the dashboard, where color marks
 provider, availability, attention, danger, and secondary status. Text labels
 always carry the same meaning, so nothing depends on color being available.

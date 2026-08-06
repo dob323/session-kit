@@ -309,6 +309,100 @@ def _reserve_conversation_color(
             return color
 
 
+def reconcile_conversation_colors(
+    config: Mapping[str, Any],
+    sessions: Sequence[Mapping[str, Any]],
+    *,
+    config_path: Callable[[], Path],
+    state_paths: Callable[[Mapping[str, Any]], Mapping[str, Path]],
+    state_lock: Callable[..., Any],
+    private_alias_parent: Callable[[Path], None],
+    private_alias_document: Callable[..., dict[str, Any]],
+    valid_colors: Callable[[Any], dict[str, str]],
+    atomic_write_json: Callable[[Path, Any], None],
+    color_for_session: Callable[..., str | None],
+    free_color: Callable[..., str],
+    palette_for: Callable[[str], Sequence[str]],
+) -> dict[str, Any]:
+    """Separate the live sessions that already share a colour, in one pass.
+
+    Sessions that were already running when a palette changed would otherwise
+    keep their collision until each one happened to relaunch. This walks the
+    live rows instead and settles all of them at once.
+
+    Running it twice must not shuffle anything a second time, and it cannot,
+    by construction rather than by a guard. Rows are settled in a fixed
+    ``(provider, uuid)`` order rather than in snapshot order, and each row
+    prefers the colour it currently shows. The first pass therefore hands every
+    row exactly the colour it will prefer on the second pass, every preference
+    is free at the moment it is asked for, and nothing moves. That holds at the
+    exhaustion boundary too: rows that had to repeat a colour prefer the
+    repeated one next time, find the palette full again, and keep it.
+
+    An override is written only where the palette order moved a row off its own
+    identity hash. A row sitting on its hash colour needs no record, so the
+    stored set stays a list of deviations rather than a copy of the inventory.
+    Nothing is ever deleted here except entries that name a colour outside the
+    palette now in force, which are already ignored on read.
+    """
+    ordered: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in sessions:
+        if not isinstance(item, Mapping):
+            continue
+        provider = str(item.get("provider") or "")
+        if provider not in PROVIDERS or not palette_for(provider):
+            continue
+        identity = item.get("identity")
+        raw = identity.get("uuid") if isinstance(identity, Mapping) else None
+        exact = valid_uuid(str(raw or ""))
+        if not exact or (provider, exact) in seen:
+            continue
+        seen.add((provider, exact))
+        ordered.append((provider, exact))
+    ordered.sort()
+
+    path = config_path()
+    paths = state_paths(config)
+    with state_lock(paths["root"], paths["config_lock"]):
+        with state_lock(paths["root"], paths["lock"]):
+            private_alias_parent(path)
+            document = private_alias_document(path, allow_missing=True)
+            raw_colors = document.get("colors")
+            before = dict(raw_colors) if isinstance(raw_colors, Mapping) else {}
+            colors = valid_colors(raw_colors)
+            dropped = sorted(
+                key for key in before if key not in colors or before[key] != colors[key]
+            )
+            taken: dict[str, set[str]] = {}
+            moved: dict[str, str] = {}
+            for provider, exact in ordered:
+                key = f"{provider}:{exact}"
+                preferred = color_for_session(provider, exact, colors)
+                hashed = color_for_session(provider, exact, {})
+                if preferred is None or hashed is None:
+                    continue
+                held = taken.setdefault(provider, set())
+                color = free_color(preferred, held, palette=palette_for(provider))
+                held.add(color)
+                if color == hashed and key not in colors:
+                    continue
+                if colors.get(key) != color:
+                    colors[key] = color
+                    moved[key] = color
+            if before != colors:
+                if colors:
+                    document["colors"] = dict(sorted(colors.items()))
+                else:
+                    document.pop("colors", None)
+                atomic_write_json(path, document)
+            return {
+                "moved": dict(sorted(moved.items())),
+                "dropped": dropped,
+                "colors": dict(sorted(colors.items())),
+            }
+
+
 def _release_conversation_color(
     config: Mapping[str, Any],
     provider: str,

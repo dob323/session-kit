@@ -42,6 +42,15 @@ Session Kit follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `sp color reconcile`, which settles every live same-provider colour collision
+  in one pass instead of waiting for each session to relaunch into the new
+  palette. It writes an override only where palette order moved a session off
+  its own identity hash, pushes each moved colour so an open Claude window
+  picks it up at its next start or resume, and clears stored colours that name
+  a colour outside the palette now in force. Repeating it changes nothing: rows
+  are settled in a fixed identity order and each prefers the colour it already
+  shows, so the second pass finds every preference free and writes no file.
+
 - Six Codex theme files, `sk-lime`, `sk-magenta`, `sk-silver`, `sk-sand`,
   `sk-sky`, and `sk-sea`. The eight Claude-named themes stay shipped so a
   rollback to 0.1.6 still finds every theme it installs.

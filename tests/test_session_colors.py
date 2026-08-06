@@ -619,6 +619,259 @@ class StoredOverrideMigrationTests(unittest.TestCase):
                 )
 
 
+def colliding_uuids(provider: str, count: int) -> tuple[str, list[str]]:
+    """Exact UUIDs whose identity hashes genuinely land on one color.
+
+    Searched rather than hardcoded so the fixture stays true if the palette
+    order ever changes; the hash is deterministic, so the answer is stable.
+    """
+    groups: dict[str, list[str]] = {}
+    for number in range(1, 20_000):
+        exact = uuid_for(number)
+        color = inventory_core.session_color(provider, exact)
+        assert color is not None
+        groups.setdefault(color, []).append(exact)
+        if len(groups[color]) >= count:
+            return color, groups[color][:count]
+    raise AssertionError(f"no {count} {provider} UUIDs share a color")
+
+
+class ReconcileTests(unittest.TestCase):
+    """One pass that separates sessions already sharing a color."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(prefix=".reconcile-", dir=REPO)
+        self.addCleanup(self.temp.cleanup)
+        base = Path(self.temp.name)
+        state = base / "state"
+        state.mkdir(mode=0o700)
+        self.config_file = base / "inventory.json"
+        self.config_file.write_text(
+            json.dumps({"schema_version": 1, "aliases": {}}), encoding="utf-8"
+        )
+        self.config_file.chmod(0o600)
+        self.config = {"state_dir": state, "max_proc_nodes": 8192}
+        patcher = mock.patch.dict(
+            os.environ, {"SESSION_KIT_CONFIG": os.fspath(self.config_file)}
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def seed(self, colors: dict[str, str]) -> None:
+        document = json.loads(self.config_file.read_text(encoding="utf-8"))
+        document["colors"] = colors
+        self.config_file.write_text(json.dumps(document), encoding="utf-8")
+
+    def rows(self, provider: str, uuids: list[str]) -> list[dict[str, object]]:
+        return [
+            {"provider": provider, "identity": {"uuid": exact}} for exact in uuids
+        ]
+
+    def effective(self, provider: str, uuids: list[str]) -> list[str]:
+        stored = inventory_core.canonical_colors(self.config)
+        return [
+            inventory_core.session_color(provider, exact, stored) for exact in uuids
+        ]
+
+    def test_it_separates_sessions_that_share_an_identity_hash_color(self) -> None:
+        shared, uuids = colliding_uuids("claude", 3)
+        rows = self.rows("claude", uuids)
+        self.assertEqual([shared] * 3, self.effective("claude", uuids))
+
+        result = inventory_core.reconcile_session_colors(self.config, rows)
+
+        after = self.effective("claude", uuids)
+        self.assertEqual(3, len(set(after)), after)
+        for color in after:
+            self.assertIn(color, inventory_core.CLAUDE_SESSION_COLORS)
+        # The first row in settle order keeps the color it already showed; only
+        # the rows that had to move are recorded.
+        self.assertEqual(shared, after[0])
+        self.assertEqual(2, len(result["moved"]))
+        self.assertNotIn(f"claude:{uuids[0]}", result["moved"])
+
+    def test_running_it_twice_does_not_shuffle_anything(self) -> None:
+        _, uuids = colliding_uuids("claude", 3)
+        rows = self.rows("claude", uuids)
+        inventory_core.reconcile_session_colors(self.config, rows)
+        settled = self.effective("claude", uuids)
+        written = self.config_file.read_bytes()
+
+        again = inventory_core.reconcile_session_colors(self.config, rows)
+
+        self.assertEqual({}, again["moved"])
+        self.assertEqual([], again["dropped"])
+        self.assertEqual(settled, self.effective("claude", uuids))
+        self.assertEqual(written, self.config_file.read_bytes())
+
+    def test_a_reversed_arrival_order_settles_the_same_way(self) -> None:
+        # Settle order is the identity, not the order the snapshot happened to
+        # list rows in, or a second pass over a reordered inventory would move
+        # sessions that were already correct.
+        _, uuids = colliding_uuids("codex", 3)
+        inventory_core.reconcile_session_colors(
+            self.config, self.rows("codex", uuids)
+        )
+        settled = self.effective("codex", uuids)
+        written = self.config_file.read_bytes()
+
+        again = inventory_core.reconcile_session_colors(
+            self.config, self.rows("codex", list(reversed(uuids)))
+        )
+
+        self.assertEqual({}, again["moved"])
+        self.assertEqual(settled, self.effective("codex", uuids))
+        self.assertEqual(written, self.config_file.read_bytes())
+
+    def test_more_sessions_than_colors_uses_every_color_then_repeats(self) -> None:
+        palette = inventory_core.CODEX_SESSION_COLORS
+        _, uuids = colliding_uuids("codex", len(palette) + 2)
+        rows = self.rows("codex", uuids)
+
+        result = inventory_core.reconcile_session_colors(self.config, rows)
+
+        after = self.effective("codex", uuids)
+        # The exhaustion boundary: every color is used exactly once before any
+        # repeats, and the two rows past the end fall back to a repeat rather
+        # than to no color or to a name outside the palette.
+        self.assertEqual(set(palette), set(after))
+        self.assertEqual(len(palette), len(set(after)))
+        self.assertEqual(len(palette) + 2, len(after))
+        for color in after:
+            self.assertIn(color, palette)
+        self.assertLessEqual(len(result["moved"]), len(uuids))
+
+        # And it still settles: a second pass over a full palette must not
+        # start rotating the repeats around.
+        written = self.config_file.read_bytes()
+        again = inventory_core.reconcile_session_colors(self.config, rows)
+        self.assertEqual({}, again["moved"])
+        self.assertEqual(after, self.effective("codex", uuids))
+        self.assertEqual(written, self.config_file.read_bytes())
+
+    def test_a_session_keeping_its_hash_color_is_not_pinned(self) -> None:
+        exact = uuid_for(200)
+        rows = self.rows("claude", [exact])
+
+        result = inventory_core.reconcile_session_colors(self.config, rows)
+
+        # No override is written for a row that never had to move, so the
+        # stored set stays a list of deviations rather than a copy of the
+        # inventory.
+        self.assertEqual({}, result["moved"])
+        self.assertEqual({}, result["colors"])
+        self.assertNotIn("colors", json.loads(self.config_file.read_text()))
+
+    def test_neither_provider_can_take_a_color_from_the_other(self) -> None:
+        claude_uuid = uuid_for(201)
+        codex_uuid = uuid_for(202)
+        rows = [
+            *self.rows("claude", [claude_uuid]),
+            *self.rows("codex", [codex_uuid]),
+        ]
+
+        result = inventory_core.reconcile_session_colors(self.config, rows)
+
+        self.assertEqual({}, result["moved"])
+        self.assertIn(
+            inventory_core.session_color("claude", claude_uuid),
+            inventory_core.CLAUDE_SESSION_COLORS,
+        )
+        self.assertIn(
+            inventory_core.session_color("codex", codex_uuid),
+            inventory_core.CODEX_SESSION_COLORS,
+        )
+
+    def test_it_clears_stored_colors_outside_the_in_force_palette(self) -> None:
+        codex_uuid = uuid_for(203)
+        claude_uuid = uuid_for(204)
+        keep = uuid_for(205)
+        self.seed(
+            {
+                f"codex:{codex_uuid}": "pink",
+                f"claude:{claude_uuid}": "lime",
+                f"codex:{keep}": "sand",
+            }
+        )
+        rows = self.rows("codex", [codex_uuid])
+
+        result = inventory_core.reconcile_session_colors(self.config, rows)
+
+        self.assertEqual(
+            [f"claude:{claude_uuid}", f"codex:{codex_uuid}"], result["dropped"]
+        )
+        self.assertEqual({f"codex:{keep}": "sand"}, result["colors"])
+        self.assertEqual(
+            inventory_core.session_color("codex", codex_uuid),
+            self.effective("codex", [codex_uuid])[0],
+        )
+        again = inventory_core.reconcile_session_colors(self.config, rows)
+        self.assertEqual([], again["dropped"])
+
+    def test_rows_without_an_exact_identity_are_skipped(self) -> None:
+        exact = uuid_for(206)
+        rows = [
+            {"provider": "shell", "identity": {"uuid": exact}},
+            {"provider": "claude", "identity": {"uuid": "not-a-uuid"}},
+            {"provider": "claude"},
+            {"provider": "claude", "identity": None},
+            "not a row",
+        ]
+
+        result = inventory_core.reconcile_session_colors(self.config, rows)
+
+        self.assertEqual({}, result["moved"])
+        self.assertEqual({}, result["colors"])
+
+    def test_the_command_refuses_a_stale_inventory_and_pushes_what_it_moves(
+        self,
+    ) -> None:
+        _, uuids = colliding_uuids("claude", 2)
+        rows = self.rows("claude", uuids)
+        stale = {"source": "cache", "stale": True, "sessions": rows}
+        with (
+            mock.patch.object(inventory_core, "snapshot", return_value=stale),
+            contextlib.redirect_stdout(io.StringIO()) as quiet,
+            contextlib.redirect_stderr(io.StringIO()) as complaint,
+        ):
+            code = inventory_core._color_command(
+                argparse.Namespace(color_action="reconcile"), dict(self.config)
+            )
+        self.assertEqual(1, code)
+        self.assertEqual("", quiet.getvalue())
+        self.assertIn("stale inventory", complaint.getvalue())
+        self.assertNotIn("colors", json.loads(self.config_file.read_text()))
+
+        live = {"source": "live", "stale": False, "sessions": rows}
+        pushed: list[tuple[str, str, str]] = []
+
+        def record(provider: str, uuid: str, color: str, **_: object) -> dict:
+            pushed.append((provider, uuid, color))
+            return {
+                "provider_color_pushes": ["claude-transcript-color"],
+                "provider_color_warnings": [],
+            }
+
+        with (
+            mock.patch.object(inventory_core, "snapshot", return_value=live),
+            mock.patch.object(
+                inventory_core, "propagate_provider_color", side_effect=record
+            ),
+            contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            code = inventory_core._color_command(
+                argparse.Namespace(color_action="reconcile"), dict(self.config)
+            )
+        payload = json.loads(output.getvalue())
+        self.assertEqual(0, code)
+        self.assertEqual(1, len(payload["moved"]))
+        # Only what actually moved is pushed, so an open window shows the new
+        # color at its next start or resume.
+        self.assertEqual(1, len(pushed))
+        self.assertEqual(["claude-transcript-color"], payload["provider_color_pushes"])
+        self.assertEqual([], payload["provider_color_warnings"])
+
+
 def quoted_names(text: str) -> tuple[str, ...]:
     return tuple(re.findall(r'"([a-z-]+)"', text))
 
