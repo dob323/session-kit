@@ -105,11 +105,31 @@ Before activation:
 4. plan recovery for every active provider conversation;
 5. choose a maintenance window.
 
-After replacement, record the running binary checksum in the private Session
-Kit state if you use binary-change monitoring.
+### Record the new fingerprint, every time
 
-Rollback restores the prior binary and also requires a planned daemon restart.
-Session Kit never performs either restart.
+The watchdog compares the running daemon against a fingerprint recorded in
+private Session Kit state. Replacing the binary without updating that value
+leaves the check reporting a changed binary on every pass, for a change you made
+on purpose. Treat this as part of the replacement, not as optional cleanup:
+
+```bash
+install -m 600 /dev/null "${XDG_STATE_HOME:-$HOME/.local/state}/session-kit/shpool-binary.sha256"
+sha256sum ~/.cargo/bin/shpool | cut -d' ' -f1 \
+  > "${XDG_STATE_HOME:-$HOME/.local/state}/session-kit/shpool-binary.sha256"
+```
+
+Use the path to the binary the daemon will actually execute, which is not
+necessarily the one you just built. Confirm afterwards with `session-kit
+doctor`, which reports a missing or no-longer-matching fingerprint.
+
+Skipping this is not a quiet failure with no consequence. It is a check that
+complains constantly and therefore stops being read, so the genuine silent
+replacement it exists to catch arrives to an audience that has learned to ignore
+it.
+
+Rollback restores the prior binary, requires the same planned daemon restart,
+and needs the fingerprint recorded again for the restored binary. Session Kit
+never performs either restart.
 
 ## Input-mode restore patch (0002)
 
