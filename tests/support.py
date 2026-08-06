@@ -14,6 +14,26 @@ from typing import Iterable
 REPO = Path(__file__).resolve().parents[1]
 RELEASE_TOOL = REPO / "deploy" / "session-kit-release"
 HELPERS = ("sp", "shpool_login", "shpool_status", "shpool_reaper", "codex_resume_here")
+# Both palettes: the eight names Claude Code's /color accepts and the six
+# Codex-only ones, in palette order. Mirrors bin/session-kit's
+# codex_theme_names, and tests/test_session_colors.py asserts it still equals
+# the palette the runtime declares.
+THEME_COLORS = (
+    "red",
+    "blue",
+    "green",
+    "yellow",
+    "purple",
+    "orange",
+    "pink",
+    "cyan",
+    "lime",
+    "magenta",
+    "silver",
+    "sand",
+    "sky",
+    "sea",
+)
 
 # Suite-wide sandbox belt: harness subprocesses inherit this environment, and
 # any real bin script they run would otherwise auto-title the developer's live
@@ -99,6 +119,7 @@ def write_runtime(repo: Path, version: str) -> str:
     required = {
         "lib/session_inventory.py": "# fixture inventory\n",
         "lib/sessionkit_inventory/__init__.py": "# fixture package\n",
+        "lib/sessionkit_inventory/colors.py": "# fixture color helpers\n",
         "lib/sessionkit_inventory/common.py": "# fixture common helpers\n",
         "lib/sessionkit_inventory/lifecycle.py": "# fixture lifecycle helpers\n",
         "lib/sessionkit_inventory/projects.py": "# fixture project helpers\n",

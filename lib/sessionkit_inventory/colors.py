@@ -1,13 +1,22 @@
-"""Session colour: the palette, its pure derivations, and colour state.
+"""Session colour: the palettes, their pure derivations, and colour state.
 
-The palette lives here together with everything that validates or rotates
-against it, so widening it is one edit in this module plus the truecolor table
+The palettes live here together with everything that validates or rotates
+against them, so widening one is an edit in this module plus the truecolor table
 in ``render``. Provider colour pushes stay with the naming domain: they share
 the propagation and retry machinery with title pushes rather than the palette.
 
-Every function that consumes the palette takes it as an argument. The facade
-passes its own ``SESSION_COLORS``, which keeps that constant the single place
-the in-force palette is decided.
+There are two palettes because the providers are not equally free. Claude Code's
+``/color`` accepts exactly eight names and rejects everything else, so the Claude
+palette is a hard external constraint rather than a preference. Codex resolves a
+colour from an ``sk-*.tmTheme`` file this kit ships and applies no allow-list at
+all, so its palette is whatever we build themes for. Giving Codex six names that
+Claude cannot use means a Claude window and a Codex window can never land on the
+same colour, and each still shows its own native tint.
+
+Every function that consumes a palette takes it as an argument, and the facade
+decides which one applies from the provider. That keeps the two constants the
+single place the in-force palettes are declared, and it means a caller that
+forgets the provider gets an empty palette rather than the wrong one.
 """
 
 from __future__ import annotations
@@ -21,7 +30,12 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 from .common import PROVIDERS, CollectionError, valid_uuid
 
 
-SESSION_COLORS = (
+# Claude Code's /color accepts these eight names and nothing else. Twenty-two
+# names were probed against Claude Code 2.1.223 with known-good and known-bad
+# controls: every other name is rejected, and gray/grey resolve to `default`,
+# which is no colour at all. This tuple is therefore a measurement, not a taste
+# decision — do not add to it without re-probing the provider.
+CLAUDE_SESSION_COLORS = (
     "red",
     "blue",
     "green",
@@ -31,6 +45,48 @@ SESSION_COLORS = (
     "pink",
     "cyan",
 )
+
+# Codex reads a theme file from disk and applies no allow-list, so these six are
+# ours to choose. They are deliberately disjoint from the Claude palette: no
+# name here is one Claude Code would accept, which is what makes a cross-provider
+# collision impossible rather than merely unlikely. Each has a matching
+# config/codex-themes/sk-<name>.tmTheme; adding a name without its theme file
+# leaves a Codex window untinted and trips the doctor's theme check.
+CODEX_SESSION_COLORS = (
+    "lime",
+    "magenta",
+    "silver",
+    "sand",
+    "sky",
+    "sea",
+)
+
+# Every colour the kit knows. Use this only where the provider genuinely is not
+# known — CLI argument choices, the shared reservation ledger, stored-document
+# scans. Anywhere the provider IS known, use palette_for_provider: validating a
+# Claude override against this union would accept `lime`, which Claude Code
+# rejects at the moment it matters and leaves the window with no colour.
+SESSION_COLORS = CLAUDE_SESSION_COLORS + CODEX_SESSION_COLORS
+
+
+def palette_for_provider(
+    provider: str,
+    *,
+    claude_palette: Sequence[str],
+    codex_palette: Sequence[str],
+) -> tuple[str, ...]:
+    """The in-force palette for one provider, or empty for anything else.
+
+    Empty rather than a default is deliberate. A caller that reaches here with
+    ``shell`` or an unknown provider has no colour to assign, and returning a
+    populated palette would let it assign one that the provider cannot show.
+    """
+    if provider == "claude":
+        return tuple(claude_palette)
+    if provider == "codex":
+        return tuple(codex_palette)
+    return ()
+
 
 # A brand-new Codex session has no conversation ID until Codex boots, so its
 # launch theme cannot come from the identity hash. The launch color is picked
@@ -64,6 +120,36 @@ def session_color(
     return palette[digest[0] % len(palette)]
 
 
+def first_free_color(
+    preferred: str,
+    occupied_colors: Iterable[str] = (),
+    *,
+    palette: Sequence[str],
+) -> str:
+    """Keep ``preferred``; if it is taken, the next free colour in palette order.
+
+    When every colour in the palette is occupied this returns ``preferred``
+    unchanged and allows the repeat. That is the only honest answer — there is
+    no free colour to give — and it keeps the result a deterministic function of
+    the identity rather than of arrival order, so a session that has to share
+    shares with the same partner every time.
+
+    This is the one place the rule lives. It used to exist twice, once in the
+    launch picker and once inlined in the conversation reservation, which is how
+    the two drifted: only one of them treated a palette-foreign colour as
+    unoccupied.
+    """
+    if preferred not in palette:
+        return preferred
+    occupied = {color for color in occupied_colors if color in palette}
+    start = palette.index(preferred)
+    for offset in range(len(palette)):
+        candidate = palette[(start + offset) % len(palette)]
+        if candidate not in occupied:
+            return candidate
+    return preferred
+
+
 def launch_color_for(
     shpool_id: str,
     occupied_colors: Iterable[str] = (),
@@ -71,13 +157,11 @@ def launch_color_for(
     palette: Sequence[str],
 ) -> str:
     digest = hashlib.sha256(f"launch:{shpool_id}".encode("utf-8")).digest()
-    start = digest[0] % len(palette)
-    occupied = {color for color in occupied_colors if color in palette}
-    for offset in range(len(palette)):
-        candidate = palette[(start + offset) % len(palette)]
-        if candidate not in occupied:
-            return candidate
-    return palette[start]
+    return first_free_color(
+        palette[digest[0] % len(palette)],
+        occupied_colors,
+        palette=palette,
+    )
 
 
 def _launch_color_dir(config: Mapping[str, Any]) -> Path | None:
@@ -184,6 +268,7 @@ def _reserve_conversation_color(
     state_lock: Callable[..., Any],
     active_color_reservations: Callable[[Path, float], dict[str, dict[str, Any]]],
     color_for_session: Callable[..., str | None],
+    free_color: Callable[..., str],
     private_alias_parent: Callable[[Path], None],
     private_alias_document: Callable[..., dict[str, Any]],
     valid_colors: Callable[[Any], dict[str, str]],
@@ -202,18 +287,14 @@ def _reserve_conversation_color(
             now = time.time()
             reservations = active_color_reservations(paths["color_reservations"], now)
             occupied = set(occupied_colors)
-            occupied.update(item["color"] for item in reservations.values())
+            occupied.update(
+                item["color"]
+                for reservation_key, item in reservations.items()
+                if reservation_key != f"conversation:{key}"
+            )
             preferred = color_for_session(provider, exact_uuid)
             assert preferred is not None
-            start = list(palette).index(preferred)
-            color = next(
-                (
-                    palette[(start + offset) % len(palette)]
-                    for offset in range(len(palette))
-                    if palette[(start + offset) % len(palette)] not in occupied
-                ),
-                preferred,
-            )
+            color = free_color(preferred, occupied, palette=palette)
             private_alias_parent(path)
             document = private_alias_document(path, allow_missing=True)
             colors = valid_colors(document.get("colors"))

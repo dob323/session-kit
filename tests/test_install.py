@@ -13,6 +13,8 @@ import tempfile
 import time
 import unittest
 
+from tests.support import THEME_COLORS
+
 
 REPO = Path(__file__).resolve().parents[1]
 RELEASE_A = "1" * 40
@@ -967,9 +969,7 @@ class InstallerTests(unittest.TestCase):
         self.installed("rollback", "--to", RELEASE_A)
 
         self.assertTrue(unrelated.is_file())
-        for color in (
-            "red", "blue", "green", "yellow", "purple", "orange", "pink", "cyan"
-        ):
+        for color in THEME_COLORS:
             self.assertFalse((themes / f"sk-{color}.tmTheme").exists())
 
     def test_mid_copy_failure_cleans_theme_temporary(self) -> None:
@@ -1008,10 +1008,7 @@ class InstallerTests(unittest.TestCase):
         )
         captured = {entry["path"] for entry in transaction["entries"]}
         expected = {
-            str(themes / f"sk-{color}.tmTheme")
-            for color in (
-                "red", "blue", "green", "yellow", "purple", "orange", "pink", "cyan"
-            )
+            str(themes / f"sk-{color}.tmTheme") for color in THEME_COLORS
         }
         self.assertTrue(expected.issubset(captured))
         self.assertNotEqual(red.read_text(encoding="utf-8"), "pre-update-theme\n")

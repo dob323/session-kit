@@ -242,7 +242,8 @@ for provider in ("claude", "codex"):
     provider_observed[provider] = detail if installed and status == "ok" else None
 
 theme_names = (
-    "red", "blue", "green", "yellow", "purple", "orange", "pink", "cyan"
+    "red", "blue", "green", "yellow", "purple", "orange", "pink", "cyan",
+    "lime", "magenta", "silver", "sand", "sky", "sea",
 )
 def secure_regular_bytes(
     path: Path,
@@ -346,7 +347,11 @@ for color in theme_names:
 if theme_errors:
     emit("warn", "codex-themes", "missing or unsafe themes: " + ", ".join(theme_errors))
 else:
-    emit("ok", "codex-themes", "all 8 themes are private regular readable files")
+    emit(
+        "ok",
+        "codex-themes",
+        f"all {len(theme_names)} themes are private regular readable files",
+    )
 
 instruction_errors = []
 for label, path in (

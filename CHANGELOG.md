@@ -4,6 +4,48 @@ Session Kit follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- Split the session palette in two, one per provider, and stopped a same-colour
+  repeat from surviving inside either. Two live rows could show one colour for
+  two separate reasons, and fixing one left the other. Claude and Codex drew
+  from a single eight-name palette, so they collided across providers; and the
+  colour comes from an identity hash, which collides on its own well before the
+  names run out — measured on live state, eight Claude sessions landed on seven
+  colours, two on pink with blue unused.
+
+  Claude Code's `/color` accepts exactly `red`, `blue`, `green`, `yellow`,
+  `purple`, `orange`, `pink`, and `cyan`. Twenty-two names were probed against
+  Claude Code 2.1.223 with known-good and known-bad controls; every other name
+  is rejected, and `gray`/`grey` resolve to `default`, which is no colour. That
+  palette is therefore fixed from outside. Codex resolves its colour from an
+  `sk-*.tmTheme` file this kit ships and applies no allow-list, so it now has
+  six names of its own — `lime`, `magenta`, `silver`, `sand`, `sky`, `sea` —
+  that Claude Code cannot use. A Claude window and a Codex window can no longer
+  land on the same colour at all.
+
+  Within a palette, a session keeps its identity-hash colour unless a live
+  session of the same provider already holds it, in which case it takes the
+  next free name in palette order. When every name is taken the hash colour
+  applies again and the repeat is allowed, because there is no free colour to
+  give; the result stays a function of identity rather than of arrival order,
+  so a session that has to share shares with the same partner every time.
+
+  Existing Codex sessions carrying a stored override that names a colour no
+  longer in the Codex palette need no migration pass. The override stops
+  matching the in-force palette, so it is ignored and the session re-hashes
+  into the palette that now applies.
+
+- Release payload schema 5 requires `lib/sessionkit_inventory/colors.py`, which
+  is where both palettes are now declared. Schemas 1 to 4 are unchanged, so a
+  rollback still validates the payload a pinned older release shipped.
+
+### Added
+
+- Six Codex theme files, `sk-lime`, `sk-magenta`, `sk-silver`, `sk-sand`,
+  `sk-sky`, and `sk-sea`. The eight Claude-named themes stay shipped so a
+  rollback to 0.1.6 still finds every theme it installs.
+
 ## [0.1.6] - 2026-08-06
 
 ### Fixed

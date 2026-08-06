@@ -28,7 +28,7 @@ import tempfile
 import uuid
 
 SCHEMA_VERSION = 1
-CURRENT_RELEASE_SCHEMA_VERSION = 4
+CURRENT_RELEASE_SCHEMA_VERSION = 5
 HELPERS = ("sp", "shpool_login", "shpool_status", "shpool_reaper", "codex_resume_here")
 LEGACY_REQUIRED_RELEASE_PAYLOAD = (
     "bin/session_kit_common",
@@ -56,6 +56,22 @@ REQUIRED_RELEASE_PAYLOAD_BY_SCHEMA = {
     4: (
         *LEGACY_REQUIRED_RELEASE_PAYLOAD,
         "lib/sessionkit_inventory/__init__.py",
+        "lib/sessionkit_inventory/common.py",
+        "lib/sessionkit_inventory/lifecycle.py",
+        "lib/sessionkit_inventory/projects.py",
+        "lib/sessionkit_inventory/providers.py",
+        "lib/sessionkit_inventory/state_io.py",
+    ),
+    # Schema 5 adds `colors`. The palettes moved into that module and split in
+    # two there, so it is now the single place the in-force colour set for each
+    # provider is declared; a payload without it cannot resolve any session
+    # colour. Themes are deliberately NOT required here: a release that ships
+    # no config/codex-themes directory at all is a supported configuration, and
+    # the installer removes the kit-owned themes it previously placed.
+    5: (
+        *LEGACY_REQUIRED_RELEASE_PAYLOAD,
+        "lib/sessionkit_inventory/__init__.py",
+        "lib/sessionkit_inventory/colors.py",
         "lib/sessionkit_inventory/common.py",
         "lib/sessionkit_inventory/lifecycle.py",
         "lib/sessionkit_inventory/projects.py",

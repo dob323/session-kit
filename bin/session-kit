@@ -138,7 +138,14 @@ platform() {
 }
 
 transaction_path=$state_root/lifecycle-transaction.json
-codex_theme_names=(red blue green yellow purple orange pink cyan)
+# The eight Claude-palette names plus the six Codex-only ones, in the order
+# lib/sessionkit_inventory/colors.py declares them. Codex windows only ever
+# resolve one of the last six, but the first eight stay installed so a
+# rollback to a release that still assigns them finds its themes in place.
+codex_theme_names=(
+  red blue green yellow purple orange pink cyan
+  lime magenta silver sand sky sea
+)
 
 projects_created=0
 

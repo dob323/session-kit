@@ -58,9 +58,12 @@ from sessionkit_inventory.terminal import (  # noqa: E402, F401
     TERMINAL_NUMBER_QUARANTINE_SECONDS,
 )
 from sessionkit_inventory.colors import (  # noqa: E402, F401
+    CLAUDE_SESSION_COLORS,
+    CODEX_SESSION_COLORS,
     COLOR_RESERVATION_MAX_AGE_SECONDS,
     LAUNCH_COLOR_MAX_AGE_SECONDS,
     SESSION_COLORS,
+    first_free_color,
 )
 from sessionkit_inventory.self_name import (  # noqa: E402, F401
     MAX_AUTO_TITLE_TRANSCRIPT_BYTES,
@@ -286,7 +289,7 @@ def _command_json(
 
 
 def _parse_claude_payload(payload: Any) -> list[dict[str, Any]]:
-    return _providers_claude._parse_claude_payload(payload, palette=SESSION_COLORS)
+    return _providers_claude._parse_claude_payload(payload, palette=CLAUDE_SESSION_COLORS)
 
 
 def read_claude_transcript_signals(
@@ -298,7 +301,7 @@ def read_claude_transcript_signals(
         home,
         environ=os.environ,
         home_factory=Path.home,
-        palette=SESSION_COLORS,
+        palette=CLAUDE_SESSION_COLORS,
     )
 
 
@@ -317,7 +320,7 @@ def _enrich_claude_payload(payload: Any) -> Any:
         payload,
         environ=os.environ,
         home_factory=Path.home,
-        palette=SESSION_COLORS,
+        palette=CLAUDE_SESSION_COLORS,
         transcript_signals=read_claude_transcript_signals,
     )
 
@@ -710,7 +713,7 @@ def build_inventory(
         adopt_launch_colors=_adopt_launch_colors,
         codex_title_echoes_prompt=_codex_title_echoes_prompt,
         schema_version=SCHEMA_VERSION,
-        palette=SESSION_COLORS,
+        claude_palette=CLAUDE_SESSION_COLORS,
         default_max_proc_nodes=DEFAULT_MAX_PROC_NODES,
     )
 
@@ -1043,7 +1046,7 @@ def propagate_provider_color(
         uuid,
         color,
         environ=environ,
-        palette=SESSION_COLORS,
+        palette=palette_for_provider(provider),
         push_claude_color=_push_claude_color,
     )
 
@@ -1288,7 +1291,7 @@ def _push_claude_color(
 
 
 def _valid_colors(raw: Any) -> dict[str, str]:
-    return _common._valid_colors(raw, palette=SESSION_COLORS)
+    return _common._valid_colors(raw, palette_for=palette_for_provider)
 
 
 def canonical_colors(config: Mapping[str, Any]) -> dict[str, str]:
@@ -1297,6 +1300,15 @@ def canonical_colors(config: Mapping[str, Any]) -> dict[str, str]:
         config_path=config_path,
         private_alias_document=_private_alias_document,
         valid_colors=_valid_colors,
+    )
+
+
+def palette_for_provider(provider: str) -> tuple[str, ...]:
+    """The colours one provider can actually display, empty for anything else."""
+    return _colors.palette_for_provider(
+        provider,
+        claude_palette=CLAUDE_SESSION_COLORS,
+        codex_palette=CODEX_SESSION_COLORS,
     )
 
 
@@ -1310,7 +1322,7 @@ def session_color(
         provider,
         uuid,
         overrides,
-        palette=SESSION_COLORS,
+        palette=palette_for_provider(provider),
     )
 
 
@@ -1318,7 +1330,7 @@ def launch_color_for(shpool_id: str, occupied_colors: Iterable[str] = ()) -> str
     return _colors.launch_color_for(
         shpool_id,
         occupied_colors,
-        palette=SESSION_COLORS,
+        palette=CODEX_SESSION_COLORS,
     )
 
 
@@ -1370,12 +1382,13 @@ def _reserve_conversation_color(
         state_lock=StateLock,
         active_color_reservations=_active_color_reservations,
         color_for_session=session_color,
+        free_color=first_free_color,
         private_alias_parent=_private_alias_parent,
         private_alias_document=_private_alias_document,
         valid_colors=_valid_colors,
         atomic_write_json=atomic_write_json,
         schema_version=SCHEMA_VERSION,
-        palette=SESSION_COLORS,
+        palette=palette_for_provider(provider),
     )
 
 
@@ -1396,7 +1409,7 @@ def _release_conversation_color(
         valid_colors=_valid_colors,
         atomic_write_json=atomic_write_json,
         schema_version=SCHEMA_VERSION,
-        palette=SESSION_COLORS,
+        palette=palette_for_provider(provider),
     )
 
 
@@ -1412,7 +1425,7 @@ def _adopt_launch_colors(
         overrides,
         launch_color_dir=_launch_color_dir,
         mutate_color=mutate_canonical_color,
-        palette=SESSION_COLORS,
+        palette=CODEX_SESSION_COLORS,
         launch_color_max_age=LAUNCH_COLOR_MAX_AGE_SECONDS,
     )
 
@@ -1435,7 +1448,7 @@ def mutate_canonical_color(
         private_alias_document=_private_alias_document,
         valid_colors=_valid_colors,
         atomic_write_json=atomic_write_json,
-        palette=SESSION_COLORS,
+        palette=palette_for_provider(provider),
     )
 
 

@@ -163,7 +163,7 @@ class ReleaseToolTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         metadata = json.loads((release / "RELEASE.json").read_text())
         self.assertEqual(metadata["commit"], self.sha1)
-        self.assertEqual(4, metadata["schema_version"])
+        self.assertEqual(5, metadata["schema_version"])
         self.assertEqual(file_mode(release), 0o555)
         self.assertTrue(
             (release / "lib/sessionkit_inventory/__init__.py").is_file()
@@ -196,6 +196,7 @@ class ReleaseToolTests(unittest.TestCase):
         legacy_repo, _ = make_git_repo(legacy_base)
         for relative in (
             "lib/sessionkit_inventory/__init__.py",
+            "lib/sessionkit_inventory/colors.py",
             "lib/sessionkit_inventory/common.py",
             "lib/sessionkit_inventory/lifecycle.py",
             "lib/sessionkit_inventory/projects.py",
@@ -232,6 +233,7 @@ class ReleaseToolTests(unittest.TestCase):
         incomplete_repo, _ = make_git_repo(incomplete_base)
         for relative in (
             "lib/sessionkit_inventory/__init__.py",
+            "lib/sessionkit_inventory/colors.py",
             "lib/sessionkit_inventory/common.py",
             "lib/sessionkit_inventory/lifecycle.py",
             "lib/sessionkit_inventory/projects.py",
@@ -273,7 +275,9 @@ class ReleaseToolTests(unittest.TestCase):
         release = self.tree.build(self.repo, self.sha1)
         metadata_path = release / "RELEASE.json"
         original = metadata_path.read_bytes()
-        for schema in (0, 5, True, "1"):
+        # One below the first schema and one above the current one, plus a
+        # bool and a string, which json round-trips but the verifier must not.
+        for schema in (0, 6, True, "1"):
             with self.subTest(schema=repr(schema)):
                 metadata = json.loads(original)
                 metadata["schema_version"] = schema
@@ -435,6 +439,7 @@ class ReleaseToolTests(unittest.TestCase):
         for index, relative in enumerate(
             (
                 "lib/sessionkit_inventory/__init__.py",
+                "lib/sessionkit_inventory/colors.py",
                 "lib/sessionkit_inventory/common.py",
                 "lib/sessionkit_inventory/lifecycle.py",
                 "lib/sessionkit_inventory/projects.py",

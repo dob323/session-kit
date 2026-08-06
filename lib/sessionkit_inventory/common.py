@@ -189,8 +189,20 @@ def _valid_automatic_title_failures(raw: Any) -> dict[str, int]:
     return failures
 
 
-def _valid_colors(raw: Any, *, palette: Sequence[str]) -> dict[str, str]:
-    """Validate provider/UUID-bound colors against the caller's palette."""
+def _valid_colors(
+    raw: Any,
+    *,
+    palette_for: Callable[[str], Sequence[str]],
+) -> dict[str, str]:
+    """Validate provider/UUID-bound colors against each provider's own palette.
+
+    The key carries the provider, so every entry is checked against the palette
+    that provider can actually display rather than against the union. An entry
+    naming a colour outside its provider's palette is dropped, not corrected:
+    that is what silently migrates a stored override left behind by an earlier
+    palette, since the caller then falls through to the identity hash and lands
+    inside the palette now in force.
+    """
     colors: dict[str, str] = {}
     if not isinstance(raw, Mapping):
         return colors
@@ -202,7 +214,7 @@ def _valid_colors(raw: Any, *, palette: Sequence[str]) -> dict[str, str]:
             separator
             and provider in PROVIDERS
             and UUID_RE.fullmatch(uuid)
-            and value in palette
+            and value in palette_for(provider)
         ):
             colors[f"{provider}:{uuid.lower()}"] = value
     return colors

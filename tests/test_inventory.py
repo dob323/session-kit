@@ -949,7 +949,7 @@ class InventoryIdentityTests(unittest.TestCase):
         fixture[4][0][exact]["title"] = "How deep is deepest ocean"
         fixture[4][0][exact]["first_user_message"] = "how deep is deepest ocean"
         fixture[4][0][exact]["session_index_name"] = "How deep is deepest ocean"
-        fixture[5]["colors"] = {f"codex:{exact}": "green"}
+        fixture[5]["colors"] = {f"codex:{exact}": "sky"}
 
         result = inventory_core.build_inventory(*fixture, now=1_800_000_000)
 
@@ -962,7 +962,7 @@ class InventoryIdentityTests(unittest.TestCase):
             row["identity"]["provenance"],
         )
         self.assertEqual("How deep is deepest ocean", row["title"])
-        self.assertEqual("green", row["display_color"])
+        self.assertEqual("sky", row["display_color"])
         self.assertEqual("idle", row["agent_status"])
 
     def test_app_server_refresh_targets_one_matching_remote_tui(self) -> None:

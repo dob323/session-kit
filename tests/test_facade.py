@@ -17,6 +17,8 @@ from tests.support import REPO
 CORE = REPO / "lib" / "session_inventory.py"
 REQUIRED_SYMBOLS = {
     "ABSENT_ALIAS_CONFIG_BACKUP",
+    "CLAUDE_SESSION_COLORS",
+    "CODEX_SESSION_COLORS",
     "CollectionError",
     "DEFAULT_MAX_PROC_NODES",
     "ROLLOUT_TAIL_BYTES",
@@ -103,6 +105,10 @@ REQUIRED_SYMBOLS = {
     "self_name_automatic_title",
     "session_color",
     "SESSION_COLORS",
+    "palette_for_provider",
+    "first_free_color",
+    "canonical_colors",
+    "mutate_canonical_color",
     "shpool_id_mutation_policy",
     "shutil",
     "snapshot",
@@ -182,7 +188,7 @@ def referenced_facade_symbols() -> set[str]:
 
 class InventoryFacadeTests(unittest.TestCase):
     def test_contract_matches_every_current_test_reference(self) -> None:
-        self.assertEqual(len(REQUIRED_SYMBOLS), 94)
+        self.assertEqual(len(REQUIRED_SYMBOLS), 100)
         self.assertEqual(REQUIRED_SYMBOLS, referenced_facade_symbols())
 
     def test_current_tested_symbols_remain_available(self) -> None:

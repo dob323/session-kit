@@ -247,7 +247,10 @@ elif operation == "recover":
     theme_entries = entries[len(values):]
     expected_themes = [
         f"sk-{color}.tmTheme"
-        for color in ("red", "blue", "green", "yellow", "purple", "orange", "pink", "cyan")
+        for color in (
+            "red", "blue", "green", "yellow", "purple", "orange", "pink", "cyan",
+            "lime", "magenta", "silver", "sand", "sky", "sea",
+        )
     ]
     if theme_entries:
         if len(theme_entries) != len(expected_themes):

@@ -338,7 +338,7 @@ def build_inventory(
     adopt_launch_colors: Callable[..., Any],
     codex_title_echoes_prompt: Callable[[str, str], bool],
     schema_version: int,
-    palette: Sequence[str],
+    claude_palette: Sequence[str],
     default_max_proc_nodes: int,
 ) -> dict[str, Any]:
     """Pure inventory composition for fixture tests and the live collector."""
@@ -815,7 +815,7 @@ def build_inventory(
         if (
             item.get("provider") == "claude"
             and display_uuid
-            and evidence in palette
+            and evidence in claude_palette
             and f"claude:{display_uuid}" not in color_overrides
         ):
             item["display_color"] = evidence

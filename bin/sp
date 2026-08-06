@@ -31,7 +31,9 @@ Usage:
   sp new [claude|codex|shell] [project-alias]
   sp name <terminal-number|shpool-id> <title>
   sp name reset <terminal-number|shpool-id>
-  sp color <terminal-number|shpool-id> <red|blue|green|yellow|purple|orange|pink|cyan>
+  sp color <terminal-number|shpool-id> <color>
+      Claude: red|blue|green|yellow|purple|orange|pink|cyan
+      Codex:  lime|magenta|silver|sand|sky|sea
   sp color reset <terminal-number|shpool-id>
   sp self-name <2-5-word-title>
   sp go <terminal-number|shpool-id>

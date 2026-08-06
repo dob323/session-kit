@@ -118,6 +118,16 @@ def render_inventory(
             "orange": "\033[38;2;242;144;81m",
             "pink": "\033[38;2;240;113;177m",
             "cyan": "\033[38;2;64;216;209m",
+            # The six Codex-only names. These carry each theme's own anchor
+            # rather than a captured render: they were chosen for the split
+            # palette, so there was no shipped frame to measure. Remeasure
+            # them the same way as the eight above once Codex has drawn them.
+            "lime": "\033[38;2;170;230;70m",
+            "magenta": "\033[38;2;255;95;255m",
+            "silver": "\033[38;2;205;210;220m",
+            "sand": "\033[38;2;214;178;130m",
+            "sky": "\033[38;2;150;205;255m",
+            "sea": "\033[38;2;95;235;170m",
         }
         if color
         else {}
