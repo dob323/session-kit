@@ -39,6 +39,7 @@ jobs:
         run: |
           bash -n install.sh
           bash -n bin/*
+          bash -n lib/sh/*
           bash -n bashrc/shpool.bashrc
           bash -n deploy/session-kit-launcher
           bash -n tests/run
@@ -93,6 +94,7 @@ jobs:
         run: |
           "$SESSION_KIT_TEST_BASH" -n install.sh
           "$SESSION_KIT_TEST_BASH" -n bin/*
+          "$SESSION_KIT_TEST_BASH" -n lib/sh/*
           "$SESSION_KIT_TEST_BASH" -n bashrc/shpool.bashrc
           "$SESSION_KIT_TEST_BASH" -n deploy/session-kit-launcher
           "$SESSION_KIT_TEST_BASH" -n tests/run
@@ -130,7 +132,7 @@ jobs:
           python -m pip install --requirement requirements-dev.txt
       - name: Check shell
         run: |
-          shellcheck install.sh bin/* bashrc/shpool.bashrc \
+          shellcheck install.sh bin/* lib/sh/* bashrc/shpool.bashrc \
             deploy/session-kit-launcher tests/run
       - name: Check Python
         env:
@@ -142,9 +144,24 @@ jobs:
             tools/build-public-tree tools/build-release-artifact \
             tools/check-doc-links tools/public-scan
           ruff format --check lib/sessionkit_inventory/__init__.py \
+            lib/sessionkit_inventory/collector.py \
+            lib/sessionkit_inventory/colors.py \
             lib/sessionkit_inventory/common.py \
+            lib/sessionkit_inventory/migration.py \
+            lib/sessionkit_inventory/model.py \
+            lib/sessionkit_inventory/names.py \
+            lib/sessionkit_inventory/names_push.py \
+            lib/sessionkit_inventory/processes.py \
             lib/sessionkit_inventory/projects.py \
             lib/sessionkit_inventory/providers.py \
+            lib/sessionkit_inventory/providers_claude.py \
+            lib/sessionkit_inventory/providers_codex.py \
+            lib/sessionkit_inventory/recovery.py \
+            lib/sessionkit_inventory/render.py \
+            lib/sessionkit_inventory/self_name.py \
+            lib/sessionkit_inventory/snapshot.py \
+            lib/sessionkit_inventory/terminal.py \
+            lib/sessionkit_inventory/validation.py \
             tests/test_doc_links.py tests/test_facade.py \
             tests/test_projects.py \
             tests/test_public_export.py tests/test_public_scan.py \

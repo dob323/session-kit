@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import datetime as dt
+import json
 import os
 from pathlib import Path
 import re
-from typing import Any, Callable, Mapping
+import shlex
+import subprocess
+import time
+from typing import Any, Callable, Mapping, Sequence
 import unicodedata
 
 
@@ -39,6 +44,11 @@ def _positive_float(value: Any, default: float, low: float, high: float) -> floa
     except (TypeError, ValueError):
         return default
     return parsed if low <= parsed <= high else default
+
+
+def _load_json_file(path: Path) -> Any:
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
 
 
 def _home(
@@ -125,6 +135,77 @@ def default_start_dir(
     if explicit:
         return Path(explicit).expanduser()
     return xdg_path("XDG_STATE_HOME", home() / ".local" / "state") / "shpool-start"
+
+
+def _valid_aliases(raw: Any) -> dict[str, str]:
+    aliases: dict[str, str] = {}
+    if not isinstance(raw, Mapping):
+        return aliases
+    for key, value in raw.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            continue
+        provider, separator, uuid = key.partition(":")
+        title = clean_text(value, 100)
+        if separator and provider in PROVIDERS and UUID_RE.fullmatch(uuid) and title:
+            aliases[f"{provider}:{uuid.lower()}"] = title
+    return aliases
+
+
+def _valid_automatic_titles(raw: Any) -> dict[str, str]:
+    """Validate retained, provider/UUID-bound automatic display titles."""
+    titles: dict[str, str] = {}
+    if not isinstance(raw, Mapping):
+        return titles
+    for key, value in raw.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            continue
+        provider, separator, uuid = key.partition(":")
+        try:
+            title = normalize_automatic_title(value)
+        except CollectionError:
+            continue
+        if separator and provider in PROVIDERS and valid_uuid(uuid):
+            titles[f"{provider}:{uuid.lower()}"] = title
+    return titles
+
+
+def _valid_automatic_title_failures(raw: Any) -> dict[str, int]:
+    failures: dict[str, int] = {}
+    if not isinstance(raw, Mapping):
+        return failures
+    for key, value in raw.items():
+        provider, separator, uuid = (
+            key.partition(":") if isinstance(key, str) else ("", "", "")
+        )
+        if (
+            separator
+            and provider in PROVIDERS
+            and valid_uuid(uuid)
+            and not isinstance(value, bool)
+            and isinstance(value, int)
+            and 0 < value <= 2
+        ):
+            failures[f"{provider}:{uuid.lower()}"] = value
+    return failures
+
+
+def _valid_colors(raw: Any, *, palette: Sequence[str]) -> dict[str, str]:
+    """Validate provider/UUID-bound colors against the caller's palette."""
+    colors: dict[str, str] = {}
+    if not isinstance(raw, Mapping):
+        return colors
+    for key, value in raw.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            continue
+        provider, separator, uuid = key.partition(":")
+        if (
+            separator
+            and provider in PROVIDERS
+            and UUID_RE.fullmatch(uuid)
+            and value in palette
+        ):
+            colors[f"{provider}:{uuid.lower()}"] = value
+    return colors
 
 
 def load_config(
@@ -257,3 +338,70 @@ def shpool_id_mutation_policy(raw: Any) -> tuple[bool, str | None]:
     ):
         return True, None
     return False, "unmanaged"
+
+
+def display_shpool_id(raw: str, limit: int = 32) -> str:
+    display_source = "".join(
+        " " if unicodedata.category(character).startswith("C") else character
+        for character in raw
+    )
+    visible = clean_text(display_source, 10000)
+    if not visible:
+        visible = "(non-printing ID)"
+    return visible if len(visible) <= limit else f"{visible[: limit - 1]}…"
+
+
+def _utc_now(now: float | None = None) -> str:
+    instant = dt.datetime.fromtimestamp(
+        now if now is not None else time.time(), dt.timezone.utc
+    )
+    return instant.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _command_from_env(
+    env_name: str,
+    default: str,
+    *,
+    environ: Mapping[str, str],
+) -> list[str]:
+    value = environ.get(env_name)
+    if value:
+        command = shlex.split(value)
+        if command:
+            return command
+    return [default]
+
+
+def default_runner(argv: Sequence[str], timeout: float) -> str:
+    completed = subprocess.run(
+        list(argv),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+    if completed.returncode != 0:
+        detail = clean_text(completed.stderr, 240) or f"exit {completed.returncode}"
+        raise CollectionError(f"{shlex.join(argv)} failed: {detail}")
+    return completed.stdout
+
+
+def _command_json(
+    *,
+    fixture_env: str,
+    command_env: str,
+    default_command: Sequence[str],
+    runner: Callable[[Sequence[str], float], str],
+    timeout: float,
+    environ: Mapping[str, str],
+    load_json_file: Callable[[Path], Any],
+    command_from_env: Callable[[str, str], list[str]],
+) -> Any:
+    """Read one provider snapshot from a fixture or the configured command."""
+    fixture = environ.get(fixture_env)
+    if fixture:
+        return load_json_file(Path(fixture).expanduser())
+    prefix = command_from_env(command_env, default_command[0])
+    return json.loads(runner([*prefix, *default_command[1:]], timeout))

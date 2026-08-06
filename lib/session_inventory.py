@@ -13,33 +13,104 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import ctypes
-import ctypes.util
 import datetime as dt
-import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
-import shlex
-import shutil
-import sqlite3
+import shutil  # noqa: F401  # re-exported facade symbol
 import stat as statmod
 import subprocess
 import sys
 import tempfile
 import time
 from typing import Any, Callable, Iterable, Mapping, Sequence
-import unicodedata
 
 _SESSION_KIT_LIB_DIR = os.fspath(Path(__file__).resolve().parent)
 if _SESSION_KIT_LIB_DIR not in sys.path:
     sys.path.insert(0, _SESSION_KIT_LIB_DIR)
 
+from sessionkit_inventory import collector as _collector  # noqa: E402
+from sessionkit_inventory import colors as _colors  # noqa: E402
 from sessionkit_inventory import common as _common  # noqa: E402
 from sessionkit_inventory import lifecycle as _lifecycle  # noqa: E402
+from sessionkit_inventory import model as _model  # noqa: E402
+from sessionkit_inventory import migration as _migration  # noqa: E402
+from sessionkit_inventory import names as _names  # noqa: E402
+from sessionkit_inventory import names_push as _names_push  # noqa: E402
+from sessionkit_inventory import processes as _processes  # noqa: E402
+from sessionkit_inventory import recovery as _recovery  # noqa: E402
+from sessionkit_inventory import render as _render  # noqa: E402
 from sessionkit_inventory import providers as _providers  # noqa: E402
+from sessionkit_inventory import providers_claude as _providers_claude  # noqa: E402
+from sessionkit_inventory import providers_codex as _providers_codex  # noqa: E402
+from sessionkit_inventory import state_io as _state_io  # noqa: E402
+from sessionkit_inventory import self_name as _self_name  # noqa: E402
+from sessionkit_inventory import snapshot as _snapshot  # noqa: E402
+from sessionkit_inventory import terminal as _terminal  # noqa: E402
+from sessionkit_inventory import validation as _validation  # noqa: E402
+from sessionkit_inventory.collector import (  # noqa: E402, F401
+    AVAILABILITY_ORDER,
+    PROVIDER_ORDER,
+)
+from sessionkit_inventory.terminal import (  # noqa: E402, F401
+    TERMINAL_NUMBER_QUARANTINE_SECONDS,
+)
+from sessionkit_inventory.colors import (  # noqa: E402, F401
+    COLOR_RESERVATION_MAX_AGE_SECONDS,
+    LAUNCH_COLOR_MAX_AGE_SECONDS,
+    SESSION_COLORS,
+)
+from sessionkit_inventory.self_name import (  # noqa: E402, F401
+    MAX_AUTO_TITLE_TRANSCRIPT_BYTES,
+    RESUME_CONTINUATION_TEXT,
+    _TITLE_TRAILING_STOPWORDS,
+)
+from sessionkit_inventory.names_push import (  # noqa: E402, F401
+    MAX_CLAUDE_SESSION_RECORDS,
+    MAX_CODEX_LIVE_RENAME_FRAME,
+    MAX_CODEX_LIVE_RENAME_SOCKETS,
+)
+from sessionkit_inventory.render import (  # noqa: E402, F401
+    DEFAULT_STALL_SECONDS,
+    _color_enabled,
+    _display_title,
+    _display_width,
+    _format_age,
+    lookup,
+    stall_threshold_seconds,
+)
+from sessionkit_inventory.validation import (  # noqa: E402, F401
+    _missing_shell_generation_is_quarantinable,
+    _missing_shell_generation_is_quarantined,
+)
+from sessionkit_inventory.recovery import (  # noqa: E402, F401
+    _generation_key,
+    _pending_conflict_fields,
+    _pending_evidence,
+    _pending_preferred_entry,
+    _remove_pending_entry,
+)
+from sessionkit_inventory.model import (  # noqa: E402, F401
+    _agent_identity,
+    _base_agent,
+    _empty_recovery,
+    _shell_title,
+    recovery_spec,
+)
+from sessionkit_inventory.providers import _arg_value, _parse_shpool_payload  # noqa: E402, F401
+from sessionkit_inventory.providers_claude import (  # noqa: E402, F401
+    MAX_CLAUDE_TITLE_SCAN_BYTES,
+    _is_native_claude,
+)
+from sessionkit_inventory.providers_codex import (  # noqa: E402, F401
+    ROLLOUT_LIFECYCLE_SEARCH_BYTES,
+    ROLLOUT_TAIL_BYTES,
+    _codex_state_databases,
+    _codex_turn_state,
+    _is_native_codex,
+)
 from sessionkit_inventory.common import (  # noqa: E402, F401
     GENERATED_OPERATIONAL_ID_RE,
     LEGACY_OPERATIONAL_ID_RE,
@@ -47,42 +118,70 @@ from sessionkit_inventory.common import (  # noqa: E402, F401
     PROVIDERS,
     UUID_RE,
     CollectionError,
+    _load_json_file,
     _positive_float,
     _positive_int,
+    _utc_now,
+    _valid_aliases,
+    _valid_automatic_title_failures,
+    _valid_automatic_titles,
     automatic_naming_enabled,
     clean_text,
+    default_runner,
+    display_shpool_id,
     natural_name_key,
     normalize_automatic_title,
     shpool_id_mutation_policy,
     valid_uuid,
 )
+from sessionkit_inventory.state_io import (  # noqa: E402, F401
+    StateLock,
+    _atomic_json_bytes,
+    _launch_fields,
+    _read_bounded_owner_file,
+    _read_private_launch_file,
+    _state_paths,
+    _terminal_generation_key,
+    atomic_write_json,
+)
+from sessionkit_inventory.processes import (  # noqa: E402, F401
+    DARWIN_PLATFORM,
+    _children_index,
+    _DarwinBsdInfo,
+    _DarwinTimeval,
+    _darwin_bsd_info,
+    _darwin_generation,
+    _darwin_procargs2,
+    _decode_c_string,
+    _is_shpool_daemon,
+    _parse_darwin_procargs2,
+    _proc_environ,
+    _proc_stat,
+    _process_age,
+    _process_ancestor_chain,
+    descendants,
+)
 
 
 SCHEMA_VERSION = 1
-PROVIDER_ORDER = {"claude": 0, "codex": 1, "shell": 2, "unknown": 3}
-AVAILABILITY_ORDER = {"ready": 0, "attached": 1}
 MAX_PRIVATE_JSON_BYTES = 1024 * 1024
 MAX_CODEX_SESSION_INDEX_BYTES = 4 * 1024 * 1024
 DEFAULT_MAX_PROC_NODES = 16384
 ABSENT_ALIAS_CONFIG_BACKUP = b"session-kit-alias-config-absent-v1\n"
 Runner = Callable[[Sequence[str], float], str]
 
-DARWIN_PLATFORM = "darwin"
-
-
 def _runtime_platform() -> str:
     """Return the real platform, with a test-only override for Linux fixtures."""
-    override = os.environ.get("SESSION_KIT_TEST_PLATFORM")
-    if os.environ.get("SESSION_KIT_TESTING") == "1" and override:
-        return override.casefold()
-    return sys.platform
+    return _processes._runtime_platform(
+        environ=os.environ,
+        platform_name=sys.platform,
+    )
 
 
 def _require_supported_platform() -> str:
-    platform = _runtime_platform()
-    if platform != DARWIN_PLATFORM and not platform.startswith("linux"):
-        raise CollectionError(f"unsupported platform: {platform}")
-    return platform
+    return _processes._require_supported_platform(
+        runtime_platform=_runtime_platform,
+    )
 
 
 def _home() -> Path:
@@ -133,63 +232,6 @@ def default_start_dir() -> Path:
     )
 
 
-def _load_json_file(path: Path) -> Any:
-    with path.open("r", encoding="utf-8") as handle:
-        return json.load(handle)
-
-
-def _valid_aliases(raw: Any) -> dict[str, str]:
-    aliases: dict[str, str] = {}
-    if not isinstance(raw, Mapping):
-        return aliases
-    for key, value in raw.items():
-        if not isinstance(key, str) or not isinstance(value, str):
-            continue
-        provider, separator, uuid = key.partition(":")
-        title = clean_text(value, 100)
-        if separator and provider in PROVIDERS and UUID_RE.fullmatch(uuid) and title:
-            aliases[f"{provider}:{uuid.lower()}"] = title
-    return aliases
-
-
-def _valid_automatic_titles(raw: Any) -> dict[str, str]:
-    """Validate retained, provider/UUID-bound automatic display titles."""
-    titles: dict[str, str] = {}
-    if not isinstance(raw, Mapping):
-        return titles
-    for key, value in raw.items():
-        if not isinstance(key, str) or not isinstance(value, str):
-            continue
-        provider, separator, uuid = key.partition(":")
-        try:
-            title = normalize_automatic_title(value)
-        except CollectionError:
-            continue
-        if separator and provider in PROVIDERS and valid_uuid(uuid):
-            titles[f"{provider}:{uuid.lower()}"] = title
-    return titles
-
-
-def _valid_automatic_title_failures(raw: Any) -> dict[str, int]:
-    failures: dict[str, int] = {}
-    if not isinstance(raw, Mapping):
-        return failures
-    for key, value in raw.items():
-        provider, separator, uuid = (
-            key.partition(":") if isinstance(key, str) else ("", "", "")
-        )
-        if (
-            separator
-            and provider in PROVIDERS
-            and valid_uuid(uuid)
-            and not isinstance(value, bool)
-            and isinstance(value, int)
-            and 0 < value <= 2
-        ):
-            failures[f"{provider}:{uuid.lower()}"] = value
-    return failures
-
-
 def load_config() -> dict[str, Any]:
     """Load and validate configuration, with safe defaults."""
     config = _common.load_config(
@@ -219,45 +261,8 @@ def load_config() -> dict[str, Any]:
     return config
 
 
-def display_shpool_id(raw: str, limit: int = 32) -> str:
-    display_source = "".join(
-        " " if unicodedata.category(character).startswith("C") else character
-        for character in raw
-    )
-    visible = clean_text(display_source, 10000)
-    if not visible:
-        visible = "(non-printing ID)"
-    return visible if len(visible) <= limit else f"{visible[: limit - 1]}…"
-
-
-def _utc_now(now: float | None = None) -> str:
-    instant = dt.datetime.fromtimestamp(now if now is not None else time.time(), dt.timezone.utc)
-    return instant.isoformat(timespec="seconds").replace("+00:00", "Z")
-
-
 def _command_from_env(env_name: str, default: str) -> list[str]:
-    value = os.environ.get(env_name)
-    if value:
-        command = shlex.split(value)
-        if command:
-            return command
-    return [default]
-
-
-def default_runner(argv: Sequence[str], timeout: float) -> str:
-    completed = subprocess.run(
-        list(argv),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=timeout,
-        check=False,
-    )
-    if completed.returncode != 0:
-        detail = clean_text(completed.stderr, 240) or f"exit {completed.returncode}"
-        raise CollectionError(f"{shlex.join(argv)} failed: {detail}")
-    return completed.stdout
+    return _common._command_from_env(env_name, default, environ=os.environ)
 
 
 def _command_json(
@@ -268,423 +273,63 @@ def _command_json(
     runner: Runner,
     timeout: float,
 ) -> Any:
-    fixture = os.environ.get(fixture_env)
-    if fixture:
-        return _load_json_file(Path(fixture).expanduser())
-    prefix = _command_from_env(command_env, default_command[0])
-    return json.loads(runner([*prefix, *default_command[1:]], timeout))
-
-
-def _parse_shpool_payload(payload: Any) -> list[dict[str, Any]]:
-    if not isinstance(payload, Mapping) or not isinstance(payload.get("sessions"), list):
-        raise CollectionError("shpool list --json returned an invalid object")
-    result: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for item in payload["sessions"]:
-        if not isinstance(item, Mapping):
-            raise CollectionError("shpool list --json contained a non-object session")
-        name = item.get("name")
-        status_raw = clean_text(item.get("status"), 32).casefold()
-        if (
-            not isinstance(name, str)
-            or not name
-            or name in seen
-            or status_raw not in {"attached", "disconnected"}
-        ):
-            raise CollectionError("shpool list --json contained an invalid or duplicate session")
-        started = item.get("started_at_unix_ms")
-        if not isinstance(started, int) or started < 0:
-            raise CollectionError(f"shpool session {name!r} has invalid started_at_unix_ms")
-        seen.add(name)
-        result.append(
-            {
-                "name": name,
-                "status": "Attached" if status_raw == "attached" else "Disconnected",
-                "started_at_unix_ms": started,
-            }
-        )
-    return result
+    return _common._command_json(
+        fixture_env=fixture_env,
+        command_env=command_env,
+        default_command=default_command,
+        runner=runner,
+        timeout=timeout,
+        environ=os.environ,
+        load_json_file=_load_json_file,
+        command_from_env=_command_from_env,
+    )
 
 
 def _parse_claude_payload(payload: Any) -> list[dict[str, Any]]:
-    if not isinstance(payload, list):
-        raise CollectionError("claude agents --json returned a non-array")
-    result: list[dict[str, Any]] = []
-    seen_pids: set[int] = set()
-    for item in payload:
-        if not isinstance(item, Mapping):
-            continue
-        pid = item.get("pid")
-        uuid = valid_uuid(item.get("sessionId"))
-        if not isinstance(pid, int) or pid <= 0 or not uuid or pid in seen_pids:
-            continue
-        seen_pids.add(pid)
-        raw_status = clean_text(item.get("status"), 40).casefold()
-        waiting_for = item.get("waitingFor")
-        needs_you = bool(waiting_for) or raw_status in {
-            "waiting",
-            "needs_input",
-            "needs your reply",
-        }
-        status = "needs your reply" if needs_you else ("working" if raw_status == "busy" else raw_status)
-        result.append(
-            {
-                "pid": pid,
-                "uuid": uuid,
-                "cwd": clean_text(item.get("cwd"), 4096),
-                "kind": clean_text(item.get("kind"), 40),
-                "started_at_unix_ms": item.get("startedAt")
-                if isinstance(item.get("startedAt"), int)
-                else None,
-                "title": clean_text(item.get("name"), 120),
-                "ai_title": clean_text(item.get("aiTitle"), 120),
-                "agent_name": clean_text(item.get("agentName"), 120),
-                "agent_color": item.get("agentColor")
-                if item.get("agentColor") in SESSION_COLORS
-                else "",
-                "name_source": clean_text(item.get("nameSource"), 20),
-                "status": status or "unknown",
-                "needs_you": needs_you,
-            }
-        )
-    return result
-
-
-MAX_CLAUDE_TITLE_SCAN_BYTES = 64 * 1024
+    return _providers_claude._parse_claude_payload(payload, palette=SESSION_COLORS)
 
 
 def read_claude_transcript_signals(
     uuid: str, home: Path | None = None
 ) -> dict[str, str]:
-    """Return Claude's persisted per-conversation title and color evidence.
-
-    The TUI stores its conversation auto-title as an ``ai-title`` transcript
-    record and its session color as an ``agent-color`` record — neither lives
-    in the session record, so the derived window label and the visible
-    conversation state can disagree. Reads are bounded to the transcript's
-    head and tail; the last record of each kind wins. Any problem returns
-    empty evidence.
-    """
-    signals = {"ai_title": "", "agent_name": "", "agent_color": ""}
-    exact_uuid = valid_uuid(uuid)
-    if not exact_uuid:
-        return signals
-    base = home if home is not None else Path(os.environ.get("HOME") or Path.home())
-    projects = base / ".claude" / "projects"
-    try:
-        transcripts = sorted(projects.glob(f"*/{exact_uuid}.jsonl"))
-    except OSError:
-        return signals
-    for transcript in transcripts[:4]:
-        if transcript.is_symlink():
-            continue
-        try:
-            size = transcript.stat().st_size
-            with open(transcript, "rb") as handle:
-                chunks = [handle.read(MAX_CLAUDE_TITLE_SCAN_BYTES)]
-                if size > 2 * MAX_CLAUDE_TITLE_SCAN_BYTES:
-                    handle.seek(size - MAX_CLAUDE_TITLE_SCAN_BYTES)
-                    chunks.append(handle.read(MAX_CLAUDE_TITLE_SCAN_BYTES))
-                elif size > MAX_CLAUDE_TITLE_SCAN_BYTES:
-                    chunks.append(handle.read())
-        except OSError:
-            continue
-        for chunk in chunks:
-            for line in chunk.split(b"\n"):
-                if not any(
-                    marker in line
-                    for marker in (b'"ai-title"', b'"agent-name"', b'"agent-color"')
-                ):
-                    continue
-                try:
-                    record = json.loads(line.decode("utf-8", "strict"))
-                except (UnicodeDecodeError, ValueError):
-                    continue
-                if (
-                    not isinstance(record, Mapping)
-                    or record.get("sessionId") != exact_uuid
-                ):
-                    continue
-                if record.get("type") == "ai-title":
-                    candidate = clean_text(record.get("aiTitle"), 120)
-                    if candidate:
-                        signals["ai_title"] = candidate
-                elif record.get("type") == "agent-name":
-                    candidate = clean_text(record.get("agentName"), 120)
-                    if candidate:
-                        signals["agent_name"] = candidate
-                elif record.get("type") == "agent-color":
-                    color = record.get("agentColor")
-                    if isinstance(color, str) and color in SESSION_COLORS:
-                        signals["agent_color"] = color
-    return signals
+    """Return Claude's persisted per-conversation title and color evidence."""
+    return _providers_claude.read_claude_transcript_signals(
+        uuid,
+        home,
+        environ=os.environ,
+        home_factory=Path.home,
+        palette=SESSION_COLORS,
+    )
 
 
 def read_claude_ai_title(uuid: str, home: Path | None = None) -> str:
     """Compatibility wrapper: the auto-title half of the transcript signals."""
-    return read_claude_transcript_signals(uuid, home)["ai_title"]
+    return _providers_claude.read_claude_ai_title(
+        uuid,
+        home,
+        transcript_signals=read_claude_transcript_signals,
+    )
 
 
 def _enrich_claude_payload(payload: Any) -> Any:
     """Attach per-session nameSource and ai-title evidence for the collector."""
-    if not isinstance(payload, list):
-        return payload
-    home = Path(os.environ.get("HOME") or Path.home())
-    for item in payload:
-        if not isinstance(item, dict):
-            continue
-        pid = item.get("pid")
-        uuid = valid_uuid(item.get("sessionId"))
-        if not isinstance(pid, int) or pid <= 0 or not uuid:
-            continue
-        record_path = home / ".claude" / "sessions" / f"{pid}.json"
-        if "nameSource" not in item and record_path.is_file():
-            try:
-                record = json.loads(record_path.read_text(encoding="utf-8"))
-                if isinstance(record, Mapping):
-                    item["nameSource"] = record.get("nameSource")
-            except (OSError, ValueError):
-                pass
-        needs_title = not item.get("aiTitle")
-        needs_name = not item.get("agentName")
-        needs_color = item.get("agentColor") not in SESSION_COLORS
-        if needs_title or needs_name or needs_color:
-            signals = read_claude_transcript_signals(uuid, home)
-            if needs_title:
-                item["aiTitle"] = signals["ai_title"]
-            if needs_name:
-                item["agentName"] = signals["agent_name"]
-            if needs_color:
-                item["agentColor"] = signals["agent_color"]
-    return payload
-
-
-def _proc_stat(path: Path) -> tuple[int, int, int]:
-    raw = path.read_text(encoding="utf-8", errors="replace")
-    left = raw.find("(")
-    right = raw.rfind(")")
-    if left < 1 or right < left:
-        raise ValueError("malformed stat")
-    pid = int(raw[:left].strip())
-    fields = raw[right + 2 :].split()
-    return pid, int(fields[1]), int(fields[19])
-
-
-def _proc_environ(path: Path) -> dict[str, str]:
-    values: dict[str, str] = {}
-    for entry in path.read_bytes().split(b"\0"):
-        if b"=" not in entry:
-            continue
-        key, value = entry.split(b"=", 1)
-        try:
-            values[key.decode("utf-8")] = value.decode("utf-8", errors="replace")
-        except UnicodeDecodeError:
-            continue
-    return values
+    return _providers_claude._enrich_claude_payload(
+        payload,
+        environ=os.environ,
+        home_factory=Path.home,
+        palette=SESSION_COLORS,
+        transcript_signals=read_claude_transcript_signals,
+    )
 
 
 def scan_process_table(proc_root: Path, max_nodes: int) -> dict[int, dict[str, Any]]:
     """Read one bounded process-table view from proc_root."""
-    table: dict[int, dict[str, Any]] = {}
-    try:
-        entries = sorted(
-            (entry for entry in proc_root.iterdir() if entry.name.isdigit()),
-            key=lambda item: int(item.name),
-        )
-    except OSError as exc:
-        raise CollectionError(f"cannot enumerate {proc_root}: {exc}") from exc
-    if len(entries) > max_nodes:
-        raise CollectionError(
-            f"{proc_root} has {len(entries)} processes, above max_proc_nodes={max_nodes}"
-        )
-    for entry in entries:
-        pid = int(entry.name)
-        try:
-            before_pid, ppid, start_ticks = _proc_stat(entry / "stat")
-            if before_pid != pid:
-                continue
-            cmdline = [
-                value.decode("utf-8", errors="replace")
-                for value in (entry / "cmdline").read_bytes().split(b"\0")
-                if value
-            ]
-            comm = clean_text((entry / "comm").read_text(encoding="utf-8", errors="replace"), 128)
-        except (OSError, ValueError):
-            continue
-        try:
-            environ = _proc_environ(entry / "environ")
-        except OSError:
-            environ = {}
-        try:
-            cwd = os.readlink(entry / "cwd")
-        except OSError:
-            cwd = ""
-        try:
-            after_pid, after_ppid, after_start_ticks = _proc_stat(entry / "stat")
-        except (OSError, ValueError):
-            continue
-        if (before_pid, ppid, start_ticks) != (
-            after_pid,
-            after_ppid,
-            after_start_ticks,
-        ):
-            continue
-        table[pid] = {
-            "pid": pid,
-            "ppid": ppid,
-            "start_ticks": start_ticks,
-            "cmdline": cmdline,
-            "comm": comm,
-            "cwd": cwd,
-            "session_name": environ.get("SHPOOL_SESSION_NAME", ""),
-        }
-    return table
-
-
-class _DarwinBsdInfo(ctypes.Structure):
-    """Stable prefix and start fields from Darwin's ``struct proc_bsdinfo``."""
-
-    _fields_ = [
-        ("pbi_flags", ctypes.c_uint32),
-        ("pbi_status", ctypes.c_uint32),
-        ("pbi_xstatus", ctypes.c_uint32),
-        ("pbi_pid", ctypes.c_uint32),
-        ("pbi_ppid", ctypes.c_uint32),
-        ("pbi_uid", ctypes.c_uint32),
-        ("pbi_gid", ctypes.c_uint32),
-        ("pbi_ruid", ctypes.c_uint32),
-        ("pbi_rgid", ctypes.c_uint32),
-        ("pbi_svuid", ctypes.c_uint32),
-        ("pbi_svgid", ctypes.c_uint32),
-        ("rfu_1", ctypes.c_uint32),
-        ("pbi_comm", ctypes.c_char * 16),
-        ("pbi_name", ctypes.c_char * 32),
-        ("pbi_nfiles", ctypes.c_uint32),
-        ("pbi_pgid", ctypes.c_uint32),
-        ("pbi_pjobc", ctypes.c_uint32),
-        ("e_tdev", ctypes.c_uint32),
-        ("e_tpgid", ctypes.c_uint32),
-        ("pbi_nice", ctypes.c_int32),
-        ("pbi_start_tvsec", ctypes.c_uint64),
-        ("pbi_start_tvusec", ctypes.c_uint64),
-    ]
-
-
-class _DarwinTimeval(ctypes.Structure):
-    _fields_ = [
-        ("tv_sec", ctypes.c_long),
-        ("tv_usec", ctypes.c_int),
-    ]
-
-
-def _parse_darwin_procargs2(payload: bytes) -> tuple[list[str], dict[str, str]]:
-    """Parse a KERN_PROCARGS2 payload without trusting text delimiters."""
-    integer_size = ctypes.sizeof(ctypes.c_int)
-    if len(payload) < integer_size:
-        raise ValueError("short KERN_PROCARGS2 payload")
-    argc = int.from_bytes(payload[:integer_size], sys.byteorder, signed=True)
-    if argc < 0 or argc > 65536:
-        raise ValueError("invalid KERN_PROCARGS2 argc")
-    values = payload[integer_size:].split(b"\0")
-    if not values:
-        raise ValueError("missing KERN_PROCARGS2 executable")
-    # First value is the executable path. Darwin may insert extra NUL padding
-    # before argv[0].
-    index = 1
-    while index < len(values) and not values[index]:
-        index += 1
-    if len(values) - index < argc:
-        raise ValueError("truncated KERN_PROCARGS2 argv")
-    argv = [
-        value.decode("utf-8", errors="replace")
-        for value in values[index : index + argc]
-    ]
-    environ: dict[str, str] = {}
-    for raw in values[index + argc :]:
-        if not raw or b"=" not in raw:
-            continue
-        key, value = raw.split(b"=", 1)
-        try:
-            name = key.decode("utf-8")
-        except UnicodeDecodeError:
-            continue
-        environ[name] = value.decode("utf-8", errors="replace")
-    return argv, environ
-
-
-def _darwin_libraries() -> tuple[Any, Any]:
-    if _runtime_platform() != DARWIN_PLATFORM:
-        raise CollectionError("Darwin native process APIs are unavailable")
-    libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.dylib", use_errno=True)
-    libproc = ctypes.CDLL(
-        ctypes.util.find_library("proc") or "/usr/lib/libproc.dylib",
-        use_errno=True,
+    return _processes.scan_process_table(
+        proc_root,
+        max_nodes,
+        proc_stat=_proc_stat,
+        proc_environ=_proc_environ,
     )
-    libc.sysctl.argtypes = [
-        ctypes.POINTER(ctypes.c_int),
-        ctypes.c_uint,
-        ctypes.c_void_p,
-        ctypes.POINTER(ctypes.c_size_t),
-        ctypes.c_void_p,
-        ctypes.c_size_t,
-    ]
-    libc.sysctl.restype = ctypes.c_int
-    libc.sysctlbyname.argtypes = [
-        ctypes.c_char_p,
-        ctypes.c_void_p,
-        ctypes.POINTER(ctypes.c_size_t),
-        ctypes.c_void_p,
-        ctypes.c_size_t,
-    ]
-    libc.sysctlbyname.restype = ctypes.c_int
-    libproc.proc_listallpids.argtypes = [ctypes.c_void_p, ctypes.c_int]
-    libproc.proc_listallpids.restype = ctypes.c_int
-    libproc.proc_pidinfo.argtypes = [
-        ctypes.c_int,
-        ctypes.c_int,
-        ctypes.c_uint64,
-        ctypes.c_void_p,
-        ctypes.c_int,
-    ]
-    libproc.proc_pidinfo.restype = ctypes.c_int
-    return libc, libproc
-
-
-def _darwin_procargs2(libc: Any, pid: int) -> bytes:
-    # CTL_KERN, KERN_PROCARGS2, pid
-    mib = (ctypes.c_int * 3)(1, 49, pid)
-    size = ctypes.c_size_t(0)
-    if libc.sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0:
-        raise OSError(ctypes.get_errno(), "KERN_PROCARGS2 size")
-    if size.value <= 0 or size.value > 16 * 1024 * 1024:
-        raise OSError("unsafe KERN_PROCARGS2 size")
-    buffer = ctypes.create_string_buffer(size.value)
-    if libc.sysctl(mib, 3, buffer, ctypes.byref(size), None, 0) != 0:
-        raise OSError(ctypes.get_errno(), "KERN_PROCARGS2 read")
-    return buffer.raw[: size.value]
-
-
-def _darwin_bsd_info(libproc: Any, pid: int) -> _DarwinBsdInfo:
-    info = _DarwinBsdInfo()
-    # PROC_PIDTBSDINFO
-    received = libproc.proc_pidinfo(
-        pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info)
-    )
-    if received != ctypes.sizeof(info):
-        raise OSError(ctypes.get_errno(), "PROC_PIDTBSDINFO")
-    return info
-
-
-def _darwin_generation(info: _DarwinBsdInfo) -> int:
-    seconds = int(info.pbi_start_tvsec)
-    microseconds = int(info.pbi_start_tvusec)
-    if seconds <= 0 or microseconds < 0 or microseconds >= 1_000_000:
-        raise ValueError("invalid Darwin process start time")
-    return seconds * 1_000_000 + microseconds
-
-
-def _decode_c_string(value: bytes) -> str:
-    return value.split(b"\0", 1)[0].decode("utf-8", errors="replace")
 
 
 def scan_darwin_process_table(
@@ -695,215 +340,72 @@ def scan_darwin_process_table(
     args_reader: Callable[[int], bytes] | None = None,
 ) -> dict[int, dict[str, Any]]:
     """Read one bounded Darwin process view using libproc and KERN_PROCARGS2."""
-    libc: Any = None
-    libproc: Any = None
-    if pids is None or bsd_reader is None or args_reader is None:
-        libc, libproc = _darwin_libraries()
-    if pids is None:
-        capacity = max_nodes + 1
-        buffer = (ctypes.c_int * capacity)()
-        count = libproc.proc_listallpids(buffer, ctypes.sizeof(buffer))
-        if count < 0:
-            raise CollectionError("cannot enumerate Darwin processes")
-        if count > max_nodes:
-            raise CollectionError(
-                f"Darwin has more than max_proc_nodes={max_nodes} processes"
-            )
-        pids = [int(buffer[index]) for index in range(count) if buffer[index] > 0]
-    unique_pids = sorted(set(pids))
-    if len(unique_pids) > max_nodes:
-        raise CollectionError(
-            f"Darwin has {len(unique_pids)} processes, above "
-            f"max_proc_nodes={max_nodes}"
-        )
-    read_bsd = bsd_reader or (lambda pid: _darwin_bsd_info(libproc, pid))
-    read_args = args_reader or (lambda pid: _darwin_procargs2(libc, pid))
-    table: dict[int, dict[str, Any]] = {}
-    for pid in unique_pids:
-        try:
-            before = read_bsd(pid)
-            generation = _darwin_generation(before)
-        except (OSError, ValueError):
-            continue
-        args_available = True
-        try:
-            argv, environ = _parse_darwin_procargs2(read_args(pid))
-        except (OSError, ValueError):
-            argv, environ = [], {}
-            args_available = False
-        try:
-            after = read_bsd(pid)
-            after_generation = _darwin_generation(after)
-        except (OSError, ValueError):
-            continue
-        before_identity = (int(before.pbi_pid), int(before.pbi_ppid), generation)
-        after_identity = (
-            int(after.pbi_pid),
-            int(after.pbi_ppid),
-            after_generation,
-        )
-        if before_identity != after_identity or before_identity[0] != pid:
-            continue
-        table[pid] = {
-            "pid": pid,
-            "ppid": before_identity[1],
-            "start_ticks": generation,
-            "generation_kind": "darwin-start-usec",
-            "args_available": args_available,
-            "cmdline": argv,
-            "comm": clean_text(
-                _decode_c_string(bytes(before.pbi_name))
-                or _decode_c_string(bytes(before.pbi_comm)),
-                128,
-            ),
-            "cwd": (
-                environ.get("PWD", "")
-                if environ.get("PWD", "").startswith("/")
-                else ""
-            ),
-            "session_name": environ.get("SHPOOL_SESSION_NAME", ""),
-            "codex_thread_id": environ.get("CODEX_THREAD_ID", ""),
-            "claude_session_id": environ.get("CLAUDE_SESSION_ID", ""),
-        }
-    return table
+    return _processes.scan_darwin_process_table(
+        max_nodes,
+        pids=pids,
+        bsd_reader=bsd_reader,
+        args_reader=args_reader,
+        darwin_libraries=_darwin_libraries,
+        darwin_bsd_info=_darwin_bsd_info,
+        darwin_procargs2=_darwin_procargs2,
+        darwin_generation=_darwin_generation,
+        parse_darwin_procargs2=_parse_darwin_procargs2,
+        decode_c_string=_decode_c_string,
+    )
+
+
+def _darwin_libraries() -> tuple[Any, Any]:
+    return _processes._darwin_libraries(runtime_platform=_runtime_platform)
 
 
 def platform_process_table(
     proc_root: Path, max_nodes: int
 ) -> dict[int, dict[str, Any]]:
-    platform = _require_supported_platform()
-    if platform == DARWIN_PLATFORM:
-        return scan_darwin_process_table(max_nodes)
-    return scan_process_table(proc_root, max_nodes)
-
-
-def _children_index(process_table: Mapping[int, Mapping[str, Any]]) -> dict[int, list[int]]:
-    children: dict[int, list[int]] = {}
-    for pid, process in process_table.items():
-        children.setdefault(int(process.get("ppid", 0)), []).append(pid)
-    for values in children.values():
-        values.sort()
-    return children
-
-
-def _is_shpool_daemon(process: Mapping[str, Any]) -> bool:
-    argv = process.get("cmdline") or []
-    executable = Path(argv[0]).name if argv else process.get("comm", "")
-    return executable == "shpool" and "daemon" in argv[1:]
+    return _processes.platform_process_table(
+        proc_root,
+        max_nodes,
+        require_supported_platform=_require_supported_platform,
+        darwin_process_table=scan_darwin_process_table,
+        linux_process_table=scan_process_table,
+    )
 
 
 def shpool_roots(
     session_names: Iterable[str], process_table: Mapping[int, Mapping[str, Any]]
 ) -> tuple[dict[str, int], dict[str, list[str]]]:
     """Map a shpool name only through a unique daemon direct child."""
-    wanted = set(session_names)
-    daemons = [pid for pid, process in process_table.items() if _is_shpool_daemon(process)]
-    roots: dict[str, int] = {}
-    diagnostics: dict[str, list[str]] = {name: [] for name in wanted}
-    if len(daemons) != 1:
-        reason = f"expected one shpool daemon in the process table, found {len(daemons)}"
-        for name in wanted:
-            diagnostics[name].append(reason)
-        return roots, diagnostics
-    daemon = daemons[0]
-    for name in wanted:
-        candidates = sorted(
-            pid
-            for pid, process in process_table.items()
-            if process.get("ppid") == daemon and process.get("session_name") == name
-        )
-        if len(candidates) == 1:
-            roots[name] = candidates[0]
-        else:
-            diagnostics[name].append(
-                f"expected one daemon child for {name!r}, found {len(candidates)}"
-            )
-    return roots, diagnostics
+    return _processes.shpool_roots(
+        session_names,
+        process_table,
+        is_shpool_daemon=_is_shpool_daemon,
+    )
 
 
 def daemon_generation(
     process_table: Mapping[int, Mapping[str, Any]]
 ) -> dict[str, int] | None:
-    candidates = [
-        process for process in process_table.values() if _is_shpool_daemon(process)
-    ]
-    if len(candidates) != 1:
-        return None
-    pid = candidates[0].get("pid")
-    start_ticks = candidates[0].get("start_ticks")
-    if not isinstance(pid, int) or not isinstance(start_ticks, int):
-        return None
-    return {"pid": pid, "process_start_ticks": start_ticks}
-
-
-def descendants(
-    root_pid: int,
-    children: Mapping[int, Sequence[int]],
-    *,
-    max_nodes: int,
-    max_depth: int,
-) -> list[int]:
-    """Bounded breadth-first descendant walk, including root_pid."""
-    found: list[int] = []
-    seen: set[int] = set()
-    queue: list[tuple[int, int]] = [(root_pid, 0)]
-    while queue:
-        pid, depth = queue.pop(0)
-        if pid in seen:
-            continue
-        seen.add(pid)
-        found.append(pid)
-        if len(found) > max_nodes:
-            raise CollectionError(f"process tree rooted at PID {root_pid} exceeded max_proc_nodes")
-        if depth >= max_depth:
-            continue
-        queue.extend((child, depth + 1) for child in children.get(pid, ()))
-    return found
-
-
-def _arg_value(argv: Sequence[str], option: str) -> str:
-    try:
-        index = argv.index(option)
-    except ValueError:
-        return ""
-    return argv[index + 1] if index + 1 < len(argv) else ""
+    return _processes.daemon_generation(
+        process_table,
+        is_shpool_daemon=_is_shpool_daemon,
+    )
 
 
 def claude_subagents(
     root_uuid: str, process_table: Mapping[int, Mapping[str, Any]]
 ) -> list[dict[str, Any]]:
-    result: list[dict[str, Any]] = []
-    for pid, process in process_table.items():
-        argv = process.get("cmdline") or []
-        if _arg_value(argv, "--parent-session-id").lower() != root_uuid:
-            continue
-        title = clean_text(_arg_value(argv, "--agent-name"), 80) or f"PID {pid}"
-        result.append(
-            {
-                "provider": "claude",
-                "uuid": None,
-                "pid": pid,
-                "title": title,
-                "status": "running",
-            }
-        )
-    return sorted(result, key=lambda item: (item["title"].casefold(), item["pid"]))
-
-
-def _is_native_codex(process: Mapping[str, Any]) -> bool:
-    argv = process.get("cmdline") or []
-    if not argv:
-        return False
-    executable = Path(argv[0]).name
-    return executable == "codex" and process.get("comm") != "node"
+    return _providers_claude.claude_subagents(
+        root_uuid,
+        process_table,
+        arg_value=_arg_value,
+    )
 
 
 def _is_codex_app_server(process: Mapping[str, Any]) -> bool:
     """Recognize the native Codex process that owns remote TUI threads."""
-    if not _is_native_codex(process):
-        return False
-    argv = list(process.get("cmdline") or [])
-    return "app-server" in argv[1:]
+    return _providers_codex._is_codex_app_server(
+        process,
+        is_native_codex=_is_native_codex,
+    )
 
 
 def codex_refresh_target(
@@ -913,121 +415,52 @@ def codex_refresh_target(
     provider_pid: int,
     provider_generation: int,
 ) -> tuple[int, int]:
-    """Prove the exact Codex process a title refresh may restart.
-
-    A direct CLI owns both the rollout and TUI. For a remote TUI the App
-    Server owns the rollout, but restarting it would destroy the resume socket;
-    select the one native TUI connected to that exact server instead.
-    """
-    shell = process_table.get(shell_pid, {})
-    provider = process_table.get(provider_pid, {})
-    if shell.get("start_ticks") != shell_generation:
-        raise CollectionError("managed shell generation changed")
-    if (
-        provider.get("start_ticks") != provider_generation
-        or not _is_native_codex(provider)
-    ):
-        raise CollectionError("Codex provider generation changed")
-    children = _children_index(process_table)
-    tree = descendants(
+    """Prove the exact Codex process a title refresh may restart."""
+    return _providers_codex.codex_refresh_target(
+        process_table,
         shell_pid,
-        children,
-        max_nodes=DEFAULT_MAX_PROC_NODES,
-        max_depth=32,
+        shell_generation,
+        provider_pid,
+        provider_generation,
+        is_native_codex=_is_native_codex,
+        is_codex_app_server=_is_codex_app_server,
+        children_index=_children_index,
+        descendants=descendants,
+        arg_value=_arg_value,
+        max_proc_nodes=DEFAULT_MAX_PROC_NODES,
     )
-    if provider_pid not in tree:
-        raise CollectionError("Codex provider is outside the managed shell")
-    if not _is_codex_app_server(provider):
-        return provider_pid, provider_generation
-    provider_argv = list(provider.get("cmdline") or [])
-    listen = _arg_value(provider_argv, "--listen")
-    if not listen.startswith("unix://"):
-        raise CollectionError("Codex App Server socket is unavailable")
-    candidates: list[tuple[int, int]] = []
-    for pid in tree:
-        if pid == provider_pid:
-            continue
-        process = process_table.get(pid, {})
-        if not _is_native_codex(process) or _is_codex_app_server(process):
-            continue
-        argv = list(process.get("cmdline") or [])
-        generation = process.get("start_ticks")
-        if (
-            _arg_value(argv, "--remote") == listen
-            and "--no-alt-screen" in argv
-            and isinstance(generation, int)
-        ):
-            candidates.append((pid, generation))
-    if len(candidates) != 1:
-        raise CollectionError(
-            f"expected one remote Codex TUI, found {len(candidates)}"
-        )
-    return candidates[0]
-
-
-def _is_native_claude(process: Mapping[str, Any]) -> bool:
-    argv = process.get("cmdline") or []
-    executable = Path(str(argv[0])).name if argv else ""
-    comm = clean_text(process.get("comm"), 128)
-    return executable == "claude" or comm in {"claude", "claude.exe"}
 
 
 def _native_claude_uuid(process: Mapping[str, Any]) -> str | None:
-    if not _is_native_claude(process):
-        return None
-    argv = list(process.get("cmdline") or [])
-    if "--parent-session-id" in argv or "--fork-session" in argv:
-        return None
-    candidate = (
-        _arg_value(argv, "--session-id")
-        or _arg_value(argv, "--resume")
-        or str(process.get("claude_session_id", ""))
+    return _providers_claude._native_claude_uuid(
+        process,
+        is_native_claude=_is_native_claude,
+        arg_value=_arg_value,
     )
-    return valid_uuid(candidate)
-
-
-ROLLOUT_TAIL_BYTES = _providers.ROLLOUT_TAIL_BYTES
-ROLLOUT_LIFECYCLE_SEARCH_BYTES = _providers.ROLLOUT_LIFECYCLE_SEARCH_BYTES
 
 
 def _rollout_turn_state(descriptor: int) -> str:
     """Compatibility facade for the provider-specific structured parser."""
-    return _providers.rollout_turn_state(descriptor)
+    return _providers_codex.rollout_turn_state(descriptor)
 
 
 def _rollout_meta_fd(descriptor: int) -> dict[str, Any] | None:
     """Parse bounded rollout metadata from an already-open descriptor."""
-    try:
-        raw = os.pread(descriptor, 1024 * 1024, 0)
-    except OSError:
-        return None
-    for line in raw.splitlines()[:64]:
-        try:
-            event = json.loads(line)
-        except (UnicodeDecodeError, ValueError):
-            continue
-        if event.get("type") == "session_meta" and isinstance(
-            event.get("payload"), Mapping
-        ):
-            meta = dict(event["payload"])
-            meta["_turn_state"] = _rollout_turn_state(descriptor)
-            return meta
-    return None
+    return _providers_codex._rollout_meta_fd(
+        descriptor,
+        rollout_turn_state=_rollout_turn_state,
+    )
 
 
 def _expected_proc_identity(
     proc_root: Path, pid: int, expected_process: Mapping[str, Any]
 ) -> tuple[int, int, int] | None:
-    try:
-        identity = _proc_stat(proc_root / str(pid) / "stat")
-    except (OSError, ValueError):
-        return None
-    expected = (
+    return _processes._expected_proc_identity(
+        proc_root,
         pid,
-        expected_process.get("ppid"),
-        expected_process.get("start_ticks"),
+        expected_process,
+        proc_stat=_proc_stat,
     )
-    return identity if identity == expected else None
 
 
 def codex_open_rollouts(
@@ -1037,77 +470,14 @@ def codex_open_rollouts(
     expected_process: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
     """Read metadata through stable, native Codex-owned proc descriptors."""
-    initial_identity = _expected_proc_identity(
-        proc_root, pid, expected_process
+    return _providers_codex.codex_open_rollouts(
+        pid,
+        proc_root,
+        codex_home,
+        expected_process,
+        expected_proc_identity=_expected_proc_identity,
+        rollout_meta_fd=_rollout_meta_fd,
     )
-    if initial_identity is None:
-        return []
-    fd_dir = proc_root / str(pid) / "fd"
-    try:
-        descriptors = sorted(fd_dir.iterdir(), key=lambda item: int(item.name))
-    except (OSError, ValueError):
-        return []
-    home_resolved = codex_home.resolve(strict=False)
-    result: list[dict[str, Any]] = []
-    seen: set[tuple[int, int]] = set()
-    for descriptor in descriptors:
-        before_identity = _expected_proc_identity(
-            proc_root, pid, expected_process
-        )
-        if before_identity != initial_identity:
-            return []
-        try:
-            opened = os.open(
-                descriptor,
-                os.O_RDONLY | getattr(os, "O_CLOEXEC", 0),
-            )
-        except OSError:
-            continue
-        try:
-            opened_stat = os.fstat(opened)
-            if not statmod.S_ISREG(opened_stat.st_mode):
-                continue
-            actual_link = Path(os.readlink(f"/proc/self/fd/{opened}"))
-            actual_text = str(actual_link)
-            if actual_text.endswith(" (deleted)"):
-                actual_link = Path(actual_text[: -len(" (deleted)")])
-            if (
-                "rollout-" not in actual_link.name
-                or actual_link.suffix != ".jsonl"
-            ):
-                continue
-            resolved = actual_link.resolve(strict=False)
-            resolved.relative_to(home_resolved)
-            file_identity = (opened_stat.st_dev, opened_stat.st_ino)
-            if file_identity in seen:
-                continue
-            meta = _rollout_meta_fd(opened)
-            after_stat = os.fstat(opened)
-            if (
-                opened_stat.st_dev,
-                opened_stat.st_ino,
-                opened_stat.st_mode,
-            ) != (
-                after_stat.st_dev,
-                after_stat.st_ino,
-                after_stat.st_mode,
-            ):
-                continue
-        except (OSError, ValueError):
-            continue
-        finally:
-            os.close(opened)
-        after_identity = _expected_proc_identity(
-            proc_root, pid, expected_process
-        )
-        if after_identity != before_identity:
-            return []
-        seen.add(file_identity)
-        if meta is not None:
-            result.append(meta)
-    if _expected_proc_identity(proc_root, pid, expected_process) != initial_identity:
-        return []
-    return result
 
 
 def codex_rollout_by_uuid(
@@ -1117,270 +487,79 @@ def codex_rollout_by_uuid(
     max_files: int = 10_000,
 ) -> list[dict[str, Any]]:
     """Read one exact Darwin Codex rollout selected only by its process UUID."""
-    sessions = codex_home / "sessions"
-    try:
-        root = sessions.resolve(strict=True)
-    except OSError:
-        return []
-    seen = 0
-    candidates: list[Path] = []
-    try:
-        for directory, names, files in os.walk(root):
-            names[:] = sorted(name for name in names if not name.startswith("."))
-            for name in sorted(files):
-                seen += 1
-                if seen > max_files:
-                    raise CollectionError("Codex rollout tree exceeds safety bound")
-                if uuid in name and name.startswith("rollout-") and name.endswith(".jsonl"):
-                    candidates.append(Path(directory) / name)
-    except OSError:
-        return []
-    if len(candidates) != 1:
-        return []
-    path = candidates[0]
-    try:
-        resolved = path.resolve(strict=True)
-        resolved.relative_to(root)
-        descriptor = os.open(
-            resolved,
-            os.O_RDONLY
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
-        )
-    except (OSError, ValueError):
-        return []
-    try:
-        metadata = os.fstat(descriptor)
-        if (
-            not statmod.S_ISREG(metadata.st_mode)
-            or metadata.st_uid != os.geteuid()
-        ):
-            return []
-        meta = _rollout_meta_fd(descriptor)
-        if meta is None or valid_uuid(meta.get("id")) != uuid:
-            return []
-        return [meta]
-    finally:
-        os.close(descriptor)
+    return _providers_codex.codex_rollout_by_uuid(
+        codex_home,
+        uuid,
+        max_files=max_files,
+        rollout_meta_fd=_rollout_meta_fd,
+    )
 
 
 def codex_rollout_state_by_path(codex_home: Path, rollout_path: object) -> str:
     """Read one child thread's state from an owner-controlled Codex rollout."""
-    if not isinstance(rollout_path, str) or not rollout_path.startswith("/"):
-        return "state unavailable"
-    try:
-        root = codex_home.resolve(strict=True)
-        raw_path = Path(rollout_path)
-        pathname = raw_path.lstat()
-        resolved = raw_path.resolve(strict=True)
-        resolved.relative_to(root)
-        descriptor = os.open(
-            raw_path,
-            os.O_RDONLY
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
-        )
-    except (OSError, ValueError):
-        return "state unavailable"
-    try:
-        metadata = os.fstat(descriptor)
-        if (
-            not statmod.S_ISREG(metadata.st_mode)
-            or metadata.st_uid != os.geteuid()
-            or metadata.st_nlink != 1
-            or (metadata.st_dev, metadata.st_ino)
-            != (pathname.st_dev, pathname.st_ino)
-        ):
-            return "state unavailable"
-        return _rollout_turn_state(descriptor)
-    finally:
-        os.close(descriptor)
+    return _providers_codex.codex_rollout_state_by_path(
+        codex_home,
+        rollout_path,
+        rollout_turn_state=_rollout_turn_state,
+    )
 
 
 def index_codex_processes(
     process_table: Mapping[int, Mapping[str, Any]], proc_root: Path, codex_home: Path
 ) -> dict[int, list[dict[str, Any]]]:
-    if _runtime_platform() == DARWIN_PLATFORM:
-        result: dict[int, list[dict[str, Any]]] = {}
-        for pid, process in process_table.items():
-            if not _is_native_codex(process):
-                continue
-            uuid = valid_uuid(process.get("codex_thread_id"))
-            result[pid] = codex_rollout_by_uuid(codex_home, uuid) if uuid else []
-        return result
-    return {
-        pid: codex_open_rollouts(
-            pid, proc_root, codex_home, process
-        )
-        for pid, process in process_table.items()
-        if _is_native_codex(process)
-    }
+    return _providers_codex.index_codex_processes(
+        process_table,
+        proc_root,
+        codex_home,
+        runtime_platform=_runtime_platform,
+        darwin_platform=DARWIN_PLATFORM,
+        is_native_codex=_is_native_codex,
+        rollout_by_uuid=codex_rollout_by_uuid,
+        open_rollouts=codex_open_rollouts,
+    )
 
 
 def _root_codex_uuid(
     process: Mapping[str, Any], metadata: Sequence[Mapping[str, Any]]
 ) -> list[str]:
-    """Return exact root threads owned by one native Codex process.
-
-    Direct Codex writes ``source=cli``. A remote TUI delegates its thread to
-    the native ``codex app-server`` process, whose open rollout is currently
-    marked ``source=vscode``. Only that validated process type may claim the
-    second source; an ordinary Codex process cannot turn arbitrary editor
-    rollouts into managed-session identity evidence.
-    """
-    identities: set[str] = set()
-    app_server = _is_codex_app_server(process)
-    for meta in metadata:
-        uuid = valid_uuid(meta.get("session_id"))
-        event_id = valid_uuid(meta.get("id"))
-        source = meta.get("source")
-        accepted_source = source == "cli" or (
-            app_server and source == "vscode"
-        )
-        if accepted_source and uuid and event_id == uuid:
-            identities.add(uuid)
-    return sorted(identities)
-
-
-def _codex_turn_state(
-    metadata: Sequence[Mapping[str, Any]], wanted_uuid: str
-) -> str:
-    """Turn state for one exact conversation, from its own rollout metadata."""
-    for meta in metadata:
-        uuid = valid_uuid(meta.get("session_id"))
-        event_id = valid_uuid(meta.get("id"))
-        if uuid == wanted_uuid and event_id == uuid:
-            state = meta.get("_turn_state")
-            if state in {
-                "needs your reply",
-                "reply optional",
-                "working",
-                "idle",
-                "state unavailable",
-            }:
-                return str(state)
-    return "state unavailable"
+    """Return exact root threads owned by one native Codex process."""
+    return _providers_codex._root_codex_uuid(
+        process,
+        metadata,
+        is_codex_app_server=_is_codex_app_server,
+    )
 
 
 def _codex_home(
     environ: Mapping[str, str] | None = None, *, default_home: Path | None = None
 ) -> Path:
     """Resolve one Codex home consistently for reads and writes."""
-    env = environ if environ is not None else os.environ
-    base = default_home if default_home is not None else _home()
-    return Path(
-        env.get("SESSION_KIT_CODEX_HOME")
-        or env.get("CODEX_HOME")
-        or (base / ".codex")
-    ).expanduser()
+    return _providers_codex._codex_home(
+        environ,
+        default_home=default_home,
+        process_environ=os.environ,
+        home=_home,
+    )
 
 
 def _codex_paths() -> tuple[Path, Path]:
-    codex_home = _codex_home()
-    db_override = os.environ.get("SESSION_KIT_CODEX_DB")
-    if db_override:
-        return codex_home, Path(db_override).expanduser()
-    databases = _codex_state_databases(codex_home)
-    if databases:
-        return codex_home, databases[-1]
-    return codex_home, codex_home / "state_5.sqlite"
-
-
-def _read_bounded_owner_file(
-    path: Path,
-    *,
-    label: str,
-    max_bytes: int,
-    exact_mode: int | None = None,
-    allow_missing: bool = False,
-) -> bytes | None:
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(path, flags)
-    except FileNotFoundError:
-        if allow_missing:
-            return None
-        raise CollectionError(f"{label} does not exist: {path}")
-    except OSError as exc:
-        raise CollectionError(f"cannot open {label}: {path}") from exc
-    try:
-        before = os.fstat(descriptor)
-        try:
-            pathname = path.lstat()
-        except OSError as exc:
-            raise CollectionError(f"cannot inspect {label}: {path}") from exc
-        mode = statmod.S_IMODE(before.st_mode)
-        if (
-            not statmod.S_ISREG(before.st_mode)
-            or before.st_uid != os.geteuid()
-            or before.st_nlink != 1
-            or before.st_size < 0
-            or before.st_size > max_bytes
-            or (exact_mode is not None and mode != exact_mode)
-            or (exact_mode is None and mode & 0o022)
-            or (before.st_dev, before.st_ino) != (pathname.st_dev, pathname.st_ino)
-        ):
-            raise CollectionError(f"unsafe {label}: {path}")
-        chunks: list[bytes] = []
-        remaining = before.st_size
-        while remaining:
-            block = os.read(descriptor, min(remaining, 65536))
-            if not block:
-                raise CollectionError(f"short read from {label}: {path}")
-            chunks.append(block)
-            remaining -= len(block)
-        if os.read(descriptor, 1):
-            raise CollectionError(f"{label} grew while reading: {path}")
-        after = os.fstat(descriptor)
-        stable = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
-        if any(getattr(before, field) != getattr(after, field) for field in stable):
-            raise CollectionError(f"{label} changed while reading: {path}")
-        return b"".join(chunks)
-    finally:
-        os.close(descriptor)
+    return _providers_codex._codex_paths(
+        environ=os.environ,
+        codex_home=_codex_home,
+        codex_state_databases=_codex_state_databases,
+    )
 
 
 def read_codex_session_index(
     path: Path, warning_sink: list[str] | None = None
 ) -> dict[str, str]:
     """Read exact UUID-bound Codex names from the append-only local index."""
-    payload = _read_bounded_owner_file(
+    return _providers_codex.read_codex_session_index(
         path,
-        label="Codex session index",
+        warning_sink,
+        read_bounded_owner_file=_read_bounded_owner_file,
         max_bytes=MAX_CODEX_SESSION_INDEX_BYTES,
-        allow_missing=True,
     )
-    if payload is None:
-        return {}
-    try:
-        text = payload.decode("utf-8", "strict")
-    except UnicodeDecodeError as exc:
-        raise CollectionError("Codex session index is not valid UTF-8") from exc
-    names: dict[str, str] = {}
-    skipped = 0
-    for number, line in enumerate(text.splitlines(), start=1):
-        if not line:
-            continue
-        try:
-            item = json.loads(line)
-        except ValueError:
-            skipped += 1
-            continue
-        if not isinstance(item, Mapping):
-            skipped += 1
-            continue
-        uuid = valid_uuid(item.get("id"))
-        title = clean_text(item.get("thread_name"), 120)
-        if not uuid or not title:
-            skipped += 1
-            continue
-        names[uuid] = title
-    if skipped and warning_sink is not None:
-        warning_sink.append(
-            f"Codex session index ignored {skipped} malformed or unnamed "
-            f"entr{'y' if skipped == 1 else 'ies'}"
-        )
-    return names
 
 
 def read_codex_db(
@@ -1388,151 +567,12 @@ def read_codex_db(
     session_index_names: Mapping[str, str] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, list[dict[str, Any]]]]:
     """Read titles and spawn edges from Codex state without creating journal files."""
-    index_names = (
-        dict(session_index_names)
-        if session_index_names is not None
-        else read_codex_session_index(db_path.parent / "session_index.jsonl")
+    return _providers_codex.read_codex_db(
+        db_path,
+        session_index_names,
+        session_index_reader=read_codex_session_index,
+        rollout_state_by_path=codex_rollout_state_by_path,
     )
-    threads = {
-        uuid: {
-            "id": uuid,
-            "title": "",
-            "cwd": "",
-            "session_index_name": clean_text(title, 120),
-        }
-        for raw_uuid, title in index_names.items()
-        if (uuid := valid_uuid(raw_uuid)) and clean_text(title, 120)
-    }
-    if not db_path.is_file():
-        return threads, {}
-    uri = f"file:{db_path.resolve()}?mode=ro"
-    connection = sqlite3.connect(uri, uri=True, timeout=1.0)
-    connection.row_factory = sqlite3.Row
-    try:
-        connection.execute("PRAGMA query_only=ON")
-        columns = {
-            row["name"] for row in connection.execute("PRAGMA table_info(threads)").fetchall()
-        }
-        required = {"id", "title", "cwd"}
-        if not required.issubset(columns):
-            raise CollectionError("Codex threads table is missing required columns")
-        optional = [
-            name
-            for name in (
-                "name",
-                "agent_nickname",
-                "agent_path",
-                "thread_source",
-                "first_user_message",
-                "rollout_path",
-            )
-            if name in columns
-        ]
-        select = ", ".join(["id", "title", "cwd", *optional])
-        database_threads = {
-            row["id"]: dict(row)
-            for row in connection.execute(f"SELECT {select} FROM threads").fetchall()
-            if valid_uuid(row["id"])
-        }
-        for uuid, thread in database_threads.items():
-            index_title = threads.get(uuid, {}).get("session_index_name")
-            threads[uuid] = thread
-            if index_title:
-                threads[uuid]["session_index_name"] = index_title
-        edges: dict[str, list[dict[str, Any]]] = {}
-        edge_tables = {
-            row["name"]
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()
-        }
-        if "thread_spawn_edges" in edge_tables:
-            for row in connection.execute(
-                "SELECT parent_thread_id, child_thread_id, status FROM thread_spawn_edges"
-            ).fetchall():
-                child = threads.get(row["child_thread_id"], {})
-                edge_status = clean_text(row["status"], 40) or "unknown"
-                if edge_status.casefold() == "open":
-                    observed = codex_rollout_state_by_path(
-                        db_path.parent, child.get("rollout_path")
-                    )
-                    if observed != "state unavailable":
-                        edge_status = observed
-                edges.setdefault(row["parent_thread_id"], []).append(
-                    {
-                        "provider": "codex",
-                        "uuid": valid_uuid(row["child_thread_id"]),
-                        "pid": None,
-                        "title": clean_text(
-                            child.get("session_index_name")
-                            or child.get("name")
-                            or child.get("agent_nickname")
-                            or child.get("agent_path")
-                            or child.get("title"),
-                            80,
-                        )
-                        or str(row["child_thread_id"])[:8],
-                        "status": edge_status,
-                    }
-                )
-        for items in edges.values():
-            items.sort(key=lambda item: (item["title"].casefold(), item["uuid"] or ""))
-        return threads, edges
-    finally:
-        connection.close()
-
-
-def recovery_spec(provider: str, uuid: str, cwd: str | None = None) -> dict[str, Any]:
-    exact_uuid = valid_uuid(uuid)
-    if provider not in PROVIDERS or not exact_uuid:
-        raise ValueError("recovery requires provider claude|codex and an exact UUID")
-    argv = (
-        ["claude", "--resume", exact_uuid]
-        if provider == "claude"
-        else ["codex", "--no-alt-screen", "resume", exact_uuid]
-    )
-    clean_cwd = clean_text(cwd, 4096) if cwd else None
-    command = shlex.join(argv)
-    if clean_cwd:
-        command = f"cd -- {shlex.quote(clean_cwd)} && {command}"
-    return {
-        "available": True,
-        "provider": provider,
-        "uuid": exact_uuid,
-        "cwd": clean_cwd,
-        "argv": argv,
-        "command": command,
-    }
-
-
-def _empty_recovery() -> dict[str, Any]:
-    return {
-        "available": False,
-        "provider": None,
-        "uuid": None,
-        "cwd": None,
-        "argv": [],
-        "command": None,
-    }
-
-
-def _agent_identity(
-    *,
-    provider: str,
-    uuid: str | None,
-    pid: int | None,
-    process_table: Mapping[int, Mapping[str, Any]],
-    provenance: str,
-    confidence: str,
-) -> dict[str, Any]:
-    process = process_table.get(pid or -1, {})
-    return {
-        "uuid": uuid,
-        "pid": pid,
-        "process_start_ticks": process.get("start_ticks"),
-        "provenance": provenance,
-        "confidence": confidence,
-    }
 
 
 def _provider_title(
@@ -1546,7 +586,7 @@ def _provider_title(
     *,
     provider_title_is_explicit: bool = True,
 ) -> str:
-    return _provider_title_info(
+    return _model._provider_title(
         provider,
         uuid,
         native_title,
@@ -1555,7 +595,8 @@ def _provider_title(
         started_at_unix_ms,
         automatic_titles,
         provider_title_is_explicit=provider_title_is_explicit,
-    )[0]
+        provider_title_info=_provider_title_info,
+    )
 
 
 def _provider_title_info(
@@ -1569,192 +610,34 @@ def _provider_title_info(
     *,
     provider_title_is_explicit: bool = True,
 ) -> tuple[str, str]:
-    key = f"{provider}:{uuid}" if uuid else ""
-    if uuid:
-        alias = aliases.get(key)
-        if alias:
-            return alias, "alias"
-    if native_title and provider_title_is_explicit:
-        return native_title, "native"
-    if uuid and automatic_naming_enabled():
-        automatic = (automatic_titles or {}).get(key)
-        if automatic:
-            return automatic, "automatic"
-    context = _context_title(provider, cwd, started_at_unix_ms)
-    if context:
-        return context, "context"
-    if uuid:
-        return f"{provider.title()} {uuid[:8]}", "uuid"
-    return provider.title(), "provider"
+    return _model._provider_title_info(
+        provider,
+        uuid,
+        native_title,
+        aliases,
+        cwd,
+        started_at_unix_ms,
+        automatic_titles,
+        provider_title_is_explicit=provider_title_is_explicit,
+        context_title=_context_title,
+    )
 
 
 def _context_title(
     provider: str, cwd: str, started_at_unix_ms: int | None
 ) -> str:
     """Return a deterministic project hint without exposing a full path."""
-    if (
-        isinstance(started_at_unix_ms, bool)
-        or not isinstance(started_at_unix_ms, int)
-        or started_at_unix_ms <= 0
-    ):
-        return ""
-    try:
-        local_start = dt.datetime.fromtimestamp(
-            started_at_unix_ms / 1000, tz=dt.timezone.utc
-        ).astimezone()
-    except (OverflowError, OSError, ValueError):
-        return ""
-    timestamp = local_start.strftime("%b %d %H:%M")
-    clean_cwd = clean_text(cwd, 4096)
-    if not clean_cwd or not clean_cwd.startswith("/"):
-        return f"{provider.title()} started {timestamp}"
-    parts = [
-        clean_text(part, 40)
-        for part in Path(clean_cwd).parts
-        if part not in {"", os.sep}
-    ]
-    generic = {
-        "app",
-        "apps",
-        "code",
-        "current",
-        "home",
-        "repo",
-        "repos",
-        "src",
-        "srv",
-        "v2",
-        "var",
-        "workspace",
-        "workspaces",
-    }
-    home_name = clean_text(_home().name, 40).casefold()
-    for part in reversed(parts):
-        folded = part.casefold()
-        if (
-            part
-            and not part.startswith(".")
-            and folded not in generic
-            and folded != home_name
-        ):
-            return f"{provider.title()} in {part} at {timestamp}"
-    return f"{provider.title()} started {timestamp}"
-
-
-def _shell_title(
-    tree: Sequence[int], root_pid: int, process_table: Mapping[int, Mapping[str, Any]]
-) -> tuple[str, str, int | None]:
-    for pid in tree:
-        if pid == root_pid:
-            continue
-        process = process_table.get(pid, {})
-        comm = clean_text(process.get("comm"), 80)
-        if comm and comm not in {"bash", "zsh", "fish", "script"}:
-            return comm, clean_text(process.get("cwd"), 4096), pid
-    root = process_table.get(root_pid, {})
-    return "Idle shell", clean_text(root.get("cwd"), 4096), root_pid
-
-
-def _base_agent(
-    *,
-    row: int | None,
-    shpool_id: str | None,
-    shpool_status: str | None,
-    availability: str | None,
-    provider: str,
-    identity: dict[str, Any],
-    title: str,
-    title_source: str,
-    native_title: str,
-    cwd: str,
-    started_at_unix_ms: int | None,
-    process_age_seconds: int | None,
-    agent_status: str,
-    needs_you: bool,
-    subagents: list[dict[str, Any]],
-    recovery: dict[str, Any],
-    diagnostics: list[str],
-    shpool_shell: dict[str, Any] | None,
-) -> dict[str, Any]:
-    mutation_allowed, mutation_reason = (
-        shpool_id_mutation_policy(shpool_id)
-        if shpool_id is not None
-        else (False, "outside-shpool")
+    return _model._context_title(
+        provider,
+        cwd,
+        started_at_unix_ms,
+        home=_home,
     )
-    return {
-        "row": row,
-        "terminal_number": None,
-        "shpool_id": shpool_id,
-        "shpool_id_raw": shpool_id,
-        "display_shpool_id": (
-            display_shpool_id(shpool_id) if shpool_id is not None else None
-        ),
-        "mutation_allowed": mutation_allowed,
-        "mutation_rejection_reason": mutation_reason,
-        "shpool_status": shpool_status,
-        "availability": availability,
-        "provider": provider,
-        "display_provider": provider,
-        "setup_incomplete": False,
-        "identity": identity,
-        "title": clean_text(title, 120),
-        "title_source": clean_text(title_source, 20),
-        "display_title": clean_text(title, 120),
-        "native_title": clean_text(native_title, 120),
-        "cwd": clean_text(cwd, 4096),
-        "started_at_unix_ms": started_at_unix_ms,
-        "process_age_seconds": process_age_seconds,
-        "agent_status": clean_text(agent_status, 60) or "unknown",
-        "needs_you": bool(needs_you),
-        "subagents": subagents,
-        "active_subagent_count": sum(
-            1
-            for child in subagents
-            if str(child.get("status") or "").casefold()
-            not in {
-                "idle",
-                "complete",
-                "completed",
-                "closed",
-                "stopped",
-                "failed",
-                "cancelled",
-                "canceled",
-            }
-        ),
-        "recovery": recovery,
-        "diagnostics": diagnostics,
-        "shpool_shell": shpool_shell,
-    }
-
-
-def _process_age(pid: int | None, process_table: Mapping[int, Mapping[str, Any]], now: float) -> int | None:
-    if not pid:
-        return None
-    ticks = process_table.get(pid, {}).get("start_ticks")
-    if not isinstance(ticks, int):
-        return None
-    if process_table.get(pid, {}).get("generation_kind") == "darwin-start-usec":
-        age = now - (ticks / 1_000_000)
-        return max(0, int(age)) if age >= 0 else None
-    try:
-        hz = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
-        uptime = float(Path("/proc/uptime").read_text().split()[0])
-    except (OSError, ValueError, KeyError):
-        return None
-    age = uptime - (ticks / hz)
-    return max(0, int(age)) if age >= 0 else None
 
 
 def _regular_file_mtime_ms(path: Path) -> int | None:
     """Return an exact regular file's mtime without following a symlink."""
-    try:
-        metadata = path.lstat()
-    except OSError:
-        return None
-    if not statmod.S_ISREG(metadata.st_mode):
-        return None
-    return metadata.st_mtime_ns // 1_000_000
+    return _collector.regular_file_mtime_ms(path)
 
 
 def recent_output_times(
@@ -1763,130 +646,15 @@ def recent_output_times(
     journal_dir: Path | None = None,
     recovery_dir: Path | None = None,
 ) -> dict[str, int]:
-    """Map operational shpool IDs to their exact active journal mtime.
-
-    Legacy sessions may still write through a recovery-map path after their
-    original inode was moved.  A valid exact map entry takes precedence, just
-    as ``sp history`` does.  Otherwise the collector checks the raw-ID legacy
-    file or every regular segment in the raw-ID directory.  Unmanaged IDs,
-    symlinks, missing files, and ambiguous map entries have no activity time.
-    """
-    wanted = {
-        value
-        for value in shpool_ids
-        if shpool_id_mutation_policy(value) == (True, None)
-    }
-    if not wanted:
-        return {}
-    active_root = journal_dir or default_journal_dir()
-    recovered_root = recovery_dir or default_journal_recovery_dir()
-    mapped: dict[str, Path | None] = {}
-    ambiguous_mappings: set[str] = set()
-    map_path = recovered_root / "current-map.tsv"
-    try:
-        map_metadata = map_path.lstat()
-        if not statmod.S_ISREG(map_metadata.st_mode):
-            raise OSError("recovery map is not a regular file")
-        with map_path.open("r", encoding="utf-8", errors="replace") as handle:
-            for raw_line in handle:
-                raw_id, separator, raw_path = raw_line.rstrip("\r\n").partition("\t")
-                if not separator or raw_id not in wanted or not raw_path.startswith("/"):
-                    continue
-                candidate = Path(raw_path)
-                previous = mapped.get(raw_id)
-                if raw_id in mapped and previous != candidate:
-                    mapped[raw_id] = None
-                    ambiguous_mappings.add(raw_id)
-                else:
-                    mapped[raw_id] = candidate
-    except OSError:
-        pass
-
-    result: dict[str, int] = {}
-    for raw_id in wanted:
-        if raw_id in ambiguous_mappings:
-            continue
-        mapped_path = mapped.get(raw_id)
-        if mapped_path is not None:
-            mapped_mtime = _regular_file_mtime_ms(mapped_path)
-            if mapped_mtime is not None:
-                result[raw_id] = mapped_mtime
-                continue
-
-        legacy_mtime = _regular_file_mtime_ms(active_root / f"{raw_id}.raw")
-        if legacy_mtime is not None:
-            result[raw_id] = legacy_mtime
-            continue
-
-        segment_dir = active_root / raw_id
-        try:
-            directory_metadata = segment_dir.lstat()
-            if not statmod.S_ISDIR(directory_metadata.st_mode):
-                continue
-            segment_mtimes = [
-                timestamp
-                for path in segment_dir.iterdir()
-                if re.fullmatch(r"segment-[0-9]+\.raw", path.name)
-                for timestamp in [_regular_file_mtime_ms(path)]
-                if timestamp is not None
-            ]
-        except OSError:
-            continue
-        if segment_mtimes:
-            result[raw_id] = max(segment_mtimes)
-    return result
-
-
-def _read_private_launch_file(directory_fd: int, name: str) -> bytes:
-    flags = os.O_RDONLY
-    if hasattr(os, "O_CLOEXEC"):
-        flags |= os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    descriptor = os.open(name, flags, dir_fd=directory_fd)
-    try:
-        before = os.fstat(descriptor)
-        if (
-            not statmod.S_ISREG(before.st_mode)
-            or statmod.S_IMODE(before.st_mode) != 0o600
-            or before.st_uid != os.geteuid()
-            or before.st_nlink != 1
-            or before.st_size <= 0
-            or before.st_size > 8192
-        ):
-            raise CollectionError("unsafe retained launch record")
-        chunks: list[bytes] = []
-        remaining = before.st_size
-        while remaining:
-            block = os.read(descriptor, min(remaining, 4096))
-            if not block:
-                raise CollectionError("short retained launch record")
-            chunks.append(block)
-            remaining -= len(block)
-        if os.read(descriptor, 1):
-            raise CollectionError("retained launch record grew while reading")
-        after = os.fstat(descriptor)
-        stable = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
-        if any(getattr(before, field) != getattr(after, field) for field in stable):
-            raise CollectionError("retained launch record changed while reading")
-        return b"".join(chunks)
-    finally:
-        os.close(descriptor)
-
-
-def _launch_fields(payload: bytes, count: int) -> list[str] | None:
-    try:
-        text = payload.decode("utf-8", "strict")
-    except UnicodeDecodeError:
-        return None
-    if (
-        not text.endswith("\n")
-        or text.count("\n") != 1
-        or "\r" in text
-    ):
-        return None
-    fields = text[:-1].split("\t")
-    return fields if len(fields) == count else None
+    """Map operational shpool IDs to their exact active journal mtime."""
+    return _collector.recent_output_times(
+        shpool_ids,
+        journal_dir=journal_dir,
+        recovery_dir=recovery_dir,
+        journal_dir_factory=default_journal_dir,
+        journal_recovery_dir_factory=default_journal_recovery_dir,
+        regular_file_mtime_ms=_regular_file_mtime_ms,
+    )
 
 
 def apply_retained_setup_attributions(
@@ -1896,157 +664,15 @@ def apply_retained_setup_attributions(
     boot_id: str | None = None,
 ) -> dict[str, Any]:
     """Add display-only provider hints from exact retained startup proofs."""
-    root = start_dir or default_start_dir()
-    current_boot_id = boot_id if boot_id is not None else _boot_id()
-    if not current_boot_id or "\t" in current_boot_id or "\n" in current_boot_id:
-        return inventory
-    flags = os.O_RDONLY
-    if hasattr(os, "O_CLOEXEC"):
-        flags |= os.O_CLOEXEC
-    if hasattr(os, "O_DIRECTORY"):
-        flags |= os.O_DIRECTORY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    try:
-        directory_fd = os.open(root, flags)
-    except OSError:
-        return inventory
-    try:
-        directory = os.fstat(directory_fd)
-        if (
-            not statmod.S_ISDIR(directory.st_mode)
-            or statmod.S_IMODE(directory.st_mode) != 0o700
-            or directory.st_uid != os.geteuid()
-        ):
-            return inventory
-        generation = inventory.get("daemon_generation")
-        if not isinstance(generation, Mapping):
-            return inventory
-        daemon_pid = generation.get("pid")
-        daemon_start = generation.get("process_start_ticks")
-        if (
-            isinstance(daemon_pid, bool)
-            or not isinstance(daemon_pid, int)
-            or daemon_pid <= 0
-            or isinstance(daemon_start, bool)
-            or not isinstance(daemon_start, int)
-            or daemon_start <= 0
-        ):
-            return inventory
-
-        for item in inventory.get("sessions", ()):
-            if not isinstance(item, dict) or item.get("provider") != "unknown":
-                continue
-            raw_id = item.get("shpool_id_raw")
-            if (
-                not isinstance(raw_id, str)
-                or shpool_id_mutation_policy(raw_id) != (True, None)
-            ):
-                continue
-            shell = item.get("shpool_shell")
-            identity = item.get("identity")
-            started = item.get("started_at_unix_ms")
-            if (
-                not isinstance(shell, Mapping)
-                or not isinstance(identity, Mapping)
-                or identity.get("confidence") != "unknown"
-                or identity.get("uuid") is not None
-                or identity.get("pid") != shell.get("pid")
-                or identity.get("process_start_ticks")
-                != shell.get("process_start_ticks")
-                or isinstance(started, bool)
-                or not isinstance(started, int)
-                or started <= 0
-                or isinstance(shell.get("pid"), bool)
-                or not isinstance(shell.get("pid"), int)
-                or shell.get("pid", 0) <= 0
-                or isinstance(shell.get("process_start_ticks"), bool)
-                or not isinstance(shell.get("process_start_ticks"), int)
-                or shell.get("process_start_ticks", 0) <= 0
-            ):
-                continue
-            try:
-                start_payload = _read_private_launch_file(directory_fd, raw_id)
-                expected_payload = _read_private_launch_file(
-                    directory_fd, f"{raw_id}.expected"
-                )
-            except (CollectionError, OSError):
-                continue
-            start = _launch_fields(start_payload, 4)
-            if start is None:
-                legacy_start = _launch_fields(start_payload, 3)
-                if legacy_start is not None:
-                    legacy_uuid = legacy_start[2]
-                    start = [
-                        *legacy_start,
-                        "resume" if legacy_uuid else "new",
-                    ]
-            expected = _launch_fields(expected_payload, 10)
-            if expected is None:
-                legacy_expected = _launch_fields(expected_payload, 9)
-                if legacy_expected is not None:
-                    legacy_uuid = legacy_expected[8]
-                    expected = [
-                        *legacy_expected,
-                        "resume" if legacy_uuid else "new",
-                    ]
-            if start is None or expected is None:
-                continue
-            provider, cwd, uuid, launch_mode = start
-            (
-                side_provider,
-                side_cwd,
-                side_boot_id,
-                side_started,
-                side_shell_pid,
-                side_shell_start,
-                side_daemon_pid,
-                side_daemon_start,
-                side_uuid,
-                side_launch_mode,
-            ) = expected
-            numeric = (
-                side_started,
-                side_shell_pid,
-                side_shell_start,
-                side_daemon_pid,
-                side_daemon_start,
-            )
-            if any(re.fullmatch(r"[1-9][0-9]*", value) is None for value in numeric):
-                continue
-            if (
-                provider not in {"claude", "codex"}
-                or launch_mode not in {"new", "resume", "fork"}
-                or side_launch_mode != launch_mode
-                or (launch_mode == "new" and uuid != "")
-                or (
-                    launch_mode in {"resume", "fork"}
-                    and valid_uuid(uuid) != uuid
-                )
-                or side_provider != provider
-                or side_cwd != cwd
-                or item.get("cwd") != cwd
-                or side_boot_id != current_boot_id
-                or int(side_started) != started
-                or int(side_shell_pid) != shell.get("pid")
-                or int(side_shell_start) != shell.get("process_start_ticks")
-                or int(side_daemon_pid) != daemon_pid
-                or int(side_daemon_start) != daemon_start
-                or side_uuid != uuid
-                or (uuid and valid_uuid(uuid) != uuid)
-            ):
-                continue
-            item["display_provider"] = provider
-            item["setup_incomplete"] = True
-            item["display_title"] = f"{provider.title()} setup incomplete"
-            if uuid and launch_mode == "resume":
-                item["_terminal_identity_hint"] = {
-                    "provider": provider,
-                    "uuid": uuid,
-                }
-    finally:
-        os.close(directory_fd)
-    return inventory
+    return _collector.apply_retained_setup_attributions(
+        inventory,
+        start_dir=start_dir,
+        boot_id=boot_id,
+        start_dir_factory=default_start_dir,
+        boot_id_reader=_boot_id,
+        launch_fields=_launch_fields,
+        read_private_launch_file=_read_private_launch_file,
+    )
 
 
 def build_inventory(
@@ -2062,498 +688,31 @@ def build_inventory(
     recent_output_by_shpool_id: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
     """Pure inventory composition for fixture tests and the live collector."""
-    current_time = time.time() if now is None else now
-    shpool_sessions = _parse_shpool_payload(shpool_payload)
-    claude_agents = _parse_claude_payload(claude_payload)
-    claude_by_pid = {item["pid"]: item for item in claude_agents}
-    aliases = _valid_aliases(config.get("aliases"))
-    automatic_titles = _valid_automatic_titles(config.get("automatic_titles"))
-    automatic_failures = _valid_automatic_title_failures(
-        config.get("automatic_title_failures")
+    return _collector.build_inventory(
+        shpool_payload,
+        claude_payload,
+        process_table,
+        codex_index,
+        codex_db_rows,
+        config,
+        now,
+        recent_output_by_shpool_id,
+        descendants=descendants,
+        shpool_roots=shpool_roots,
+        daemon_generation=daemon_generation,
+        parse_claude_payload=_parse_claude_payload,
+        native_claude_uuid=_native_claude_uuid,
+        claude_subagents=claude_subagents,
+        root_codex_uuid=_root_codex_uuid,
+        provider_title_info=_provider_title_info,
+        session_color=session_color,
+        valid_colors=_valid_colors,
+        adopt_launch_colors=_adopt_launch_colors,
+        codex_title_echoes_prompt=_codex_title_echoes_prompt,
+        schema_version=SCHEMA_VERSION,
+        palette=SESSION_COLORS,
+        default_max_proc_nodes=DEFAULT_MAX_PROC_NODES,
     )
-    codex_threads, codex_edges = codex_db_rows
-    roots, root_diagnostics = shpool_roots(
-        (item["name"] for item in shpool_sessions), process_table
-    )
-    child_index = _children_index(process_table)
-    recent_outputs = recent_output_by_shpool_id or {}
-    mapped_claude: set[int] = set()
-    mapped_codex: set[int] = set()
-    sessions: list[dict[str, Any]] = []
-
-    for shpool in shpool_sessions:
-        name = shpool["name"]
-        status = shpool["status"]
-        availability = "ready" if status == "Disconnected" else "attached"
-        diagnostics = list(root_diagnostics.get(name, ()))
-        root_pid = roots.get(name)
-        tree: list[int] = []
-        if root_pid:
-            try:
-                tree = descendants(
-                    root_pid,
-                    child_index,
-                    max_nodes=int(
-                        config.get("max_proc_nodes", DEFAULT_MAX_PROC_NODES)
-                    ),
-                    max_depth=int(config.get("max_proc_depth", 32)),
-                )
-            except CollectionError as exc:
-                diagnostics.append(str(exc))
-        claude_candidates = [
-            pid
-            for pid in tree
-            if pid in claude_by_pid
-            and claude_by_pid[pid].get("kind") in {"", "interactive"}
-        ]
-        native_claude_candidates = [
-            (pid, native_uuid)
-            for pid in tree
-            if pid not in claude_by_pid
-            and (native_uuid := _native_claude_uuid(process_table.get(pid, {})))
-        ]
-        codex_candidates: list[tuple[int, str]] = []
-        for candidate_pid in tree:
-            for candidate_uuid in _root_codex_uuid(
-                process_table.get(candidate_pid, {}),
-                codex_index.get(candidate_pid, ()),
-            ):
-                codex_candidates.append((candidate_pid, candidate_uuid))
-        codex_candidates = sorted(set(codex_candidates))
-
-        pid: int | None
-        uuid: str | None
-        starting_provider = None
-        provider_title_is_explicit = True
-        provider_title_state = "ready"
-        claude_color_evidence = ""
-        if (
-            len(claude_candidates) == 1
-            and not native_claude_candidates
-            and not codex_candidates
-        ):
-            pid = claude_candidates[0]
-            agent = claude_by_pid[pid]
-            uuid = agent["uuid"]
-            native_title = agent["title"]
-            claude_color_evidence = agent.get("agent_color") or ""
-            # Claude persists its conversation auto-title as a transcript
-            # ai-title record while the session record keeps a derived window
-            # label. The visible conversation title outranks the derived
-            # label; any explicit rename keeps outranking both.
-            if agent.get("agent_name"):
-                native_title = agent["agent_name"]
-            elif agent.get("ai_title") and agent.get("name_source") == "derived":
-                native_title = agent["ai_title"]
-                # Transcript hydration prepares the next start, but only the
-                # live structured agent name proves this process rendered it.
-                # External writes cannot repaint an already-running TUI.
-                if agent.get("title") != native_title:
-                    provider_title_state = "pending"
-            provider = "claude"
-            cwd = agent["cwd"] or clean_text(process_table.get(pid, {}).get("cwd"), 4096)
-            identity = _agent_identity(
-                provider=provider,
-                uuid=uuid,
-                pid=pid,
-                process_table=process_table,
-                provenance="claude agents --json",
-                confidence="exact",
-            )
-            subagents = claude_subagents(uuid, process_table)
-            recovery = recovery_spec(provider, uuid, cwd or None)
-            mapped_claude.add(pid)
-            agent_status = agent["status"]
-            needs_you = agent["needs_you"]
-        elif (
-            len(native_claude_candidates) == 1
-            and not claude_candidates
-            and not codex_candidates
-        ):
-            pid, uuid = native_claude_candidates[0]
-            provider = "claude"
-            native_title = "Claude started"
-            cwd = clean_text(process_table.get(pid, {}).get("cwd"), 4096)
-            identity = _agent_identity(
-                provider=provider,
-                uuid=uuid,
-                pid=pid,
-                process_table=process_table,
-                provenance="native Claude CLI session argument",
-                confidence="exact",
-            )
-            subagents = claude_subagents(uuid, process_table)
-            recovery = recovery_spec(provider, uuid, cwd or None)
-            mapped_claude.add(pid)
-            agent_status = "running"
-            needs_you = False
-            provider_title_is_explicit = False
-        elif (
-            len(codex_candidates) == 1
-            and not claude_candidates
-            and not native_claude_candidates
-        ):
-            pid, uuid = codex_candidates[0]
-            thread = codex_threads.get(uuid, {})
-            native_title = clean_text(
-                thread.get("session_index_name")
-                or thread.get("name")
-                or thread.get("title"),
-                120,
-            )
-            # The session-index name is exact rename evidence. A database
-            # title also counts as a real name on current Codex, which
-            # auto-titles threads there — recognizable by the schema carrying
-            # first_user_message separately. Older stores kept the raw prompt
-            # in the title, and a title that still echoes the first prompt is
-            # that same behavior on any schema.
-            db_title = clean_text(thread.get("title"), 120)
-            first_message = clean_text(thread.get("first_user_message"), 200)
-            has_split_prompt_schema = "first_user_message" in thread
-            title_echoes_prompt = _codex_title_echoes_prompt(
-                db_title, first_message
-            )
-            provider_title_is_explicit = bool(
-                thread.get("session_index_name")
-            ) or (
-                has_split_prompt_schema
-                and bool(db_title)
-                and not title_echoes_prompt
-            )
-            provider = "codex"
-            cwd = clean_text(
-                thread.get("cwd") or process_table.get(pid, {}).get("cwd"), 4096
-            )
-            identity = _agent_identity(
-                provider=provider,
-                uuid=uuid,
-                pid=pid,
-                process_table=process_table,
-                provenance="native Codex PID open exact rollout",
-                confidence="exact",
-            )
-            subagents = list(codex_edges.get(uuid, ()))
-            recovery = recovery_spec(provider, uuid, cwd or None)
-            mapped_codex.add(pid)
-            turn_state = _codex_turn_state(codex_index.get(pid, ()), uuid)
-            agent_status = turn_state
-            needs_you = turn_state == "needs your reply"
-        else:
-            known_provider_process = any(
-                _is_native_claude(process_table.get(pid, {}))
-                or _is_native_codex(process_table.get(pid, {}))
-                for pid in tree
-            )
-            claude_count = len(claude_candidates) + len(native_claude_candidates)
-            ambiguous = claude_count > 1 or len(codex_candidates) > 1 or (
-                bool(claude_count) and bool(codex_candidates)
-            )
-            if ambiguous or known_provider_process or not root_pid:
-                provider = "unknown"
-                pid = root_pid
-                native_title = "Unresolved provider session"
-                cwd = clean_text(process_table.get(root_pid or -1, {}).get("cwd"), 4096)
-                provider_cwds = {
-                    candidate_cwd
-                    for candidate in tree
-                    if (
-                        _is_native_claude(process_table.get(candidate, {}))
-                        or _is_native_codex(process_table.get(candidate, {}))
-                    )
-                    and (
-                        candidate_cwd := clean_text(
-                            process_table.get(candidate, {}).get("cwd"), 4096
-                        )
-                    ).startswith("/")
-                }
-                if not cwd and len(provider_cwds) == 1:
-                    cwd = next(iter(provider_cwds))
-                diagnostics.append(
-                    f"identity candidates: Claude={claude_count}, Codex={len(codex_candidates)}"
-                )
-                agent_status = "unknown"
-                # A new Codex session has no rollout until its first message, so
-                # it cannot be identified — but calling it "unresolved" reads as
-                # broken when it is simply unused. Name what is actually running
-                # so the row is recognisable. Identity stays unknown: this is a
-                # label, and it grants nothing.
-                if not ambiguous:
-                    running = {
-                        "codex"
-                        if _is_native_codex(process_table.get(candidate, {}))
-                        else "claude"
-                        if _is_native_claude(process_table.get(candidate, {}))
-                        else clean_text(
-                            process_table.get(candidate, {}).get("comm"), 128
-                        )
-                        for candidate in tree
-                    }
-                    for candidate_provider in ("codex", "claude"):
-                        if candidate_provider in running:
-                            starting_provider = candidate_provider
-                            native_title = (
-                                f"{candidate_provider.title()} started, no messages yet"
-                            )
-                            break
-            else:
-                provider = "shell"
-                native_title, cwd, pid = _shell_title(tree, root_pid, process_table)
-                agent_status = "idle" if native_title == "Idle shell" else "running"
-            uuid = None
-            identity = _agent_identity(
-                provider=provider,
-                uuid=None,
-                pid=pid,
-                process_table=process_table,
-                provenance="process tree" if root_pid else "none",
-                confidence="unknown" if provider == "unknown" else "exact",
-            )
-            subagents = []
-            recovery = _empty_recovery()
-            needs_you = False
-
-        title, title_source = _provider_title_info(
-            provider,
-            uuid,
-            native_title,
-            aliases,
-            cwd,
-            shpool["started_at_unix_ms"],
-            automatic_titles,
-            provider_title_is_explicit=provider_title_is_explicit,
-        )
-        recent_output_at = recent_outputs.get(name)
-        if (
-            isinstance(recent_output_at, bool)
-            or not isinstance(recent_output_at, int)
-            or recent_output_at < 0
-        ):
-            recent_output_at = None
-        sessions.append(
-            _base_agent(
-                row=None,
-                shpool_id=name,
-                shpool_status=status,
-                availability=availability,
-                provider=provider,
-                identity=identity,
-                title=title,
-                title_source=title_source,
-                native_title=native_title,
-                cwd=cwd,
-                started_at_unix_ms=shpool["started_at_unix_ms"],
-                process_age_seconds=_process_age(identity.get("pid"), process_table, current_time),
-                agent_status=agent_status,
-                needs_you=needs_you,
-                subagents=subagents,
-                recovery=recovery,
-                diagnostics=diagnostics,
-                shpool_shell=(
-                    {
-                        "pid": root_pid,
-                        "process_start_ticks": process_table.get(root_pid, {}).get(
-                            "start_ticks"
-                        ),
-                    }
-                    if root_pid
-                    else None
-                ),
-            )
-        )
-        if claude_color_evidence:
-            sessions[-1]["_claude_agent_color"] = claude_color_evidence
-        if provider == "claude":
-            sessions[-1]["provider_title_state"] = provider_title_state
-        if provider == "unknown" and starting_provider:
-            # Display only. `provider` stays "unknown", so identity, mutation
-            # and recovery decisions are completely unaffected.
-            sessions[-1]["display_provider"] = starting_provider
-        sessions[-1]["recent_output_at_unix_ms"] = recent_output_at
-        sessions[-1]["recent_output_age_seconds"] = (
-            max(0, int(current_time - (recent_output_at / 1000)))
-            if recent_output_at is not None
-            else None
-        )
-        title_key = f"{provider}:{uuid}" if uuid else ""
-        attempts = automatic_failures.get(title_key, 0)
-        if provider not in PROVIDERS or not uuid:
-            automatic_state = "not-applicable"
-        elif not automatic_naming_enabled():
-            automatic_state = "disabled"
-        elif provider == "claude" and provider_title_state == "pending":
-            automatic_state = "pending"
-        elif title_source in {"alias", "native"}:
-            automatic_state = "not-needed"
-        elif title_source == "automatic":
-            automatic_state = "ready"
-        elif attempts >= 2:
-            automatic_state = "failed"
-        else:
-            automatic_state = "pending"
-        sessions[-1]["automatic_name_state"] = automatic_state
-        sessions[-1]["automatic_name_attempts"] = attempts
-
-    outside_agents: list[dict[str, Any]] = []
-    for agent in claude_agents:
-        if (
-            agent["pid"] in mapped_claude
-            or agent["kind"] not in {"", "interactive"}
-            or agent["pid"] not in process_table
-        ):
-            continue
-        uuid = agent["uuid"]
-        recovery = recovery_spec("claude", uuid, agent["cwd"] or None)
-        outside_title, outside_title_source = _provider_title_info(
-            "claude",
-            uuid,
-            agent["title"],
-            aliases,
-            agent["cwd"],
-            agent["started_at_unix_ms"],
-            automatic_titles,
-        )
-        outside_agents.append(
-            _base_agent(
-                row=None,
-                shpool_id=None,
-                shpool_status=None,
-                availability=None,
-                provider="claude",
-                identity=_agent_identity(
-                    provider="claude",
-                    uuid=uuid,
-                    pid=agent["pid"],
-                    process_table=process_table,
-                    provenance="claude agents --json",
-                    confidence="exact",
-                ),
-                title=outside_title,
-                title_source=outside_title_source,
-                native_title=agent["title"],
-                cwd=agent["cwd"],
-                started_at_unix_ms=agent["started_at_unix_ms"],
-                process_age_seconds=_process_age(agent["pid"], process_table, current_time),
-                agent_status=agent["status"],
-                needs_you=agent["needs_you"],
-                subagents=claude_subagents(uuid, process_table),
-                recovery=recovery,
-                diagnostics=["active provider root is outside shpool"],
-                shpool_shell=None,
-            )
-        )
-        if agent.get("agent_color"):
-            outside_agents[-1]["_claude_agent_color"] = agent["agent_color"]
-    for pid, metadata in codex_index.items():
-        if pid in mapped_codex:
-            continue
-        identities = _root_codex_uuid(process_table.get(pid, {}), metadata)
-        if len(identities) != 1:
-            continue
-        uuid = identities[0]
-        thread = codex_threads.get(uuid, {})
-        native_title = clean_text(
-            thread.get("session_index_name")
-            or thread.get("name")
-            or thread.get("title"),
-            120,
-        )
-        cwd = clean_text(thread.get("cwd") or process_table.get(pid, {}).get("cwd"), 4096)
-        outside_title, outside_title_source = _provider_title_info(
-            "codex",
-            uuid,
-            native_title,
-            aliases,
-            cwd,
-            None,
-            automatic_titles,
-            provider_title_is_explicit=bool(thread.get("session_index_name")),
-        )
-        turn_state = _codex_turn_state(metadata, uuid)
-        outside_agents.append(
-            _base_agent(
-                row=None,
-                shpool_id=None,
-                shpool_status=None,
-                availability=None,
-                provider="codex",
-                identity=_agent_identity(
-                    provider="codex",
-                    uuid=uuid,
-                    pid=pid,
-                    process_table=process_table,
-                    provenance="native Codex PID open exact rollout",
-                    confidence="exact",
-                ),
-                title=outside_title,
-                title_source=outside_title_source,
-                native_title=native_title,
-                cwd=cwd,
-                started_at_unix_ms=None,
-                process_age_seconds=_process_age(pid, process_table, current_time),
-                agent_status=turn_state,
-                needs_you=turn_state == "needs your reply",
-                subagents=list(codex_edges.get(uuid, ())),
-                recovery=recovery_spec("codex", uuid, cwd or None),
-                diagnostics=["active provider root is outside shpool"],
-                shpool_shell=None,
-            )
-        )
-    sessions.sort(
-        key=lambda item: (
-            AVAILABILITY_ORDER.get(item["availability"], 9),
-            PROVIDER_ORDER.get(item["provider"], 9),
-            not bool(item.get("needs_you")),
-            item.get("recent_output_at_unix_ms") is None,
-            -(item.get("recent_output_at_unix_ms") or 0),
-            natural_name_key(item["shpool_id"]),
-        )
-    )
-    for row, item in enumerate(sessions, start=1):
-        item["row"] = row
-    outside_agents.sort(
-        key=lambda item: (
-            PROVIDER_ORDER.get(item["provider"], 9),
-            item["title"].casefold(),
-            item["identity"].get("uuid") or "",
-        )
-    )
-    color_overrides = _valid_colors(config.get("colors"))
-    color_overrides = _adopt_launch_colors(config, sessions, color_overrides)
-    for item in sessions + outside_agents:
-        # A Claude session's transcript agent-color is what the session
-        # actually renders in its own prompt chip; it must beat the identity
-        # hash or the list shows a different color than the session itself
-        # (a stored pink rendered yellow, proven live 2026-08-02). Explicit
-        # config overrides still win over both.
-        raw_uuid = (item.get("identity") or {}).get("uuid")
-        display_uuid = valid_uuid(raw_uuid)
-        item_provider = item.get("provider")
-        provider = item_provider if isinstance(item_provider, str) else "unknown"
-        evidence = item.get("_claude_agent_color")
-        if (
-            item.get("provider") == "claude"
-            and display_uuid
-            and evidence in SESSION_COLORS
-            and f"claude:{display_uuid}" not in color_overrides
-        ):
-            item["display_color"] = evidence
-        else:
-            item["display_color"] = session_color(
-                provider,
-                display_uuid,
-                color_overrides,
-            )
-        item.pop("_claude_agent_color", None)
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "generated_at": _utc_now(current_time),
-        "source": "live",
-        "stale": False,
-        "warnings": [],
-        "daemon_generation": daemon_generation(process_table),
-        "sessions": sessions,
-        "outside_agents": outside_agents,
-    }
 
 
 def apply_provider_title_states(
@@ -2659,11 +818,7 @@ def _quarantine_orphaned_provider_untitled_markers(
 
 def _shpool_executable() -> str:
     """Resolve shpool for contexts (systemd user services) whose PATH omits it."""
-    found = shutil.which("shpool")
-    if found:
-        return found
-    fallback = Path.home() / ".cargo" / "bin" / "shpool"
-    return str(fallback) if fallback.is_file() else "shpool"
+    return _providers._shpool_executable(home_factory=Path.home)
 
 
 def collect_live(
@@ -2673,296 +828,63 @@ def collect_live(
     proc_root: Path | None = None,
 ) -> dict[str, Any]:
     """Collect a live inventory using one call per external list command."""
-    invoke = runner or default_runner
-    timeout = float(config.get("command_timeout_seconds", 6.0))
-    root = proc_root or Path(os.environ.get("SESSION_KIT_PROC_ROOT", "/proc"))
-    try:
-        shpool_payload = _command_json(
-            fixture_env="SESSION_KIT_SHPOOL_JSON_FILE",
-            command_env="SESSION_KIT_SHPOOL_CMD",
-            default_command=(_shpool_executable(), "list", "--json"),
-            runner=invoke,
-            timeout=timeout,
-        )
-    except (OSError, ValueError, subprocess.SubprocessError, CollectionError) as exc:
-        raise CollectionError(f"cannot collect shpool snapshot: {exc}") from exc
-    _parse_shpool_payload(shpool_payload)
-    process_table = platform_process_table(
-        root, int(config.get("max_proc_nodes", DEFAULT_MAX_PROC_NODES))
-    )
-    warnings: list[str] = []
-    claude_failed = False
-    try:
-        claude_payload = _command_json(
-            fixture_env="SESSION_KIT_CLAUDE_JSON_FILE",
-            command_env="SESSION_KIT_CLAUDE_CMD",
-            default_command=("claude", "agents", "--json"),
-            runner=invoke,
-            timeout=timeout,
-        )
-        claude_payload = _enrich_claude_payload(claude_payload)
-        _parse_claude_payload(claude_payload)
-    except (OSError, ValueError, subprocess.SubprocessError, CollectionError) as exc:
-        claude_payload = []
-        claude_failed = True
-        warnings.append(f"Claude inventory unavailable: {clean_text(str(exc), 240)}")
-    codex_home, db_path = _codex_paths()
-    codex_index = index_codex_processes(process_table, root, codex_home)
-    codex_visible = bool(codex_index)
-    session_index_names: dict[str, str] = {}
-    naming_warnings: list[str] = []
-    try:
-        session_index_names = read_codex_session_index(
-            codex_home / "session_index.jsonl", naming_warnings
-        )
-    except CollectionError as exc:
-        naming_warnings.append(
-            f"Codex session names unavailable: {clean_text(str(exc), 240)}"
-        )
-    try:
-        codex_rows = read_codex_db(db_path, session_index_names)
-    except (OSError, sqlite3.Error, CollectionError) as exc:
-        codex_rows = (
-            {
-                uuid: {
-                    "id": uuid,
-                    "title": "",
-                    "cwd": "",
-                    "session_index_name": title,
-                }
-                for uuid, title in session_index_names.items()
-            },
-            {},
-        )
-        codex_failed = True
-        if codex_visible:
-            warnings.append(
-                f"Codex metadata unavailable: {clean_text(str(exc), 240)}"
-            )
-    else:
-        codex_failed = not db_path.is_file()
-        if codex_failed and codex_visible:
-            warnings.append(
-                "Codex metadata unavailable: database does not exist: "
-                f"{clean_text(str(db_path), 240)}"
-            )
-    recent_outputs = recent_output_times(
-        item["name"] for item in _parse_shpool_payload(shpool_payload)
-    )
-    inventory = build_inventory(
-        shpool_payload,
-        claude_payload,
-        process_table,
-        codex_index,
-        codex_rows,
+    return _collector.collect_live(
         config,
-        recent_output_by_shpool_id=recent_outputs,
+        runner=runner,
+        proc_root=proc_root,
+        environ=os.environ,
+        default_runner=default_runner,
+        command_json=_command_json,
+        shpool_executable=_shpool_executable,
+        platform_process_table=platform_process_table,
+        default_max_proc_nodes=DEFAULT_MAX_PROC_NODES,
+        enrich_claude_payload=_enrich_claude_payload,
+        parse_claude_payload=_parse_claude_payload,
+        codex_paths=_codex_paths,
+        index_codex_processes=index_codex_processes,
+        read_codex_session_index=read_codex_session_index,
+        read_codex_db=read_codex_db,
+        recent_output_times=recent_output_times,
+        build_inventory=build_inventory,
+        apply_provider_title_states=apply_provider_title_states,
+        apply_retained_setup_attributions=apply_retained_setup_attributions,
     )
-    apply_provider_title_states(inventory, config)
-    apply_retained_setup_attributions(inventory)
-    inventory["warnings"].extend(warnings)
-    inventory["naming_warnings"] = naming_warnings
-    # Optional providers may be absent on a general-purpose installation.
-    # A query failure is material only when that provider is visibly running.
-    claude_visible = any(
-        _is_native_claude(process)
-        for process in process_table.values()
-    )
-    inventory["_complete"] = not (
-        (claude_failed and claude_visible) or (codex_failed and codex_visible)
-    )
-    return inventory
-
-
-def _state_paths(config: Mapping[str, Any]) -> dict[str, Path]:
-    root = Path(config["state_dir"])
-    return {
-        "root": root,
-        "inventory": root / "inventory.json",
-        "manifest": root / "recovery-manifest.json",
-        "pending": root / "recovery-pending.json",
-        "aliases": root / "aliases.json",
-        "aliases_archive": root / "aliases.json.migrated-v1",
-        "aliases_source_backup": root / "aliases.json.pre-migration-v1",
-        "terminal_numbers": root / "terminal-numbers.json",
-        "terminal_numbers_epoch": root / "terminal-numbers.initialized.json",
-        "terminal_numbers_retired": root / "terminal-numbers-retired.json",
-        "color_reservations": root / "color-reservations.json",
-        "provider_title_retries": root / "provider-title-retries.json",
-        "provider_untitled_quarantine": root / "provider-untitled-quarantine",
-        "config_lock": root / "config.lock",
-        "lock": root / "inventory.lock",
-    }
-
-
-class StateLock:
-    def __init__(self, root: Path, lock_path: Path):
-        self.root = root
-        self.lock_path = lock_path
-        self.fd: int | None = None
-
-    def __enter__(self) -> "StateLock":
-        self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        try:
-            root_stat = self.root.lstat()
-        except OSError as exc:
-            raise CollectionError(f"cannot inspect state directory {self.root}") from exc
-        if (
-            not statmod.S_ISDIR(root_stat.st_mode)
-            or statmod.S_IMODE(root_stat.st_mode) != 0o700
-            or root_stat.st_uid != os.geteuid()
-        ):
-            raise CollectionError(
-                f"state directory must be a mode-0700 current-owner real directory: {self.root}"
-            )
-        flags = os.O_RDWR | os.O_CREAT
-        if hasattr(os, "O_CLOEXEC"):
-            flags |= os.O_CLOEXEC
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        try:
-            descriptor = os.open(self.lock_path, flags, 0o600)
-            opened = os.fstat(descriptor)
-            before = self.lock_path.lstat()
-            if (
-                not statmod.S_ISREG(opened.st_mode)
-                or statmod.S_IMODE(opened.st_mode) != 0o600
-                or opened.st_uid != os.geteuid()
-                or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
-            ):
-                raise CollectionError(
-                    f"state lock must be a mode-0600 current-owner regular file: {self.lock_path}"
-                )
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
-            after = self.lock_path.lstat()
-            if (opened.st_dev, opened.st_ino) != (after.st_dev, after.st_ino):
-                raise CollectionError(f"state lock changed while locking: {self.lock_path}")
-        except BaseException:
-            if "descriptor" in locals():
-                with contextlib.suppress(OSError):
-                    fcntl.flock(descriptor, fcntl.LOCK_UN)
-                os.close(descriptor)
-            raise
-        self.fd = descriptor
-        return self
-
-    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
-        if self.fd is not None:
-            fcntl.flock(self.fd, fcntl.LOCK_UN)
-            os.close(self.fd)
-            self.fd = None
-
-
-def atomic_write_json(path: Path, payload: Any) -> None:
-    """Write JSON with mode 0600, fsync, and same-directory atomic replace."""
-    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    try:
-        os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            descriptor = -1
-            json.dump(payload, handle, indent=2, sort_keys=True)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        os.chmod(path, 0o600)
-        directory_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-        try:
-            os.unlink(temporary)
-        except FileNotFoundError:
-            pass
 
 
 def _read_state_json(path: Path) -> Any:
-    try:
-        value = _load_json_file(path)
-    except (OSError, ValueError):
-        return None
-    return value
+    return _state_io._read_state_json(path, load_json_file=_load_json_file)
 
 
 def _alias_document_from_bytes(payload: bytes, *, label: str) -> dict[str, Any]:
-    try:
-        raw = json.loads(payload.decode("utf-8", "strict"))
-    except (UnicodeDecodeError, ValueError) as exc:
-        raise CollectionError(f"{label} is invalid JSON") from exc
-    if (
-        not isinstance(raw, dict)
-        or raw.get("schema_version", SCHEMA_VERSION) != SCHEMA_VERSION
-        or ("aliases" in raw and not isinstance(raw["aliases"], Mapping))
-        or (
-            "automatic_titles" in raw
-            and not isinstance(raw["automatic_titles"], Mapping)
-        )
-        or (
-            "automatic_title_failures" in raw
-            and not isinstance(raw["automatic_title_failures"], Mapping)
-        )
-    ):
-        raise CollectionError(f"{label} has an invalid schema")
-    aliases = raw.get("aliases", {})
-    normalized = _valid_aliases(aliases)
-    if len(normalized) != len(aliases):
-        raise CollectionError(f"{label} contains an invalid alias")
-    raw["schema_version"] = SCHEMA_VERSION
-    raw["aliases"] = dict(sorted(normalized.items()))
-    if "automatic_titles" in raw:
-        titles = _valid_automatic_titles(raw["automatic_titles"])
-        if len(titles) != len(raw["automatic_titles"]):
-            raise CollectionError(f"{label} contains an invalid automatic title")
-        raw["automatic_titles"] = dict(sorted(titles.items()))
-    if "automatic_title_failures" in raw:
-        failures = _valid_automatic_title_failures(raw["automatic_title_failures"])
-        if len(failures) != len(raw["automatic_title_failures"]):
-            raise CollectionError(
-                f"{label} contains an invalid automatic title failure"
-            )
-        raw["automatic_title_failures"] = dict(sorted(failures.items()))
-    return raw
+    return _names._alias_document_from_bytes(
+        payload,
+        label=label,
+        schema_version=SCHEMA_VERSION,
+    )
 
 
 def _private_alias_document(path: Path, *, allow_missing: bool) -> dict[str, Any]:
-    payload = _read_bounded_owner_file(
+    return _names._private_alias_document(
         path,
-        label="canonical alias config",
-        max_bytes=MAX_PRIVATE_JSON_BYTES,
-        exact_mode=0o600,
         allow_missing=allow_missing,
+        max_private_json_bytes=MAX_PRIVATE_JSON_BYTES,
+        schema_version=SCHEMA_VERSION,
+        alias_document_from_bytes=_alias_document_from_bytes,
     )
-    if payload is None:
-        return {"schema_version": SCHEMA_VERSION, "aliases": {}}
-    return _alias_document_from_bytes(payload, label="canonical alias config")
-
-
-def _atomic_json_bytes(payload: Any) -> bytes:
-    return (
-        json.dumps(payload, indent=2, sort_keys=True) + "\n"
-    ).encode("utf-8")
 
 
 def _private_alias_parent(path: Path) -> None:
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    metadata = path.parent.lstat()
-    if (
-        not statmod.S_ISDIR(metadata.st_mode)
-        or statmod.S_ISLNK(metadata.st_mode)
-        or metadata.st_uid != os.geteuid()
-        or statmod.S_IMODE(metadata.st_mode) != 0o700
-    ):
-        raise CollectionError(
-            f"alias config directory must be mode-0700 current-owner: {path.parent}"
-        )
+    return _names._private_alias_parent(
+        path,
+    )
 
 
 def canonical_aliases(config: Mapping[str, Any]) -> dict[str, str]:
-    return dict(_private_alias_document(config_path(), allow_missing=True)["aliases"])
+    return _names.canonical_aliases(
+        config,
+        config_path=config_path,
+        private_alias_document=_private_alias_document,
+    )
 
 
 def mutate_canonical_alias(
@@ -2971,35 +893,24 @@ def mutate_canonical_alias(
     uuid: str,
     title: str | None,
 ) -> dict[str, str]:
-    exact_uuid = valid_uuid(uuid)
-    if provider not in PROVIDERS or not exact_uuid:
-        raise CollectionError("alias requires provider claude|codex and an exact UUID")
-    path = config_path()
-    paths = _state_paths(config)
-    # config.lock is the alias-write lock used by pinned schema-v1 releases.
-    # Keep it outermost so an old picker and this core cannot lose each
-    # other's config update during a mixed-release rollback window.
-    with StateLock(paths["root"], paths["config_lock"]):
-        with StateLock(paths["root"], paths["lock"]):
-            _private_alias_parent(path)
-            document = _private_alias_document(path, allow_missing=True)
-            aliases = dict(document["aliases"])
-            key = f"{provider}:{exact_uuid}"
-            if title is None:
-                aliases.pop(key, None)
-            else:
-                clean_title = clean_text(title, 100)
-                if not clean_title:
-                    raise CollectionError("alias title must contain visible text")
-                aliases[key] = clean_title
-            document["aliases"] = dict(sorted(aliases.items()))
-            atomic_write_json(path, document)
-            return dict(document["aliases"])
+    return _names.mutate_canonical_alias(
+        config,
+        provider,
+        uuid,
+        title,
+        atomic_write_json=atomic_write_json,
+        config_path=config_path,
+        private_alias_document=_private_alias_document,
+        private_alias_parent=_private_alias_parent,
+    )
 
 
 def canonical_automatic_titles(config: Mapping[str, Any]) -> dict[str, str]:
-    document = _private_alias_document(config_path(), allow_missing=True)
-    return _valid_automatic_titles(document.get("automatic_titles"))
+    return _names.canonical_automatic_titles(
+        config,
+        config_path=config_path,
+        private_alias_document=_private_alias_document,
+    )
 
 
 def mutate_canonical_automatic_title(
@@ -3012,64 +923,19 @@ def mutate_canonical_automatic_title(
     revalidate: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Atomically set/reset one automatic title without crossing alias provenance."""
-    exact_uuid = valid_uuid(uuid)
-    if provider not in PROVIDERS or not exact_uuid:
-        raise CollectionError(
-            "automatic title requires provider claude|codex and an exact UUID"
-        )
-    if title is not None and not automatic_naming_enabled():
-        raise CollectionError("automatic naming is disabled")
-    clean_title = normalize_automatic_title(title) if title is not None else None
-    path = config_path()
-    paths = _state_paths(config)
-    key = f"{provider}:{exact_uuid}"
-    with StateLock(paths["root"], paths["config_lock"]):
-        with StateLock(paths["root"], paths["lock"]):
-            if revalidate is not None:
-                revalidate()
-            _private_alias_parent(path)
-            document = _private_alias_document(path, allow_missing=True)
-            aliases = dict(document["aliases"])
-            if clean_title is not None and key in aliases:
-                raise CollectionError("explicit local alias already owns this title")
-            titles = _valid_automatic_titles(document.get("automatic_titles"))
-            failures = _valid_automatic_title_failures(
-                document.get("automatic_title_failures")
-            )
-            existing = titles.get(key)
-            if clean_title is None:
-                titles.pop(key, None)
-            elif existing and existing != clean_title and not overwrite:
-                raise CollectionError("automatic title is already set")
-            else:
-                titles[key] = clean_title
-            failures.pop(key, None)
-            document["automatic_titles"] = dict(sorted(titles.items()))
-            if failures:
-                document["automatic_title_failures"] = dict(
-                    sorted(failures.items())
-                )
-            else:
-                document.pop("automatic_title_failures", None)
-            atomic_write_json(path, document)
-            verified = _private_alias_document(path, allow_missing=False)
-            verified_titles = _valid_automatic_titles(
-                verified.get("automatic_titles")
-            )
-            if verified_titles.get(key) != clean_title:
-                if not (clean_title is None and key not in verified_titles):
-                    raise CollectionError("automatic title atomic verification failed")
-            if clean_title is not None and key in verified["aliases"]:
-                raise CollectionError(
-                    "explicit alias appeared during automatic title write"
-                )
-            return {
-                "schema_version": SCHEMA_VERSION,
-                "provider": provider,
-                "uuid": exact_uuid,
-                "title": clean_title,
-                "automatic_titles": verified_titles,
-            }
+    return _names.mutate_canonical_automatic_title(
+        config,
+        provider,
+        uuid,
+        title,
+        overwrite=overwrite,
+        revalidate=revalidate,
+        schema_version=SCHEMA_VERSION,
+        atomic_write_json=atomic_write_json,
+        config_path=config_path,
+        private_alias_document=_private_alias_document,
+        private_alias_parent=_private_alias_parent,
+    )
 
 
 def mutate_canonical_self_name(
@@ -3081,58 +947,18 @@ def mutate_canonical_self_name(
     revalidate: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Atomically set the paired alias and automatic title for a proved caller."""
-    exact_uuid = valid_uuid(uuid)
-    if provider not in PROVIDERS or not exact_uuid:
-        raise CollectionError(
-            "self-name requires provider claude|codex and an exact UUID"
-        )
-    if not automatic_naming_enabled():
-        raise CollectionError("automatic naming is disabled")
-    clean_title = normalize_automatic_title(title)
-    path = config_path()
-    paths = _state_paths(config)
-    key = f"{provider}:{exact_uuid}"
-    with StateLock(paths["root"], paths["config_lock"]):
-        with StateLock(paths["root"], paths["lock"]):
-            if revalidate is not None:
-                revalidate()
-            _private_alias_parent(path)
-            document = _private_alias_document(path, allow_missing=True)
-            aliases = dict(document["aliases"])
-            titles = _valid_automatic_titles(document.get("automatic_titles"))
-            failures = _valid_automatic_title_failures(
-                document.get("automatic_title_failures")
-            )
-            aliases[key] = clean_title
-            titles[key] = clean_title
-            failures.pop(key, None)
-            document["aliases"] = dict(sorted(aliases.items()))
-            document["automatic_titles"] = dict(sorted(titles.items()))
-            if failures:
-                document["automatic_title_failures"] = dict(
-                    sorted(failures.items())
-                )
-            else:
-                document.pop("automatic_title_failures", None)
-            atomic_write_json(path, document)
-            verified = _private_alias_document(path, allow_missing=False)
-            verified_titles = _valid_automatic_titles(
-                verified.get("automatic_titles")
-            )
-            if verified["aliases"].get(key) != clean_title:
-                raise CollectionError("self-name alias atomic verification failed")
-            if verified_titles.get(key) != clean_title:
-                raise CollectionError(
-                    "self-name automatic title atomic verification failed"
-                )
-            return {
-                "schema_version": SCHEMA_VERSION,
-                "provider": provider,
-                "uuid": exact_uuid,
-                "title": clean_title,
-                "aliases": dict(verified["aliases"]),
-                "automatic_titles": verified_titles,
-            }
+    return _names.mutate_canonical_self_name(
+        config,
+        provider,
+        uuid,
+        title,
+        revalidate=revalidate,
+        schema_version=SCHEMA_VERSION,
+        atomic_write_json=atomic_write_json,
+        config_path=config_path,
+        private_alias_document=_private_alias_document,
+        private_alias_parent=_private_alias_parent,
+    )
 
 
 def record_automatic_title_failure(
@@ -3143,91 +969,45 @@ def record_automatic_title_failure(
     revalidate: Callable[[], None] | None = None,
 ) -> int:
     """Record at most two proved root-turn naming failures."""
-    exact_uuid = valid_uuid(uuid)
-    if provider not in PROVIDERS or not exact_uuid:
-        raise CollectionError("automatic title failure requires an exact identity")
-    path = config_path()
-    paths = _state_paths(config)
-    key = f"{provider}:{exact_uuid}"
-    with StateLock(paths["root"], paths["config_lock"]):
-        with StateLock(paths["root"], paths["lock"]):
-            if revalidate is not None:
-                revalidate()
-            _private_alias_parent(path)
-            document = _private_alias_document(path, allow_missing=True)
-            if key in document["aliases"]:
-                return 0
-            titles = _valid_automatic_titles(document.get("automatic_titles"))
-            if key in titles:
-                return 0
-            failures = _valid_automatic_title_failures(
-                document.get("automatic_title_failures")
-            )
-            failures[key] = min(2, failures.get(key, 0) + 1)
-            document["automatic_title_failures"] = dict(sorted(failures.items()))
-            atomic_write_json(path, document)
-            verified = _private_alias_document(path, allow_missing=False)
-            attempts = _valid_automatic_title_failures(
-                verified.get("automatic_title_failures")
-            ).get(key)
-            if attempts != failures[key]:
-                raise CollectionError(
-                    "automatic title failure atomic verification failed"
-                )
-            return attempts
+    return _names.record_automatic_title_failure(
+        config,
+        provider,
+        uuid,
+        revalidate=revalidate,
+        atomic_write_json=atomic_write_json,
+        config_path=config_path,
+        private_alias_document=_private_alias_document,
+        private_alias_parent=_private_alias_parent,
+    )
 
 
 def _exact_active_title_keys(inventory: Mapping[str, Any]) -> set[str]:
-    keys: set[str] = set()
-    for item in [*inventory.get("sessions", ()), *inventory.get("outside_agents", ())]:
-        if not isinstance(item, Mapping):
-            continue
-        provider = item.get("provider")
-        identity = item.get("identity")
-        uuid = identity.get("uuid") if isinstance(identity, Mapping) else None
-        if (
-            provider in PROVIDERS
-            and isinstance(identity, Mapping)
-            and identity.get("confidence") == "exact"
-            and valid_uuid(uuid)
-        ):
-            keys.add(f"{provider}:{valid_uuid(uuid)}")
-    return keys
+    return _names._exact_active_title_keys(
+        inventory,
+    )
 
 
 def _automatic_title_prune_plan(
     titles: Mapping[str, str], active_keys: set[str]
 ) -> tuple[list[str], str]:
-    orphans = sorted(set(titles) - active_keys)
-    evidence = json.dumps(
-        {
-            "schema_version": SCHEMA_VERSION,
-            "automatic_titles": dict(sorted(titles.items())),
-            "active_keys": sorted(active_keys),
-            "orphans": orphans,
-        },
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-    return orphans, hashlib.sha256(evidence).hexdigest()
+    return _names._automatic_title_prune_plan(
+        titles,
+        active_keys,
+        schema_version=SCHEMA_VERSION,
+    )
 
 
 def audit_automatic_titles(
     config: Mapping[str, Any], inventory: Mapping[str, Any]
 ) -> dict[str, Any]:
-    titles = canonical_automatic_titles(config)
-    orphans, token = _automatic_title_prune_plan(
-        titles, _exact_active_title_keys(inventory)
+    return _names.audit_automatic_titles(
+        config,
+        inventory,
+        schema_version=SCHEMA_VERSION,
+        automatic_title_prune_plan=_automatic_title_prune_plan,
+        exact_active_title_keys=_exact_active_title_keys,
+        canonical_automatic_titles_reader=canonical_automatic_titles,
     )
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "automatic_title_count": len(titles),
-        "orphan_count": len(orphans),
-        "orphans": orphans,
-        "prune_token": token,
-        "dry_run": True,
-    }
 
 
 def prune_automatic_titles(
@@ -3236,1105 +1016,18 @@ def prune_automatic_titles(
     prune_token: str,
 ) -> dict[str, Any]:
     """Apply only the exact orphan set previously exposed by a dry-run token."""
-    path = config_path()
-    paths = _state_paths(config)
-    with StateLock(paths["root"], paths["config_lock"]):
-        with StateLock(paths["root"], paths["lock"]):
-            _private_alias_parent(path)
-            document = _private_alias_document(path, allow_missing=True)
-            titles = _valid_automatic_titles(document.get("automatic_titles"))
-            active_keys = _exact_active_title_keys(inventory)
-            orphans, expected = _automatic_title_prune_plan(titles, active_keys)
-            if not re.fullmatch(r"[0-9a-f]{64}", prune_token) or prune_token != expected:
-                raise CollectionError(
-                    "automatic title prune token is stale or does not match dry run"
-                )
-            for key in orphans:
-                titles.pop(key, None)
-            document["automatic_titles"] = dict(sorted(titles.items()))
-            failures = _valid_automatic_title_failures(
-                document.get("automatic_title_failures")
-            )
-            for key in orphans:
-                failures.pop(key, None)
-            if failures:
-                document["automatic_title_failures"] = dict(
-                    sorted(failures.items())
-                )
-            else:
-                document.pop("automatic_title_failures", None)
-            atomic_write_json(path, document)
-            return {
-                "schema_version": SCHEMA_VERSION,
-                "pruned": orphans,
-                "automatic_title_count": len(titles),
-            }
-
-
-MAX_CLAUDE_SESSION_RECORDS = 512
-
-
-def _push_claude_title(home: Path, uuid: str, title: str) -> tuple[list[str], list[str]]:
-    pushed: list[str] = []
-    warnings: list[str] = []
-    sessions = home / ".claude" / "sessions"
-    if not sessions.is_dir():
-        return pushed, ["Claude sessions directory unavailable; title not pushed"]
-    intent = sessions / f"{uuid}.nameintent"
-    try:
-        if intent.is_symlink():
-            raise OSError("refusing symlinked name intent")
-        descriptor, temporary = tempfile.mkstemp(
-            prefix=f".{intent.name}.", dir=sessions
-        )
-        try:
-            os.fchmod(descriptor, 0o600)
-            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                descriptor = -1
-                handle.write(title + "\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, intent)
-        finally:
-            if descriptor >= 0:
-                os.close(descriptor)
-            with contextlib.suppress(FileNotFoundError):
-                os.unlink(temporary)
-        pushed.append("claude-nameintent")
-    except OSError as exc:
-        warnings.append(f"Claude name intent not written: {exc}")
-    # The prompt bar's bottom-right name is a transcript agent-name record —
-    # the exact store /rename persists, hydrated at session start/resume,
-    # rendered beside the agent-color. Same append discipline as colors.
-    projects = home / ".claude" / "projects"
-    try:
-        transcripts = sorted(projects.glob(f"*/{uuid}.jsonl"))
-    except OSError:
-        transcripts = []
-    name_entry = json.dumps(
-        {"type": "agent-name", "agentName": title, "sessionId": uuid},
-        separators=(",", ":"),
+    return _names.prune_automatic_titles(
+        config,
+        inventory,
+        prune_token,
+        schema_version=SCHEMA_VERSION,
+        atomic_write_json=atomic_write_json,
+        config_path=config_path,
+        automatic_title_prune_plan=_automatic_title_prune_plan,
+        exact_active_title_keys=_exact_active_title_keys,
+        private_alias_document=_private_alias_document,
+        private_alias_parent=_private_alias_parent,
     )
-    for transcript in transcripts[:4]:
-        if transcript.is_symlink():
-            continue
-        try:
-            with open(transcript, "a", encoding="utf-8") as handle:
-                handle.write(name_entry + "\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            pushed.append("claude-transcript-name")
-        except OSError as exc:
-            warnings.append(f"Claude transcript name not appended: {exc}")
-    # The per-PID session record names the thread in Claude's own session
-    # picker. Records carry the exact sessionId, so match by content.
-    try:
-        records = sorted(sessions.glob("*.json"))[:MAX_CLAUDE_SESSION_RECORDS]
-    except OSError as exc:
-        return pushed, warnings + [f"Claude session records unreadable: {exc}"]
-    for record in records:
-        if record.is_symlink() or not re.fullmatch(r"\d+\.json", record.name):
-            continue
-        try:
-            data = json.loads(record.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if not isinstance(data, dict) or data.get("sessionId") != uuid:
-            continue
-        try:
-            data["name"] = title
-            atomic_write_json(record, data)
-            pushed.append("claude-session-record")
-        except OSError as exc:
-            warnings.append(f"Claude session record not updated: {exc}")
-    return pushed, warnings
-
-
-def _codex_state_databases(codex_root: Path) -> list[Path]:
-    """Codex state stores ordered oldest-to-newest by schema number.
-
-    Lexical order breaks at two digits (state_10 sorts before state_5), so
-    the numeric suffix is the key. Empty files are placeholder artifacts,
-    never the live store.
-    """
-
-    def version(path: Path) -> tuple[int, str]:
-        suffix = path.stem.rsplit("_", 1)[-1]
-        return (int(suffix) if suffix.isdigit() else -1, path.name)
-
-    try:
-        candidates = [
-            path
-            for path in codex_root.glob("state_*.sqlite")
-            if path.stat().st_size > 0
-        ]
-    except OSError:
-        return []
-    return sorted(candidates, key=version)
-
-
-def _codex_title_echoes_prompt(title: str, first_message: str) -> bool:
-    """True when a stored title is just the first prompt (or a prefix cut)."""
-    return bool(title) and bool(first_message) and (
-        first_message.casefold().startswith(title.casefold())
-        or title.casefold().startswith(first_message.casefold())
-    )
-
-
-def codex_bounce_prepare(
-    uuid: str, codex_root: Path | None = None, now: float | None = None
-) -> str:
-    """Resolve the real name a bounced Codex process should boot under.
-
-    Session-index rename evidence wins; otherwise a database title that does
-    not merely echo the first prompt. Codex seeds threads.title with the raw
-    prompt and replaces it within about two minutes of the first answer, so
-    an echo-shaped title only counts once the thread has been quiet long
-    enough that it must be the final title (a terse prompt can BE the real
-    title). The chosen name is mirrored into the session index when its
-    latest entry differs, because the relaunched status bar reads only the
-    index. Returns "" when the thread has no real name yet — the caller must
-    then defer the bounce and keep its one-shot marker so a later reopen
-    retries after the title exists.
-    """
-    import sqlite3
-
-    if codex_root is None:
-        codex_root = _codex_home()
-    title = ""
-    first_message = ""
-    has_split_prompt_schema = False
-    settled = False
-    databases = _codex_state_databases(codex_root)
-    if databases:
-        fetched = None
-        selected_columns: list[str] = []
-        try:
-            connection = sqlite3.connect(
-                f"file:{databases[-1]}?mode=ro", uri=True
-            )
-            try:
-                columns = {
-                    row[1]
-                    for row in connection.execute(
-                        "PRAGMA table_info(threads)"
-                    )
-                }
-                has_split_prompt_schema = "first_user_message" in columns
-                selected_columns = ["title"]
-                if has_split_prompt_schema:
-                    selected_columns.append("first_user_message")
-                if "updated_at" in columns:
-                    selected_columns.append("updated_at")
-                fetched = connection.execute(
-                    "SELECT "
-                    + ", ".join(selected_columns)
-                    + " FROM threads WHERE id = ?",
-                    (uuid,),
-                ).fetchone()
-            finally:
-                connection.close()
-        except sqlite3.Error:
-            fetched = None
-        if fetched:
-            values = dict(zip(selected_columns, fetched))
-            title = str(values.get("title") or "").strip()
-            if has_split_prompt_schema:
-                first_message = str(
-                    values.get("first_user_message") or ""
-                ).strip()
-            updated_at = values.get("updated_at")
-            if isinstance(updated_at, (int, float)) and not isinstance(
-                updated_at, bool
-            ):
-                current = time.time() if now is None else now
-                settled = current - float(updated_at) > 300
-    index = codex_root / "session_index.jsonl"
-    index_name = ""
-    if index.is_file() and not index.is_symlink():
-        try:
-            if index.stat().st_size <= MAX_CODEX_SESSION_INDEX_BYTES:
-                for line in index.read_text(encoding="utf-8").splitlines():
-                    try:
-                        entry = json.loads(line)
-                    except ValueError:
-                        continue
-                    if isinstance(entry, dict) and entry.get("id") == uuid:
-                        candidate = str(
-                            entry.get("thread_name") or ""
-                        ).strip()
-                        if candidate:
-                            index_name = candidate
-        except OSError:
-            index_name = ""
-    # Codex never writes the session index itself: every entry is a
-    # deliberate push (kit title, auto-titler, rename mirror), so any entry
-    # counts as a real name even when it is echo-shaped. Only the database
-    # title needs the seed-vs-final test.
-    index_is_explicit = bool(index_name)
-    if has_split_prompt_schema:
-        title_is_explicit = bool(title) and (
-            settled or not _codex_title_echoes_prompt(title, first_message)
-        )
-    else:
-        title_is_explicit = bool(title)
-    if index_is_explicit:
-        chosen = index_name
-    elif title_is_explicit:
-        chosen = title
-    else:
-        return ""
-    if index_name != chosen:
-        # A failed mirror would relaunch under the stale bar name and burn
-        # the one-shot bounce on nothing, so it defers instead.
-        if index.is_symlink():
-            return ""
-        try:
-            _append_codex_index_entry(index, uuid, chosen[:100])
-        except OSError:
-            return ""
-    return chosen
-
-
-def claude_bounce_prepare(
-    uuid: str, home: Path | None = None, now: float | None = None
-) -> tuple[str, bool]:
-    """Decide whether a Claude window can only be named by a restart.
-
-    Claude applies a kit name intent through its SessionStart and prompt
-    hooks — a living window renames at the next prompt, and a fresh boot
-    renames immediately. A session whose name arrived AFTER boot and that
-    never saw another prompt (ask, read, close) therefore shows its stale
-    title until the provider restarts. Returns (title, clear):
-    title != "" — bounce is warranted; "" with clear=True — the live window
-    already renamed (a real prompt followed the intent), so the caller
-    should drop its untitled marker; "" with clear=False — defer, a name
-    may still arrive.
-    """
-    if home is None:
-        home = Path.home()
-    intent = home / ".claude" / "sessions" / f"{uuid}.nameintent"
-    try:
-        if intent.is_symlink() or not intent.is_file():
-            return "", False
-        intent_mtime = intent.stat().st_mtime
-        title = intent.read_text(encoding="utf-8").splitlines()[0].strip()[:64]
-    except (OSError, IndexError):
-        return "", False
-    if not title:
-        return "", False
-    try:
-        transcripts = sorted(
-            (home / ".claude" / "projects").glob(f"*/{uuid}.jsonl"),
-            key=lambda path: path.stat().st_mtime,
-        )
-    except OSError:
-        transcripts = []
-    if not transcripts:
-        return "", False
-    last_prompt = 0.0
-    try:
-        with open(transcripts[-1], encoding="utf-8") as handle:
-            for line in handle:
-                try:
-                    record = json.loads(line)
-                except ValueError:
-                    continue
-                if not isinstance(record, Mapping) or record.get("type") != "user":
-                    continue
-                if record.get("isMeta"):
-                    continue
-                message = record.get("message")
-                if not isinstance(message, Mapping):
-                    continue
-                content = message.get("content")
-                # Real prompts are strings; tool results arrive as lists.
-                # The synthesized resume-mount pair is not a human prompt.
-                if not isinstance(content, str):
-                    continue
-                if content.startswith("Continue from where you left off."):
-                    continue
-                stamp = record.get("timestamp")
-                if not isinstance(stamp, str):
-                    continue
-                try:
-                    parsed = dt.datetime.fromisoformat(
-                        stamp.replace("Z", "+00:00")
-                    ).timestamp()
-                except ValueError:
-                    continue
-                last_prompt = max(last_prompt, parsed)
-    except OSError:
-        return "", False
-    if last_prompt > intent_mtime + 1:
-        # The hook applied the name at that prompt; the window is current.
-        return "", True
-    return title, False
-
-
-def codex_pending_auto_titles(
-    environ: Mapping[str, str] | None = None,
-) -> list[dict[str, str]]:
-    """Kit-side auto-titler for Codex threads nobody has named.
-
-    Codex seeds threads.title with the raw first prompt and has no title
-    hook, and agents only self-name work they judge substantive — so a plain
-    question thread stays unnamed on every surface. Recent split-schema
-    threads whose title is empty or still echoes the first prompt, and which
-    have no session-index entry (the deliberate-name evidence), get the same
-    seven-word heuristic title Claude sessions get, pushed into both Codex
-    stores. Self-terminating: the push writes the index entry that excludes
-    the thread from every later pass, and a later agent self-name simply
-    overwrites it (last-writer-wins).
-    """
-    import sqlite3
-
-    env = environ if environ is not None else os.environ
-    reconciled = _reconcile_pending_provider_titles(load_config(), "codex", env)
-    if not automatic_naming_enabled(env):
-        return reconciled
-    if str(env.get("SESSION_KIT_CODEX_AUTOTITLE", "")).strip().casefold() in {
-        "0",
-        "false",
-        "no",
-        "off",
-    }:
-        return reconciled
-    codex_root, database = _codex_paths()
-    if not database.is_file():
-        return reconciled
-    try:
-        connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
-        try:
-            columns = {
-                row[1]
-                for row in connection.execute("PRAGMA table_info(threads)")
-            }
-            if not {"id", "title", "first_user_message", "updated_at"} <= columns:
-                return reconciled
-            # Only human root threads: subagent threads inherit their task
-            # prompt as first_user_message, and titling them replaces useful
-            # agent nicknames with near-duplicate task titles. Non-interactive
-            # `codex exec` runs are one-shot jobs nobody reopens — titling
-            # them only fills the index with prompt fragments.
-            root_filter = ""
-            if "thread_source" in columns:
-                root_filter = (
-                    " AND (thread_source IS NULL OR thread_source = 'user')"
-                )
-            elif "agent_path" in columns:
-                root_filter = " AND (agent_path IS NULL OR agent_path = '')"
-            if "source" in columns:
-                root_filter += " AND (source IS NULL OR source != 'exec')"
-            rows = connection.execute(
-                "SELECT id, title, first_user_message, updated_at"
-                " FROM threads"
-                " WHERE first_user_message IS NOT NULL"
-                " AND first_user_message != ''" + root_filter +
-                " ORDER BY updated_at DESC LIMIT 200"
-            ).fetchall()
-        finally:
-            connection.close()
-    except sqlite3.Error:
-        return reconciled
-    index = codex_root / "session_index.jsonl"
-    # Latest entry per id wins — the file is append-ordered and renames are
-    # appended, so later lines overwrite earlier ones here.
-    indexed: dict[str, str] = {}
-    if index.is_file() and not index.is_symlink():
-        try:
-            if index.stat().st_size > MAX_CODEX_SESSION_INDEX_BYTES:
-                return reconciled
-            for line in index.read_text(encoding="utf-8").splitlines():
-                try:
-                    entry = json.loads(line)
-                except ValueError:
-                    continue
-                if isinstance(entry, Mapping) and entry.get("id"):
-                    indexed[str(entry["id"])] = str(
-                        entry.get("thread_name") or ""
-                    ).strip()
-        except OSError:
-            # Unable to prove which threads already carry deliberate names;
-            # titling anyway could overwrite one, so do nothing.
-            return reconciled
-    cutoff = time.time() - 7 * 86400
-    results: list[dict[str, str]] = [
-        {"uuid": str(item["uuid"]), "title": str(item["title"])}
-        for item in reconciled
-    ]
-    # Live app-server windows repaint from a socket rename; derive the
-    # socket root from the caller's exact environment (no real-home
-    # fallback) so sandboxed runs stay inert.
-    live_state_dir: Path | None = None
-    if env.get("SESSION_KIT_CODEX_LIVE_RENAME") != "0":
-        live_home = env.get("HOME")
-        if live_home:
-            live_state_dir = _session_kit_state_dir(env, Path(live_home))
-    healed = 0
-    for uuid, raw_title, first_message, updated_at in rows:
-        exact = valid_uuid(uuid)
-        if not exact:
-            continue
-        if exact in indexed:
-            # Heal the database half of the dual write: the status bar reads
-            # threads.title, and a curated index name next to a prompt-echo
-            # (or empty) database title means the earlier UPDATE never landed
-            # or Codex re-stamped the seed over it. Re-assert, bounded and
-            # fail-open; each inventory build converges the two stores.
-            index_name = indexed[exact]
-            title = str(raw_title or "").strip()
-            first = str(first_message or "").strip()
-            if (
-                healed < 20
-                and index_name
-                and index_name != title
-                and not _codex_title_echoes_prompt(index_name, first)
-                and (not title or _codex_title_echoes_prompt(title, first))
-            ):
-                _push_codex_thread_title(codex_root, exact, index_name)
-                if live_state_dir is not None:
-                    _push_codex_live_rename(live_state_dir, exact, index_name)
-                healed += 1
-            continue
-        if exact == "00000000-0000-0000-0000-000000000000":
-            continue
-        if (
-            not isinstance(updated_at, (int, float))
-            or isinstance(updated_at, bool)
-            or float(updated_at) < cutoff
-        ):
-            continue
-        title = str(raw_title or "").strip()
-        first = str(first_message or "").strip()
-        if title and not _codex_title_echoes_prompt(title, first):
-            # A real name someone wrote; never replace it.
-            continue
-        derived = derive_prompt_title(first)
-        if not derived:
-            continue
-        # Both writes target the exact store tree the candidates were read
-        # from — pushing anywhere else would split reads and writes across
-        # different Codex homes.
-        try:
-            _append_codex_index_entry(index, exact, derived[:100])
-        except OSError:
-            continue
-        _push_codex_thread_title(codex_root, exact, derived)
-        if live_state_dir is not None:
-            _push_codex_live_rename(live_state_dir, exact, derived)
-        results.append({"uuid": exact, "title": derived})
-        if len(results) >= 20:
-            break
-    return results
-
-
-def _append_codex_index_entry(index: Path, uuid: str, title: str) -> None:
-    entry = json.dumps(
-        {
-            "id": uuid,
-            "thread_name": title,
-            "updated_at": dt.datetime.now(dt.timezone.utc)
-            .isoformat()
-            .replace("+00:00", "Z"),
-        },
-        separators=(",", ":"),
-    )
-    descriptor = os.open(index, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-    with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
-        handle.write(entry + "\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-
-
-def _push_codex_thread_title(
-    codex_root: Path, uuid: str, title: str
-) -> tuple[list[str], list[str]]:
-    """Set threads.title in Codex's own state database.
-
-    The Codex TUI's thread-title status item and its rename flow read and
-    write this column (the session index alone never reaches the status
-    bar). Update-only — a missing row is reported, never created — and every
-    failure is fail-open.
-    """
-    import sqlite3
-
-    candidates = _codex_state_databases(codex_root)
-    if not candidates:
-        # Older Codex builds have no thread store; nothing to report.
-        return [], []
-    database = candidates[-1]
-    try:
-        connection = sqlite3.connect(database, timeout=1.0)
-        try:
-            cursor = connection.execute(
-                "UPDATE threads SET title = ? WHERE id = ?", (title, uuid)
-            )
-            connection.commit()
-            if cursor.rowcount > 0:
-                return ["codex-thread-title"], []
-            return [], ["Codex thread row not found; thread title not set"]
-        finally:
-            connection.close()
-    except sqlite3.Error as exc:
-        return [], [f"Codex thread title not set: {exc}"]
-
-
-MAX_CODEX_LIVE_RENAME_SOCKETS = 8
-MAX_CODEX_LIVE_RENAME_FRAME = 1024 * 1024
-
-
-def _session_kit_state_dir(env: Mapping[str, str], home: Path) -> Path:
-    """The session-kit state directory under the caller's exact sandbox.
-
-    Same precedence as the shell helpers: SESSION_KIT_STATE_DIR names the
-    kit directory itself; otherwise it lives under XDG_STATE_HOME or the
-    sandbox home. Never falls back to the real home — an explicit
-    environment IS the caller's sandbox.
-    """
-    explicit = env.get("SESSION_KIT_STATE_DIR")
-    if explicit:
-        return Path(explicit)
-    xdg = env.get("XDG_STATE_HOME")
-    if xdg:
-        return Path(xdg) / "session-kit"
-    return home / ".local" / "state" / "session-kit"
-
-
-def _ws_send_frame(connection: Any, payload: bytes, opcode: int = 1) -> None:
-    import struct
-
-    header = bytes([0x80 | opcode])
-    length = len(payload)
-    if length < 126:
-        header += bytes([length | 0x80])
-    elif length < 65536:
-        header += bytes([126 | 0x80]) + struct.pack("!H", length)
-    else:
-        header += bytes([127 | 0x80]) + struct.pack("!Q", length)
-    mask = os.urandom(4)
-    masked = bytes(
-        value ^ mask[index % 4] for index, value in enumerate(payload)
-    )
-    connection.sendall(header + mask + masked)
-
-
-def _ws_recv_frame(connection: Any) -> tuple[int, bytes]:
-    import struct
-
-    def read_exact(count: int) -> bytes:
-        data = b""
-        while len(data) < count:
-            chunk = connection.recv(count - len(data))
-            if not chunk:
-                raise OSError("WebSocket closed mid-frame")
-            data += chunk
-        return data
-
-    first, second = read_exact(2)
-    opcode = first & 0x0F
-    length = second & 0x7F
-    if length == 126:
-        length = struct.unpack("!H", read_exact(2))[0]
-    elif length == 127:
-        length = struct.unpack("!Q", read_exact(8))[0]
-    if length > MAX_CODEX_LIVE_RENAME_FRAME:
-        raise OSError("oversized WebSocket frame")
-    mask = read_exact(4) if second & 0x80 else b""
-    payload = read_exact(length)
-    if mask:
-        payload = bytes(
-            value ^ mask[index % 4] for index, value in enumerate(payload)
-        )
-    return opcode, payload
-
-
-def _ws_request(
-    connection: Any, request_id: int, method: str, params: dict[str, Any]
-) -> None:
-    _ws_send_frame(
-        connection,
-        json.dumps(
-            {"method": method, "id": request_id, "params": params},
-            separators=(",", ":"),
-        ).encode(),
-    )
-    while True:
-        opcode, payload = _ws_recv_frame(connection)
-        if opcode == 8:
-            raise OSError("WebSocket closed by server")
-        if opcode == 9:
-            _ws_send_frame(connection, payload, opcode=10)
-            continue
-        if opcode != 1:
-            continue
-        try:
-            message = json.loads(payload)
-        except ValueError:
-            continue
-        if not isinstance(message, dict) or message.get("id") != request_id:
-            continue
-        if message.get("error") is not None:
-            raise OSError(f"app-server {method} refused: {message['error']}")
-        return
-
-
-def _push_codex_live_rename(
-    kit_state_dir: Path, uuid: str, title: str
-) -> tuple[list[str], list[str]]:
-    """Repaint live app-server-backed Codex windows with the new name.
-
-    A direct-TUI Codex bar repaints only at process start, but a remote TUI
-    attached to a kit app-server repaints its thread-title item from the
-    thread/name/updated broadcast — so a rename through the socket names a
-    LIVE window with no provider restart. Every kit app-server shares one
-    thread store, so the rename is offered to each live socket; a server
-    not hosting the thread writes the same value the direct push already
-    wrote, harmlessly. Entirely fail-open: absent, dead, or refusing
-    sockets never block the store push and never warn — most sessions are
-    direct TUIs with no socket at all.
-    """
-    import base64
-    import socket as socketmod
-
-    app_root = kit_state_dir / "app-server"
-    try:
-        candidates = sorted(app_root.iterdir())[:MAX_CODEX_LIVE_RENAME_SOCKETS]
-    except OSError:
-        return [], []
-    delivered = False
-    for directory in candidates:
-        socket_path = directory / "app.sock"
-        try:
-            if socket_path.is_symlink() or not statmod.S_ISSOCK(
-                os.stat(socket_path).st_mode
-            ):
-                continue
-        except OSError:
-            continue
-        connection = socketmod.socket(socketmod.AF_UNIX, socketmod.SOCK_STREAM)
-        connection.settimeout(2.0)
-        try:
-            connection.connect(os.fspath(socket_path))
-            key = base64.b64encode(os.urandom(16)).decode()
-            connection.sendall(
-                (
-                    "GET / HTTP/1.1\r\nHost: localhost\r\n"
-                    "Upgrade: websocket\r\nConnection: Upgrade\r\n"
-                    f"Sec-WebSocket-Key: {key}\r\n"
-                    "Sec-WebSocket-Version: 13\r\n\r\n"
-                ).encode()
-            )
-            response = b""
-            while not response.endswith(b"\r\n\r\n"):
-                if len(response) > 65536:
-                    raise OSError("oversized upgrade response")
-                byte = connection.recv(1)
-                if not byte:
-                    raise OSError("app-server closed during upgrade")
-                response += byte
-            if b" 101 " not in response.split(b"\r\n", 1)[0]:
-                raise OSError("WebSocket upgrade refused")
-            _ws_request(
-                connection,
-                1,
-                "initialize",
-                {
-                    "clientInfo": {
-                        "name": "session-kit-live-rename",
-                        "title": "Session Kit live rename",
-                        "version": "1.0",
-                    }
-                },
-            )
-            _ws_send_frame(
-                connection,
-                json.dumps(
-                    {"method": "initialized", "params": {}},
-                    separators=(",", ":"),
-                ).encode(),
-            )
-            _ws_request(
-                connection,
-                2,
-                "thread/name/set",
-                {"threadId": uuid, "name": title},
-            )
-            delivered = True
-        except (OSError, ValueError):
-            continue
-        finally:
-            with contextlib.suppress(OSError):
-                connection.close()
-    if delivered:
-        return ["codex-live-rename"], []
-    return [], []
-
-
-def _push_codex_title(
-    codex_root: Path,
-    uuid: str,
-    title: str,
-    kit_state_dir: Path | None = None,
-) -> tuple[list[str], list[str]]:
-    if not codex_root.is_dir():
-        return [], ["Codex home unavailable; title not pushed"]
-    index = codex_root / "session_index.jsonl"
-    if index.is_symlink():
-        return [], ["Codex session index is a symlink; title not pushed"]
-    try:
-        if index.exists() and index.stat().st_size > MAX_CODEX_SESSION_INDEX_BYTES:
-            return [], ["Codex session index exceeds the bounded size; title not pushed"]
-        _append_codex_index_entry(index, uuid, title)
-    except OSError as exc:
-        return [], [f"Codex session index not appended: {exc}"]
-    thread_pushes, thread_warnings = _push_codex_thread_title(
-        codex_root, uuid, title
-    )
-    live_pushes: list[str] = []
-    if kit_state_dir is not None:
-        live_pushes, _ = _push_codex_live_rename(kit_state_dir, uuid, title)
-    return (
-        ["codex-session-index", *thread_pushes, *live_pushes],
-        thread_warnings,
-    )
-
-
-SESSION_COLORS = (
-    "red",
-    "blue",
-    "green",
-    "yellow",
-    "purple",
-    "orange",
-    "pink",
-    "cyan",
-)
-
-
-def _valid_colors(raw: Any) -> dict[str, str]:
-    colors: dict[str, str] = {}
-    if not isinstance(raw, Mapping):
-        return colors
-    for key, value in raw.items():
-        if not isinstance(key, str) or not isinstance(value, str):
-            continue
-        provider, separator, uuid = key.partition(":")
-        if (
-            separator
-            and provider in PROVIDERS
-            and UUID_RE.fullmatch(uuid)
-            and value in SESSION_COLORS
-        ):
-            colors[f"{provider}:{uuid.lower()}"] = value
-    return colors
-
-
-def canonical_colors(config: Mapping[str, Any]) -> dict[str, str]:
-    document = _private_alias_document(config_path(), allow_missing=True)
-    return _valid_colors(document.get("colors"))
-
-
-def session_color(
-    provider: str,
-    uuid: str | None,
-    overrides: Mapping[str, str] | None = None,
-) -> str | None:
-    """Stable per-conversation color: explicit override, else identity hash."""
-    if provider not in PROVIDERS or not uuid:
-        return None
-    exact_uuid = valid_uuid(uuid)
-    if not exact_uuid:
-        return None
-    override = (overrides or {}).get(f"{provider}:{exact_uuid}")
-    if override in SESSION_COLORS:
-        return override
-    digest = hashlib.sha256(f"{provider}:{exact_uuid}".encode("utf-8")).digest()
-    return SESSION_COLORS[digest[0] % len(SESSION_COLORS)]
-
-
-# A brand-new Codex session has no conversation ID until Codex boots, so its
-# launch theme cannot come from the identity hash. The launch color is picked
-# deterministically from the shpool session name, recorded as a marker, and
-# adopted as that conversation's explicit override the first time the live
-# collector sees the session's real ID — from then on the window theme, the
-# picker row, and every future resume agree.
-LAUNCH_COLOR_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
-
-
-COLOR_RESERVATION_MAX_AGE_SECONDS = 10 * 60
-
-
-def launch_color_for(shpool_id: str, occupied_colors: Iterable[str] = ()) -> str:
-    digest = hashlib.sha256(f"launch:{shpool_id}".encode("utf-8")).digest()
-    start = digest[0] % len(SESSION_COLORS)
-    occupied = {color for color in occupied_colors if color in SESSION_COLORS}
-    for offset in range(len(SESSION_COLORS)):
-        candidate = SESSION_COLORS[(start + offset) % len(SESSION_COLORS)]
-        if candidate not in occupied:
-            return candidate
-    return SESSION_COLORS[start]
-
-
-def _launch_color_dir(config: Mapping[str, Any]) -> Path | None:
-    state_dir = config.get("state_dir")
-    if not state_dir:
-        return None
-    return Path(state_dir) / "launch-color"
-
-
-def _active_color_reservations(path: Path, now: float) -> dict[str, dict[str, Any]]:
-    raw = _read_state_json(path)
-    entries = raw.get("entries", {}) if isinstance(raw, Mapping) else {}
-    return {
-        key: {"color": item["color"], "created_at": float(item["created_at"])}
-        for key, item in entries.items()
-        if isinstance(key, str)
-        and isinstance(item, Mapping)
-        and item.get("color") in SESSION_COLORS
-        and isinstance(item.get("created_at"), (int, float))
-        and not isinstance(item.get("created_at"), bool)
-        and 0 <= now - float(item["created_at"]) <= COLOR_RESERVATION_MAX_AGE_SECONDS
-    }
-
-
-def record_launch_color(
-    config: Mapping[str, Any], shpool_id: str, occupied_colors: Iterable[str] = ()
-) -> str | None:
-    """Pick and persist a launch color for a session with no conversation ID."""
-    if (
-        not shpool_id
-        or "/" in shpool_id
-        or shpool_id.startswith(".")
-        or len(shpool_id) > 128
-    ):
-        return None
-    directory = _launch_color_dir(config)
-    if directory is None:
-        return launch_color_for(shpool_id, occupied_colors)
-    paths = _state_paths(config)
-    with StateLock(paths["root"], paths["lock"]):
-        now = time.time()
-        reservations = _active_color_reservations(paths["color_reservations"], now)
-        reservation_key = f"launch:{shpool_id}"
-        existing = reservations.get(reservation_key)
-        if existing:
-            color = str(existing["color"])
-        else:
-            occupied = set(occupied_colors)
-            occupied.update(item["color"] for item in reservations.values())
-            color = launch_color_for(shpool_id, occupied)
-            reservations[reservation_key] = {"color": color, "created_at": now}
-        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        descriptor = os.open(directory / shpool_id, flags, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write(color + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        atomic_write_json(
-            paths["color_reservations"],
-            {"schema_version": SCHEMA_VERSION, "entries": reservations},
-        )
-        return color
-
-
-def _reserve_conversation_color(
-    config: Mapping[str, Any],
-    provider: str,
-    uuid: str,
-    occupied_colors: Iterable[str],
-) -> str:
-    exact_uuid = valid_uuid(uuid)
-    if provider not in PROVIDERS or not exact_uuid:
-        raise CollectionError("conversation color requires an exact provider UUID")
-    paths = _state_paths(config)
-    path = config_path()
-    key = f"{provider}:{exact_uuid}"
-    with StateLock(paths["root"], paths["config_lock"]):
-        with StateLock(paths["root"], paths["lock"]):
-            now = time.time()
-            reservations = _active_color_reservations(paths["color_reservations"], now)
-            occupied = set(occupied_colors)
-            occupied.update(item["color"] for item in reservations.values())
-            preferred = session_color(provider, exact_uuid)
-            assert preferred is not None
-            start = SESSION_COLORS.index(preferred)
-            color = next(
-                (
-                    SESSION_COLORS[(start + offset) % len(SESSION_COLORS)]
-                    for offset in range(len(SESSION_COLORS))
-                    if SESSION_COLORS[(start + offset) % len(SESSION_COLORS)] not in occupied
-                ),
-                preferred,
-            )
-            _private_alias_parent(path)
-            document = _private_alias_document(path, allow_missing=True)
-            colors = _valid_colors(document.get("colors"))
-            colors[key] = color
-            document["colors"] = dict(sorted(colors.items()))
-            atomic_write_json(path, document)
-            reservations[f"conversation:{key}"] = {"color": color, "created_at": now}
-            atomic_write_json(
-                paths["color_reservations"],
-                {"schema_version": SCHEMA_VERSION, "entries": reservations},
-            )
-            return color
-
-
-def _release_conversation_color(
-    config: Mapping[str, Any], provider: str, uuid: str, color: str
-) -> bool:
-    """Roll back one failed pre-bake only when reservation and override match."""
-    exact_uuid = valid_uuid(uuid)
-    if provider not in PROVIDERS or not exact_uuid or color not in SESSION_COLORS:
-        return False
-    paths = _state_paths(config)
-    path = config_path()
-    key = f"{provider}:{exact_uuid}"
-    reservation_key = f"conversation:{key}"
-    with StateLock(paths["root"], paths["config_lock"]):
-        with StateLock(paths["root"], paths["lock"]):
-            reservations = _active_color_reservations(
-                paths["color_reservations"], time.time()
-            )
-            reserved = reservations.get(reservation_key)
-            document = _private_alias_document(path, allow_missing=True)
-            colors = _valid_colors(document.get("colors"))
-            if not reserved or reserved.get("color") != color or colors.get(key) != color:
-                return False
-            reservations.pop(reservation_key, None)
-            colors.pop(key, None)
-            if colors:
-                document["colors"] = dict(sorted(colors.items()))
-            else:
-                document.pop("colors", None)
-            atomic_write_json(path, document)
-            atomic_write_json(
-                paths["color_reservations"],
-                {"schema_version": SCHEMA_VERSION, "entries": reservations},
-            )
-            return True
-
-
-def _adopt_launch_colors(
-    config: Mapping[str, Any],
-    sessions: Sequence[Mapping[str, Any]],
-    overrides: Mapping[str, str],
-) -> dict[str, str]:
-    """Turn launch-color markers into explicit overrides once IDs are known."""
-    current = dict(overrides)
-    directory = _launch_color_dir(config)
-    if directory is None or not directory.is_dir():
-        return current
-    now = time.time()
-    by_shpool_id: dict[str, Mapping[str, Any]] = {
-        str(item.get("shpool_id") or ""): item
-        for item in sessions
-        if item.get("provider") == "codex"
-    }
-    try:
-        markers = list(directory.iterdir())
-    except OSError:
-        return current
-    for marker in markers:
-        try:
-            if marker.is_symlink() or not marker.is_file():
-                continue
-            stat_result = marker.stat()
-            if now - stat_result.st_mtime > LAUNCH_COLOR_MAX_AGE_SECONDS:
-                marker.unlink(missing_ok=True)
-                continue
-            item = by_shpool_id.get(marker.name)
-            if item is None:
-                continue
-            uuid = valid_uuid(str((item.get("identity") or {}).get("uuid") or ""))
-            if not uuid:
-                continue
-            color = marker.read_text(encoding="utf-8", errors="strict").strip()
-            if color not in SESSION_COLORS:
-                marker.unlink(missing_ok=True)
-                continue
-            key = f"codex:{uuid}"
-            if key not in current:
-                current = mutate_canonical_color(config, "codex", uuid, color)
-            marker.unlink(missing_ok=True)
-        except (OSError, ValueError, CollectionError):
-            continue
-    return current
-
-
-def mutate_canonical_color(
-    config: Mapping[str, Any],
-    provider: str,
-    uuid: str,
-    color: str | None,
-) -> dict[str, str]:
-    exact_uuid = valid_uuid(uuid)
-    if provider not in PROVIDERS or not exact_uuid:
-        raise CollectionError("color requires provider claude|codex and an exact UUID")
-    if color is not None and color not in SESSION_COLORS:
-        raise CollectionError(
-            "color must be one of: " + ", ".join(SESSION_COLORS)
-        )
-    path = config_path()
-    paths = _state_paths(config)
-    with StateLock(paths["root"], paths["config_lock"]):
-        with StateLock(paths["root"], paths["lock"]):
-            _private_alias_parent(path)
-            document = _private_alias_document(path, allow_missing=True)
-            colors = _valid_colors(document.get("colors"))
-            key = f"{provider}:{exact_uuid}"
-            if color is None:
-                colors.pop(key, None)
-            else:
-                colors[key] = color
-            if colors:
-                document["colors"] = dict(sorted(colors.items()))
-            else:
-                document.pop("colors", None)
-            atomic_write_json(path, document)
-            return dict(colors)
-
-
-def _push_claude_color(
-    home: Path, uuid: str, color: str
-) -> tuple[list[str], list[str]]:
-    """Append the exact agent-color record /color itself writes.
-
-    Claude Code reads it at session start/resume; nothing is ever typed into
-    a live terminal. Missing transcripts fail open.
-    """
-    projects = home / ".claude" / "projects"
-    if not projects.is_dir():
-        return [], ["Claude projects directory unavailable; color not pushed"]
-    try:
-        transcripts = sorted(projects.glob(f"*/{uuid}.jsonl"))
-    except OSError as exc:
-        return [], [f"Claude transcripts unreadable: {exc}"]
-    if not transcripts:
-        return [], ["no Claude transcript for this conversation; color not pushed"]
-    entry = json.dumps(
-        {"type": "agent-color", "agentColor": color, "sessionId": uuid},
-        separators=(",", ":"),
-    )
-    pushed: list[str] = []
-    warnings: list[str] = []
-    for transcript in transcripts[:4]:
-        if transcript.is_symlink():
-            warnings.append(f"refusing symlinked transcript: {transcript.name}")
-            continue
-        try:
-            with open(transcript, "a", encoding="utf-8") as handle:
-                handle.write(entry + "\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            pushed.append("claude-transcript-color")
-        except OSError as exc:
-            warnings.append(f"Claude transcript not appended: {exc}")
-    return pushed, warnings
 
 
 def propagate_provider_color(
@@ -4344,39 +1037,15 @@ def propagate_provider_color(
     *,
     environ: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
-    """One-shot push of a session color into provider-native storage.
-
-    Codex has no native color surface; its rows carry the kit-side color only.
-    """
-    exact_uuid = valid_uuid(uuid)
-    if provider not in PROVIDERS or not exact_uuid or color not in SESSION_COLORS:
-        return {
-            "provider_color_pushes": [],
-            "provider_color_warnings": ["invalid provider color push request"],
-        }
-    if provider != "claude":
-        return {"provider_color_pushes": [], "provider_color_warnings": []}
-    env = environ if environ is not None else os.environ
-    # An explicit environment IS the caller's sandbox; falling back to the
-    # real home from inside one would leak pushes into live provider stores.
-    home_raw = env.get("HOME") or (
-        os.fspath(Path.home()) if environ is None else ""
+    """One-shot push of a session color into provider-native storage."""
+    return _names.propagate_provider_color(
+        provider,
+        uuid,
+        color,
+        environ=environ,
+        palette=SESSION_COLORS,
+        push_claude_color=_push_claude_color,
     )
-    if not home_raw:
-        return {
-            "provider_color_pushes": [],
-            "provider_color_warnings": [
-                "caller environment has no HOME; provider color not pushed"
-            ],
-        }
-    home = Path(home_raw)
-    pushed, warnings = _push_claude_color(home, exact_uuid, color)
-    for warning in warnings:
-        print(f"session inventory: {warning}", file=sys.stderr)
-    return {
-        "provider_color_pushes": pushed,
-        "provider_color_warnings": warnings,
-    }
 
 
 def propagate_provider_title(
@@ -4386,1017 +1055,803 @@ def propagate_provider_title(
     *,
     environ: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
-    """One-shot push of an assigned name into the provider's own surfaces.
-
-    Assignment semantics are last-writer-wins: the push happens once at
-    assignment time and later provider-side renames stand until the next
-    assignment. Every failure is fail-open — naming never breaks because a
-    provider surface is unavailable — but each skipped surface is reported.
-    """
-    exact_uuid = valid_uuid(uuid)
-    clean_title = clean_text(title, 100)
-    if (
-        provider not in PROVIDERS
-        or not exact_uuid
-        or not clean_title
-        # A placeholder identity must never be written into provider stores.
-        or set(exact_uuid.replace("-", "")) <= {"0"}
-    ):
-        return {
-            "provider_title_pushes": [],
-            "provider_title_warnings": ["invalid provider title push request"],
-        }
-    env = environ if environ is not None else os.environ
-    # An explicit environment IS the caller's sandbox; falling back to the
-    # real home from inside one would leak pushes into live provider stores.
-    home_raw = env.get("HOME") or (
-        os.fspath(Path.home()) if environ is None else ""
+    """One-shot push of an assigned name into the provider's own surfaces."""
+    return _names.propagate_provider_title(
+        provider,
+        uuid,
+        title,
+        environ=environ,
+        codex_home=_codex_home,
+        push_claude_title=_push_claude_title,
+        push_codex_title=_push_codex_title,
+        session_kit_state_dir=_session_kit_state_dir,
     )
-    if not home_raw:
-        return {
-            "provider_title_pushes": [],
-            "provider_title_warnings": [
-                "caller environment has no HOME; provider title not pushed"
-            ],
-        }
-    home = Path(home_raw)
-    if provider == "claude":
-        pushed, warnings = _push_claude_title(home, exact_uuid, clean_title)
-    else:
-        live_state_dir: Path | None = _session_kit_state_dir(env, home)
-        if env.get("SESSION_KIT_CODEX_LIVE_RENAME") == "0":
-            live_state_dir = None
-        pushed, warnings = _push_codex_title(
-            _codex_home(env, default_home=home),
-            exact_uuid,
-            clean_title,
-            kit_state_dir=live_state_dir,
-        )
-    for warning in warnings:
-        print(f"session inventory: {warning}", file=sys.stderr)
-    return {
-        "provider_title_pushes": pushed,
-        "provider_title_warnings": warnings,
-    }
 
 
 def _record_provider_title_retry(
     config: Mapping[str, Any], provider: str, uuid: str, title: str
 ) -> None:
-    paths = _state_paths(config)
-    key = f"{provider}:{uuid}"
-    with StateLock(paths["root"], paths["lock"]):
-        raw = _read_state_json(paths["provider_title_retries"])
-        entries = dict(raw.get("entries", {})) if isinstance(raw, Mapping) else {}
-        entries[key] = {
-            "provider": provider,
-            "uuid": uuid,
-            "title": title,
-            "attempts": 0,
-            "updated_at": _utc_now(),
-        }
-        atomic_write_json(
-            paths["provider_title_retries"],
-            {"schema_version": SCHEMA_VERSION, "entries": entries},
-        )
+    return _names._record_provider_title_retry(
+        config,
+        provider,
+        uuid,
+        title,
+        schema_version=SCHEMA_VERSION,
+        read_state_json=_read_state_json,
+        atomic_write_json=atomic_write_json,
+    )
 
 
 def _provider_title_retry_disposition(
     provider: str, uuid: str, title: str, environ: Mapping[str, str]
 ) -> str:
     """Return retry, satisfied, superseded, or defer from native evidence."""
-    home_raw = environ.get("HOME")
-    if provider == "claude":
-        if not home_raw:
-            return "defer"
-        home = Path(home_raw)
-        try:
-            transcripts = [
-                path
-                for path in (home / ".claude" / "projects").glob(f"*/{uuid}.jsonl")
-                if path.is_file() and not path.is_symlink()
-            ]
-        except OSError:
-            return "defer"
-        if not transcripts:
-            return "defer"
-        native = read_claude_transcript_signals(uuid, home)["agent_name"]
-        if native == title:
-            return "satisfied"
-        if native:
-            return "superseded"
-        return "retry"
-
-    codex_root = _codex_home(environ, default_home=Path(home_raw) if home_raw else _home())
-    try:
-        indexed = read_codex_session_index(codex_root / "session_index.jsonl")
-    except CollectionError:
-        return "defer"
-    index_title = indexed.get(uuid, "")
-    if index_title and index_title != title:
-        return "superseded"
-    databases = _codex_state_databases(codex_root)
-    if not databases:
-        return "defer"
-    try:
-        connection = sqlite3.connect(f"file:{databases[-1]}?mode=ro", uri=True)
-        try:
-            columns = {
-                row[1] for row in connection.execute("PRAGMA table_info(threads)")
-            }
-            if "title" not in columns:
-                return "defer"
-            first_column = "first_user_message" if "first_user_message" in columns else "NULL"
-            row = connection.execute(
-                f"SELECT title, {first_column} FROM threads WHERE id = ?", (uuid,)
-            ).fetchone()
-        finally:
-            connection.close()
-    except sqlite3.Error:
-        return "defer"
-    if row is None:
-        return "defer"
-    native_title = clean_text(row[0], 120)
-    first_message = clean_text(row[1], 8192)
-    if native_title == title and index_title == title:
-        return "satisfied"
-    if (
-        native_title
-        and native_title != title
-        and not _codex_title_echoes_prompt(native_title, first_message)
-    ):
-        return "superseded"
-    return "retry"
+    return _names._provider_title_retry_disposition(
+        provider,
+        uuid,
+        title,
+        environ,
+        codex_home=_codex_home,
+        codex_title_echoes_prompt=_codex_title_echoes_prompt,
+        home_resolver=_home,
+        transcript_signals=read_claude_transcript_signals,
+        read_session_index=read_codex_session_index,
+    )
 
 
 def _reconcile_pending_provider_titles(
     config: Mapping[str, Any], provider: str, environ: Mapping[str, str], limit: int = 4
 ) -> list[dict[str, Any]]:
     """Retry a bounded number of exact failed self-name provider pushes."""
-    paths = _state_paths(config)
-    with StateLock(paths["root"], paths["lock"]):
-        raw = _read_state_json(paths["provider_title_retries"])
-    entries = dict(raw.get("entries", {})) if isinstance(raw, Mapping) else {}
-    candidates = [
-        (key, item)
-        for key, item in sorted(entries.items())
-        if isinstance(item, Mapping)
-        and item.get("provider") == provider
-        and valid_uuid(item.get("uuid"))
-        and clean_text(item.get("title"), 100)
-        and isinstance(item.get("attempts"), int)
-        and item.get("attempts", 0) < 3
-    ][:limit]
-    results: list[dict[str, Any]] = []
-    for key, item in candidates:
-        disposition = _provider_title_retry_disposition(
-            provider, str(item["uuid"]), str(item["title"]), environ
-        )
-        if disposition in {"satisfied", "superseded"}:
-            with StateLock(paths["root"], paths["lock"]):
-                current = _read_state_json(paths["provider_title_retries"])
-                current_entries = (
-                    dict(current.get("entries", {}))
-                    if isinstance(current, Mapping)
-                    else {}
-                )
-                stored = current_entries.get(key)
-                if isinstance(stored, Mapping) and stored.get("title") == item.get("title"):
-                    current_entries.pop(key, None)
-                    atomic_write_json(
-                        paths["provider_title_retries"],
-                        {"schema_version": SCHEMA_VERSION, "entries": current_entries},
-                    )
-            results.append(
-                {"uuid": str(item["uuid"]), "title": str(item["title"]), "status": disposition}
-            )
-            continue
-        if disposition == "defer":
-            results.append(
-                {"uuid": str(item["uuid"]), "title": str(item["title"]), "status": "deferred"}
-            )
-            continue
-        result = propagate_provider_title(
-            provider,
-            str(item["uuid"]),
-            str(item["title"]),
-            environ=environ,
-        )
-        with StateLock(paths["root"], paths["lock"]):
-            current = _read_state_json(paths["provider_title_retries"])
-            current_entries = (
-                dict(current.get("entries", {}))
-                if isinstance(current, Mapping)
-                else {}
-            )
-            stored = current_entries.get(key)
-            if not isinstance(stored, Mapping) or stored.get("title") != item.get("title"):
-                continue
-            if result.get("provider_title_warnings"):
-                updated = dict(stored)
-                updated["attempts"] = min(3, int(stored.get("attempts", 0)) + 1)
-                updated["updated_at"] = _utc_now()
-                current_entries[key] = updated
-            else:
-                current_entries.pop(key, None)
-            atomic_write_json(
-                paths["provider_title_retries"],
-                {"schema_version": SCHEMA_VERSION, "entries": current_entries},
-            )
-        results.append(
-            {
-                "uuid": str(item["uuid"]),
-                "title": str(item["title"]),
-                **result,
-            }
-        )
-    return results
+    return _names._reconcile_pending_provider_titles(
+        config,
+        provider,
+        environ,
+        limit,
+        schema_version=SCHEMA_VERSION,
+        read_state_json=_read_state_json,
+        atomic_write_json=atomic_write_json,
+        retry_disposition=_provider_title_retry_disposition,
+        propagate_title=propagate_provider_title,
+    )
 
 
 def claude_pending_native_hydrations(
     config: dict[str, Any] | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Fill absent visible records for exact managed Claude sessions.
-
-    Claude's ai-title record names the conversation in inventory, but the
-    prompt bar and future resumes use agent-name. A missing native color has
-    the same next-start behavior. This bounded reconciliation never replaces
-    a provider-side rename or color.
-    """
-    env = environ if environ is not None else os.environ
-    naming_enabled = automatic_naming_enabled(env)
-    settings = config or load_config()
-    hydrated: list[dict[str, Any]] = _reconcile_pending_provider_titles(
-        settings, "claude", env
+    """Fill absent visible records for exact managed Claude sessions."""
+    return _names.claude_pending_native_hydrations(
+        config,
+        environ,
+        canonical_colors=canonical_colors,
+        guard_inventory=guard_live_inventory,
+        load_config=load_config,
+        transcript_signals=read_claude_transcript_signals,
+        session_color=session_color,
+        snapshot_inventory=snapshot,
+        propagate_color=propagate_provider_color,
+        propagate_title=propagate_provider_title,
+        reconcile_pending_titles=_reconcile_pending_provider_titles,
     )
-    try:
-        live = snapshot(write_state=False, config=settings)
-    except CollectionError:
-        return hydrated
-    if not guard_live_inventory(live):
-        return hydrated
-    home_raw = env.get("HOME") or (
-        os.fspath(Path.home()) if environ is None else ""
+
+
+def _push_claude_title(home: Path, uuid: str, title: str) -> tuple[list[str], list[str]]:
+    return _names_push._push_claude_title(
+        home,
+        uuid,
+        title,
+        atomic_write_json=atomic_write_json,
+        max_session_records=MAX_CLAUDE_SESSION_RECORDS,
     )
-    if not home_raw:
-        return hydrated
-    home = Path(home_raw)
-    colors = canonical_colors(settings)
-    for item in live.get("sessions", ()):
-        if not isinstance(item, Mapping) or item.get("provider") != "claude":
-            continue
-        uuid = valid_uuid(str((item.get("identity") or {}).get("uuid") or ""))
-        if not uuid:
-            continue
-        signals = read_claude_transcript_signals(uuid, home)
-        pushes: list[str] = []
-        warnings: list[str] = []
-        title = signals["ai_title"]
-        if (
-            naming_enabled
-            and title
-            and not signals["agent_name"]
-            and item.get("native_title") == title
-            and item.get("provider_title_state") == "pending"
-        ):
-            result = propagate_provider_title("claude", uuid, title, environ=env)
-            pushes.extend(result["provider_title_pushes"])
-            warnings.extend(result["provider_title_warnings"])
-        color = session_color("claude", uuid, colors)
-        if color and not signals["agent_color"]:
-            result = propagate_provider_color("claude", uuid, color, environ=env)
-            pushes.extend(result["provider_color_pushes"])
-            warnings.extend(result["provider_color_warnings"])
-        if pushes or warnings:
-            hydrated.append(
-                {"uuid": uuid, "pushes": pushes, "warnings": warnings}
-            )
-    return hydrated
 
 
-# A conversation launched through the first-window color pre-bake opens as a
-# resume, and Claude Code never auto-titles a resumed conversation (its
-# once-only guard initializes from the loaded message count, which the
-# resume-synthesized continuation pair makes non-zero). These sessions carry a
-# unique signature: a synthetic isMeta user record holding the resume
-# continuation text, written at load before the human's first prompt. For
-# exactly those sessions the kit derives a title from the first real prompt
-# and writes it through the same native records /rename persists. Sessions
-# outside that signature are never touched, so Claude's own (better) auto
-# titles are never masked.
-RESUME_CONTINUATION_TEXT = "Continue from where you left off."
-MAX_AUTO_TITLE_TRANSCRIPT_BYTES = 8 * 1024 * 1024
-_TITLE_TRAILING_STOPWORDS = frozenset(
-    "a an and any are at be but by each every for from how if in is it of on "
-    "or so that the then there this to was were what when which who why will "
-    "with".split()
-)
+def _codex_title_echoes_prompt(title: str, first_message: str) -> bool:
+    """True when a stored title is just the first prompt (or a prefix cut)."""
+    return _names_push._codex_title_echoes_prompt(
+        title,
+        first_message,
+    )
+
+
+def codex_bounce_prepare(
+    uuid: str, codex_root: Path | None = None, now: float | None = None
+) -> str:
+    """Resolve the real name a bounced Codex process should boot under."""
+    return _names_push.codex_bounce_prepare(
+        uuid,
+        codex_root,
+        now,
+        codex_home=_codex_home,
+        max_session_index_bytes=MAX_CODEX_SESSION_INDEX_BYTES,
+    )
+
+
+def claude_bounce_prepare(
+    uuid: str, home: Path | None = None, now: float | None = None
+) -> tuple[str, bool]:
+    """Decide whether a Claude window can only be named by a restart."""
+    return _names_push.claude_bounce_prepare(
+        uuid,
+        home,
+        now,
+    )
+
+
+def codex_pending_auto_titles(
+    environ: Mapping[str, str] | None = None,
+) -> list[dict[str, str]]:
+    """Kit-side auto-titler for Codex threads nobody has named."""
+    return _names_push.codex_pending_auto_titles(
+        environ,
+        codex_paths=_codex_paths,
+        reconcile_pending_titles=_reconcile_pending_provider_titles,
+        derive_title=derive_prompt_title,
+        load_config=load_config,
+        max_session_index_bytes=MAX_CODEX_SESSION_INDEX_BYTES,
+        push_live_rename=_push_codex_live_rename,
+    )
+
+
+def _append_codex_index_entry(index: Path, uuid: str, title: str) -> None:
+    return _names_push._append_codex_index_entry(
+        index,
+        uuid,
+        title,
+    )
+
+
+def _push_codex_thread_title(
+    codex_root: Path, uuid: str, title: str
+) -> tuple[list[str], list[str]]:
+    """Set threads.title in Codex's own state database."""
+    return _names_push._push_codex_thread_title(
+        codex_root,
+        uuid,
+        title,
+    )
+
+
+def _session_kit_state_dir(env: Mapping[str, str], home: Path) -> Path:
+    """The session-kit state directory under the caller's exact sandbox."""
+    return _names_push._session_kit_state_dir(
+        env,
+        home,
+    )
+
+
+def _ws_send_frame(connection: Any, payload: bytes, opcode: int = 1) -> None:
+    return _names_push._ws_send_frame(
+        connection,
+        payload,
+        opcode,
+    )
+
+
+def _ws_recv_frame(connection: Any) -> tuple[int, bytes]:
+    return _names_push._ws_recv_frame(
+        connection,
+        max_frame=MAX_CODEX_LIVE_RENAME_FRAME,
+    )
+
+
+def _ws_request(
+    connection: Any, request_id: int, method: str, params: dict[str, Any]
+) -> None:
+    return _names_push._ws_request(
+        connection,
+        request_id,
+        method,
+        params,
+        max_frame=MAX_CODEX_LIVE_RENAME_FRAME,
+    )
+
+
+def _push_codex_live_rename(
+    kit_state_dir: Path, uuid: str, title: str
+) -> tuple[list[str], list[str]]:
+    """Repaint live app-server-backed Codex windows with the new name."""
+    return _names_push._push_codex_live_rename(
+        kit_state_dir,
+        uuid,
+        title,
+        max_sockets=MAX_CODEX_LIVE_RENAME_SOCKETS,
+        max_frame=MAX_CODEX_LIVE_RENAME_FRAME,
+    )
+
+
+def _push_codex_title(
+    codex_root: Path,
+    uuid: str,
+    title: str,
+    kit_state_dir: Path | None = None,
+) -> tuple[list[str], list[str]]:
+    return _names_push._push_codex_title(
+        codex_root,
+        uuid,
+        title,
+        kit_state_dir,
+        max_session_index_bytes=MAX_CODEX_SESSION_INDEX_BYTES,
+        push_live_rename=_push_codex_live_rename,
+    )
+
+
+def _push_claude_color(
+    home: Path, uuid: str, color: str
+) -> tuple[list[str], list[str]]:
+    """Append the exact agent-color record /color itself writes."""
+    return _names_push._push_claude_color(
+        home,
+        uuid,
+        color,
+    )
+
+
+def _valid_colors(raw: Any) -> dict[str, str]:
+    return _common._valid_colors(raw, palette=SESSION_COLORS)
+
+
+def canonical_colors(config: Mapping[str, Any]) -> dict[str, str]:
+    return _colors.canonical_colors(
+        config,
+        config_path=config_path,
+        private_alias_document=_private_alias_document,
+        valid_colors=_valid_colors,
+    )
+
+
+def session_color(
+    provider: str,
+    uuid: str | None,
+    overrides: Mapping[str, str] | None = None,
+) -> str | None:
+    """Stable per-conversation color: explicit override, else identity hash."""
+    return _colors.session_color(
+        provider,
+        uuid,
+        overrides,
+        palette=SESSION_COLORS,
+    )
+
+
+def launch_color_for(shpool_id: str, occupied_colors: Iterable[str] = ()) -> str:
+    return _colors.launch_color_for(
+        shpool_id,
+        occupied_colors,
+        palette=SESSION_COLORS,
+    )
+
+
+def _launch_color_dir(config: Mapping[str, Any]) -> Path | None:
+    return _colors._launch_color_dir(config)
+
+
+def _active_color_reservations(path: Path, now: float) -> dict[str, dict[str, Any]]:
+    return _colors._active_color_reservations(
+        path,
+        now,
+        read_state_json=_read_state_json,
+        palette=SESSION_COLORS,
+        reservation_max_age=COLOR_RESERVATION_MAX_AGE_SECONDS,
+    )
+
+
+def record_launch_color(
+    config: Mapping[str, Any], shpool_id: str, occupied_colors: Iterable[str] = ()
+) -> str | None:
+    """Pick and persist a launch color for a session with no conversation ID."""
+    return _colors.record_launch_color(
+        config,
+        shpool_id,
+        occupied_colors,
+        launch_color_dir=_launch_color_dir,
+        launch_color=launch_color_for,
+        active_color_reservations=_active_color_reservations,
+        state_paths=_state_paths,
+        state_lock=StateLock,
+        atomic_write_json=atomic_write_json,
+        schema_version=SCHEMA_VERSION,
+    )
+
+
+def _reserve_conversation_color(
+    config: Mapping[str, Any],
+    provider: str,
+    uuid: str,
+    occupied_colors: Iterable[str],
+) -> str:
+    return _colors._reserve_conversation_color(
+        config,
+        provider,
+        uuid,
+        occupied_colors,
+        state_paths=_state_paths,
+        config_path=config_path,
+        state_lock=StateLock,
+        active_color_reservations=_active_color_reservations,
+        color_for_session=session_color,
+        private_alias_parent=_private_alias_parent,
+        private_alias_document=_private_alias_document,
+        valid_colors=_valid_colors,
+        atomic_write_json=atomic_write_json,
+        schema_version=SCHEMA_VERSION,
+        palette=SESSION_COLORS,
+    )
+
+
+def _release_conversation_color(
+    config: Mapping[str, Any], provider: str, uuid: str, color: str
+) -> bool:
+    """Roll back one failed pre-bake only when reservation and override match."""
+    return _colors._release_conversation_color(
+        config,
+        provider,
+        uuid,
+        color,
+        state_paths=_state_paths,
+        config_path=config_path,
+        state_lock=StateLock,
+        active_color_reservations=_active_color_reservations,
+        private_alias_document=_private_alias_document,
+        valid_colors=_valid_colors,
+        atomic_write_json=atomic_write_json,
+        schema_version=SCHEMA_VERSION,
+        palette=SESSION_COLORS,
+    )
+
+
+def _adopt_launch_colors(
+    config: Mapping[str, Any],
+    sessions: Sequence[Mapping[str, Any]],
+    overrides: Mapping[str, str],
+) -> dict[str, str]:
+    """Turn launch-color markers into explicit overrides once IDs are known."""
+    return _colors._adopt_launch_colors(
+        config,
+        sessions,
+        overrides,
+        launch_color_dir=_launch_color_dir,
+        mutate_color=mutate_canonical_color,
+        palette=SESSION_COLORS,
+        launch_color_max_age=LAUNCH_COLOR_MAX_AGE_SECONDS,
+    )
+
+
+def mutate_canonical_color(
+    config: Mapping[str, Any],
+    provider: str,
+    uuid: str,
+    color: str | None,
+) -> dict[str, str]:
+    return _colors.mutate_canonical_color(
+        config,
+        provider,
+        uuid,
+        color,
+        config_path=config_path,
+        state_paths=_state_paths,
+        state_lock=StateLock,
+        private_alias_parent=_private_alias_parent,
+        private_alias_document=_private_alias_document,
+        valid_colors=_valid_colors,
+        atomic_write_json=atomic_write_json,
+        palette=SESSION_COLORS,
+    )
 
 
 def derive_prompt_title(prompt: Any) -> str | None:
-    """Derive a short display title from a first user prompt.
-
-    Pure heuristic — no model call: first sentence, at most seven words,
-    trailing function words trimmed, sentence-cased, capped at 64 characters.
-    """
-    if not isinstance(prompt, str):
-        return None
-    text = re.sub(r"\s+", " ", prompt).strip()
-    if not text or text.startswith("/"):
-        return None
-    text = re.split(r"(?<=[.!?])\s", text, maxsplit=1)[0]
-    words = text.split(" ")[:7]
-    trimmed = list(words)
-    while trimmed and trimmed[-1].lower().strip("?,.:;!\"'") in _TITLE_TRAILING_STOPWORDS:
-        trimmed.pop()
-    if not trimmed:
-        trimmed = words
-    title = " ".join(trimmed).rstrip(" ,;:.!?\"'")
-    if len(title) < 4:
-        return None
-    title = title[:64].rstrip()
-    return title[0].upper() + title[1:]
+    """Derive a short display title from a first user prompt."""
+    return _self_name.derive_prompt_title(
+        prompt,
+        stopwords=_TITLE_TRAILING_STOPWORDS,
+    )
 
 
 def _first_text_block(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        for block in content:
-            if isinstance(block, Mapping) and block.get("type") == "text":
-                text = block.get("text")
-                if isinstance(text, str):
-                    return text
-    return ""
+    return _self_name._first_text_block(
+        content,
+    )
 
 
 def auto_title_from_hook(
     raw: Any, *, environ: Mapping[str, str] | None = None
 ) -> dict[str, Any]:
-    """Title a pre-baked Claude conversation from its first real prompt.
-
-    Input is the UserPromptSubmit hook payload (JSON text). Eligibility is
-    strict and every miss fails open with title=null: the transcript must
-    carry the resume-continuation signature, no real conversation beyond the
-    triggering prompt, and no title of any kind (ai, /rename, agent-name,
-    kit name intent) may already exist.
-    """
-    out: dict[str, Any] = {"title": None, "pushes": [], "warnings": []}
-
-    def skip(reason: str) -> dict[str, Any]:
-        out["reason"] = reason
-        return out
-
-    try:
-        payload = json.loads(raw if isinstance(raw, str) else "")
-    except ValueError:
-        return skip("hook payload is not valid JSON")
-    if not isinstance(payload, Mapping):
-        return skip("hook payload is not an object")
-    # UserPromptSubmit fires before the first turn is flushed to disk (the
-    # pre-bake signature is not yet visible then); Stop fires right after the
-    # first answer with everything durable. Supporting both means the title
-    # lands at the end of the first exchange.
-    if payload.get("hook_event_name") not in ("UserPromptSubmit", "Stop"):
-        return skip("not a UserPromptSubmit or Stop event")
-    uuid = valid_uuid(str(payload.get("session_id") or ""))
-    if not uuid:
-        return skip("missing or invalid session_id")
-
-    env = environ if environ is not None else os.environ
-    home = Path(env.get("HOME") or os.fspath(Path.home()))
-    transcript_raw = payload.get("transcript_path")
-    if not isinstance(transcript_raw, str) or not transcript_raw:
-        return skip("missing transcript_path")
-    transcript = Path(transcript_raw)
-    projects = (home / ".claude" / "projects").resolve()
-    try:
-        resolved = transcript.resolve(strict=True)
-    except OSError:
-        return skip("transcript unavailable")
-    if (
-        transcript.is_symlink()
-        or resolved.name != f"{uuid}.jsonl"
-        or resolved.parent.parent != projects
-    ):
-        return skip("transcript path is not this session's own transcript")
-    if (home / ".claude" / "sessions" / f"{uuid}.nameintent").exists():
-        return skip("a kit name intent already exists")
-    try:
-        if resolved.stat().st_size > MAX_AUTO_TITLE_TRANSCRIPT_BYTES:
-            return skip("transcript exceeds the bounded size")
-        lines = resolved.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
-        return skip("transcript unreadable")
-
-    signature = False
-    real_users = 0
-    first_prompt: str | None = None
-    for line in lines:
-        try:
-            record = json.loads(line)
-        except ValueError:
-            continue
-        if not isinstance(record, Mapping):
-            continue
-        kind = record.get("type")
-        if kind in ("ai-title", "agent-name", "custom-title"):
-            return skip("the session already has a title")
-        if kind != "user":
-            continue
-        if record.get("isSidechain"):
-            continue
-        content = (
-            record.get("message", {}).get("content")
-            if isinstance(record.get("message"), Mapping)
-            else None
-        )
-        text = _first_text_block(content)
-        if record.get("isMeta"):
-            if text.startswith(RESUME_CONTINUATION_TEXT):
-                signature = True
-            continue
-        # Tool results are stored as user-typed records too; only records
-        # carrying prompt text count as human prompts.
-        if isinstance(content, str) or text:
-            real_users += 1
-            if first_prompt is None:
-                first_prompt = content if isinstance(content, str) else text
-    if not signature:
-        return skip("no pre-bake resume signature")
-    if real_users > 1:
-        return skip("conversation already has prior prompts")
-    # The conversation's own first prompt names the topic; the live payload
-    # prompt is the fallback for the pre-flush window.
-    title = derive_prompt_title(first_prompt) or derive_prompt_title(
-        payload.get("prompt")
+    """Title a pre-baked Claude conversation from its first real prompt."""
+    return _self_name.auto_title_from_hook(
+        raw,
+        environ=environ,
+        derive_title=derive_prompt_title,
+        propagate_title=propagate_provider_title,
+        max_transcript_bytes=MAX_AUTO_TITLE_TRANSCRIPT_BYTES,
+        resume_continuation_text=RESUME_CONTINUATION_TEXT,
     )
-    if not title:
-        return skip("prompt does not yield a title")
 
-    entry = json.dumps(
-        {"type": "ai-title", "aiTitle": title, "sessionId": uuid},
-        separators=(",", ":"),
+
+def prove_self_name_caller(
+    inventory: Mapping[str, Any],
+    process_table: Mapping[int, Mapping[str, Any]],
+    environ: Mapping[str, str],
+    current_pid: int,
+) -> dict[str, Any]:
+    """Prove one exact managed root conversation and its current shell generation."""
+    return _self_name.prove_self_name_caller(
+        inventory,
+        process_table,
+        environ,
+        current_pid,
     )
-    try:
-        with open(resolved, "a", encoding="utf-8") as handle:
-            handle.write(entry + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        out["pushes"].append("claude-transcript-ai-title")
-    except OSError as exc:
-        return skip(f"transcript not appended: {exc}")
-    pushed = propagate_provider_title("claude", uuid, title, environ=env)
-    out["title"] = title
-    out["pushes"].extend(pushed.get("provider_title_pushes", []))
-    out["warnings"].extend(pushed.get("provider_title_warnings", []))
-    return out
+
+
+def self_name_automatic_title(
+    config: Mapping[str, Any],
+    title: str,
+    *,
+    inventory: Mapping[str, Any] | None = None,
+    process_table: Mapping[int, Mapping[str, Any]] | None = None,
+    environ: Mapping[str, str] | None = None,
+    current_pid: int | None = None,
+) -> dict[str, Any]:
+    """Provider-neutral exact self-name entry point used by root agents."""
+    return _self_name.self_name_automatic_title(
+        config,
+        title,
+        inventory=inventory,
+        process_table=process_table,
+        environ=environ,
+        current_pid=current_pid,
+        default_max_proc_nodes=DEFAULT_MAX_PROC_NODES,
+        record_retry=_record_provider_title_retry,
+        canonical_colors=canonical_colors,
+        mutate_self_name=mutate_canonical_self_name,
+        normalize_title=normalize_automatic_title,
+        process_table_reader=platform_process_table,
+        propagate_color=propagate_provider_color,
+        propagate_title=propagate_provider_title,
+        prove_caller=prove_self_name_caller,
+        record_title_failure=record_automatic_title_failure,
+        session_color=session_color,
+        snapshot_inventory=snapshot,
+    )
 
 
 def _strict_legacy_aliases(path: Path) -> tuple[bytes, dict[str, str]] | None:
-    payload = _read_bounded_owner_file(
+    return _migration._strict_legacy_aliases(
         path,
-        label="legacy runtime alias file",
-        max_bytes=MAX_PRIVATE_JSON_BYTES,
-        exact_mode=0o600,
-        allow_missing=True,
+        max_private_json_bytes=MAX_PRIVATE_JSON_BYTES,
+        schema_version=SCHEMA_VERSION,
     )
-    if payload is None:
-        return None
-    try:
-        raw = json.loads(payload.decode("utf-8", "strict"))
-    except (UnicodeDecodeError, ValueError) as exc:
-        raise CollectionError("legacy runtime alias file is invalid JSON") from exc
-    aliases = raw.get("aliases") if isinstance(raw, Mapping) else None
-    normalized = _valid_aliases(aliases)
-    if (
-        not isinstance(raw, Mapping)
-        or raw.get("schema_version") != SCHEMA_VERSION
-        or not isinstance(aliases, Mapping)
-        or len(normalized) != len(aliases)
-    ):
-        raise CollectionError("legacy runtime alias file has an invalid schema")
-    return payload, normalized
 
 
 def _create_private_backup(path: Path, payload: bytes) -> None:
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    try:
-        descriptor = os.open(path, flags, 0o600)
-    except FileExistsError:
-        existing = _read_bounded_owner_file(
-            path,
-            label="alias migration backup",
-            max_bytes=MAX_PRIVATE_JSON_BYTES,
-            exact_mode=0o600,
-        )
-        if existing != payload:
-            raise CollectionError("alias migration backup already exists with other bytes")
-        return
-    try:
-        os.fchmod(descriptor, 0o600)
-        view = memoryview(payload)
-        while view:
-            written = os.write(descriptor, view)
-            if written <= 0:
-                raise CollectionError("could not write alias migration backup")
-            view = view[written:]
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-    directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(directory)
-    finally:
-        os.close(directory)
+    return _migration._create_private_backup(
+        path,
+        payload,
+        max_private_json_bytes=MAX_PRIVATE_JSON_BYTES,
+    )
 
 
 def _alias_migration_images(
     backup_bytes: bytes, runtime_aliases: Mapping[str, str]
 ) -> tuple[bytes | None, dict[str, Any], bytes]:
-    if backup_bytes == ABSENT_ALIAS_CONFIG_BACKUP:
-        preimage = {
-            "schema_version": SCHEMA_VERSION,
-            "aliases": {},
-        }
-        preimage_bytes = None
-    else:
-        preimage = _alias_document_from_bytes(
-            backup_bytes, label="alias migration backup"
-        )
-        preimage_bytes = backup_bytes
-    merged = {
-        **_valid_aliases(preimage.get("aliases")),
-        **dict(runtime_aliases),
-    }
-    postimage = dict(preimage)
-    postimage["aliases"] = dict(sorted(merged.items()))
-    return preimage_bytes, postimage, _atomic_json_bytes(postimage)
+    return _migration._alias_migration_images(
+        backup_bytes,
+        runtime_aliases,
+        absent_alias_backup=ABSENT_ALIAS_CONFIG_BACKUP,
+        schema_version=SCHEMA_VERSION,
+        alias_document_from_bytes=_alias_document_from_bytes,
+    )
 
 
 def migrate_runtime_aliases(config: Mapping[str, Any]) -> dict[str, Any]:
     """Explicitly preserve the old effective runtime-wins values in config."""
-    paths = _state_paths(config)
-    config_file = config_path()
-    backup = config_file.with_name(f"{config_file.name}.pre-runtime-alias-migration-v1")
-    with StateLock(paths["root"], paths["config_lock"]):
-        with StateLock(paths["root"], paths["lock"]):
-            legacy = _strict_legacy_aliases(paths["aliases"])
-            archived = _strict_legacy_aliases(paths["aliases_archive"])
-            if legacy is None:
-                if archived is not None:
-                    source_backup = _read_bounded_owner_file(
-                        paths["aliases_source_backup"],
-                        label="legacy runtime alias source backup",
-                        max_bytes=MAX_PRIVATE_JSON_BYTES,
-                        exact_mode=0o600,
-                    )
-                    if source_backup != archived[0]:
-                        raise CollectionError(
-                            "archived runtime aliases diverge from migration evidence"
-                        )
-                    backup_bytes = _read_bounded_owner_file(
-                        backup,
-                        label="alias migration backup",
-                        max_bytes=MAX_PRIVATE_JSON_BYTES,
-                        exact_mode=0o600,
-                    )
-                    if backup_bytes is None:
-                        raise CollectionError("alias migration backup is unavailable")
-                    before = _read_bounded_owner_file(
-                        config_file,
-                        label="canonical alias config",
-                        max_bytes=MAX_PRIVATE_JSON_BYTES,
-                        exact_mode=0o600,
-                        allow_missing=True,
-                    )
-                    (
-                        preimage_bytes,
-                        postimage,
-                        postimage_bytes,
-                    ) = _alias_migration_images(
-                        backup_bytes, archived[1]
-                    )
-                    repaired = False
-                    if before == postimage_bytes:
-                        pass
-                    elif before == preimage_bytes:
-                        _private_alias_parent(config_file)
-                        atomic_write_json(config_file, postimage)
-                        repaired = True
-                    else:
-                        raise CollectionError(
-                            "canonical alias config diverged from the migration postimage"
-                        )
-                    directory = os.open(
-                        paths["root"], os.O_RDONLY | os.O_DIRECTORY
-                    )
-                    try:
-                        os.fsync(directory)
-                    finally:
-                        os.close(directory)
-                return {
-                    "schema_version": SCHEMA_VERSION,
-                    "migrated": bool(archived is not None and repaired),
-                    "already_migrated": bool(
-                        archived is not None and not repaired
-                    ),
-                    "aliases": canonical_aliases(config),
-                }
-            rollback_retry = archived is not None
-            if archived is not None and archived[0] != legacy[0]:
-                raise CollectionError(
-                    "active and archived runtime aliases differ"
-                )
-            _private_alias_parent(config_file)
-            before = _read_bounded_owner_file(
-                config_file,
-                label="canonical alias config",
-                max_bytes=MAX_PRIVATE_JSON_BYTES,
-                exact_mode=0o600,
-                allow_missing=True,
-            )
-            backup_bytes = _read_bounded_owner_file(
-                backup,
-                label="alias migration backup",
-                max_bytes=MAX_PRIVATE_JSON_BYTES,
-                exact_mode=0o600,
-                allow_missing=True,
-            )
-            if backup_bytes is None:
-                backup_bytes = (
-                    before
-                    if before is not None
-                    else ABSENT_ALIAS_CONFIG_BACKUP
-                )
-                _create_private_backup(backup, backup_bytes)
-            _create_private_backup(
-                paths["aliases_source_backup"], legacy[0]
-            )
-            (
-                preimage_bytes,
-                postimage,
-                postimage_bytes,
-            ) = _alias_migration_images(backup_bytes, legacy[1])
-            if before == postimage_bytes:
-                pass
-            elif before == preimage_bytes:
-                atomic_write_json(config_file, postimage)
-            else:
-                raise CollectionError(
-                    "canonical alias config diverged during migration"
-                )
-            if rollback_retry:
-                os.unlink(paths["aliases"])
-            else:
-                os.replace(paths["aliases"], paths["aliases_archive"])
-            directory = os.open(paths["root"], os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
-            durable_archive = _strict_legacy_aliases(paths["aliases_archive"])
-            source_backup = _read_bounded_owner_file(
-                paths["aliases_source_backup"],
-                label="legacy runtime alias source backup",
-                max_bytes=MAX_PRIVATE_JSON_BYTES,
-                exact_mode=0o600,
-            )
-            if durable_archive is None:
-                raise CollectionError(
-                    "runtime alias archive did not reach its durable postcondition"
-                )
-            if (
-                durable_archive[0] != legacy[0]
-                or source_backup != legacy[0]
-                or paths["aliases"].exists()
-            ):
-                raise CollectionError(
-                    "runtime alias archive did not reach its durable postcondition"
-                )
-            return {
-                "schema_version": SCHEMA_VERSION,
-                "migrated": True,
-                "already_migrated": False,
-                "aliases": dict(postimage["aliases"]),
-            }
+    return _migration.migrate_runtime_aliases(
+        config,
+        absent_alias_backup=ABSENT_ALIAS_CONFIG_BACKUP,
+        max_private_json_bytes=MAX_PRIVATE_JSON_BYTES,
+        schema_version=SCHEMA_VERSION,
+        private_alias_parent=_private_alias_parent,
+        atomic_write_json=atomic_write_json,
+        canonical_aliases=canonical_aliases,
+        config_path=config_path,
+        alias_migration_images_fn=_alias_migration_images,
+        create_private_backup_fn=_create_private_backup,
+        strict_legacy_aliases_fn=_strict_legacy_aliases,
+    )
+
+
+def _release_sha(value: Any) -> str:
+    return _migration._release_sha(
+        value,
+        release_root=Path(__file__).resolve().parent.parent,
+    )
+
+
+def _daemon_start_epoch(
+    proc_root: Path, generation: Mapping[str, Any]
+) -> float:
+    return _migration._daemon_start_epoch(
+        proc_root,
+        generation,
+    )
+
+
+def _legacy_identities(value: Mapping[str, Any]) -> dict[str, tuple[str, str]]:
+    return _migration._legacy_identities(
+        value,
+    )
+
+
+def _evidence_identities(value: Mapping[str, Any]) -> dict[str, tuple[str, str]]:
+    return _migration._evidence_identities(
+        value,
+    )
+
+
+def _current_identities(
+    inventory: Mapping[str, Any],
+) -> tuple[dict[str, tuple[str, str]], set[tuple[str, str]]]:
+    return _migration._current_identities(
+        inventory,
+    )
+
+
+def _migration_context(
+    config: Mapping[str, Any],
+    *,
+    legacy_bytes: bytes,
+    evidence_path: Path,
+    collector: Callable[[Mapping[str, Any]], dict[str, Any]] | None = None,
+    proc_root: Path | None = None,
+) -> dict[str, Any]:
+    return _migration._migration_context(
+        config,
+        legacy_bytes=legacy_bytes,
+        evidence_path=evidence_path,
+        collector=collector,
+        proc_root=proc_root,
+        generation_key=_generation_key,
+        has_recovery_entries=_has_recovery_entries,
+        parse_private_json=_parse_private_json,
+        parse_utc_timestamp=_parse_utc_timestamp,
+        sha256=_sha256,
+        collect_live=collect_live,
+        recovery_manifest=recovery_manifest,
+        strict_live_inventory=strict_live_inventory,
+    )
+
+
+def _plan_token(plan: Mapping[str, Any]) -> str:
+    return _migration._plan_token(
+        plan,
+        json_bytes=_json_bytes,
+        sha256=_sha256,
+    )
+
+
+def plan_legacy_recovery_manifest(
+    config: Mapping[str, Any],
+    continuity_evidence: str | Path,
+    release_sha: str,
+    *,
+    collector: Callable[[Mapping[str, Any]], dict[str, Any]] | None = None,
+    proc_root: Path | None = None,
+    now: float | None = None,
+) -> dict[str, Any]:
+    """Create a read-only, content-addressed migration plan."""
+    return _migration.plan_legacy_recovery_manifest(
+        config,
+        continuity_evidence,
+        release_sha,
+        collector=collector,
+        proc_root=proc_root,
+        now=now,
+        schema_version=SCHEMA_VERSION,
+        json_bytes=_json_bytes,
+        read_private_regular_bytes=_read_private_regular_bytes,
+        sha256=_sha256,
+        migration_context_fn=_migration_context,
+        plan_token_fn=_plan_token,
+        verify_release_sha=_release_sha,
+    )
+
+
+def publish_legacy_migration_plan(
+    config: Mapping[str, Any], output: str | Path, plan: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Durably create a reviewed plan as a private, non-overwriting state file."""
+    return _migration.publish_legacy_migration_plan(
+        config,
+        output,
+        plan,
+        schema_version=SCHEMA_VERSION,
+        json_bytes=_json_bytes,
+        read_private_regular_bytes=_read_private_regular_bytes,
+        write_manifest_backup=_write_legacy_manifest_backup,
+    )
+
+
+def _validate_migration_plan(
+    plan: Mapping[str, Any], paths: Mapping[str, Path], release_sha: str
+) -> None:
+    return _migration._validate_migration_plan(
+        plan,
+        paths,
+        release_sha,
+        schema_version=SCHEMA_VERSION,
+        generation_key=_generation_key,
+        json_bytes=_json_bytes,
+        sha256=_sha256,
+        plan_token_fn=_plan_token,
+        verify_release_sha=_release_sha,
+    )
+
+
+def _receipt_path(paths: Mapping[str, Path]) -> Path:
+    return _migration._receipt_path(
+        paths,
+    )
+
+
+def _migration_receipt(
+    plan: Mapping[str, Any], phase: str, *, now: float | None = None
+) -> dict[str, Any]:
+    return _migration._migration_receipt(
+        plan,
+        phase,
+        now=now,
+        schema_version=SCHEMA_VERSION,
+    )
+
+
+def _read_matching_receipt(
+    path: Path, plan: Mapping[str, Any], *, required: bool
+) -> Mapping[str, Any] | None:
+    return _migration._read_matching_receipt(
+        path,
+        plan,
+        required=required,
+        schema_version=SCHEMA_VERSION,
+        parse_private_json=_parse_private_json,
+        parse_utc_timestamp=_parse_utc_timestamp,
+    )
+
+
+def _revalidate_plan_context(
+    config: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    legacy_bytes: bytes,
+    *,
+    collector: Callable[[Mapping[str, Any]], dict[str, Any]] | None,
+    proc_root: Path | None,
+) -> None:
+    return _migration._revalidate_plan_context(
+        config,
+        plan,
+        legacy_bytes,
+        collector=collector,
+        proc_root=proc_root,
+        json_bytes=_json_bytes,
+        sha256=_sha256,
+        migration_context_fn=_migration_context,
+    )
+
+
+def apply_legacy_recovery_manifest(
+    config: Mapping[str, Any],
+    plan_path: str | Path,
+    release_sha: str,
+    *,
+    collector: Callable[[Mapping[str, Any]], dict[str, Any]] | None = None,
+    proc_root: Path | None = None,
+) -> dict[str, Any]:
+    """Apply or safely resume one reviewed legacy migration plan."""
+    return _migration.apply_legacy_recovery_manifest(
+        config,
+        plan_path,
+        release_sha,
+        collector=collector,
+        proc_root=proc_root,
+        schema_version=SCHEMA_VERSION,
+        parse_private_json=_parse_private_json,
+        read_private_regular_bytes=_read_private_regular_bytes,
+        sha256=_sha256,
+        write_manifest_backup=_write_legacy_manifest_backup,
+        atomic_write_json=atomic_write_json,
+        migration_receipt_fn=_migration_receipt,
+        read_matching_receipt_fn=_read_matching_receipt,
+        revalidate_plan_context_fn=_revalidate_plan_context,
+        validate_migration_plan_fn=_validate_migration_plan,
+    )
+
+
+def rollback_legacy_recovery_manifest(
+    config: Mapping[str, Any],
+    plan_path: str | Path,
+    release_sha: str,
+    *,
+    collector: Callable[[Mapping[str, Any]], dict[str, Any]] | None = None,
+    proc_root: Path | None = None,
+) -> dict[str, Any]:
+    """Restore exact legacy bytes while every plan and generation guard holds."""
+    return _migration.rollback_legacy_recovery_manifest(
+        config,
+        plan_path,
+        release_sha,
+        collector=collector,
+        proc_root=proc_root,
+        schema_version=SCHEMA_VERSION,
+        atomic_write_private_bytes=_atomic_write_private_bytes,
+        parse_private_json=_parse_private_json,
+        read_private_regular_bytes=_read_private_regular_bytes,
+        sha256=_sha256,
+        atomic_write_json=atomic_write_json,
+        migration_receipt_fn=_migration_receipt,
+        read_matching_receipt_fn=_read_matching_receipt,
+        revalidate_plan_context_fn=_revalidate_plan_context,
+        validate_migration_plan_fn=_validate_migration_plan,
+    )
 
 
 def _boot_id() -> str | None:
-    override = os.environ.get("SESSION_KIT_BOOT_ID_FILE")
-    if override:
-        try:
-            value = Path(override).read_text(encoding="utf-8").strip()
-        except OSError:
-            return None
-        return value or None
-    if _runtime_platform() == DARWIN_PLATFORM:
-        try:
-            libc, _ = _darwin_libraries()
-            boot_time = _DarwinTimeval()
-            size = ctypes.c_size_t(ctypes.sizeof(boot_time))
-            if libc.sysctlbyname(
-                b"kern.boottime",
-                ctypes.byref(boot_time),
-                ctypes.byref(size),
-                None,
-                0,
-            ) != 0:
-                return None
-            if boot_time.tv_sec <= 0 or boot_time.tv_usec < 0:
-                return None
-            return f"darwin:{boot_time.tv_sec}:{boot_time.tv_usec}"
-        except (OSError, ValueError):
-            return None
-    try:
-        value = Path("/proc/sys/kernel/random/boot_id").read_text(
-            encoding="utf-8"
-        ).strip()
-    except OSError:
-        return None
-    return value or None
+    return _processes._boot_id(
+        environ=os.environ,
+        runtime_platform=_runtime_platform,
+        darwin_libraries=_darwin_libraries,
+    )
 
 
 def _empty_terminal_registry(boot_id: str) -> dict[str, Any]:
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "boot_id": boot_id,
-        "next_number": 1,
-        "bindings": {},
-    }
+    return _state_io._empty_terminal_registry(
+        boot_id,
+        schema_version=SCHEMA_VERSION,
+    )
 
 
 def _validate_terminal_registry(raw: Any, boot_id: str) -> dict[str, Any]:
-    if not isinstance(raw, Mapping) or set(raw) != {
-        "schema_version",
-        "boot_id",
-        "next_number",
-        "bindings",
-    }:
-        raise CollectionError("terminal number registry has an invalid schema")
-    if raw.get("schema_version") != SCHEMA_VERSION:
-        raise CollectionError("terminal number registry has an unsupported schema")
-    stored_boot = raw.get("boot_id")
-    next_number = raw.get("next_number")
-    bindings = raw.get("bindings")
-    if (
-        not isinstance(stored_boot, str)
-        or not stored_boot
-        or isinstance(next_number, bool)
-        or not isinstance(next_number, int)
-        or next_number <= 0
-        or not isinstance(bindings, Mapping)
-    ):
-        raise CollectionError("terminal number registry has invalid fields")
-    checked: dict[str, int] = {}
-    ai_by_number: dict[int, str] = {}
-    generation_by_number: dict[int, str] = {}
-    for key, value in bindings.items():
-        if (
-            not isinstance(key, str)
-            or isinstance(value, bool)
-            or not isinstance(value, int)
-            or value <= 0
-        ):
-            raise CollectionError("terminal number registry has an invalid binding")
-        if key.startswith("ai:"):
-            _, separator, remainder = key.partition(":")
-            provider, separator, uuid = remainder.partition(":")
-            if (
-                not separator
-                or provider not in PROVIDERS
-                or valid_uuid(uuid) != uuid
-                or (value in ai_by_number and ai_by_number[value] != key)
-            ):
-                raise CollectionError(
-                    "terminal number registry has a conflicting AI binding"
-                )
-            ai_by_number[value] = key
-        elif re.fullmatch(r"generation:[0-9a-f]{64}", key):
-            if (
-                value in generation_by_number
-                and generation_by_number[value] != key
-            ):
-                raise CollectionError(
-                    "terminal number registry has duplicate generation bindings"
-                )
-            generation_by_number[value] = key
-        else:
-            raise CollectionError("terminal number registry has an invalid key")
-        checked[key] = value
-    if checked and next_number <= max(checked.values()):
-        raise CollectionError("terminal number registry would reuse a number")
-    if stored_boot != boot_id:
-        return _empty_terminal_registry(boot_id)
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "boot_id": stored_boot,
-        "next_number": next_number,
-        "bindings": checked,
-    }
+    return _state_io._validate_terminal_registry(
+        raw,
+        boot_id,
+        schema_version=SCHEMA_VERSION,
+        empty_registry=_empty_terminal_registry,
+    )
 
 
 def _read_terminal_registry(
     path: Path, boot_id: str, epoch_path: Path | None = None
 ) -> dict[str, Any]:
-    payload = _read_bounded_owner_file(
+    return _state_io._read_terminal_registry(
         path,
-        label="terminal number registry",
+        boot_id,
+        epoch_path,
+        schema_version=SCHEMA_VERSION,
         max_bytes=MAX_PRIVATE_JSON_BYTES,
-        exact_mode=0o600,
-        allow_missing=True,
+        read_bounded_owner_file=_read_bounded_owner_file,
+        empty_registry=_empty_terminal_registry,
+        validate_registry=_validate_terminal_registry,
     )
-    if payload is None:
-        if epoch_path is not None:
-            epoch_payload = _read_bounded_owner_file(
-                epoch_path,
-                label="terminal number initialization receipt",
-                max_bytes=4096,
-                exact_mode=0o600,
-                allow_missing=True,
-            )
-            if epoch_payload is not None:
-                try:
-                    epoch = json.loads(epoch_payload.decode("utf-8", "strict"))
-                except (UnicodeDecodeError, ValueError) as exc:
-                    raise CollectionError(
-                        "terminal number initialization receipt is invalid"
-                    ) from exc
-                if (
-                    not isinstance(epoch, Mapping)
-                    or set(epoch) != {"schema_version", "boot_id"}
-                    or epoch.get("schema_version") != SCHEMA_VERSION
-                    or not isinstance(epoch.get("boot_id"), str)
-                    or not epoch["boot_id"]
-                ):
-                    raise CollectionError(
-                        "terminal number initialization receipt has an invalid schema"
-                    )
-                if epoch["boot_id"] == boot_id:
-                    raise CollectionError(
-                        "same-boot terminal number registry disappeared"
-                    )
-        return _empty_terminal_registry(boot_id)
-    try:
-        raw = json.loads(payload.decode("utf-8", "strict"))
-    except (UnicodeDecodeError, ValueError) as exc:
-        raise CollectionError("terminal number registry is invalid JSON") from exc
-    return _validate_terminal_registry(raw, boot_id)
-
-
-def _terminal_generation_key(
-    inventory: Mapping[str, Any], item: Mapping[str, Any], boot_id: str
-) -> str | None:
-    shell = item.get("shpool_shell")
-    values = (
-        item.get("started_at_unix_ms"),
-        shell.get("pid") if isinstance(shell, Mapping) else None,
-        shell.get("process_start_ticks") if isinstance(shell, Mapping) else None,
-    )
-    if any(
-        isinstance(value, bool) or not isinstance(value, int) or value <= 0
-        for value in values
-    ):
-        return None
-    raw_id = item.get("shpool_id_raw")
-    if not isinstance(raw_id, str) or not raw_id:
-        return None
-    payload = json.dumps(
-        [boot_id, raw_id, values[0], values[1], values[2]],
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return f"generation:{hashlib.sha256(payload).hexdigest()}"
 
 
 def _terminal_ai_key(item: Mapping[str, Any]) -> str | None:
-    identity = item.get("identity")
-    provider = item.get("provider")
-    if (
-        provider in PROVIDERS
-        and isinstance(identity, Mapping)
-        and identity.get("confidence") == "exact"
-    ):
-        uuid = valid_uuid(identity.get("uuid"))
-        if uuid:
-            return f"ai:{provider}:{uuid}"
-    hint = item.get("_terminal_identity_hint")
-    if isinstance(hint, Mapping) and hint.get("provider") in PROVIDERS:
-        uuid = valid_uuid(hint.get("uuid"))
-        if uuid:
-            return f"ai:{hint['provider']}:{uuid}"
-    return None
-
-
-def _missing_shell_generation_is_quarantinable(
-    item: Mapping[str, Any],
-) -> bool:
-    """Recognize only an inert disconnected shpool row with no live shell."""
-    identity = item.get("identity")
-    recovery = item.get("recovery")
-    raw_id = item.get("shpool_id_raw")
-    started = item.get("started_at_unix_ms")
-    diagnostics = item.get("diagnostics")
-    expected_diagnostic = (
-        f"expected one daemon child for {raw_id!r}, found 0"
-        if isinstance(raw_id, str)
-        else ""
-    )
-    return (
-        item.get("provider") == "unknown"
-        and item.get("display_provider") == "unknown"
-        and item.get("availability") == "ready"
-        and clean_text(item.get("shpool_status"), 32).casefold() == "disconnected"
-        and isinstance(raw_id, str)
-        and bool(raw_id)
-        and raw_id == item.get("shpool_id")
-        and shpool_id_mutation_policy(raw_id) == (True, None)
-        and isinstance(started, int)
-        and not isinstance(started, bool)
-        and started > 0
-        and item.get("shpool_shell") is None
-        and isinstance(identity, Mapping)
-        and identity.get("confidence") == "unknown"
-        and identity.get("uuid") is None
-        and identity.get("pid") is None
-        and identity.get("process_start_ticks") is None
-        and identity.get("provenance") == "none"
-        and isinstance(recovery, Mapping)
-        and recovery.get("available") is False
-        and recovery.get("provider") is None
-        and recovery.get("uuid") is None
-        and not isinstance(item.get("_terminal_identity_hint"), Mapping)
-        and isinstance(diagnostics, list)
-        and expected_diagnostic in diagnostics
-    )
-
-
-def _missing_shell_generation_is_quarantined(
-    item: Mapping[str, Any],
-) -> bool:
-    return (
-        _missing_shell_generation_is_quarantinable(item)
-        and item.get("terminal_number") is None
-        and item.get("mutation_allowed") is False
-        and item.get("mutation_rejection_reason") == "missing-shell-generation"
-    )
-
-
-# A dead session's number stays reserved this long before a new session may
-# take it (Dan 2026-08-02: recycle-with-quarantine). A conversation recovered
-# inside the window keeps its number via its surviving AI binding.
-TERMINAL_NUMBER_QUARANTINE_SECONDS = 7 * 86400
+    return _terminal._terminal_ai_key(item)
 
 
 def _read_terminal_retirements(path: Path, boot_id: str) -> dict[int, float]:
-    """Retirement ledger: number -> unix time its last session disappeared.
-
-    Kept OUTSIDE the registry file: pinned schema-v1 releases reject unknown
-    registry keys, and standing windows keep running them. A boot change
-    resets the ledger with the registry (numbers restart at 1 anyway).
-    """
-    raw_bytes = _read_bounded_owner_file(
+    """Retirement ledger: number -> unix time its last session disappeared."""
+    return _terminal._read_terminal_retirements(
         path,
-        label="terminal retirement ledger",
+        boot_id,
         max_bytes=MAX_PRIVATE_JSON_BYTES,
-        exact_mode=0o600,
-        allow_missing=True,
     )
-    if raw_bytes is None:
-        return {}
-    try:
-        payload = json.loads(raw_bytes.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError):
-        return {}
-    if not isinstance(payload, Mapping) or payload.get("boot_id") != boot_id:
-        return {}
-    raw = payload.get("retired")
-    result: dict[int, float] = {}
-    if isinstance(raw, Mapping):
-        for key, value in raw.items():
-            if (
-                isinstance(key, str)
-                and key.isdigit()
-                and int(key) > 0
-                and isinstance(value, (int, float))
-                and not isinstance(value, bool)
-                and value > 0
-            ):
-                result[int(key)] = float(value)
-    return result
 
 
 def _terminal_retirement_payload(
     retired: Mapping[int, float], boot_id: str
 ) -> dict[str, Any]:
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "boot_id": boot_id,
-        "retired": {str(k): retired[k] for k in sorted(retired)},
-    }
+    return _terminal._terminal_retirement_payload(
+        retired,
+        boot_id,
+        schema_version=SCHEMA_VERSION,
+    )
 
 
 def apply_terminal_numbers(
@@ -5409,209 +1864,38 @@ def apply_terminal_numbers(
     current_time: float | None = None,
 ) -> dict[str, Any]:
     """Apply boot-stable selectors without changing contiguous internal rows."""
-    checked = _validate_terminal_registry(registry, boot_id)
-    bindings: dict[str, int] = dict(checked["bindings"])
-    next_number = checked["next_number"]
-    recycle = allocate and retired is not None
-    now = current_time if current_time is not None else time.time()
-    if recycle:
-        assert retired is not None
-        # Bindings whose number finished its quarantine are pruned; the
-        # number becomes allocatable below. Live numbers are never here.
-        expired = {
-            number
-            for number, stamp in retired.items()
-            if now - stamp >= TERMINAL_NUMBER_QUARANTINE_SECONDS
-        }
-        if expired:
-            for key in [k for k, v in bindings.items() if v in expired]:
-                del bindings[key]
-            for expired_number in expired:
-                retired.pop(expired_number, None)
-    reserved_numbers: set[int] = set(bindings.values())
-    active_numbers: set[int] = set()
-    for item in inventory.get("sessions", ()):
-        if not isinstance(item, dict):
-            raise CollectionError("cannot number a non-object managed session")
-        generation_key = _terminal_generation_key(inventory, item, boot_id)
-        ai_key = _terminal_ai_key(item)
-        if generation_key is None:
-            if _missing_shell_generation_is_quarantinable(item):
-                item["terminal_number"] = None
-                item["mutation_allowed"] = False
-                item["mutation_rejection_reason"] = "missing-shell-generation"
-                item.pop("_terminal_identity_hint", None)
-                continue
-            if allocate:
-                raise CollectionError(
-                    "managed session lacks an exact generation for numbering"
-                )
-        ai_number = bindings.get(ai_key) if ai_key else None
-        generation_number = (
-            bindings.get(generation_key) if generation_key else None
-        )
-        generation_ai_key = (
-            next(
-                (
-                    key
-                    for key, value in bindings.items()
-                    if key.startswith("ai:") and value == generation_number
-                ),
-                None,
-            )
-            if generation_number is not None
-            else None
-        )
-        number: int | None
-        if ai_number is not None:
-            # Exact AI identity is the continuity proof when a recovered
-            # conversation appears in a newly created shpool generation.  The
-            # provisional number remains consumed, but the new generation is
-            # rebound to the conversation's established terminal number.
-            number = ai_number
-        elif generation_number is not None and (
-            ai_key is None or generation_ai_key is None
-        ):
-            number = generation_number
-        elif generation_number is not None and not allocate:
-            # The generation was already promoted to another exact
-            # conversation. A read-only guard must not expose that number as
-            # belonging to this unrelated identity.
-            number = None
-        elif allocate and recycle:
-            # Lowest free number: anything not reserved by a live or
-            # quarantined binding. Keeps numbers small forever.
-            number = 1
-            while number in reserved_numbers:
-                number += 1
-            reserved_numbers.add(number)
-            if number >= next_number:
-                next_number = number + 1
-        elif allocate:
-            number = next_number
-            next_number += 1
-        else:
-            number = None
-        if number is not None:
-            if number in active_numbers:
-                raise CollectionError(
-                    "terminal number registry maps two active sessions to one number"
-                )
-            active_numbers.add(number)
-            if allocate:
-                assert generation_key is not None
-                for key, value in tuple(bindings.items()):
-                    if (
-                        key.startswith("generation:")
-                        and value == number
-                        and key != generation_key
-                    ):
-                        del bindings[key]
-                bindings[generation_key] = number
-                if ai_key:
-                    bindings[ai_key] = number
-        item["terminal_number"] = number
-        item.pop("_terminal_identity_hint", None)
-    if recycle:
-        assert retired is not None
-        # Stamp newly dead numbers; clear stamps on anything alive again
-        # (an exact recovery inside the quarantine window).
-        bound = set(bindings.values())
-        for number in bound - active_numbers:
-            retired.setdefault(number, now)
-        for number in active_numbers:
-            retired.pop(number, None)
-        # Legacy invariant for pinned releases: next_number stays above
-        # every stored binding even after pruning shrank the map.
-        top = max(bound, default=0)
-        if next_number <= top:
-            next_number = top + 1
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "boot_id": boot_id,
-        "next_number": next_number,
-        "bindings": dict(sorted(bindings.items())),
-    }
+    return _terminal.apply_terminal_numbers(
+        inventory,
+        registry,
+        boot_id=boot_id,
+        allocate=allocate,
+        retired=retired,
+        current_time=current_time,
+        validate_registry=_validate_terminal_registry,
+        schema_version=SCHEMA_VERSION,
+        quarantine_seconds=TERMINAL_NUMBER_QUARANTINE_SECONDS,
+    )
 
 
 def recovery_manifest(inventory: Mapping[str, Any]) -> dict[str, Any]:
-    sessions: dict[str, dict[str, Any]] = {}
-    for item in inventory.get("sessions", ()):
-        recovery = item.get("recovery", {})
-        shpool_id = item.get("shpool_id_raw") or item.get("shpool_id")
-        if not shpool_id or not recovery.get("available"):
-            continue
-        sessions[shpool_id] = {
-            "scope": "shpool",
-            "provider": recovery["provider"],
-            "uuid": recovery["uuid"],
-            "title": item.get("title", ""),
-            "cwd": recovery.get("cwd"),
-            "argv": recovery.get("argv", []),
-            "command": recovery.get("command"),
-        }
-    outside_agents: dict[str, dict[str, Any]] = {}
-    for item in inventory.get("outside_agents", ()):
-        recovery = item.get("recovery", {})
-        provider = recovery.get("provider")
-        uuid = valid_uuid(recovery.get("uuid"))
-        if not recovery.get("available") or provider not in PROVIDERS or not uuid:
-            continue
-        key = f"outside:{provider}:{uuid}"
-        outside_agents[key] = {
-            "scope": "outside",
-            "provider": provider,
-            "uuid": uuid,
-            "title": item.get("title", ""),
-            "cwd": recovery.get("cwd"),
-            "argv": recovery.get("argv", []),
-            "command": recovery.get("command"),
-        }
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "generated_at": inventory.get("generated_at"),
-        "boot_id": _boot_id(),
-        "daemon_generation": inventory.get("daemon_generation"),
-        "sessions": sessions,
-        "outside_agents": outside_agents,
-    }
-
-
-def _generation_key(value: Mapping[str, Any]) -> tuple[str, int, int] | None:
-    generation = value.get("daemon_generation")
-    if not isinstance(generation, Mapping):
-        return None
-    boot_id = value.get("boot_id")
-    pid = generation.get("pid")
-    start_ticks = generation.get("process_start_ticks")
-    if (
-        not isinstance(boot_id, str)
-        or not boot_id
-        or not isinstance(pid, int)
-        or pid <= 0
-        or not isinstance(start_ticks, int)
-        or start_ticks <= 0
-    ):
-        return None
-    return boot_id, pid, start_ticks
+    return _recovery.recovery_manifest(
+        inventory,
+        schema_version=SCHEMA_VERSION,
+        boot_id=_boot_id,
+    )
 
 
 def _valid_recovery_state(value: Any) -> bool:
-    return (
-        isinstance(value, Mapping)
-        and value.get("schema_version") == SCHEMA_VERSION
-        and isinstance(value.get("sessions"), Mapping)
-        and (
-            "outside_agents" not in value
-            or isinstance(value.get("outside_agents"), Mapping)
-        )
+    return _recovery._valid_recovery_state(
+        value,
+        schema_version=SCHEMA_VERSION,
     )
 
 
 def _has_recovery_entries(value: Any) -> bool:
-    return bool(
-        _valid_recovery_state(value)
-        and (value.get("sessions") or value.get("outside_agents"))
+    return _recovery._has_recovery_entries(
+        value,
+        valid_recovery_state=_valid_recovery_state,
     )
 
 
@@ -5747,687 +2031,6 @@ def _parse_utc_timestamp(value: Any, label: str) -> dt.datetime:
     return parsed.astimezone(dt.timezone.utc)
 
 
-def _release_sha(value: Any) -> str:
-    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{40}", value):
-        raise CollectionError("release SHA must be one full lowercase 40-character commit")
-    release_root = Path(__file__).resolve().parent.parent
-    release_metadata = release_root / "RELEASE.json"
-    configured_root = os.environ.get("SESSION_KIT_RELEASE_DIR")
-    if configured_root and Path(configured_root).resolve() != release_root:
-        raise CollectionError("executing release does not match SESSION_KIT_RELEASE_DIR")
-    if release_metadata.exists() or configured_root:
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-        try:
-            descriptor = os.open(release_metadata, flags)
-            metadata = os.fstat(descriptor)
-            content = b""
-            while True:
-                block = os.read(descriptor, 64 * 1024)
-                if not block:
-                    break
-                content += block
-        except OSError as exc:
-            raise CollectionError("cannot verify executing immutable release") from exc
-        finally:
-            if "descriptor" in locals():
-                os.close(descriptor)
-        try:
-            document = json.loads(content)
-        except (UnicodeDecodeError, ValueError) as exc:
-            raise CollectionError("executing RELEASE.json is invalid") from exc
-        if (
-            not statmod.S_ISREG(metadata.st_mode)
-            or metadata.st_uid != os.geteuid()
-            or statmod.S_IMODE(metadata.st_mode) & 0o222
-            or metadata.st_size > 64 * 1024
-            or release_root.name != value
-            or not isinstance(document, Mapping)
-            or document.get("commit") != value
-        ):
-            raise CollectionError("release SHA is not bound to the executing immutable release")
-    return value
-
-
-def _daemon_start_epoch(
-    proc_root: Path, generation: Mapping[str, Any]
-) -> float:
-    pid = generation.get("pid")
-    expected_ticks = generation.get("process_start_ticks")
-    if (
-        not isinstance(pid, int)
-        or pid <= 0
-        or not isinstance(expected_ticks, int)
-        or expected_ticks <= 0
-    ):
-        raise CollectionError("current daemon generation is not exact")
-    try:
-        before = _proc_stat(proc_root / str(pid) / "stat")
-        lines = (proc_root / "stat").read_text(
-            encoding="utf-8", errors="replace"
-        ).splitlines()
-        boot_values = [
-            int(line.split()[1])
-            for line in lines
-            if len(line.split()) == 2 and line.split()[0] == "btime"
-        ]
-        ticks_per_second = int(os.sysconf("SC_CLK_TCK"))
-        after = _proc_stat(proc_root / str(pid) / "stat")
-    except (OSError, ValueError) as exc:
-        raise CollectionError("cannot prove current daemon wall-clock start") from exc
-    if (
-        len(boot_values) != 1
-        or boot_values[0] <= 0
-        or ticks_per_second <= 0
-        or before != after
-        or before[0] != pid
-        or before[2] != expected_ticks
-    ):
-        raise CollectionError("current daemon changed while proving continuity")
-    return boot_values[0] + (expected_ticks / ticks_per_second)
-
-
-def _legacy_identities(value: Mapping[str, Any]) -> dict[str, tuple[str, str]]:
-    sessions = value.get("sessions")
-    outside = value.get("outside_agents", {})
-    if not isinstance(sessions, Mapping) or not sessions or outside:
-        raise CollectionError(
-            "legacy migration requires nonempty shpool sessions and no outside roots"
-        )
-    result: dict[str, tuple[str, str]] = {}
-    uuids: set[str] = set()
-    for shpool_id, item in sessions.items():
-        if not isinstance(shpool_id, str) or not shpool_id or not isinstance(item, Mapping):
-            raise CollectionError("legacy recovery manifest contains an invalid session")
-        provider = item.get("provider")
-        uuid = valid_uuid(item.get("uuid"))
-        if provider not in PROVIDERS or not uuid or uuid in uuids:
-            raise CollectionError("legacy recovery identities must be exact and unique")
-        result[shpool_id] = (provider, uuid)
-        uuids.add(uuid)
-    return result
-
-
-def _evidence_identities(value: Mapping[str, Any]) -> dict[str, tuple[str, str]]:
-    rows = value.get("sessions")
-    if not isinstance(rows, list) or not rows:
-        raise CollectionError("continuity evidence must contain a nonempty session list")
-    result: dict[str, tuple[str, str]] = {}
-    uuids: set[str] = set()
-    for item in rows:
-        if not isinstance(item, Mapping):
-            raise CollectionError("continuity evidence contains a non-object session")
-        shpool_id = item.get("shpool_name")
-        provider = item.get("provider")
-        uuid = valid_uuid(item.get("provider_uuid"))
-        if (
-            not isinstance(shpool_id, str)
-            or not shpool_id
-            or provider not in PROVIDERS
-            or not uuid
-            or shpool_id in result
-            or uuid in uuids
-        ):
-            raise CollectionError("continuity evidence identities must be exact and unique")
-        result[shpool_id] = (provider, uuid)
-        uuids.add(uuid)
-    return result
-
-
-def _current_identities(
-    inventory: Mapping[str, Any],
-) -> tuple[dict[str, tuple[str, str]], set[tuple[str, str]]]:
-    sessions: dict[str, tuple[str, str]] = {}
-    all_roots: set[tuple[str, str]] = set()
-    seen_uuids: set[str] = set()
-    for item in inventory.get("sessions", ()):
-        identity = item.get("identity")
-        recovery = item.get("recovery")
-        shpool_id = item.get("shpool_id_raw")
-        provider = item.get("provider")
-        uuid = valid_uuid(identity.get("uuid")) if isinstance(identity, Mapping) else None
-        recovery_uuid = (
-            valid_uuid(recovery.get("uuid")) if isinstance(recovery, Mapping) else None
-        )
-        if (
-            not isinstance(shpool_id, str)
-            or provider not in PROVIDERS
-            or not uuid
-            or not isinstance(recovery, Mapping)
-            or recovery.get("available") is not True
-            or recovery.get("provider") != provider
-            or recovery_uuid != uuid
-            or shpool_id in sessions
-            or uuid in seen_uuids
-        ):
-            raise CollectionError("current shpool identities are not exact and unique")
-        sessions[shpool_id] = (provider, uuid)
-        all_roots.add((provider, uuid))
-        seen_uuids.add(uuid)
-    outside = inventory.get("outside_agents", ())
-    if outside:
-        # This one-time migration has no trusted historical evidence for
-        # outside roots, so including or excluding them would be an assumption.
-        raise CollectionError("legacy migration refuses current outside provider roots")
-    return sessions, all_roots
-
-
-def _migration_context(
-    config: Mapping[str, Any],
-    *,
-    legacy_bytes: bytes,
-    evidence_path: Path,
-    collector: Callable[[Mapping[str, Any]], dict[str, Any]] | None = None,
-    proc_root: Path | None = None,
-) -> dict[str, Any]:
-    collect = collector or collect_live
-    try:
-        legacy = json.loads(legacy_bytes)
-    except (UnicodeDecodeError, ValueError) as exc:
-        raise CollectionError("legacy recovery manifest is invalid JSON") from exc
-    if (
-        not isinstance(legacy, Mapping)
-        or not _has_recovery_entries(legacy)
-        or legacy.get("daemon_generation") is not None
-        or not isinstance(legacy.get("boot_id"), str)
-        or not legacy.get("boot_id")
-    ):
-        raise CollectionError("source is not a null-generation legacy manifest")
-    legacy_generated = _parse_utc_timestamp(
-        legacy.get("generated_at"), "legacy generated_at"
-    )
-    evidence_bytes, evidence = _parse_private_json(
-        evidence_path, "continuity evidence"
-    )
-    evidence_captured = _parse_utc_timestamp(
-        evidence.get("captured_at"), "continuity evidence captured_at"
-    )
-    if evidence_captured > legacy_generated:
-        raise CollectionError("continuity evidence was captured after the legacy manifest")
-    legacy_ids = _legacy_identities(legacy)
-    if _evidence_identities(evidence) != legacy_ids:
-        raise CollectionError(
-            "continuity evidence does not exactly match every legacy identity"
-        )
-    settings = dict(config)
-    live = collect(settings)
-    if not isinstance(live, Mapping):
-        raise CollectionError("collector returned a non-object inventory")
-    live = dict(live)
-    complete = bool(live.pop("_complete", True))
-    if not complete or not strict_live_inventory(live):
-        raise CollectionError(
-            "legacy recovery migration requires a complete strict live inventory"
-        )
-    detected = recovery_manifest(live)
-    detected_key = _generation_key(detected)
-    if (
-        detected_key is None
-        or not _has_recovery_entries(detected)
-        or detected.get("boot_id") != legacy.get("boot_id")
-    ):
-        raise CollectionError(
-            "legacy and current manifests do not have one exact same-boot generation"
-        )
-    generation = detected["daemon_generation"]
-    if evidence.get("daemon_pid") != generation.get("pid"):
-        raise CollectionError("current daemon PID does not match continuity evidence")
-    root = proc_root or Path(os.environ.get("SESSION_KIT_PROC_ROOT", "/proc"))
-    daemon_started = _daemon_start_epoch(root, generation)
-    if daemon_started > evidence_captured.timestamp():
-        raise CollectionError("current daemon did not predate continuity evidence")
-    current_ids, all_current_roots = _current_identities(live)
-    if not set(current_ids).issubset(legacy_ids):
-        raise CollectionError("current inventory contains a root absent from legacy evidence")
-    reconciliation: list[dict[str, Any]] = []
-    for shpool_id in sorted(legacy_ids, key=natural_name_key):
-        provider, uuid = legacy_ids[shpool_id]
-        current = current_ids.get(shpool_id)
-        if current is not None:
-            if current != (provider, uuid):
-                raise CollectionError(
-                    f"current identity changed under legacy shpool ID {shpool_id!r}"
-                )
-            disposition = "carried"
-        else:
-            if (provider, uuid) in all_current_roots:
-                raise CollectionError(
-                    f"legacy identity moved from shpool ID {shpool_id!r}"
-                )
-            disposition = "ended"
-        reconciliation.append(
-            {
-                "shpool_id": shpool_id,
-                "provider": provider,
-                "uuid": uuid,
-                "disposition": disposition,
-            }
-        )
-    return {
-        "legacy": dict(legacy),
-        "legacy_sha256": _sha256(legacy_bytes),
-        "evidence_sha256": _sha256(evidence_bytes),
-        "evidence_captured_at": evidence_captured.isoformat().replace("+00:00", "Z"),
-        "daemon_started_at": dt.datetime.fromtimestamp(
-            daemon_started, dt.timezone.utc
-        ).isoformat(timespec="microseconds").replace("+00:00", "Z"),
-        "generation": dict(generation),
-        "target_manifest": detected,
-        "current_roots": [
-            {"shpool_id": key, "provider": value[0], "uuid": value[1]}
-            for key, value in sorted(current_ids.items(), key=lambda item: natural_name_key(item[0]))
-        ],
-        "reconciliation": reconciliation,
-    }
-
-
-def _plan_token(plan: Mapping[str, Any]) -> str:
-    body = dict(plan)
-    body.pop("plan_token", None)
-    return _sha256(_json_bytes(body))
-
-
-def plan_legacy_recovery_manifest(
-    config: Mapping[str, Any],
-    continuity_evidence: str | Path,
-    release_sha: str,
-    *,
-    collector: Callable[[Mapping[str, Any]], dict[str, Any]] | None = None,
-    proc_root: Path | None = None,
-    now: float | None = None,
-) -> dict[str, Any]:
-    """Create a read-only, content-addressed migration plan."""
-    paths = _state_paths(config)
-    if paths["pending"].exists() or paths["pending"].is_symlink():
-        raise CollectionError("legacy recovery migration refuses an existing pending queue")
-    source_before = _read_private_regular_bytes(paths["manifest"])
-    evidence_path = Path(continuity_evidence).expanduser()
-    if not evidence_path.is_absolute():
-        evidence_path = Path.cwd() / evidence_path
-    context = _migration_context(
-        config,
-        legacy_bytes=source_before,
-        evidence_path=evidence_path,
-        collector=collector,
-        proc_root=proc_root,
-    )
-    if _read_private_regular_bytes(paths["manifest"]) != source_before:
-        raise CollectionError("legacy manifest changed while planning")
-    release = _release_sha(release_sha)
-    source_hash = context["legacy_sha256"]
-    archive = paths["root"] / f"recovery-manifest.legacy.{source_hash}.json"
-    target = context["target_manifest"]
-    plan: dict[str, Any] = {
-        "schema_version": SCHEMA_VERSION,
-        "plan_version": 1,
-        "action": "legacy-recovery-manifest-migration",
-        "created_at": _utc_now(now),
-        "release_sha": release,
-        "source_manifest": {
-            "path": str(paths["manifest"].resolve()),
-            "sha256": source_hash,
-            "boot_id": context["legacy"]["boot_id"],
-            "generated_at": context["legacy"]["generated_at"],
-        },
-        "continuity_evidence": {
-            "path": str(evidence_path.resolve()),
-            "sha256": context["evidence_sha256"],
-            "captured_at": context["evidence_captured_at"],
-            "daemon_pid": context["generation"]["pid"],
-            "daemon_started_at": context["daemon_started_at"],
-        },
-        "daemon_generation": context["generation"],
-        "current_roots": context["current_roots"],
-        "reconciliation": context["reconciliation"],
-        "target_manifest": target,
-        "target_manifest_sha256": _sha256(_json_bytes(target)),
-        "archive_path": str(archive.resolve()),
-    }
-    plan["plan_token"] = _plan_token(plan)
-    return plan
-
-
-def publish_legacy_migration_plan(
-    config: Mapping[str, Any], output: str | Path, plan: Mapping[str, Any]
-) -> dict[str, Any]:
-    """Durably create a reviewed plan as a private, non-overwriting state file."""
-    paths = _state_paths(config)
-    destination = Path(output).expanduser()
-    if not destination.is_absolute():
-        destination = Path.cwd() / destination
-    with StateLock(paths["root"], paths["lock"]):
-        if destination.parent.resolve() != paths["root"].resolve():
-            raise CollectionError(
-                "migration plan output must be inside the owner-only state directory"
-            )
-        if destination.exists() or destination.is_symlink():
-            raise CollectionError(f"migration plan output already exists: {destination}")
-        content = _json_bytes(plan)
-        _write_legacy_manifest_backup(destination, content)
-        if _read_private_regular_bytes(destination) != content:
-            raise CollectionError("durable migration plan verification failed")
-    dispositions = {
-        "carried": sum(
-            item.get("disposition") == "carried"
-            for item in plan.get("reconciliation", ())
-            if isinstance(item, Mapping)
-        ),
-        "ended": sum(
-            item.get("disposition") == "ended"
-            for item in plan.get("reconciliation", ())
-            if isinstance(item, Mapping)
-        ),
-    }
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "result": "planned",
-        "plan": str(destination),
-        "plan_token": plan.get("plan_token"),
-        "release_sha": plan.get("release_sha"),
-        "source_manifest_sha256": plan.get("source_manifest", {}).get("sha256"),
-        "target_manifest_sha256": plan.get("target_manifest_sha256"),
-        "reconciliation": dispositions,
-    }
-
-
-def _validate_migration_plan(
-    plan: Mapping[str, Any], paths: Mapping[str, Path], release_sha: str
-) -> None:
-    expected_top_level = {
-        "schema_version",
-        "plan_version",
-        "action",
-        "created_at",
-        "release_sha",
-        "source_manifest",
-        "continuity_evidence",
-        "daemon_generation",
-        "current_roots",
-        "reconciliation",
-        "target_manifest",
-        "target_manifest_sha256",
-        "archive_path",
-        "plan_token",
-    }
-    if (
-        set(plan) != expected_top_level
-        or plan.get("schema_version") != SCHEMA_VERSION
-        or plan.get("plan_version") != 1
-        or plan.get("action") != "legacy-recovery-manifest-migration"
-        or plan.get("release_sha") != _release_sha(release_sha)
-        or plan.get("plan_token") != _plan_token(plan)
-        or not isinstance(plan.get("source_manifest"), Mapping)
-        or not isinstance(plan.get("continuity_evidence"), Mapping)
-        or not isinstance(plan.get("target_manifest"), Mapping)
-        or not isinstance(plan.get("reconciliation"), list)
-        or not isinstance(plan.get("current_roots"), list)
-        or not isinstance(plan.get("daemon_generation"), Mapping)
-    ):
-        raise CollectionError("migration plan is invalid, altered, or for another release")
-    source = plan["source_manifest"]
-    evidence = plan["continuity_evidence"]
-    target = plan["target_manifest"]
-    if (
-        set(source) != {"path", "sha256", "boot_id", "generated_at"}
-        or set(evidence)
-        != {"path", "sha256", "captured_at", "daemon_pid", "daemon_started_at"}
-        or source.get("path") != str(paths["manifest"].resolve())
-        or not re.fullmatch(r"[0-9a-f]{64}", str(source.get("sha256", "")))
-        or not re.fullmatch(r"[0-9a-f]{64}", str(evidence.get("sha256", "")))
-        or plan.get("archive_path")
-        != str(
-            (
-                paths["root"]
-                / f"recovery-manifest.legacy.{source.get('sha256')}.json"
-            ).resolve()
-        )
-        or plan.get("target_manifest_sha256")
-        != _sha256(_json_bytes(target))
-        or _generation_key(target)
-        != (
-            source.get("boot_id"),
-            plan.get("daemon_generation", {}).get("pid"),
-            plan.get("daemon_generation", {}).get("process_start_ticks"),
-        )
-        or evidence.get("daemon_pid")
-        != plan.get("daemon_generation", {}).get("pid")
-    ):
-        raise CollectionError("migration plan paths or hashes are invalid")
-
-
-def _receipt_path(paths: Mapping[str, Path]) -> Path:
-    return paths["root"] / "recovery-manifest-migration-receipt.json"
-
-
-def _migration_receipt(
-    plan: Mapping[str, Any], phase: str, *, now: float | None = None
-) -> dict[str, Any]:
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "action": "legacy-recovery-manifest-migration",
-        "phase": phase,
-        "updated_at": _utc_now(now),
-        "plan_token": plan["plan_token"],
-        "release_sha": plan["release_sha"],
-        "source_manifest_sha256": plan["source_manifest"]["sha256"],
-        "target_manifest_sha256": plan["target_manifest_sha256"],
-        "continuity_evidence_sha256": plan["continuity_evidence"]["sha256"],
-        "daemon_generation": plan["daemon_generation"],
-        "reconciliation": plan["reconciliation"],
-        "archive_path": plan["archive_path"],
-    }
-
-
-def _read_matching_receipt(
-    path: Path, plan: Mapping[str, Any], *, required: bool
-) -> Mapping[str, Any] | None:
-    if not path.exists() and not path.is_symlink():
-        if required:
-            raise CollectionError("migration receipt is missing")
-        return None
-    _, receipt = _parse_private_json(path, "migration receipt")
-    expected_fields = {
-        "schema_version",
-        "action",
-        "phase",
-        "updated_at",
-        "plan_token",
-        "release_sha",
-        "source_manifest_sha256",
-        "target_manifest_sha256",
-        "continuity_evidence_sha256",
-        "daemon_generation",
-        "reconciliation",
-        "archive_path",
-    }
-    _parse_utc_timestamp(receipt.get("updated_at"), "migration receipt updated_at")
-    if (
-        set(receipt) != expected_fields
-        or receipt.get("schema_version") != SCHEMA_VERSION
-        or receipt.get("action") != "legacy-recovery-manifest-migration"
-        or receipt.get("plan_token") != plan.get("plan_token")
-        or receipt.get("release_sha") != plan.get("release_sha")
-        or receipt.get("source_manifest_sha256")
-        != plan["source_manifest"]["sha256"]
-        or receipt.get("target_manifest_sha256")
-        != plan.get("target_manifest_sha256")
-        or receipt.get("continuity_evidence_sha256")
-        != plan["continuity_evidence"]["sha256"]
-        or receipt.get("daemon_generation") != plan.get("daemon_generation")
-        or receipt.get("reconciliation") != plan.get("reconciliation")
-        or receipt.get("archive_path") != plan.get("archive_path")
-        or receipt.get("phase") not in {"archive-published", "applied", "rolled-back"}
-    ):
-        raise CollectionError("migration receipt does not match the reviewed plan")
-    return receipt
-
-
-def _revalidate_plan_context(
-    config: Mapping[str, Any],
-    plan: Mapping[str, Any],
-    legacy_bytes: bytes,
-    *,
-    collector: Callable[[Mapping[str, Any]], dict[str, Any]] | None,
-    proc_root: Path | None,
-) -> None:
-    evidence_path = Path(str(plan["continuity_evidence"]["path"]))
-    context = _migration_context(
-        config,
-        legacy_bytes=legacy_bytes,
-        evidence_path=evidence_path,
-        collector=collector,
-        proc_root=proc_root,
-    )
-    semantic_target = dict(context["target_manifest"])
-    semantic_target["generated_at"] = plan["target_manifest"].get("generated_at")
-    if (
-        context["legacy_sha256"] != plan["source_manifest"]["sha256"]
-        or context["evidence_sha256"] != plan["continuity_evidence"]["sha256"]
-        or context["generation"] != plan["daemon_generation"]
-        or context["current_roots"] != plan["current_roots"]
-        or context["reconciliation"] != plan["reconciliation"]
-        or semantic_target != plan["target_manifest"]
-        or _sha256(_json_bytes(plan["target_manifest"]))
-        != plan["target_manifest_sha256"]
-    ):
-        raise CollectionError("live state no longer matches the reviewed migration plan")
-
-
-def apply_legacy_recovery_manifest(
-    config: Mapping[str, Any],
-    plan_path: str | Path,
-    release_sha: str,
-    *,
-    collector: Callable[[Mapping[str, Any]], dict[str, Any]] | None = None,
-    proc_root: Path | None = None,
-) -> dict[str, Any]:
-    """Apply or safely resume one reviewed legacy migration plan."""
-    paths = _state_paths(config)
-    _, plan = _parse_private_json(Path(plan_path).expanduser(), "migration plan")
-    _validate_migration_plan(plan, paths, release_sha)
-    source_hash = plan["source_manifest"]["sha256"]
-    target_hash = plan["target_manifest_sha256"]
-    archive = Path(str(plan["archive_path"]))
-    receipt_path = _receipt_path(paths)
-    with StateLock(paths["root"], paths["lock"]):
-        if paths["pending"].exists() or paths["pending"].is_symlink():
-            raise CollectionError("legacy recovery migration refuses an existing pending queue")
-        canonical = _read_private_regular_bytes(paths["manifest"])
-        canonical_hash = _sha256(canonical)
-        receipt = _read_matching_receipt(
-            receipt_path, plan, required=canonical_hash == target_hash
-        )
-        if receipt and receipt.get("phase") == "rolled-back":
-            raise CollectionError("reviewed migration plan was already rolled back")
-        if canonical_hash not in {source_hash, target_hash}:
-            raise CollectionError("recovery manifest no longer matches plan source or target")
-        if archive.exists() or archive.is_symlink():
-            legacy_bytes = _read_private_regular_bytes(archive)
-            if _sha256(legacy_bytes) != source_hash:
-                raise CollectionError("legacy archive does not match the reviewed source")
-        else:
-            if canonical_hash != source_hash:
-                raise CollectionError("legacy archive is missing after target publication")
-            legacy_bytes = canonical
-        if canonical_hash == target_hash:
-            if receipt is None:
-                raise CollectionError("target manifest has no matching migration receipt")
-            if receipt.get("phase") != "applied":
-                atomic_write_json(
-                    receipt_path, _migration_receipt(plan, "applied")
-                )
-            return {
-                "schema_version": SCHEMA_VERSION,
-                "result": "already-applied",
-                "plan_token": plan["plan_token"],
-                "receipt": str(receipt_path),
-            }
-        _revalidate_plan_context(
-            config,
-            plan,
-            legacy_bytes,
-            collector=collector,
-            proc_root=proc_root,
-        )
-        if not archive.exists():
-            _write_legacy_manifest_backup(archive, canonical)
-        if _sha256(_read_private_regular_bytes(archive)) != source_hash:
-            raise CollectionError("durable legacy archive verification failed")
-        atomic_write_json(
-            receipt_path, _migration_receipt(plan, "archive-published")
-        )
-        if _sha256(_read_private_regular_bytes(paths["manifest"])) != source_hash:
-            raise CollectionError("legacy manifest changed before migration publication")
-        atomic_write_json(paths["manifest"], plan["target_manifest"])
-        if _sha256(_read_private_regular_bytes(paths["manifest"])) != target_hash:
-            raise CollectionError("target recovery manifest verification failed")
-        atomic_write_json(receipt_path, _migration_receipt(plan, "applied"))
-        return {
-            "schema_version": SCHEMA_VERSION,
-            "result": "applied",
-            "plan_token": plan["plan_token"],
-            "archive": str(archive),
-            "receipt": str(receipt_path),
-        }
-
-
-def rollback_legacy_recovery_manifest(
-    config: Mapping[str, Any],
-    plan_path: str | Path,
-    release_sha: str,
-    *,
-    collector: Callable[[Mapping[str, Any]], dict[str, Any]] | None = None,
-    proc_root: Path | None = None,
-) -> dict[str, Any]:
-    """Restore exact legacy bytes while every plan and generation guard holds."""
-    paths = _state_paths(config)
-    _, plan = _parse_private_json(Path(plan_path).expanduser(), "migration plan")
-    _validate_migration_plan(plan, paths, release_sha)
-    source_hash = plan["source_manifest"]["sha256"]
-    target_hash = plan["target_manifest_sha256"]
-    archive = Path(str(plan["archive_path"]))
-    receipt_path = _receipt_path(paths)
-    with StateLock(paths["root"], paths["lock"]):
-        if paths["pending"].exists() or paths["pending"].is_symlink():
-            raise CollectionError("legacy migration rollback refuses an existing pending queue")
-        receipt = _read_matching_receipt(receipt_path, plan, required=True)
-        assert receipt is not None
-        legacy_bytes = _read_private_regular_bytes(archive)
-        if _sha256(legacy_bytes) != source_hash:
-            raise CollectionError("legacy archive does not match the reviewed source")
-        canonical = _read_private_regular_bytes(paths["manifest"])
-        canonical_hash = _sha256(canonical)
-        if canonical_hash not in {source_hash, target_hash}:
-            raise CollectionError("rollback refuses a changed recovery manifest")
-        _revalidate_plan_context(
-            config,
-            plan,
-            legacy_bytes,
-            collector=collector,
-            proc_root=proc_root,
-        )
-        if canonical_hash == source_hash:
-            if receipt.get("phase") != "rolled-back":
-                atomic_write_json(
-                    receipt_path, _migration_receipt(plan, "rolled-back")
-                )
-            return {
-                "schema_version": SCHEMA_VERSION,
-                "result": "already-rolled-back",
-                "plan_token": plan["plan_token"],
-                "receipt": str(receipt_path),
-            }
-        _atomic_write_private_bytes(paths["manifest"], legacy_bytes)
-        if _sha256(_read_private_regular_bytes(paths["manifest"])) != source_hash:
-            raise CollectionError("exact legacy rollback verification failed")
-        atomic_write_json(receipt_path, _migration_receipt(plan, "rolled-back"))
-        return {
-            "schema_version": SCHEMA_VERSION,
-            "result": "rolled-back",
-            "plan_token": plan["plan_token"],
-            "receipt": str(receipt_path),
-        }
-
-
 def update_recovery_state(paths: Mapping[str, Path], inventory: Mapping[str, Any]) -> None:
     """Preserve exact pre-generation recovery data until explicitly resolved.
 
@@ -6436,321 +2039,47 @@ def update_recovery_state(paths: Mapping[str, Path], inventory: Mapping[str, Any
     ``recovery-pending.json`` before the current manifest can advance.  Empty
     and partial post-reboot inventories therefore cannot erase the queue.
     """
-    detected = recovery_manifest(inventory)
-    existing = _read_state_json(paths["manifest"])
-    pending = _read_state_json(paths["pending"])
-    existing_valid = _has_recovery_entries(existing)
-    pending_valid = _has_recovery_entries(pending)
-    detected_key = _generation_key(detected)
-    existing_key = _generation_key(existing) if existing_valid else None
-
-    # An unavailable/ambiguous daemon identity is not evidence of a restart.
-    # Do not advance or queue anything until both sides have exact generation
-    # keys; a later complete refresh can make the transition safely.
-    if detected_key is None or (existing_valid and existing_key is None):
-        return
-
-    if existing_valid and existing_key == detected_key:
-        existing_semantic = dict(existing)
-        detected_semantic = dict(detected)
-        existing_semantic.pop("generated_at", None)
-        detected_semantic.pop("generated_at", None)
-        if existing_semantic == detected_semantic:
-            # Timestamp-only refreshes must not invalidate an exact migration
-            # postimage or create needless state churn.
-            return
-
-    if existing_valid and existing_key != detected_key:
-        assert existing_key is not None
-        boot_changed = existing_key[0] != detected_key[0]
-        new_pending = {
-            "schema_version": SCHEMA_VERSION,
-            "generated_at": inventory.get("generated_at"),
-            "source_boot_id": existing.get("boot_id"),
-            "source_daemon_generation": existing.get("daemon_generation"),
-            "detected_boot_id": detected.get("boot_id"),
-            "detected_daemon_generation": detected.get("daemon_generation"),
-            "sessions": dict(existing["sessions"]),
-            # Outside-provider roots survive a daemon-only restart; they are
-            # recovery work only when the host boot itself changed.
-            "outside_agents": (
-                dict(existing.get("outside_agents", {})) if boot_changed else {}
-            ),
-        }
-        if pending_valid:
-            pending_source = (
-                pending.get("source_boot_id"),
-                json.dumps(pending.get("source_daemon_generation"), sort_keys=True),
-            )
-            new_source = (
-                new_pending.get("source_boot_id"),
-                json.dumps(new_pending.get("source_daemon_generation"), sort_keys=True),
-            )
-            if pending_source == new_source:
-                # Never shrink an unresolved queue during a partial restore.
-                new_pending["sessions"] = {
-                    **new_pending["sessions"],
-                    **dict(pending["sessions"]),
-                }
-                new_pending["outside_agents"] = {
-                    **new_pending.get("outside_agents", {}),
-                    **dict(pending.get("outside_agents", {})),
-                }
-            else:
-                # A second generation arrived before the first was reviewed.
-                # Keep the oldest queue primary and retain the later one
-                # explicitly instead of silently overwriting either.
-                new_pending = dict(pending)
-                queued = list(new_pending.get("queued_generations", ()))
-                candidate = {
-                    "source_boot_id": existing.get("boot_id"),
-                    "source_daemon_generation": existing.get("daemon_generation"),
-                    "sessions": dict(existing["sessions"]),
-                    "outside_agents": (
-                        dict(existing.get("outside_agents", {}))
-                        if boot_changed
-                        else {}
-                    ),
-                }
-                candidate_key = (
-                    candidate["source_boot_id"],
-                    json.dumps(candidate["source_daemon_generation"], sort_keys=True),
-                )
-                existing_keys = {
-                    (
-                        item.get("source_boot_id"),
-                        json.dumps(item.get("source_daemon_generation"), sort_keys=True),
-                    )
-                    for item in queued
-                    if isinstance(item, Mapping)
-                }
-                if candidate_key not in existing_keys:
-                    queued.append(candidate)
-                new_pending["queued_generations"] = queued
-                new_pending["detected_boot_id"] = detected.get("boot_id")
-                new_pending["detected_daemon_generation"] = detected.get(
-                    "daemon_generation"
-                )
-        if _has_recovery_entries(new_pending):
-            atomic_write_json(paths["pending"], new_pending)
-
-    # Never replace the latest nonempty exact manifest with an empty snapshot.
-    if detected["sessions"] or detected["outside_agents"]:
-        atomic_write_json(paths["manifest"], detected)
+    return _recovery.update_recovery_state(
+        paths,
+        inventory,
+        schema_version=SCHEMA_VERSION,
+        recovery_manifest=recovery_manifest,
+        read_state_json=_read_state_json,
+        has_recovery_entries=_has_recovery_entries,
+        generation_key=_generation_key,
+        atomic_write_json=atomic_write_json,
+    )
 
 
 def source_generation_key(boot_id: Any, generation: Any) -> str | None:
-    if not isinstance(generation, Mapping):
-        return None
-    candidate = {
-        "boot_id": boot_id,
-        "daemon_generation": generation,
-    }
-    exact = _generation_key(candidate)
-    if exact is None:
-        return None
-    return f"{exact[0]}:{exact[1]}:{exact[2]}"
-
-
-def _pending_evidence(entry: Mapping[str, Any]) -> dict[str, Any]:
-    return {
-        "source_generation_key": entry.get("source_generation_key"),
-        "queue": entry.get("queue"),
-        "queue_index": entry.get("queue_index"),
-        "scope": entry.get("scope"),
-        "old_shpool_id": entry.get("old_shpool_id"),
-    }
-
-
-def _pending_conflict_fields(entries: Sequence[Mapping[str, Any]]) -> list[str]:
-    fields = ("scope", "cwd", "argv", "command")
-    return [
-        field
-        for field in fields
-        if len({json.dumps(item.get(field), sort_keys=True) for item in entries}) > 1
-    ]
-
-
-def _pending_preferred_entry(entries: Sequence[dict[str, Any]]) -> dict[str, Any]:
-    primary = [item for item in entries if item.get("queue") == "primary"]
-    if primary:
-        return primary[0]
-
-    def queue_index(item: dict[str, Any]) -> int:
-        value = item.get("queue_index")
-        return value if isinstance(value, int) else -1
-
-    return max(entries, key=queue_index)
+    return _recovery.source_generation_key(
+        boot_id,
+        generation,
+        generation_key=_generation_key,
+    )
 
 
 def flatten_pending(value: Any) -> dict[str, Any]:
     """Return one safe recovery candidate per exact provider conversation."""
-    entries: list[dict[str, Any]] = []
-    if not _valid_recovery_state(value):
-        return {
-            "schema_version": SCHEMA_VERSION,
-            "generated_at": None,
-            "entries": [],
-        }
-    generations: list[
-        tuple[
-            str,
-            int | None,
-            Any,
-            Any,
-            Mapping[str, Any],
-            Mapping[str, Any],
-        ]
-    ] = [
-        (
-            "primary",
-            None,
-            value.get("source_boot_id"),
-            value.get("source_daemon_generation"),
-            value.get("sessions", {}),
-            value.get("outside_agents", {}),
-        )
-    ]
-    for index, queued in enumerate(value.get("queued_generations", ())):
-        if not isinstance(queued, Mapping) or not isinstance(queued.get("sessions"), Mapping):
-            continue
-        generations.append(
-            (
-                "queued",
-                index,
-                queued.get("source_boot_id"),
-                queued.get("source_daemon_generation"),
-                queued["sessions"],
-                queued.get("outside_agents", {})
-                if isinstance(queued.get("outside_agents", {}), Mapping)
-                else {},
-            )
-        )
-    for (
-        queue,
-        queue_index,
-        boot_id,
-        generation,
-        sessions,
-        outside_agents,
-    ) in generations:
-        key = source_generation_key(boot_id, generation)
-        scoped_entries = (
-            ("shpool", sessions),
-            ("outside", outside_agents),
-        )
-        for scope, stored_entries in scoped_entries:
-            for old_shpool_id, raw_session in stored_entries.items():
-                if not isinstance(old_shpool_id, str) or not isinstance(
-                    raw_session, Mapping
-                ):
-                    continue
-                uuid = valid_uuid(raw_session.get("uuid"))
-                provider = raw_session.get("provider")
-                entries.append(
-                    {
-                        "source_generation_key": key,
-                        "source_boot_id": boot_id,
-                        "source_daemon_generation": generation,
-                        "queue": queue,
-                        "queue_index": queue_index,
-                        "scope": scope,
-                        "old_shpool_id": old_shpool_id,
-                        "display_old_shpool_id": display_shpool_id(old_shpool_id),
-                        "provider": provider if provider in PROVIDERS else None,
-                        "uuid": uuid,
-                        "title": clean_text(raw_session.get("title"), 120),
-                        "cwd": clean_text(raw_session.get("cwd"), 4096) or None,
-                        "argv": list(raw_session.get("argv", ()))
-                        if isinstance(raw_session.get("argv"), list)
-                        else [],
-                        "command": clean_text(raw_session.get("command"), 8192)
-                        or None,
-                        "actionable": bool(key and uuid and provider in PROVIDERS),
-                    }
-                )
-    entries.sort(
-        key=lambda item: (
-            item["source_generation_key"] or "",
-            natural_name_key(item["old_shpool_id"]),
-            item["uuid"] or "",
-        )
+    return _recovery.flatten_pending(
+        value,
+        schema_version=SCHEMA_VERSION,
+        valid_recovery_state=_valid_recovery_state,
+        source_generation_key=source_generation_key,
+        pending_preferred_entry=_pending_preferred_entry,
+        pending_conflict_fields=_pending_conflict_fields,
+        pending_evidence=_pending_evidence,
     )
-    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
-    ungrouped: list[dict[str, Any]] = []
-    for entry in entries:
-        provider = entry.get("provider")
-        uuid = entry.get("uuid")
-        if provider in PROVIDERS and isinstance(uuid, str):
-            grouped.setdefault((provider, uuid), []).append(entry)
-        else:
-            ungrouped.append(entry)
-    deduplicated: list[dict[str, Any]] = []
-    for duplicates in grouped.values():
-        preferred = dict(_pending_preferred_entry(duplicates))
-        conflicts = _pending_conflict_fields(duplicates)
-        preferred["duplicate_count"] = len(duplicates) - 1
-        preferred["evidence"] = [_pending_evidence(item) for item in duplicates]
-        preferred["conflict_fields"] = conflicts
-        preferred["actionable"] = bool(preferred["actionable"] and not conflicts)
-        deduplicated.append(preferred)
-    for entry in ungrouped:
-        retained = dict(entry)
-        retained.update(
-            duplicate_count=0,
-            evidence=[_pending_evidence(entry)],
-            conflict_fields=[],
-        )
-        deduplicated.append(retained)
-    deduplicated.sort(
-        key=lambda item: (
-            item["source_generation_key"] or "",
-            natural_name_key(item["old_shpool_id"]),
-            item["uuid"] or "",
-        )
-    )
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "generated_at": value.get("generated_at"),
-        "detected_boot_id": value.get("detected_boot_id"),
-        "detected_daemon_generation": value.get("detected_daemon_generation"),
-        "entries": deduplicated,
-    }
 
 
 def list_pending(config: Mapping[str, Any]) -> dict[str, Any]:
-    paths = _state_paths(config)
-    with StateLock(paths["root"], paths["lock"]):
-        return flatten_pending(_read_state_json(paths["pending"]))
-
-
-def _remove_pending_entry(
-    pending: dict[str, Any],
-    *,
-    queue: str,
-    queue_index: int | None,
-    scope: str,
-    old_shpool_id: str,
-) -> None:
-    container = "outside_agents" if scope == "outside" else "sessions"
-    if queue == "primary":
-        sessions = pending.get(container)
-        if isinstance(sessions, dict):
-            sessions.pop(old_shpool_id, None)
-        return
-    queued = pending.get("queued_generations")
-    if not isinstance(queued, list) or not isinstance(queue_index, int):
-        raise CollectionError("pending queue changed during acknowledgment")
-    if queue_index < 0 or queue_index >= len(queued):
-        raise CollectionError("pending generation changed during acknowledgment")
-    generation = queued[queue_index]
-    if not isinstance(generation, dict) or not isinstance(
-        generation.get(container), dict
-    ):
-        raise CollectionError("pending generation is malformed")
-    generation[container].pop(old_shpool_id, None)
-    if not generation.get("sessions") and not generation.get("outside_agents"):
-        queued.pop(queue_index)
+    return _recovery.list_pending(
+        config,
+        state_paths=_state_paths,
+        state_lock=StateLock,
+        read_state_json=_read_state_json,
+        flatten_pending=flatten_pending,
+    )
 
 
 def acknowledge_pending(
@@ -6762,1001 +2091,105 @@ def acknowledge_pending(
     collector: Callable[[Mapping[str, Any]], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Compare-and-ack one restored entry under the inventory state lock."""
-    exact_uuid = valid_uuid(uuid)
-    if not generation_key or not old_shpool_id or not exact_uuid:
-        raise CollectionError("pending ack requires generation key, old shpool ID, and exact UUID")
-    paths = _state_paths(config)
-    with StateLock(paths["root"], paths["lock"]):
-        pending_raw = _read_state_json(paths["pending"])
-        if not _valid_recovery_state(pending_raw):
-            raise CollectionError("no valid pending recovery queue exists")
-        pending = json.loads(json.dumps(pending_raw))
-        flattened = flatten_pending(pending)
-        matches = [
-            item
-            for item in flattened["entries"]
-            if item["source_generation_key"] == generation_key
-            and item["old_shpool_id"] == old_shpool_id
-            and item["uuid"] == exact_uuid
-            and item["actionable"]
-        ]
-        if len(matches) != 1:
-            raise CollectionError("pending entry no longer matches generation, shpool ID, and UUID")
-        target = matches[0]
-
-        settings = dict(config)
-        live = (
-            collector(settings)
-            if collector is not None
-            else collect_live(settings)
-        )
-        complete = bool(live.pop("_complete", True))
-        if not complete or not strict_live_inventory(live):
-            raise CollectionError("strict live inventory unavailable; pending entry was not acknowledged")
-        active_matches = [
-            item
-            for item in [*live.get("sessions", ()), *live.get("outside_agents", ())]
-            if item.get("provider") == target["provider"]
-            and item.get("identity", {}).get("uuid") == exact_uuid
-            and item.get("identity", {}).get("confidence") == "exact"
-        ]
-        if len(active_matches) != 1:
-            raise CollectionError(
-                "exact pending provider UUID is not uniquely active; pending entry was not acknowledged"
-            )
-        evidence = target.get("evidence")
-        if not isinstance(evidence, list) or not evidence:
-            raise CollectionError("pending recovery evidence is incomplete")
-        ordered_evidence = sorted(
-            evidence,
-            key=lambda item: (
-                item.get("queue") == "primary",
-                -(item.get("queue_index") if isinstance(item.get("queue_index"), int) else -1),
-            ),
-        )
-        for source in ordered_evidence:
-            if not isinstance(source, Mapping):
-                raise CollectionError("pending recovery evidence is malformed")
-            _remove_pending_entry(
-                pending,
-                queue=str(source.get("queue") or ""),
-                queue_index=source.get("queue_index"),
-                scope=str(source.get("scope") or ""),
-                old_shpool_id=str(source.get("old_shpool_id") or ""),
-            )
-        pending["updated_at"] = _utc_now()
-        atomic_write_json(paths["pending"], pending)
-        return {
-            "schema_version": SCHEMA_VERSION,
-            "acknowledged": target,
-            "remaining": flatten_pending(pending),
-        }
+    return _recovery.acknowledge_pending(
+        config,
+        generation_key,
+        old_shpool_id,
+        uuid,
+        collector=collector,
+        schema_version=SCHEMA_VERSION,
+        state_paths=_state_paths,
+        state_lock=StateLock,
+        read_state_json=_read_state_json,
+        valid_recovery_state=_valid_recovery_state,
+        flatten_pending=flatten_pending,
+        collect_live=collect_live,
+        strict_live_inventory=strict_live_inventory,
+        remove_pending_entry=_remove_pending_entry,
+        atomic_write_json=atomic_write_json,
+    )
 
 
 def _cold_inventory(error: str) -> dict[str, Any]:
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "generated_at": _utc_now(),
-        "source": "cold",
-        "stale": True,
-        "warnings": [clean_text(error, 400)],
-        "daemon_generation": None,
-        "sessions": [],
-        "outside_agents": [],
-    }
+    return _snapshot._cold_inventory(
+        error,
+        schema_version=SCHEMA_VERSION,
+    )
 
 
 def snapshot(*, write_state: bool = True, config: dict[str, Any] | None = None) -> dict[str, Any]:
-    settings = config or load_config()
-    paths = _state_paths(settings)
-    if write_state:
-        with StateLock(paths["root"], paths["lock"]):
-            cached = _read_state_json(paths["inventory"])
-    else:
-        # --no-write is also useful in deployment validation.  Do not create a
-        # state directory or lock file merely to inspect existing state.
-        cached = _read_state_json(paths["inventory"])
-    try:
-        live = collect_live(settings)
-    except CollectionError as exc:
-        live = None
-        failure = str(exc)
-    else:
-        assert live is not None
-        failure = "; ".join(live.get("warnings", ()))
-    complete = bool(live and live.pop("_complete", True))
-    if complete and live is not None:
-        result: dict[str, Any] = live
-        try:
-            boot_id = _boot_id()
-            if not boot_id:
-                raise CollectionError("current boot identity is unavailable")
-            if write_state:
-                with StateLock(paths["root"], paths["lock"]):
-                    locked_cached = _read_state_json(paths["inventory"])
-                    _lifecycle.persist_last_exact(
-                        result,
-                        (
-                            locked_cached
-                            if isinstance(locked_cached, Mapping)
-                            else None
-                        ),
-                        state_dir=paths["root"],
-                        boot_id=boot_id,
-                    )
-                    _lifecycle.apply_provider_exit_states(
-                        result,
-                        (
-                            locked_cached
-                            if isinstance(locked_cached, Mapping)
-                            else None
-                        ),
-                        state_dir=paths["root"],
-                        boot_id=boot_id,
-                    )
-                    registry = _read_terminal_registry(
-                        paths["terminal_numbers"],
-                        boot_id,
-                        paths["terminal_numbers_epoch"],
-                    )
-                    retired_numbers = _read_terminal_retirements(
-                        paths["terminal_numbers_retired"], boot_id
-                    )
-                    updated_registry = apply_terminal_numbers(
-                        result,
-                        registry,
-                        boot_id=boot_id,
-                        allocate=True,
-                        retired=retired_numbers,
-                    )
-                    atomic_write_json(
-                        paths["terminal_numbers"], updated_registry
-                    )
-                    atomic_write_json(
-                        paths["terminal_numbers_retired"],
-                        _terminal_retirement_payload(retired_numbers, boot_id),
-                    )
-                    atomic_write_json(
-                        paths["terminal_numbers_epoch"],
-                        {
-                            "schema_version": SCHEMA_VERSION,
-                            "boot_id": boot_id,
-                        },
-                    )
-                    quarantined_markers = _quarantine_orphaned_provider_untitled_markers(
-                        settings, result
-                    )
-                    if quarantined_markers:
-                        result["provider_untitled_quarantine"] = quarantined_markers
-                    atomic_write_json(paths["inventory"], result)
-                    update_recovery_state(paths, result)
-                    _lifecycle.prune_inactive_state(
-                        paths["root"],
-                        [
-                            item["shpool_id_raw"]
-                            for item in result.get("sessions", ())
-                            if isinstance(item, Mapping)
-                            and isinstance(item.get("shpool_id_raw"), str)
-                        ],
-                    )
-            else:
-                _lifecycle.apply_provider_exit_states(
-                    result,
-                    cached if isinstance(cached, Mapping) else None,
-                    state_dir=paths["root"],
-                    boot_id=boot_id,
-                )
-                registry = _read_terminal_registry(
-                    paths["terminal_numbers"],
-                    boot_id,
-                    paths["terminal_numbers_epoch"],
-                )
-                apply_terminal_numbers(
-                    result, registry, boot_id=boot_id, allocate=False
-                )
-        except CollectionError as exc:
-            failure = str(exc)
-            warnings = list(result.get("warnings", ()))
-            warnings.append(f"terminal numbering unavailable: {failure}")
-            result["warnings"] = warnings
-            complete = False
-        if complete:
-            return result
-    if isinstance(cached, Mapping) and cached.get("schema_version") == SCHEMA_VERSION:
-        result = dict(cached)
-        result["source"] = "cache"
-        result["stale"] = True
-        warnings = list(result.get("warnings", ()))
-        warnings.append(f"live refresh failed; showing last-known-good: {failure}")
-        result["warnings"] = warnings
-        return result
-    if live is not None:
-        live["source"] = "cold"
-        live["stale"] = True
-        return live
-    return _cold_inventory(f"inventory unavailable and no last-known-good cache exists: {failure}")
+    return _snapshot.snapshot(
+        write_state=write_state,
+        config=config,
+        schema_version=SCHEMA_VERSION,
+        load_config=load_config,
+        state_paths=_state_paths,
+        state_lock=StateLock,
+        read_state_json=_read_state_json,
+        collect_live=collect_live,
+        boot_id_factory=_boot_id,
+        persist_last_exact=_lifecycle.persist_last_exact,
+        apply_provider_exit_states=_lifecycle.apply_provider_exit_states,
+        prune_inactive_state=_lifecycle.prune_inactive_state,
+        read_terminal_registry=_read_terminal_registry,
+        read_terminal_retirements=_read_terminal_retirements,
+        apply_terminal_numbers=apply_terminal_numbers,
+        terminal_retirement_payload=_terminal_retirement_payload,
+        atomic_write_json=atomic_write_json,
+        quarantine_orphaned_provider_untitled_markers=(
+            _quarantine_orphaned_provider_untitled_markers
+        ),
+        update_recovery_state=update_recovery_state,
+        cold_inventory=_cold_inventory,
+    )
 
 
-def _format_age(seconds: int | None) -> str:
-    if seconds is None:
-        return ""
-    minutes = seconds // 60
-    if minutes < 60:
-        return f"{minutes}m"
-    hours, minutes = divmod(minutes, 60)
-    if hours < 24:
-        return f"{hours}h {minutes}m"
-    days, hours = divmod(hours, 24)
-    return f"{days}d {hours}h"
 
 
 def _short_path(path: str) -> str:
-    home = str(_home())
-    return f"~{path[len(home):]}" if path == home or path.startswith(home + os.sep) else path
+    return _render._short_path(path, home_factory=_home)
 
 
-def _display_width(value: str) -> int:
-    """Conservative terminal-cell width without adding a runtime dependency."""
-    return sum(
-        0
-        if unicodedata.combining(character)
-        else 2
-        if unicodedata.east_asian_width(character) in {"W", "F"}
-        else 1
-        for character in value
-    )
 
 
-def _display_title(value: Any, limit: int = 48) -> str:
-    """Control-safe, terminal-cell-aware truncation for display only."""
-    text = clean_text(value, 10000)
-    if _display_width(text) <= limit:
-        return text
-    if limit <= 1:
-        return "…"
-    kept: list[str] = []
-    used = 0
-    for character in text:
-        cells = _display_width(character)
-        if used + cells > limit - 1:
-            break
-        kept.append(character)
-        used += cells
-    return f"{''.join(kept)}…"
 
 
-def _color_enabled() -> bool:
-    return (
-        sys.stdout.isatty()
-        and not os.environ.get("NO_COLOR")
-        and not os.environ.get("SESSION_KIT_NO_COLOR")
-    )
 
 
-DEFAULT_STALL_SECONDS = 2700
 
 
-def stall_threshold_seconds() -> int:
-    """Silence after which a session stops being described as running.
-
-    Deliberately far above any normal pause. Codex sessions report "running"
-    for their whole life, working or waiting, so a short threshold would label
-    every parked session and the warning would stop meaning anything. Override
-    with SESSION_KIT_STALL_SECONDS.
-    """
-    return _positive_int(
-        os.environ.get("SESSION_KIT_STALL_SECONDS"),
-        DEFAULT_STALL_SECONDS,
-        60,
-        86400,
-    )
 
 
 def render_inventory(inventory: Mapping[str, Any], rows_only: bool = False) -> str:
-    """Render action-first/provider groups with sequential visible row numbers."""
-    color = _color_enabled()
-    bold = "\033[1m" if color else ""
-    dim = "\033[2m" if color else ""
-    cyan = "\033[36m" if color else ""
-    green = "\033[32m" if color else ""
-    yellow = "\033[33m" if color else ""
-    reset = "\033[0m" if color else ""
-    # Truecolor values equal to what Codex RENDERS for each sk-<color> theme
-    # accent (measured from captured frames — Codex contrast-adjusts the raw
-    # theme hex), so a session's name is pixel-identical here and in its own
-    # Codex status bar. Remeasure if the theme anchors ever change.
-    session_palette = (
-        {
-            "red": "\033[38;2;237;93;93m",
-            "blue": "\033[38;2;97;166;240m",
-            "green": "\033[38;2;63;221;115m",
-            "yellow": "\033[38;2;249;215;108m",
-            "purple": "\033[38;2;173;115;239m",
-            "orange": "\033[38;2;242;144;81m",
-            "pink": "\033[38;2;240;113;177m",
-            "cyan": "\033[38;2;64;216;209m",
-        }
-        if color
-        else {}
+    return _render.render_inventory(
+        inventory,
+        rows_only,
+        color_enabled=_color_enabled,
     )
 
-    def tint(item: Mapping[str, Any], text: str) -> str:
-        code = session_palette.get(item.get("display_color") or "")
-        return f"{code}{text}{reset}" if code else text
-    terminal_columns = shutil.get_terminal_size(fallback=(101, 24)).columns
-    columns = _positive_int(
-        os.environ.get("COLUMNS"),
-        max(2, min(240, terminal_columns)),
-        2,
-        240,
-    )
-    width = max(1, columns - 1)
-    lines: list[str] = []
-    if inventory.get("stale"):
-        lines.append(f"{yellow}  Warning: showing {inventory.get('source')} inventory.{reset}")
-    sessions = list(inventory.get("sessions", ()))
-    has_terminal_numbers = any(
-        isinstance(item, Mapping)
-        and isinstance(item.get("terminal_number"), int)
-        and not isinstance(item.get("terminal_number"), bool)
-        and item.get("terminal_number", 0) > 0
-        for item in sessions
-    )
-    available_count = sum(
-        1 for item in sessions if item.get("availability") == "ready"
-    )
-    attached_count = sum(
-        1 for item in sessions if item.get("availability") == "attached"
-    )
-    session_word = "session" if len(sessions) == 1 else "sessions"
-    lines.append(
-        f"  {len(sessions)} {session_word}: {available_count} available, "
-        f"{attached_count} open in another window"
-    )
-    if sessions:
-        lines.append("")
-    for availability in ("ready", "attached"):
-        selected = [item for item in sessions if item.get("availability") == availability]
-        if not selected:
-            continue
-        heading = (
-            "Available to open"
-            if availability == "ready"
-            else "Already open in another window"
-        )
-        lines.append(f"  {bold}{heading}{reset}")
-        for provider in ("claude", "codex", "shell", "unknown"):
-            # Group by the display provider so this view agrees with the
-            # chooser: a started-but-unused Codex session belongs under Codex,
-            # not under Unknown, even though its identity is not yet resolvable.
-            group = [
-                item
-                for item in selected
-                if (item.get("display_provider") or item.get("provider")) == provider
-            ]
-            if not group:
-                continue
-            lines.append(f"    {cyan}{provider.title()}{reset}")
-            for item in group:
-                process_age = _format_age(item.get("process_age_seconds"))
-                recent_output_age = _format_age(
-                    item.get("recent_output_age_seconds")
-                )
-                status = clean_text(item.get("agent_status") or "unknown", 64)
-                recent_seconds = item.get("recent_output_age_seconds")
-                # "running" is not evidence for Codex, which reports it whether
-                # it is working or waiting. State the silence instead.
-                if (
-                    status.casefold() == "running"
-                    and isinstance(recent_seconds, int)
-                    and not isinstance(recent_seconds, bool)
-                    and recent_seconds >= stall_threshold_seconds()
-                    and recent_output_age
-                ):
-                    status = f"quiet {recent_output_age}"
-                status_parts = (
-                    ["needs your reply"]
-                    if item.get("needs_you")
-                    else [status]
-                )
-                if recent_output_age:
-                    status_parts.append(f"recent output {recent_output_age} ago")
-                if process_age:
-                    status_parts.append(f"process age {process_age}")
-                agent_count = int(
-                    item.get("active_subagent_count", len(item.get("subagents", ())))
-                )
-                if agent_count:
-                    status_parts.append(
-                        f"{agent_count} subagent{'s' if agent_count != 1 else ''}"
-                    )
-                selector = item.get("terminal_number")
-                if (
-                    isinstance(selector, bool)
-                    or not isinstance(selector, int)
-                    or selector <= 0
-                ):
-                    selector = "-" if has_terminal_numbers else item.get("row")
-                prefix = f"      {selector:>2}  "
-                title_room = max(1, width - _display_width(prefix))
-                title = _display_title(item.get("title"), title_room)
-                lines.append(
-                    f"      {green}{selector:>2}{reset}  {tint(item, title)}"
-                )
-                detail_prefix = "          "
-                detail_room = max(1, width - _display_width(detail_prefix))
-                details = _display_title(" | ".join(status_parts), detail_room)
-                detail_color = (
-                    yellow
-                    if item.get("needs_you")
-                    or status.casefold() == "provider exited"
-                    else dim
-                )
-                lines.append(f"{detail_prefix}{detail_color}{details}{reset}")
-    outside = list(inventory.get("outside_agents", ()))
-    if outside:
-        lines.append(f"  {bold}Outside shpool{reset}")
-        for item in outside:
-            uuid = item.get("identity", {}).get("uuid") or ""
-            agent_count = int(
-                item.get("active_subagent_count", len(item.get("subagents", ())))
-            )
-            prefix = f"      -  [{item.get('provider')}] "
-            title = _display_title(
-                item.get("title"), max(1, width - _display_width(prefix))
-            )
-            lines.append(f"{prefix}{tint(item, title)}")
-            detail_parts = [clean_text(item.get("agent_status") or "unknown", 64)]
-            if uuid:
-                detail_parts.append(uuid[:8])
-            if agent_count:
-                detail_parts.append(
-                    f"{agent_count} subagent{'s' if agent_count != 1 else ''}"
-                )
-            detail_prefix = "          "
-            details = _display_title(
-                " | ".join(detail_parts),
-                max(1, width - _display_width(detail_prefix)),
-            )
-            lines.append(f"{detail_prefix}{dim}{details}{reset}")
-    if not sessions and not outside:
-        lines.append("  No sessions found.")
-    if not rows_only:
-        lines.extend(
-            [
-                "",
-                f"  {dim}sp go <n>: open | sp new: start{reset}",
-                f"  {dim}sp close <n>: close | sp find \"text\": search history{reset}",
-            ]
-        )
-    return "\n".join(lines)
 
-
-def lookup(inventory: Mapping[str, Any], selector: str) -> dict[str, Any] | None:
-    matches: list[dict[str, Any]] = []
-    if selector.isdigit():
-        number = int(selector)
-        sessions = list(inventory.get("sessions", ()))
-        if any(
-            isinstance(item.get("terminal_number"), int)
-            and not isinstance(item.get("terminal_number"), bool)
-            and item.get("terminal_number", 0) > 0
-            for item in sessions
-            if isinstance(item, Mapping)
-        ):
-            matches = [
-                item
-                for item in sessions
-                if item.get("terminal_number") == number
-            ]
-        else:
-            matches = [item for item in sessions if item.get("row") == number]
-    else:
-        matches = [
-            item
-            for item in inventory.get("sessions", ())
-            if (item.get("shpool_id_raw") or item.get("shpool_id")) == selector
-        ]
-    return matches[0] if len(matches) == 1 else None
 
 
 def strict_live_inventory(inventory: Mapping[str, Any]) -> bool:
-    """True only for a complete, unambiguous live mutation guard snapshot."""
-    if not guard_live_inventory(inventory):
-        return False
-    generation = inventory.get("daemon_generation")
-    outside_agents = inventory.get("outside_agents")
-    if (
-        inventory.get("source") != "live"
-        or inventory.get("stale") is not False
-        or inventory.get("warnings")
-        or not isinstance(generation, Mapping)
-        or not isinstance(generation.get("pid"), int)
-        or generation.get("pid", 0) <= 0
-        or not isinstance(generation.get("process_start_ticks"), int)
-        or generation.get("process_start_ticks", 0) <= 0
-        or not isinstance(outside_agents, list)
-    ):
-        return False
-    exact_provider_uuids: set[tuple[str, str]] = set()
-    for item in inventory.get("sessions", ()):
-        identity = item.get("identity")
-        shell = item.get("shpool_shell")
-        raw_id = item.get("shpool_id_raw")
-        provider = item.get("provider")
-        mutation_allowed, mutation_reason = shpool_id_mutation_policy(raw_id)
-        if (
-            not isinstance(raw_id, str)
-            or raw_id != item.get("shpool_id")
-            or item.get("mutation_allowed") is not mutation_allowed
-            or item.get("mutation_rejection_reason") != mutation_reason
-            or provider not in {"claude", "codex", "shell"}
-            or not isinstance(identity, Mapping)
-            or identity.get("confidence") != "exact"
-            or not isinstance(identity.get("pid"), int)
-            or not isinstance(identity.get("process_start_ticks"), int)
-            or not isinstance(shell, Mapping)
-            or not isinstance(shell.get("pid"), int)
-            or not isinstance(shell.get("process_start_ticks"), int)
-        ):
-            return False
-        if provider in PROVIDERS:
-            if not isinstance(provider, str):
-                return False
-            uuid = valid_uuid(identity.get("uuid"))
-            if not uuid:
-                return False
-            key = (provider, uuid)
-            if key in exact_provider_uuids:
-                return False
-            exact_provider_uuids.add(key)
-        elif identity.get("uuid") is not None:
-            return False
-    for item in outside_agents:
-        if not isinstance(item, Mapping):
-            return False
-        provider = item.get("provider")
-        identity = item.get("identity")
-        if (
-            provider not in PROVIDERS
-            or not isinstance(identity, Mapping)
-            or identity.get("confidence") != "exact"
-            or isinstance(identity.get("pid"), bool)
-            or not isinstance(identity.get("pid"), int)
-            or identity.get("pid", 0) <= 0
-            or isinstance(identity.get("process_start_ticks"), bool)
-            or not isinstance(identity.get("process_start_ticks"), int)
-            or identity.get("process_start_ticks", 0) <= 0
-        ):
-            return False
-        if not isinstance(provider, str):
-            return False
-        uuid = valid_uuid(identity.get("uuid"))
-        if not uuid:
-            return False
-        key = (provider, uuid)
-        if key in exact_provider_uuids:
-            return False
-        exact_provider_uuids.add(key)
-    return True
+    return _validation.strict_live_inventory(
+        inventory,
+        guard_inventory=guard_live_inventory,
+    )
 
 
 def guard_live_inventory(inventory: Mapping[str, Any]) -> bool:
-    """Validate a live mutation snapshot without rejecting unrelated unknown rows.
-
-    Unlike ``strict_live_inventory``, this predicate permits an unresolved
-    provider session.  It still requires an exact daemon generation, an exact
-    shell generation for every managed row, and exact provider identity for
-    every row whose provider is known.
-    """
-
-    def positive_int(value: Any) -> bool:
-        return isinstance(value, int) and not isinstance(value, bool) and value > 0
-
-    if not isinstance(inventory, Mapping):
-        return False
-    generation = inventory.get("daemon_generation")
-    warnings = inventory.get("warnings")
-    sessions = inventory.get("sessions")
-    outside_agents = inventory.get("outside_agents")
-    if (
-        inventory.get("schema_version") != SCHEMA_VERSION
-        or inventory.get("source") != "live"
-        or inventory.get("stale") is not False
-        or not isinstance(warnings, list)
-        or warnings
-        or not isinstance(generation, Mapping)
-        or not positive_int(generation.get("pid"))
-        or not positive_int(generation.get("process_start_ticks"))
-        or not isinstance(sessions, list)
-        or not isinstance(outside_agents, list)
-    ):
-        return False
-
-    rows: set[int] = set()
-    terminal_numbers: set[int] = set()
-    raw_ids: set[str] = set()
-    exact_provider_uuids: set[tuple[str, str]] = set()
-    for item in sessions:
-        if not isinstance(item, Mapping):
-            return False
-        row = item.get("row")
-        raw_id = item.get("shpool_id_raw")
-        identity = item.get("identity")
-        shell = item.get("shpool_shell")
-        provider = item.get("provider")
-        terminal_number = item.get("terminal_number")
-        if _missing_shell_generation_is_quarantined(item):
-            if (
-                isinstance(row, bool)
-                or not isinstance(row, int)
-                or row <= 0
-                or row in rows
-                or not isinstance(raw_id, str)
-                or raw_id in raw_ids
-            ):
-                return False
-            rows.add(row)
-            raw_ids.add(raw_id)
-            continue
-        mutation_allowed, mutation_reason = shpool_id_mutation_policy(raw_id)
-        if (
-            isinstance(row, bool)
-            or not isinstance(row, int)
-            or row <= 0
-            or row in rows
-            or not isinstance(raw_id, str)
-            or not raw_id
-            or raw_id in raw_ids
-            or raw_id != item.get("shpool_id")
-            or item.get("mutation_allowed") is not mutation_allowed
-            or item.get("mutation_rejection_reason") != mutation_reason
-            or not isinstance(identity, Mapping)
-            or not isinstance(shell, Mapping)
-            or not positive_int(shell.get("pid"))
-            or not positive_int(shell.get("process_start_ticks"))
-        ):
-            return False
-        if terminal_number is not None and (
-            isinstance(terminal_number, bool)
-            or not isinstance(terminal_number, int)
-            or terminal_number <= 0
-            or terminal_number in terminal_numbers
-        ):
-            return False
-        if isinstance(terminal_number, int):
-            terminal_numbers.add(terminal_number)
-        rows.add(row)
-        raw_ids.add(raw_id)
-
-        if provider == "unknown":
-            if (
-                identity.get("confidence") != "unknown"
-                or identity.get("uuid") is not None
-                or identity.get("pid") != shell.get("pid")
-                or identity.get("process_start_ticks")
-                != shell.get("process_start_ticks")
-            ):
-                return False
-            continue
-        if provider not in {"claude", "codex", "shell"}:
-            return False
-        if (
-            identity.get("confidence") != "exact"
-            or not positive_int(identity.get("pid"))
-            or not positive_int(identity.get("process_start_ticks"))
-        ):
-            return False
-        if provider in {"claude", "codex"}:
-            uuid = valid_uuid(identity.get("uuid"))
-            if not uuid:
-                return False
-            key = (provider, uuid)
-            if key in exact_provider_uuids:
-                return False
-            exact_provider_uuids.add(key)
-        elif identity.get("uuid") is not None:
-            return False
-
-    for item in outside_agents:
-        if not isinstance(item, Mapping):
-            return False
-        provider = item.get("provider")
-        identity = item.get("identity")
-        if (
-            provider not in PROVIDERS
-            or not isinstance(identity, Mapping)
-            or identity.get("confidence") != "exact"
-            or not positive_int(identity.get("pid"))
-            or not positive_int(identity.get("process_start_ticks"))
-        ):
-            return False
-        if not isinstance(provider, str):
-            return False
-        uuid = valid_uuid(identity.get("uuid"))
-        if not uuid:
-            return False
-        key = (provider, uuid)
-        if key in exact_provider_uuids:
-            return False
-        exact_provider_uuids.add(key)
-
-    return rows == set(range(1, len(sessions) + 1))
+    return _validation.guard_live_inventory(
+        inventory,
+        schema_version=SCHEMA_VERSION,
+    )
 
 
 def load_inventory_input(path: str | Path) -> dict[str, Any]:
-    """Load a previously frozen v1 snapshot for TOCTOU-safe render/lookup."""
-    source = Path(path).expanduser()
-    try:
-        value = _load_json_file(source)
-    except (OSError, ValueError) as exc:
-        raise CollectionError(f"cannot read inventory input {source}: {exc}") from exc
-    if (
-        not isinstance(value, Mapping)
-        or value.get("schema_version") != SCHEMA_VERSION
-        or not isinstance(value.get("sessions"), list)
-        or not isinstance(value.get("outside_agents"), list)
-    ):
-        raise CollectionError(f"inventory input {source} is not a valid v1 snapshot")
-    names: set[str] = set()
-    rows: set[int] = set()
-    terminal_numbers: set[int] = set()
-    has_terminal_numbers = any(
-        isinstance(item, Mapping)
-        and isinstance(item.get("terminal_number"), int)
-        and not isinstance(item.get("terminal_number"), bool)
-        and item.get("terminal_number", 0) > 0
-        for item in value["sessions"]
+    return _validation.load_inventory_input(
+        path,
+        schema_version=SCHEMA_VERSION,
+        load_json_file=_load_json_file,
     )
-    for item in value["sessions"]:
-        if not isinstance(item, Mapping):
-            raise CollectionError(f"inventory input {source} has a non-object session")
-        name = item.get("shpool_id")
-        raw_name = item.get("shpool_id_raw", name)
-        row = item.get("row")
-        terminal_number = item.get("terminal_number")
-        if (
-            not isinstance(name, str)
-            or not name
-            or raw_name != name
-            or not isinstance(row, int)
-            or row <= 0
-            or name in names
-            or row in rows
-            or (
-                has_terminal_numbers
-                and _missing_shell_generation_is_quarantinable(item)
-                and not _missing_shell_generation_is_quarantined(item)
-            )
-            or (
-                has_terminal_numbers
-                and terminal_number is None
-                and not _missing_shell_generation_is_quarantined(item)
-            )
-            or (
-                has_terminal_numbers
-                and terminal_number is not None
-                and (
-                    isinstance(terminal_number, bool)
-                    or not isinstance(terminal_number, int)
-                    or terminal_number <= 0
-                    or terminal_number in terminal_numbers
-                )
-            )
-        ):
-            raise CollectionError(f"inventory input {source} has invalid or duplicate selectors")
-        names.add(name)
-        rows.add(row)
-        if has_terminal_numbers and terminal_number is not None:
-            terminal_numbers.add(terminal_number)
-    return dict(value)
-
-
-def _process_ancestor_chain(
-    process_table: Mapping[int, Mapping[str, Any]], current_pid: int
-) -> list[int]:
-    chain: list[int] = []
-    seen: set[int] = set()
-    pid = current_pid
-    for _ in range(128):
-        if pid in seen or pid <= 0:
-            raise CollectionError("automatic name caller ancestry is ambiguous")
-        process = process_table.get(pid)
-        if not isinstance(process, Mapping):
-            raise CollectionError("automatic name caller process is stale")
-        chain.append(pid)
-        seen.add(pid)
-        parent = process.get("ppid")
-        if isinstance(parent, bool) or not isinstance(parent, int) or parent <= 0:
-            break
-        if parent not in process_table:
-            break
-        pid = parent
-    else:
-        raise CollectionError("automatic name caller ancestry exceeds safety bound")
-    return chain
-
-
-def prove_self_name_caller(
-    inventory: Mapping[str, Any],
-    process_table: Mapping[int, Mapping[str, Any]],
-    environ: Mapping[str, str],
-    current_pid: int,
-) -> dict[str, Any]:
-    """Prove one exact managed root conversation and its current shell generation."""
-    if inventory.get("source") != "live" or inventory.get("stale") is not False:
-        raise CollectionError("automatic naming requires a fresh live inventory")
-    shpool_id = environ.get("SHPOOL_SESSION_NAME", "")
-    if not shpool_id:
-        raise CollectionError("automatic naming is unavailable outside a managed shell")
-    matches = [
-        item
-        for item in inventory.get("sessions", ())
-        if isinstance(item, Mapping) and item.get("shpool_id_raw") == shpool_id
-    ]
-    if len(matches) != 1:
-        raise CollectionError("automatic name caller session is ambiguous or stale")
-    item = matches[0]
-    provider = item.get("provider")
-    identity = item.get("identity")
-    shell = item.get("shpool_shell")
-    if (
-        provider not in PROVIDERS
-        or item.get("setup_incomplete") is not False
-        or not isinstance(identity, Mapping)
-        or identity.get("confidence") != "exact"
-        or not isinstance(shell, Mapping)
-    ):
-        raise CollectionError("automatic name caller setup is incomplete")
-    uuid = valid_uuid(identity.get("uuid"))
-    provider_pid = identity.get("pid")
-    provider_start = identity.get("process_start_ticks")
-    shell_pid = shell.get("pid")
-    shell_start = shell.get("process_start_ticks")
-    if (
-        not uuid
-        or any(
-            isinstance(value, bool) or not isinstance(value, int) or value <= 0
-            for value in (provider_pid, provider_start, shell_pid, shell_start)
-        )
-    ):
-        raise CollectionError("automatic name caller lacks an exact generation")
-    chain = _process_ancestor_chain(process_table, current_pid)
-    if provider_pid not in chain or shell_pid not in chain:
-        raise CollectionError("automatic name caller is outside the exact provider root")
-    if chain.index(provider_pid) >= chain.index(shell_pid):
-        raise CollectionError("automatic name caller ancestry is not a managed root")
-    if process_table[provider_pid].get("start_ticks") != provider_start:
-        raise CollectionError("automatic name provider generation changed")
-    if process_table[shell_pid].get("start_ticks") != shell_start:
-        raise CollectionError("automatic name shell generation changed")
-    for pid in chain[: chain.index(provider_pid) + 1]:
-        argv = process_table[pid].get("cmdline") or ()
-        if "--parent-session-id" in argv or "--agent-name" in argv:
-            raise CollectionError("automatic naming is refused for a subagent")
-    if provider == "codex":
-        caller_uuid = valid_uuid(environ.get("CODEX_THREAD_ID"))
-        if any(
-            isinstance(child, Mapping)
-            and child.get("provider") == "codex"
-            and valid_uuid(child.get("uuid")) == caller_uuid
-            for child in item.get("subagents", ())
-        ):
-            raise CollectionError("automatic naming is refused for a subagent")
-        if caller_uuid != uuid:
-            raise CollectionError("Codex caller is not the managed root conversation")
-    else:
-        claude_uuid = environ.get("CLAUDE_SESSION_ID")
-        if claude_uuid and valid_uuid(claude_uuid) != uuid:
-            raise CollectionError("Claude caller is not the managed root conversation")
-    return {
-        "provider": provider,
-        "uuid": uuid,
-        "shpool_id": shpool_id,
-        "provider_pid": provider_pid,
-        "provider_start_ticks": provider_start,
-        "shell_pid": shell_pid,
-        "shell_start_ticks": shell_start,
-    }
-
-
-def self_name_automatic_title(
-    config: Mapping[str, Any],
-    title: str,
-    *,
-    inventory: Mapping[str, Any] | None = None,
-    process_table: Mapping[int, Mapping[str, Any]] | None = None,
-    environ: Mapping[str, str] | None = None,
-    current_pid: int | None = None,
-) -> dict[str, Any]:
-    """Provider-neutral exact self-name entry point used by root agents."""
-    caller_environ = environ if environ is not None else os.environ
-    if not automatic_naming_enabled(caller_environ):
-        raise CollectionError("automatic naming is disabled")
-    proc_root = Path(caller_environ.get("SESSION_KIT_PROC_ROOT", "/proc"))
-    supplied_evidence = inventory is not None or process_table is not None
-    live = inventory or snapshot(write_state=False, config=dict(config))
-    table = process_table or platform_process_table(
-        proc_root, int(config.get("max_proc_nodes", DEFAULT_MAX_PROC_NODES))
-    )
-    pid = current_pid if current_pid is not None else os.getpid()
-    evidence = prove_self_name_caller(live, table, caller_environ, pid)
-
-    def revalidate() -> None:
-        if supplied_evidence:
-            new_live, new_table = live, table
-        else:
-            new_live = snapshot(write_state=False, config=dict(config))
-            new_table = platform_process_table(
-                proc_root,
-                int(config.get("max_proc_nodes", DEFAULT_MAX_PROC_NODES)),
-            )
-        repeated = prove_self_name_caller(
-            new_live, new_table, caller_environ, pid
-        )
-        if repeated != evidence:
-            raise CollectionError("automatic name caller changed before write")
-
-    try:
-        normalized = normalize_automatic_title(title)
-    except CollectionError as reason:
-        attempts = record_automatic_title_failure(
-            config,
-            str(evidence["provider"]),
-            str(evidence["uuid"]),
-            revalidate=revalidate,
-        )
-        suffix = "name failed" if attempts >= 2 else "name pending"
-        raise CollectionError(
-            f"automatic title rejected ({reason}); {suffix}"
-        ) from reason
-    # A self-name owns both display tiers. Write them in one transaction so a
-    # repeated rename cannot trip over the alias created by the previous one.
-    result = mutate_canonical_self_name(
-        config,
-        str(evidence["provider"]),
-        str(evidence["uuid"]),
-        normalized,
-        revalidate=revalidate,
-    )
-    result["caller"] = evidence
-    # A self-name is an explicit rename, not background bookkeeping: it also
-    # becomes the alias, the top display tier. In the automatic tier alone it
-    # lost to the provider's own ai-title, so the picker kept showing a stale
-    # native name after an agent explicitly renamed itself. `sp name reset`
-    # still demotes it like any alias.
-    native_push = propagate_provider_title(
-        str(evidence["provider"]),
-        str(evidence["uuid"]),
-        normalized,
-        environ=caller_environ,
-    )
-    result.update(native_push)
-    if native_push.get("provider_title_warnings"):
-        _record_provider_title_retry(
-            config,
-            str(evidence["provider"]),
-            str(evidence["uuid"]),
-            normalized,
-        )
-        result["automatic_name_state"] = "pending"
-    else:
-        result["automatic_name_state"] = "ready"
-    effective_color = session_color(
-        str(evidence["provider"]),
-        str(evidence["uuid"]),
-        canonical_colors(config),
-    )
-    if effective_color:
-        result.update(
-            propagate_provider_color(
-                str(evidence["provider"]),
-                str(evidence["uuid"]),
-                effective_color,
-                environ=caller_environ,
-            )
-        )
-    return result
 
 
 def _json_print(value: Any) -> None:

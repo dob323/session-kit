@@ -3,9 +3,23 @@
 Session Kit welcomes focused bug reports, feature requests, documentation
 fixes, and pull requests.
 
-The project ships Linux and macOS public betas (see the latest release on
-GitHub). Reports about provider compatibility, lifecycle safety, privacy, and
-clean installation are especially useful.
+The project ships Linux and macOS public betas, published as GitHub
+prereleases. Reports about provider compatibility, lifecycle safety, privacy,
+and clean installation are especially useful, and reports from operating
+systems, shells, and hardware the maintainer cannot test are the most valuable
+of all.
+
+## What to expect
+
+Session Kit is maintained by one person alongside other work. Replies are
+best-effort and there is no response-time commitment; a quiet issue has not been
+rejected. Security reports follow [their own process](SECURITY.md) and are
+handled ahead of everything else.
+
+A pull request may be declined even when the code is correct, if it would
+weaken the identity and safety model, add a default that writes or transmits
+data, or introduce behavior that cannot be proved from local evidence. Opening
+an issue before a large change saves work on both sides.
 
 ## Before opening an issue
 
@@ -80,6 +94,12 @@ installations on a persistent Mac account.
   per-user launchd jobs on macOS.
 - Do not add telemetry, prompt logging, terminal logging, or notifications by
   default.
+
+A change that moves code between modules must not change behavior in the same
+commit, and every symbol an existing test patches on `lib/session_inventory.py`
+must stay reachable through it. See
+[the modularization roadmap](docs/maintainers/modularization-roadmap.md) for the
+compatibility contract and the patch-point ledger.
 
 By contributing, you agree that your contribution is licensed under the
 [MIT License](LICENSE). Changes to the shpool-derived patch remain under

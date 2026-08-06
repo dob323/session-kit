@@ -1,0 +1,649 @@
+#!/usr/bin/env bash
+# Picker action menu and the proof-bound actions behind it: open, take over,
+# close, rename, fork, and guided new sessions. Every state change goes out as
+# a proof-bound sp command. Source this file; do not execute it.
+#
+# Source order: bin/shpool_login sources this module ahead of its first trap.
+# These functions read SNAPSHOT, VIEW, PAGE, QUERY, RECOVERY, SP_CMD,
+# CONFIRM_FORGIVE, PICKER_REFUSED_STATUS, and PICKER_ATTACH_FAILED_STATUS, all
+# assigned in that file before the boot sequence runs, and call into the theme,
+# live, view, and render modules.
+#
+# Globals the entry script owns are assigned there, not here.
+# shellcheck disable=SC2154
+
+show_other_provider_sessions() {
+  python3 - "$VIEW" <<'PY'
+import json
+import os
+import re
+import shutil
+import sys
+import unicodedata
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    data = json.load(handle)
+rows = data.get("outside_agents", [])
+width = max(1, min(239, shutil.get_terminal_size(fallback=(100, 24)).columns - 1))
+
+def clean(value):
+    text = "".join(
+        " " if unicodedata.category(character).startswith("C") else character
+        for character in str(value or "")
+    )
+    return " ".join(text.split())
+
+def cells(text):
+    return sum(
+        0 if unicodedata.combining(character)
+        else 2 if unicodedata.east_asian_width(character) in {"W", "F"}
+        else 1
+        for character in text
+    )
+
+def shorten(text, room):
+    text = clean(text)
+    if cells(text) <= room:
+        return text
+    kept = []
+    used = 0
+    for character in text:
+        size = cells(character)
+        if used + size > max(0, room - 1):
+            break
+        kept.append(character)
+        used += size
+    return "".join(kept) + "…"
+
+def project_hint(value):
+    path = clean(value)
+    if not path.startswith("/"):
+        return ""
+    parts = [part for part in path.split("/") if part]
+    account_names = {
+        parts[index + 1].casefold()
+        for index, part in enumerate(parts[:-1])
+        if part.casefold() in {"home", "users"}
+    }
+    account_names.add(os.path.basename(os.path.expanduser("~")).casefold())
+    generic = {
+        "app", "apps", "code", "current", "home", "repo", "repos", "src",
+        "srv", "users", "v2", "var", "workspace", "workspaces",
+    }
+    for part in reversed(parts):
+        folded = part.casefold()
+        if (
+            part
+            and not part.startswith(".")
+            and folded not in generic
+            and folded not in account_names
+        ):
+            return part
+    return ""
+
+def private_names(value):
+    path = clean(value)
+    parts = [part for part in path.split("/") if part] if path.startswith("/") else []
+    names = {
+        parts[index + 1]
+        for index, part in enumerate(parts[:-1])
+        if part.casefold() in {"home", "users"}
+    }
+    home_name = os.path.basename(os.path.expanduser("~"))
+    if home_name:
+        names.add(home_name)
+    return {name for name in names if name}
+
+def safe_title(value, cwd, fallback):
+    title = clean(value)
+    path = clean(cwd)
+    hint = project_hint(cwd)
+    if path:
+        title = title.replace(path, hint or fallback)
+    for name in sorted(private_names(cwd), key=len, reverse=True):
+        title = re.sub(re.escape(name), "account", title, flags=re.IGNORECASE)
+    return clean(title) or fallback
+
+print()
+print("  Other provider sessions")
+if data.get("stale"):
+    print("  Last-known provider roots outside the session manager; they are not confirmed live or attachable here.")
+else:
+    print("  Detected live provider roots outside the session manager; they are not attachable here.")
+if not rows:
+    print("  No matching other provider sessions.")
+else:
+    previous_provider = None
+    labels = {"claude": "Claude", "codex": "Codex"}
+    for row in rows:
+        provider = labels.get(
+            str(row.get("display_provider") or row.get("provider") or "").casefold(),
+            "Unknown",
+        )
+        if provider != previous_provider:
+            print(f"    {provider}")
+            previous_provider = provider
+        hint = project_hint(row.get("cwd"))
+        title = safe_title(
+            row.get("display_title") or row.get("title"),
+            row.get("cwd"),
+            provider,
+        )
+        detail = "not attachable here"
+        if hint:
+            detail = f"project: {hint} | {detail}"
+        prefix = "      -  "
+        title_room = max(1, width - cells(prefix) - cells(detail) - 3)
+        print(prefix + shorten(title, title_room) + " | " + detail)
+print()
+PY
+  local ignored
+  picker_read ignored "  Enter: Back ❯ " || return 0
+}
+
+number_metadata() {
+  local number=$1
+  python3 - "$VIEW" "$number" <<'PY'
+import base64
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    data = json.load(handle)
+wanted = int(sys.argv[2])
+matches = [
+    row
+    for row in data.get("sessions", [])
+    if row.get("terminal_number") == wanted
+]
+if len(matches) != 1:
+    raise SystemExit(2)
+row = matches[0]
+values = (
+    row.get("availability"),
+    "true" if row.get("mutation_allowed") is True else "false",
+    row.get("display_shpool_id"),
+    row.get("provider"),
+    row.get("title"),
+    row.get("shpool_id_raw"),
+    (row.get("identity") or {}).get("uuid"),
+    (row.get("identity") or {}).get("confidence"),
+)
+for value in values:
+    print(base64.b64encode(str(value or "").encode()).decode())
+PY
+}
+
+decode64() {
+  printf '%s' "$1" | base64 -d
+}
+
+create_proof() {
+  local number=$1
+  python3 - "$VIEW" "$number" "$SK_STATE_DIR" <<'PY'
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+import tempfile
+
+view_path, number_text, state_dir = sys.argv[1:4]
+with open(view_path, encoding="utf-8") as handle:
+    data = json.load(handle)
+if data.get("stale") or data.get("source") != "live":
+    raise SystemExit(3)
+wanted = int(number_text)
+matches = [
+    row
+    for row in data.get("sessions", [])
+    if row.get("terminal_number") == wanted
+]
+if len(matches) != 1:
+    raise SystemExit(2)
+row = matches[0]
+if row.get("mutation_allowed") is not True:
+    raise SystemExit(3)
+identity = row.get("identity") or {}
+shell = row.get("shpool_shell") or {}
+daemon = data.get("daemon_generation") or {}
+proof = {
+    "daemon_pid": daemon.get("pid"),
+    "daemon_process_start_ticks": daemon.get("process_start_ticks"),
+    "proof_type": "session-kit-picker-session-v1",
+    "provider": row.get("provider"),
+    "provider_pid": identity.get("pid"),
+    "provider_process_start_ticks": identity.get("process_start_ticks"),
+    "schema_version": 1,
+    "shell_pid": shell.get("pid"),
+    "shell_process_start_ticks": shell.get("process_start_ticks"),
+    "shpool_id": row.get("shpool_id_raw"),
+    "started_at_unix_ms": row.get("started_at_unix_ms"),
+    "uuid": identity.get("uuid") or "",
+}
+payload = (json.dumps(proof, sort_keys=True, separators=(",", ":")) + "\n").encode()
+descriptor, name = tempfile.mkstemp(prefix="picker-proof.", suffix=".json", dir=state_dir)
+try:
+    os.fchmod(descriptor, 0o600)
+    with os.fdopen(descriptor, "wb") as handle:
+        descriptor = -1
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+    metadata = os.lstat(name)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_uid != os.geteuid()
+    ):
+        raise OSError("unsafe proof")
+    print(name)
+except BaseException:
+    if descriptor >= 0:
+        os.close(descriptor)
+    try:
+        os.unlink(name)
+    except OSError:
+        pass
+    raise
+PY
+}
+
+run_proof_action() {
+  local command=$1 number=$2
+  shift 2
+  local proof status
+  proof=$(create_proof "$number") || {
+    echo "  The displayed session is stale or unsafe. Nothing changed."
+    return 1
+  }
+  TEMP_FILES+=("$proof")
+  "$SP_CMD" "$command" "$proof" "$@"
+  status=$?
+  command rm -f -- "$proof"
+  if (( status != 0 )); then
+    # The caller explains the failure itself when it has something better to
+    # say than a bare refusal.
+    if [[ ${PROOF_ACTION_QUIET:-0} != 1 ]]; then
+      echo "  The action was refused. Nothing changed."
+    fi
+    return "$status"
+  fi
+}
+
+refresh_after_action() {
+  # A failed refresh must never kill the picker: the previous snapshot stays
+  # on screen (marked stale, actions disabled) and the next loop retries.
+  if ! refresh_snapshot; then
+    sk_log_action picker_refresh failed || true
+    echo "  Live sessions could not be refreshed; showing the previous view."
+  fi
+}
+
+choose_number() {
+  local number=$1 metadata
+  require_live_actions || return
+  number_on_page "$number" || {
+    echo "  Choose a number shown here. Nothing changed."
+    return
+  }
+  metadata=$(number_metadata "$number") || {
+    echo "  The displayed row changed format. Nothing changed."
+    return
+  }
+  local -a fields=()
+  mapfile -t fields <<<"$metadata"
+  if (( ${#fields[@]} != 8 )); then
+    echo "  The displayed row changed format. Nothing changed."
+    return
+  fi
+  local availability mutation display_id provider title title_state
+  availability=$(decode64 "${fields[0]}")
+  mutation=$(decode64 "${fields[1]}")
+  display_id=$(decode64 "${fields[2]}")
+  provider=$(decode64 "${fields[3]}")
+  title=$(decode64 "${fields[4]}")
+  title_state=$(python3 - "$VIEW" "$number" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    rows = json.load(handle).get("sessions", [])
+matches = [row for row in rows if row.get("terminal_number") == int(sys.argv[2])]
+print(str(matches[0].get("provider_title_state") or "") if len(matches) == 1 else "")
+PY
+) || title_state=""
+  if [[ $mutation != true ]]; then
+    printf '  %s is display-only. Nothing changed.\n' "$display_id"
+    return
+  fi
+  if [[ $availability == ready ]]; then
+    # The window's tab carries the thread name for the whole attachment —
+    # the only in-window name surface Codex has (Claude's own title hook
+    # re-asserts the same name in-session). Cleared again on return.
+    if [[ -t 1 && -n $title ]]; then
+      printf '\033]0;%s\007' "$title"
+    fi
+    local open_status=0
+    PROOF_ACTION_QUIET=1 run_proof_action picker-open "$number" || open_status=$?
+    # The attachment (or its failed attempt) owned the screen; start the
+    # menu from a clean frame.
+    picker_clear_screen
+    case "$open_status" in
+      0) ;;
+      "$PICKER_REFUSED_STATUS")
+        echo "  The displayed session changed or failed a safety check. Nothing changed."
+        ;;
+      "$PICKER_ATTACH_FAILED_STATUS")
+        echo "  The session manager could not connect. This does not prove the session is dead."
+        echo "  The session was left alone; refresh, inspect its history, or try again."
+        ;;
+      *)
+        echo "  The open command failed without a verified cause. The session was left alone."
+        ;;
+    esac
+    if [[ -t 1 ]]; then
+      printf '\033]0;%s\007' "session kit"
+    fi
+    refresh_after_action
+    return
+  fi
+
+  while true; do
+    echo
+    printf '  %s [%s]\n' "$title" "$display_id"
+    echo "  Already open in another SSH window."
+    echo
+    echo "  1  Move it here (the other window disconnects)"
+    echo "  2  View full terminal history"
+    echo "  3  Close it (the shell and everything inside will end)"
+    if [[ $provider == codex && $title_state == pending ]]; then
+      echo "  4  Apply the pending title (restarts only a proven-idle Codex provider)"
+    fi
+    echo "  Enter  Back"
+    echo
+    local action
+    picker_read action "  action ❯ " || return 0
+    case "$action" in
+      "") return ;;
+      1)
+        run_proof_action picker-takeover "$number" || true
+        CONFIRM_FORGIVE=1
+        refresh_after_action
+        return
+        ;;
+      2)
+        run_proof_action picker-history "$number" || true
+        refresh_after_action
+        return
+        ;;
+      3)
+        run_proof_action picker-close "$number" || true
+        CONFIRM_FORGIVE=1
+        refresh_after_action
+        return
+        ;;
+      4)
+        if [[ $provider == codex && $title_state == pending ]]; then
+          run_proof_action picker-title-refresh "$number" || true
+          refresh_after_action
+          return
+        fi
+        echo "  That session has no pending Codex title. Nothing changed."
+        ;;
+      *) echo "  Unknown choice. Nothing changed." ;;
+    esac
+  done
+}
+
+# Accepts one number, a comma/space list, or ranges: k 5 · k 5, 6, 8 · k 4-7.
+# Every number is validated against the CURRENT page before anything closes;
+# one bad token refuses the whole request so a typo never kills a neighbor.
+direct_close() {
+  local raw=$1 token
+  local -a numbers=()
+  raw=${raw//,/ }
+  for token in $raw; do
+    if [[ $token =~ ^[0-9]+$ ]]; then
+      numbers+=("$token")
+    elif [[ $token =~ ^([0-9]+)-([0-9]+)$ ]]; then
+      local first=${BASH_REMATCH[1]} last=${BASH_REMATCH[2]}
+      if (( first > last || last - first > 98 )); then
+        echo "  Use k with visible numbers or small ranges. Nothing changed."
+        return
+      fi
+      local expanded
+      for (( expanded=first; expanded<=last; expanded++ )); do
+        numbers+=("$expanded")
+      done
+    else
+      echo "  Use k with visible numbers (k 5, 6, 8). Nothing changed."
+      return
+    fi
+  done
+  (( ${#numbers[@]} > 0 )) || {
+    echo "  Use k with visible numbers (k 5, 6, 8). Nothing changed."
+    return
+  }
+  require_live_actions || return
+  local number
+  for number in "${numbers[@]}"; do
+    number_on_page "$number" || {
+      echo "  $number is not shown here. Nothing changed."
+      return
+    }
+  done
+  for number in "${numbers[@]}"; do
+    run_proof_action picker-close "$number" || true
+  done
+  CONFIRM_FORGIVE=1
+  refresh_after_action
+}
+
+rename_number() {
+  local number=$1 metadata provider
+  require_live_actions || return
+  number_on_page "$number" || {
+    echo "  Choose a number shown here. Nothing changed."
+    return
+  }
+  metadata=$(number_metadata "$number") || return
+  local -a fields=()
+  mapfile -t fields <<<"$metadata"
+  if (( ${#fields[@]} != 8 )); then
+    echo "  The displayed row changed format. Nothing changed."
+    return
+  fi
+  provider=$(decode64 "${fields[3]}")
+  if [[ $provider != claude && $provider != codex ]]; then
+    echo "  Only Claude and Codex conversations can have a custom name."
+    return
+  fi
+  local title
+  picker_read title "  New name (Enter: cancel) ❯ " || return 0
+  [[ -n ${title//[[:space:]]/} ]] || {
+    echo "  Rename cancelled."
+    return
+  }
+  run_proof_action picker-name "$number" "$title" || true
+  refresh_after_action
+}
+
+reset_name_number() {
+  local number=$1 metadata provider uuid confidence
+  require_live_actions || return
+  number_on_page "$number" || {
+    echo "  Choose a number shown here. Nothing changed."
+    return
+  }
+  metadata=$(number_metadata "$number") || return
+  local -a fields=()
+  mapfile -t fields <<<"$metadata"
+  if (( ${#fields[@]} != 8 )); then
+    echo "  The displayed row changed format. Nothing changed."
+    return
+  fi
+  provider=$(decode64 "${fields[3]}")
+  uuid=$(decode64 "${fields[6]}")
+  confidence=$(decode64 "${fields[7]}")
+  if [[ ( $provider != claude && $provider != codex ) ||
+        $confidence != exact || -z $uuid ]]; then
+    echo "  Only exact Claude and Codex conversations can reset a custom name."
+    return
+  fi
+  run_proof_action picker-name-reset "$number" || true
+  refresh_after_action
+}
+
+fork_number() {
+  local number=$1 metadata provider uuid confidence
+  require_live_actions || return
+  number_on_page "$number" || {
+    echo "  Choose a number shown here. Nothing changed."
+    return
+  }
+  metadata=$(number_metadata "$number") || return
+  local -a fields=()
+  mapfile -t fields <<<"$metadata"
+  if (( ${#fields[@]} != 8 )); then
+    echo "  The displayed row changed format. Nothing changed."
+    return
+  fi
+  provider=$(decode64 "${fields[3]}")
+  uuid=$(decode64 "${fields[6]}")
+  confidence=$(decode64 "${fields[7]}")
+  if [[ ( $provider != claude && $provider != codex ) ||
+        $confidence != exact || -z $uuid ]]; then
+    echo "  Only exact Claude and Codex conversations can be forked."
+    return
+  fi
+  run_proof_action picker-fork "$number" || true
+  refresh_after_action
+}
+
+project_file() {
+  local destination=$1
+  python3 - "$SK_PROJECTS_FILE" "$destination" <<'PY'
+import json
+import os
+from pathlib import Path
+import re
+import sys
+import unicodedata
+
+source, destination = map(Path, sys.argv[1:3])
+projects = []
+# The provider is already chosen before this list is shown, so two configured
+# rows that differ only by provider would render as identical lines. Keep the
+# first row for each directory and show it under its configured alias.
+listed = set()
+if source.is_file() and not source.is_symlink():
+    for line in source.read_text(encoding="utf-8").splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        fields = line.split("\t")
+        if len(fields) < 3:
+            continue
+        alias, configured_provider, cwd = fields[:3]
+        if (
+            re.fullmatch(r"[a-z0-9_-]+", alias)
+            and configured_provider in {"claude", "codex", "shell"}
+            and cwd.startswith("/")
+            and not any(
+                unicodedata.category(character).startswith("C")
+                for character in cwd
+            )
+            and os.path.isdir(cwd)
+        ):
+            try:
+                key = os.path.realpath(cwd)
+            except OSError:
+                key = cwd
+            if key in listed:
+                continue
+            listed.add(key)
+            projects.append({"alias": alias, "cwd": cwd})
+default = next((index for index, row in enumerate(projects, 1) if row["alias"] == "sl"), 1 if projects else None)
+with destination.open("w", encoding="utf-8") as handle:
+    json.dump({"projects": projects, "default": default}, handle, sort_keys=True, separators=(",", ":"))
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+os.chmod(destination, 0o600)
+PY
+}
+
+guided_new() {
+  require_live_actions || return
+  echo
+  echo "  New session"
+  echo "  1  Claude Code"
+  echo "  2  Codex"
+  echo "  3  Regular managed shell"
+  echo "  Enter  Back"
+  echo
+  local answer provider
+  picker_read answer "  provider ❯ " || return 0
+  case "$answer" in
+    "") return ;;
+    1) provider=claude ;;
+    2) provider=codex ;;
+    3) provider=shell ;;
+    *) echo "  Unknown choice. Nothing changed."; return ;;
+  esac
+
+  local projects
+  new_temp login-projects || return
+  projects=$NEW_TEMP
+  project_file "$projects" || {
+    echo "  Project list is unavailable. Nothing started."
+    return
+  }
+  echo
+  python3 - "$projects" <<'PY'
+import json,sys,unicodedata
+d=json.load(open(sys.argv[1]))
+default=d.get("default")
+print("  Project")
+for number,row in enumerate(d.get("projects",[]),1):
+    print(f"  {number:2}  {row['alias']}: {row['cwd']}")
+if default:
+    row=d["projects"][default-1]
+    print(f"  Enter  Use {row['alias']}: {row['cwd']} | b  Back")
+else:
+    print("  Enter  Current directory | b  Back")
+PY
+  echo
+  local project_choice project_alias
+  picker_read project_choice "  project ❯ " || return 0
+  [[ $project_choice != b && $project_choice != B ]] || return
+  project_alias=$(python3 - "$projects" "$project_choice" <<'PY'
+import json,sys
+d=json.load(open(sys.argv[1]))
+choice=sys.argv[2].strip()
+if not choice:
+    default=d.get("default")
+    if not default:
+        print("")
+        raise SystemExit(0)
+    choice=str(default)
+if not choice.isdigit():
+    raise SystemExit(2)
+number=int(choice)
+rows=d.get("projects",[])
+if number < 1 or number > len(rows):
+    raise SystemExit(2)
+print(rows[number-1]["alias"])
+PY
+) || {
+    echo "  Unknown project. Nothing started."
+    return
+  }
+  if [[ $provider == claude || $provider == codex ]]; then
+    echo "  After exact startup proof, use name <number> to assign an optional conversation name."
+  fi
+  if [[ -n $project_alias ]]; then
+    "$SP_CMD" new "$provider" "$project_alias" || true
+  else
+    "$SP_CMD" new "$provider" || true
+  fi
+  refresh_after_action
+}

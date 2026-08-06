@@ -25,9 +25,44 @@ stable launcher -> selected immutable release -> helper
 managed Bash -> optional journal -> provider -> persistent managed Bash
 ```
 
-`lib/session_inventory.py` is the compatibility entry point. Focused
-implementation is moving into `lib/sessionkit_inventory/` in small,
-behavior-preserving steps.
+## Inventory modules
+
+`lib/session_inventory.py` is the compatibility entry point: an executable,
+importable facade holding CLI parsing, `main`, and thin wrappers. Implementation
+lives in `lib/sessionkit_inventory/`.
+
+| Module | Responsibility |
+| --- | --- |
+| `common` | shared configuration, validation, and identity helpers |
+| `state_io` | owner-only state file primitives: locks, atomic writes, checksums |
+| `processes` | native process discovery, ancestry, generations, boot identity |
+| `providers` | shared provider helpers, the shpool snapshot reader, the live join |
+| `providers_claude` | read-only Claude Code readers: agent records and transcripts |
+| `providers_codex` | read-only Codex readers: rollouts, session index, state store |
+| `model` | session record shaping: identity, recovery, titles, the base row |
+| `collector` | bounded read-only joins and live collection |
+| `validation` | strict validation of snapshots and operator-supplied input |
+| `render` | width, semantic color, and the dashboard, detail, and lookup views |
+| `colors` | the palettes, their pure derivations, and color state |
+| `terminal` | terminal numbers: retirement ledger and boot-stable assignment |
+| `names` | name intent and title propagation policy |
+| `names_push` | provider-native name and color writing |
+| `self_name` | automatic naming and the self-name caller proof |
+| `lifecycle` | privacy-minimal provider-exit state |
+| `recovery` | recovery transactions: manifest, pending queue, acknowledgement |
+| `reaper` | fail-closed planning for provider-exited terminal cleanup |
+| `snapshot` | one exact refresh, or a documented fallback |
+| `migration` | one-time legacy transitions |
+| `projects` | discover and manage project shortcuts |
+
+Two rules keep this safe to change. No package module imports the facade, and
+the dependency graph stays acyclic. Every symbol an existing test patches on the
+facade stays reachable through it, which means a facade wrapper injects its
+collaborators at call time rather than letting a module resolve a sibling
+directly. Where a name is deliberately resolved inside the package instead,
+[the modularization roadmap](maintainers/modularization-roadmap.md) records it
+and says which module to patch. Patching the wrong one is silent: the patch
+applies against nothing and the test still passes.
 
 The inventory:
 
@@ -126,6 +161,11 @@ The beta supports these two platform models:
 - macOS 14 or newer supports Apple Silicon and Intel with Python 3.11 or newer,
   Homebrew Bash 4 or newer, official shpool 0.11.0, native Darwin process APIs,
   and per-user LaunchAgents in the logged-in GUI user's `gui/$UID` domain.
+
+Both platforms run official shpool 0.11.0 by default. That release contains a
+detach deadlock which can make every managed session unreachable at once; the
+optional `0004` patch fixes it. Read [the patch notes](../shpool-patch/README.md)
+before deciding what to run, on either platform.
 
 The outer macOS login shell may remain zsh, but the managed shpool shell is the
 validated modern Bash executable. The LaunchAgents are not privileged or

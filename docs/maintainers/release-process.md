@@ -46,6 +46,18 @@ require upgrading to the latest patch.
 15. The public repository has no earlier or conflicting tag that changes the
     declared first-release version. Private-source tags are not copied into the
     public history.
+16. Every version reference that ships to a reader names the version being
+    released. Beta releases are GitHub prereleases, so `releases/latest` returns
+    404 and a documented download must name its tag. Check the `README.md`
+    install section and release link, and the CHANGELOG heading:
+
+    ```bash
+    grep -rn "v0\.[0-9]\+\.[0-9]\+" README.md CHANGELOG.md docs/*.md \
+      | grep -v CHANGELOG.md:
+    ```
+
+    Every hit outside the CHANGELOG's own version history must be the version
+    being released.
 
 ## Build a candidate
 

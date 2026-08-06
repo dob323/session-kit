@@ -1,13 +1,18 @@
 # Install Session Kit
 
-Session Kit `v0.1.5` is a public beta for Linux with systemd and macOS 14 or
+Session Kit `v0.2.0` is a public beta for Linux with systemd and macOS 14 or
 newer. Install the accepted release artifact under a single-user account where
 provider conversations are recoverable.
+
+Beta releases are published as GitHub prereleases. `releases/latest` does not
+resolve to a prerelease, so name the tag explicitly or browse
+[all releases](https://github.com/dob323/session-kit/releases). Release assets
+are named by source commit rather than by version.
 
 ```bash
 mkdir session-kit-download
 cd session-kit-download
-gh release download v0.1.5 --repo dob323/session-kit
+gh release download v0.2.0 --repo dob323/session-kit
 if command -v sha256sum >/dev/null; then
   sha256sum --check session-kit-*.sha256
 else
@@ -39,7 +44,7 @@ an install or update.
 
 Without the GitHub CLI, download the `.tar.gz`, `.sha256`, and
 `.provenance.json` assets from the
-[`v0.1.5` release](https://github.com/dob323/session-kit/releases/tag/v0.1.5),
+[`v0.2.0` release](https://github.com/dob323/session-kit/releases/tag/v0.2.0),
 and put them in one empty directory. The checksum file covers the archive. Use
 `sha256sum --check` on Linux or
 `shasum -a 256 --check` on macOS. The provenance file records the exact source
