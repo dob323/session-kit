@@ -81,15 +81,19 @@ class ProviderExitShellTests(unittest.TestCase):
         self.state = self.base / "state"
         self.start = self.base / "start"
         self.project = self.base / "project"
-        self.bin = self.base / "bin"
+        # The bashrc prepends $HOME/.cargo/bin:$HOME/.local/bin:/opt/homebrew/bin
+        # to PATH. On macOS a real provider in the Homebrew prefix would
+        # therefore shadow a stub placed anywhere later, so the stub lives in
+        # the fixture HOME, which that prepend puts first on both platforms.
+        self.bin = self.home / ".local" / "bin"
         for path in (
             self.home,
             self.state,
             self.start,
             self.project,
-            self.bin,
         ):
             path.mkdir(mode=0o700)
+        self.bin.mkdir(mode=0o700, parents=True)
         self.config = self.base / "inventory.json"
         self.config.write_text(
             json.dumps(
@@ -144,11 +148,14 @@ class ProviderExitShellTests(unittest.TestCase):
         # harness exercises the real launch path on both platforms.
         command = r"""
 bash --noprofile --norc -ic '
+  # Captured out here on purpose: inside the function, $6 would refer to the
+  # sixth argument of the function rather than of this script.
+  inventory_core="$6"
   start_ticks() {
     if [ -r "/proc/$1/stat" ]; then
       awk "{print \$22}" "/proc/$1/stat"
     else
-      python3 "$6" platform process-info "$1" | cut -f2
+      python3 "$inventory_core" platform process-info "$1" | cut -f2
     fi
   }
   shell_start=$(start_ticks $$)
