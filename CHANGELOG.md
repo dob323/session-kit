@@ -4,6 +4,33 @@ Session Kit follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-06
+
+### Changed
+
+- Split `lib/session_inventory.py` into `lib/sessionkit_inventory/`. The file
+  held configuration, process inspection, provider discovery, inventory
+  assembly, state, naming, recovery, rendering, and CLI parsing in one place;
+  it now holds CLI parsing, `main`, and compatibility wrappers, and is 2,905
+  lines rather than 7,008 across twenty-one focused modules.
+
+  No behaviour changes. The facade stays executable and importable by path with
+  identical symbols, signatures, exit codes, JSON fields, and rendered output;
+  no package module imports it; the dependency graph is acyclic; and imports
+  perform no scans, locks, configuration reads, or state writes.
+
+  The defect this work had to defend against is silent rather than loud. When a
+  package module resolves a sibling symbol directly, patching that name on the
+  facade reaches nothing: the patch applies against nothing and the test stays
+  green against the real implementation. Constants are the worst case, because
+  a differential run with every constant at its real value is clean by
+  construction. Three constants reached zero reachability and were caught only
+  by patching each one and observing whether behaviour moved.
+  `docs/maintainers/modularization-roadmap.md` records the compatibility
+  contract and a hand-triaged ledger of the names deliberately resolved inside
+  the package, with the module to patch for each.
+
+
 ### Changed
 
 - Split the session palette in two, one per provider, and stopped a same-colour
@@ -54,6 +81,30 @@ Session Kit follows [Semantic Versioning](https://semver.org/).
 - Six Codex theme files, `sk-lime`, `sk-magenta`, `sk-silver`, `sk-sand`,
   `sk-sky`, and `sk-sea`. The eight Claude-named themes stay shipped so a
   rollback to 0.1.6 still finds every theme it installs.
+
+- A `shpool-binary` check in `session-kit doctor`. The watchdog already
+  compared the running daemon against a recorded fingerprint, but nothing
+  reported whether that comparison could still tell you anything. Both ways
+  it goes inert are silent: with no fingerprint recorded the check is
+  skipped, and with a stale one it reports a changed binary on every pass
+  for a rebuild you made on purpose, until the report stops being read.
+  Doctor now distinguishes absent, malformed, and no-longer-matching,
+  because the remedy differs for each. The shpool patch guide gives the
+  exact command to record it, which it previously left to the reader.
+
+- Documentation rewritten across every page. Corrections rather than polish:
+  the release badge linked to `releases/latest`, which returns 404 for every
+  release this project has cut because beta releases are prereleases; the
+  install command was pinned to a superseded tag; the architecture page still
+  described the module split as in progress; the shpool patch guide asked the
+  reader to record a fingerprint without naming a path or command, which is why
+  one was left stale on a live installation; and `configuration.md` documented
+  three watchdog variables in prose while its supported-overrides list implied
+  they were unsupported. The troubleshooting guide gained the failure where
+  every session becomes unreachable at once, which had no entry despite being
+  the one condition no Session Kit command can diagnose, since every command
+  blocks for the same reason the sessions do.
+
 
 ## [0.1.6] - 2026-08-06
 
