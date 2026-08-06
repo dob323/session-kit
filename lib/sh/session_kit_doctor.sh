@@ -109,7 +109,7 @@ doctor_command() {
   local audit_output audit_ok=1 audit_name
   local -a audit_names=(
     claude-version codex-version codex-themes naming-instructions naming-hook
-    kill-switches acceptance
+    kill-switches acceptance shpool-binary
   )
   declare -A audit_expected=() audit_seen=()
   for audit_name in "${audit_names[@]}"; do audit_expected[$audit_name]=1; done
@@ -117,6 +117,7 @@ doctor_command() {
     "${SESSION_KIT_CODEX_HOME:-${CODEX_HOME:-$HOME/.codex}}" \
     "$release_id" "$current_platform" <<'PY'
 import datetime
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -331,6 +332,51 @@ def safe_directory_chain(path: Path, *, final_owner: bool = False) -> bool:
     except OSError:
         return False
 
+
+# The watchdog compares the running shpool daemon against a fingerprint
+# recorded in private state. Two states leave that check present but no longer
+# protecting anything, and both are silent: an absent fingerprint skips the
+# check entirely, and a stale one reports a change on every pass until the
+# report stops being read. Report each distinctly rather than as one failure.
+state_root = Path(os.environ.get("XDG_STATE_HOME") or (home / ".local/state"))
+fingerprint_bytes = secure_regular_bytes(
+    state_root / "session-kit" / "shpool-binary.sha256", 4096
+)
+recorded_fingerprint = None
+if fingerprint_bytes is not None:
+    candidate = fingerprint_bytes.decode("utf-8", "replace").strip()
+    if re.fullmatch(r"[0-9a-f]{64}", candidate):
+        recorded_fingerprint = candidate
+if fingerprint_bytes is None:
+    emit(
+        "warn",
+        "shpool-binary",
+        "no fingerprint recorded, so the watchdog binary check is inactive",
+    )
+elif recorded_fingerprint is None:
+    emit(
+        "warn",
+        "shpool-binary",
+        "recorded fingerprint is not a sha256 digest, so the check is inactive",
+    )
+else:
+    shpool_path = shutil.which("shpool")
+    if not shpool_path:
+        emit("warn", "shpool-binary", "shpool is not on PATH, so it cannot be compared")
+    else:
+        installed_bytes = secure_regular_bytes(Path(shpool_path), 512 * 1_048_576)
+        if installed_bytes is None:
+            emit("warn", "shpool-binary", "installed shpool binary could not be read")
+        elif hashlib.sha256(installed_bytes).hexdigest() == recorded_fingerprint:
+            emit("ok", "shpool-binary", "recorded fingerprint matches the installed shpool")
+        else:
+            emit(
+                "warn",
+                "shpool-binary",
+                "recorded fingerprint no longer matches "
+                + shpool_path
+                + "; re-record it after a deliberate rebuild",
+            )
 
 theme_errors = []
 codex_root_safe = safe_directory_chain(codex_home, final_owner=True)
