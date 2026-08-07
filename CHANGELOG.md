@@ -4,6 +4,24 @@ Session Kit follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Process scans no longer read `/proc/<pid>/environ` or `/proc/<pid>/cwd` for
+  processes another user owns. Both are readable only by the process owner, so
+  those reads always failed and the caller fell back to the same empty values
+  the scan now uses directly. The inventory asks only for processes it owns
+  (root excepted) and the reaper reads `environ` only for the daemon's direct
+  children, which are the only ones it ever consults. On a host with hundreds of
+  processes this removes upwards of two thousand failed system calls per sweep;
+  where the kernel is auditing failed opens, each of those was also a log record.
+
+- Commands no longer retry a bytecode cache write into the release directory.
+  A release is installed read-only, so `__pycache__` could never be created
+  there and every import attempted it anyway. `PYTHONDONTWRITEBYTECODE` is now
+  set where the entry points converge. Nothing that was cached stops being
+  cached, because nothing ever was, and a `.pyc` precompiled by a future install
+  step is still read.
+
 ## [0.2.0] - 2026-08-06
 
 ### Changed

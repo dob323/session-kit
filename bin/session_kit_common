@@ -4,6 +4,13 @@
 SESSION_KIT_BIN_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 SESSION_KIT_RELEASE_DIR=$(cd -- "$SESSION_KIT_BIN_DIR/.." && pwd -P)
 
+# A release directory is installed read-only, so Python's bytecode cache can
+# never be written there: every import attempts to create __pycache__ and is
+# denied. Nothing is lost by not asking, since nothing was ever cached, and it
+# saves a failed syscall per module per command. This only disables writing, so
+# a .pyc precompiled by a future install step is still read.
+export PYTHONDONTWRITEBYTECODE=1
+
 SK_STATE_DIR=${SESSION_KIT_STATE_DIR:-${XDG_STATE_HOME:-"$HOME/.local/state"}/session-kit}
 SK_JOURNAL_DIR=${SESSION_KIT_JOURNAL_DIR:-${XDG_STATE_HOME:-"$HOME/.local/state"}/shpool-journal}
 SK_ARCHIVE_DIR=${SESSION_KIT_ARCHIVE_DIR:-${XDG_STATE_HOME:-"$HOME/.local/state"}/shpool-archive}

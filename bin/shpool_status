@@ -5,6 +5,11 @@ set -u
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 CORE=${SESSION_KIT_INVENTORY_CORE:-"$SCRIPT_DIR/../lib/session_inventory.py"}
 
+# See bin/session_kit_common: the release directory is read-only, so writing a
+# bytecode cache always fails. This entry point does not source that file, and
+# it runs on every login picker and every `sp` render, so it sets it here too.
+export PYTHONDONTWRITEBYTECODE=1
+
 case "${1:-}" in
   ""|--rows|--json|--lookup)
     # Claude stores auto-titles separately from the prompt-bar name. Fill the

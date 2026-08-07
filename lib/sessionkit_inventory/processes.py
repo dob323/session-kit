@@ -58,6 +58,25 @@ def _proc_environ(path: Path) -> dict[str, str]:
     return values
 
 
+def _readable_by_us(entry: Path) -> bool:
+    """True when this process could read ``entry``'s restricted proc files.
+
+    ``/proc/<pid>/environ`` and ``/proc/<pid>/cwd`` are readable only by the
+    process owner, so for any other uid the read always fails and the caller
+    falls back to the same empty values this guard returns. Skipping it keeps a
+    scan from making one denied syscall per foreign process, which on a busy
+    host with auditing on failed opens is a lot of log for no information.
+
+    Root is exempt, so it keeps reading everything.
+    """
+    if os.getuid() == 0:
+        return True
+    try:
+        return entry.stat().st_uid == os.getuid()
+    except OSError:
+        return False
+
+
 def scan_process_table(
     proc_root: Path,
     max_nodes: int,
@@ -95,13 +114,20 @@ def scan_process_table(
             )
         except (OSError, ValueError):
             continue
-        try:
-            environ = proc_environ(entry / "environ")
-        except OSError:
+        if _readable_by_us(entry):
+            try:
+                environ = proc_environ(entry / "environ")
+            except OSError:
+                environ = {}
+            try:
+                cwd = os.readlink(entry / "cwd")
+            except OSError:
+                cwd = ""
+        else:
+            # Same result the OSError branches produce, without the denied
+            # syscall. A shpool session is always our own uid, so a foreign
+            # process can never supply a session name anyway.
             environ = {}
-        try:
-            cwd = os.readlink(entry / "cwd")
-        except OSError:
             cwd = ""
         try:
             after_pid, after_ppid, after_start_ticks = proc_stat(entry / "stat")

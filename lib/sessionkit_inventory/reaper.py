@@ -75,7 +75,15 @@ def scan_shell_facts(
                 .replace(b"\0", b" ")
                 .decode("utf-8", "replace")
             )
-            environ = (entry / "environ").read_bytes().split(b"\0")
+            # Only the daemon's direct children are ever asked for a session name
+            # (see the facts loop below), and /proc/<pid>/environ is readable only
+            # by the process owner. Reading it for every pid meant a denied open
+            # per foreign process for a result that was then discarded. `before[0]`
+            # is the ppid, so this is exactly children[daemon_pid].
+            if before[0] == daemon_pid:
+                environ = (entry / "environ").read_bytes().split(b"\0")
+            else:
+                environ = []
         except OSError:
             continue
         after = _proc_stat(entry / "stat")
