@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass, field
+import grp
 import hashlib
 import json
 import os
 from pathlib import Path
+import pwd
 import re
 import secrets
 import stat
@@ -245,6 +247,61 @@ def _restore_state(value: Mapping[str, Any]) -> dict[str, str]:
     return {key: str(restore[key]) for key in expected}
 
 
+def _private_group(gid: int) -> bool:
+    """Report whether gid is the caller's own single-member private group.
+
+    Distributions that ship USERGROUPS_ENAB with umask 002 give every account
+    a private group of its own name and create directories group-writable, so
+    a provider installer leaves its config directory at 0775 there. That mode
+    grants no other account write access while the group really is private, so
+    every condition below must hold and any lookup failure refuses.
+    """
+    try:
+        account = pwd.getpwuid(os.geteuid())
+        group = grp.getgrgid(gid)
+        accounts = pwd.getpwall()
+    except (KeyError, OSError):
+        return False
+    if gid != account.pw_gid or group.gr_name != account.pw_name or list(group.gr_mem):
+        return False
+    # An enumeration that does not even list this account cannot show whether a
+    # second one holds the group, so its silence proves nothing and refuses.
+    covered = False
+    for other in accounts:
+        if other.pw_name == account.pw_name:
+            covered = other.pw_gid == gid
+        elif other.pw_gid == gid:
+            return False
+    return covered
+
+
+def _mode_permits(info: os.stat_result) -> bool:
+    """Report whether a directory mode may be written through.
+
+    World-writable is never allowed. Group-writable is allowed only for a
+    directory the caller owns whose group is the caller's own private group,
+    where the bit widens access to nobody.
+    """
+    mode = stat.S_IMODE(info.st_mode)
+    if mode & 0o002:
+        return False
+    if not mode & 0o020:
+        return True
+    return info.st_uid == os.geteuid() and _private_group(info.st_gid)
+
+
+def _unsafe_directory(directory: Path, info: os.stat_result) -> HookConfigError:
+    """Name the exact refused directory and, when the caller owns it, the fix."""
+    mode = stat.S_IMODE(info.st_mode)
+    if stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid() and mode & 0o022:
+        bits = "go-w" if mode & 0o002 else "g-w"
+        return HookConfigError(
+            f"provider hook directory is unsafe: {directory} is mode {mode:04o}, "
+            f"which lets other accounts write it; run: chmod {bits} {directory}"
+        )
+    return HookConfigError(f"provider hook directory is unsafe: {directory}")
+
+
 def _open_parent(path: Path, *, create: bool) -> int:
     """Open every ancestor without following links and return the parent fd."""
     if not path.is_absolute() or ".." in path.parts:
@@ -266,10 +323,10 @@ def _open_parent(path: Path, *, create: bool) -> int:
             if (
                 not stat.S_ISDIR(info.st_mode)
                 or info.st_uid not in {0, os.geteuid()}
-                or (info.st_mode & 0o022) != 0
+                or not _mode_permits(info)
             ):
                 os.close(child)
-                raise HookConfigError(f"provider hook directory is unsafe: {path.parent}")
+                raise _unsafe_directory(Path(*path.parent.parts[: index + 2]), info)
             if final and info.st_uid != os.geteuid():
                 os.close(child)
                 raise HookConfigError(f"provider hook directory is not user-owned: {path.parent}")
@@ -716,23 +773,55 @@ def configure(path: Path, *, command: str, enabled: bool) -> dict[str, Any]:
     return {"changed": False, "path": os.fspath(path)}
 
 
+def preflight(*paths: Path) -> int:
+    """Report each provider config directory before the installer writes.
+
+    Prints one "<status>\t<detail>" line per target so a caller can render the
+    detail, including the repair to run, in its own preflight format. Missing
+    directories pass: the installer creates them at 0700.
+    """
+    failed = 0
+    for path in paths:
+        try:
+            descriptor = _open_parent(path, create=False)
+        except FileNotFoundError:
+            print("ok", f"{path.parent} is absent and will be created", sep="\t")
+            continue
+        except (HookConfigError, OSError) as exc:
+            print("fail", " ".join(str(exc).split()), sep="\t")
+            failed = 1
+            continue
+        os.close(descriptor)
+        print("ok", f"{path.parent} is reachable without exposing it", sep="\t")
+    return failed
+
+
 def main(argv: list[str] | None = None) -> int:
     values = sys.argv[1:] if argv is None else argv
     if values == ["codex-hook"]:
         return codex_hook()
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=("enable", "disable"))
+    parser.add_argument("action", choices=("enable", "disable", "preflight"))
     parser.add_argument("--claude-settings", required=True, type=Path)
     parser.add_argument("--codex-hooks", required=True, type=Path)
     args = parser.parse_args(values)
+    if args.action == "preflight":
+        return preflight(args.claude_settings, args.codex_hooks)
     enabled = args.action == "enable"
-    configure(args.claude_settings, command=CLAUDE_COMMAND, enabled=enabled)
-    if (
-        os.environ.get("SESSION_KIT_TESTING") == "1"
-        and os.environ.get("SESSION_KIT_TEST_FAILPOINT") == "provider-hooks-claude"
-    ):
-        raise HookConfigError("isolated test failpoint after Claude hook activation")
-    configure(args.codex_hooks, command=CODEX_COMMAND, enabled=enabled)
+    # A refusal here is a diagnosis the operator can act on, not a defect in
+    # the kit, so it prints the offending path and its repair instead of a
+    # traceback. The lifecycle transaction still owns rollback.
+    try:
+        configure(args.claude_settings, command=CLAUDE_COMMAND, enabled=enabled)
+        if (
+            os.environ.get("SESSION_KIT_TESTING") == "1"
+            and os.environ.get("SESSION_KIT_TEST_FAILPOINT") == "provider-hooks-claude"
+        ):
+            raise HookConfigError("isolated test failpoint after Claude hook activation")
+        configure(args.codex_hooks, command=CODEX_COMMAND, enabled=enabled)
+    except HookConfigError as exc:
+        print(f"session-kit: {exc}", file=sys.stderr)
+        return 1
     return 0
 
 

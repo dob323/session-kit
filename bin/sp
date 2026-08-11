@@ -24,45 +24,362 @@ fi
 PICKER_REFUSED_STATUS=74
 PICKER_ATTACH_FAILED_STATUS=75
 
+# The short synopsis every argument mistake prints. The full reference is one
+# command away rather than forty lines of stderr on a typo.
 usage() {
   cat <<'EOF'
-Usage:
-  sp list
+usage: sp <command> [arguments]
+       sp help [topic]
+
+Run 'sp help' for every command with a one-line description, or
+'sp help <topic>' for one area in detail.
+EOF
+}
+
+# The complete human command reference, grouped by the job being done. The
+# machine verbs -- picker-*, restore-exact -- are deliberately absent: the
+# picker and the managed shell call them with proof arguments a person does
+# not hold, so listing them here would only invite someone to run one by hand.
+# `sp help machine` names them for anyone reading the source.
+sp_help_overview() {
+  cat <<'EOF'
+sp manages Claude Code, Codex, and shell sessions inside shpool.
+
+usage: sp <command> [arguments]
+       sp help [topic]
+
+Sessions
+  sp list                            every managed session with its live state
   sp new [claude|codex|shell] [project-alias] [--account ALIAS] [--model ID] [--launch-key KEY]
+      [--worktree BRANCH] runs the session in that branch's own git worktree
       Codex also accepts [--prompt-file OWNER-PRIVATE-FILE]
-  sp name <terminal-number|shpool-id> <title>
-  sp name reset <terminal-number|shpool-id>
-  sp color <terminal-number|shpool-id> <color>
+  sp go <session>                    open a ready session in this terminal
+  sp takeover <session>              move an attached session here, after a check
+  sp close <session>                 end one managed terminal
+  sp detail <session>                everything known about one session
+  sp health                          manager, daemon, and resource state
+  sp prune                           review terminals eligible for cleanup
+  sp repair <session>                rebuild after a proven shpool handoff failure
+  sp verify-start <session>          re-prove a provider start left pending
+
+Names and colors
+  sp name <session> <title>          set a local title
+  sp name reset <session>            remove the local title
+  sp self-name <2-5-word-title>      title the session you are running in
+  sp color <session> <color>         set one session's color
       Claude: red|blue|green|yellow|purple|orange|pink|cyan
       Codex:  lime|magenta|silver|sand|sky|sea
-  sp color reset <terminal-number|shpool-id>
-  sp color reconcile
-  sp self-name <2-5-word-title>
-  sp go <terminal-number|shpool-id>
-  sp takeover <terminal-number|shpool-id>
-  sp close <terminal-number|shpool-id>
-  sp repair <terminal-number|shpool-id>
-  sp prune
-  sp detail <terminal-number|shpool-id>
-  sp account list [claude|codex]
+  sp color reset <session>           return to the derived color
+  sp color reconcile                 give every live session its own color
+
+Messages
+  sp msg <all|idle|3|1,3,5|2-4|shpool-id> "text" [--fyi] [--yes]
+  sp msg report [msg-id]             read a message with its replies
+  sp msg reply <msg-id> "text"       answer a message from this session
+  sp msg list                        the message ledger
+
+Delegated work
+  sp teardown <session> [--merged-into REF] [--force]
+                                     close a worker and prune its worktree
+  sp worktree list                   worktrees materialized for delegated work
+  sp worktree materialize --repo DIR --branch BRANCH
+  sp worktree teardown --branch BRANCH [--merged-into REF] [--force]
+  sp receipt cap --msg-id ID [--max-usd N] [--max-tokens N] [--max-iterations N]
+                                     the cost cap a plan is approved with
+  sp receipt show [--receipt ID | --msg-id ID]
+                                     what a run cost, verified, changed, and why it stopped
+  sp receipt spend|verifier|files|close|list|gate ...
+
+Accounts
+  sp account list [claude|codex]     enrolled accounts and last verification
   sp account adopt-default <claude|codex> <alias> <email>
   sp account enroll <claude|codex> <alias> <email>
   sp account verify <claude|codex> <alias>
   sp account configure-feeds <roster-json> <advice-json>
-  sp find <text>
-  sp msg <all|idle|3|1,3,5|2-4|shpool-id> "text" [--fyi] [--yes]
-  sp msg report [msg-id]
-  sp msg reply <msg-id> "text"
-  sp msg list
-  sp history <terminal-number|shpool-id>
-  sp health
-  sp recover
-  sp verify-start <terminal-number|shpool-id>
-  sp prompt-quarantine list
+
+History and recovery
+  sp find <text>                     search journals for text
+  sp history <session>               replay one session's journal
+  sp recover                         exact recovery records for closed work
+  sp prompt-quarantine list          prompts held back from delivery
   sp prompt-quarantine ingest|discard <key>
   sp prompt-quarantine resume <key> <absolute-project-directory>
-  sp prompt-quarantine prune
+  sp prompt-quarantine prune         drop held prompts that expired
+
+Topics
+  sp help sessions      start, open, move, and close sessions
+  sp help names         titles and colors
+  sp help messages      sp msg, replies, and the message centre
+  sp help accounts      provider profiles and account switching
+  sp help history       journals, search, recovery, and quarantine
+  sp help selectors     what <session> accepts
+  sp help exit-codes    what every status a Session Kit command returns means
+  sp help completion    turn on tab completion
+  sp help machine       the verbs the picker and the managed shell call
+
+<session> is a terminal number or an exact shpool ID. Both -h and --help print
+this reference, with or without shpool installed.
 EOF
+}
+
+sp_help_topic() {
+  case "$1" in
+    sessions)
+      cat <<'EOF'
+Sessions
+
+  sp list                            every managed session with its live state
+  sp new [claude|codex|shell] [project-alias] [--account ALIAS] [--model ID]
+  sp go <session>                    open a ready session in this terminal
+  sp takeover <session>              move an attached session here, after a check
+  sp close <session>                 end one managed terminal
+  sp detail <session>                everything known about one session
+  sp health                          manager, daemon, and resource state
+  sp prune                           review terminals eligible for cleanup
+  sp repair <session>                rebuild after a proven shpool handoff failure
+  sp verify-start <session>          re-prove a provider start left pending
+
+`sp new <project-alias>` alone uses the provider stored for that alias. A
+terminal number stays with its session for the current host boot; terminal 1 is
+reserved for Fleet Supervisor, so ordinary sessions start at 2.
+
+`sp go` opens a detached session. `sp takeover` moves an attached one after a
+fresh identity check, and the window that had it returns to its picker; the
+conversation is never duplicated. Closing ends the managed terminal only, and
+keeps provider history and any journal.
+
+`sp repair` is for direct evidence of an unrecoverable shpool handoff failure.
+Silence alone does not qualify, and if every session is unreachable at once,
+repair is the wrong tool.
+
+Automation closes only with an explicit opt-in and the exact shpool ID:
+
+  SESSION_KIT_NONINTERACTIVE=1 SESSION_KIT_CONFIRM_ID=<exact-shpool-id> \
+    sp close <exact-shpool-id>
+EOF
+      ;;
+    names | colors | color)
+      cat <<'EOF'
+Names and colors
+
+  sp name <session> <title>          set a local title
+  sp name reset <session>            remove the local title
+  sp self-name <2-5-word-title>      title the session you are running in
+  sp color <session> <color>         set one session's color
+  sp color reset <session>           return to the derived color
+  sp color reconcile                 give every live session its own color
+
+Claude sessions take red, blue, green, yellow, purple, orange, pink, and cyan --
+the eight names Claude Code itself accepts. Codex sessions take lime, magenta,
+silver, sand, sky, and sea. The two palettes never overlap, so a Claude row and
+a Codex row cannot look alike.
+
+Title priority: a local manual name, then an explicit provider rename, then a
+retained automatic title, then a provider-and-project description, then a
+shortened identity, then the shell command. `sp name reset` removes only the
+local name; it does not hand the session back to automatic naming.
+
+A color is derived from the conversation identity, so it is the same every time
+you return. `sp color reconcile` settles every live session at once, moves only
+the ones that have to move, and changes nothing on a second run.
+EOF
+      ;;
+    messages | msg)
+      cat <<'EOF'
+Messages
+
+  sp msg                             open the message centre on a terminal
+  sp msg <all|idle|3|1,3,5|2-4|shpool-id> "text" [--fyi] [--yes]
+  sp msg report [msg-id]             read a message with its replies
+  sp msg reply <msg-id> "text"       answer a message from this session
+  sp msg list                        the message ledger
+
+Targets are the same selectors the rest of sp takes, plus `all` and `idle`, and
+they combine: `sp msg 1,3,5 "..."`, `sp msg 2-4 "..."`. A mass send asks for one
+confirmation; --yes answers it in advance, and --fyi marks a message as needing
+no reply.
+
+With no arguments and a terminal to draw on, `sp msg` is the message centre:
+write, watch replies land on the same screen, and answer from there. Without a
+terminal -- a pipe, a cron, SESSION_KIT_NONINTERACTIVE=1, TERM=dumb, or
+SESSION_KIT_MSG_CONSOLE=0 -- the same verbs print and exit.
+
+The picker opens the centre with `s` and lists new replies as rows. A reply
+outlives its session: one from a room that has since closed still opens.
+EOF
+      ;;
+    accounts | account)
+      cat <<'EOF'
+Accounts
+
+  sp account list [claude|codex]     enrolled accounts and last verification
+  sp account adopt-default <claude|codex> <alias> <email>
+                                     record the login this machine already has
+  sp account enroll <claude|codex> <alias> <email>
+                                     create a separate provider profile
+  sp account verify <claude|codex> <alias>
+                                     confirm a profile is signed in
+  sp account configure-feeds <roster-json> <advice-json>
+                                     point account advice at local feeds
+  sp new <claude|codex> [project-alias] --account <alias>
+
+Claude Code profiles use separate CLAUDE_CONFIG_DIR roots and Codex profiles
+separate CODEX_HOME roots. Enroll, complete the provider's own sign-in, then
+verify. Session Kit never asks for, copies, or prints a provider token.
+
+Changing the account of an existing conversation is a picker action, not a
+command: select the session and choose `Change account`. Every switch is
+confirmed on its own and proceeds only when fresh evidence proves the exact
+conversation has no active turn, tool, hook, or subagent work.
+EOF
+      ;;
+    history | recovery | recover | quarantine)
+      cat <<'EOF'
+History and recovery
+
+  sp find <text>                     search journals for text
+  sp history <session>               replay one session's journal
+  sp recover                         exact recovery records for closed work
+  sp prompt-quarantine list          prompts held back from delivery
+  sp prompt-quarantine ingest|discard <key>
+  sp prompt-quarantine resume <key> <absolute-project-directory>
+  sp prompt-quarantine prune         drop held prompts that expired
+
+History exists only for sessions whose journals were explicitly enabled;
+journals hold raw terminal output, so they are off unless you opted in.
+
+Recovery uses an exact Claude Code or Codex UUID and never falls back to
+recency, directory, or "latest". An active UUID cannot be resumed into a second
+writable terminal: open the terminal that has it, or fork it deliberately.
+
+A quarantined prompt is one the kit refused to deliver blindly. `list` shows
+what is held, `ingest` accepts one, `discard` drops it, and `resume` restarts it
+in an absolute project directory you name.
+EOF
+      ;;
+    selectors | selector | session | targets)
+      cat <<'EOF'
+Selectors
+
+<session> is either the terminal number shown in the picker and in `sp list`, or
+the exact shpool ID. Every command that takes one accepts both.
+
+Terminal numbers are display conveniences. They are stable for the current host
+boot and never change meaning under a repaint, but they describe what is on
+screen, not which conversation you mean. Never automate a move, close, repair,
+or cleanup by number -- pass the exact shpool ID.
+
+`sp msg` accepts more: `all`, `idle`, a list (1,3,5), and a range (2-4).
+
+No Session Kit screen prints a shpool ID or a provider UUID, and no flag reveals
+one. Identifiers live in the 0600 state files, in the JSON modes
+(`shpool_status --json`, `--lookup`), and in proofs. Commands still accept an ID
+wherever they accept a number, so a script that already holds one keeps working.
+EOF
+      ;;
+    exit-codes | exit | status | codes)
+      cat <<'EOF'
+Exit codes
+
+Every Session Kit command uses the same statuses.
+
+  0    the command did what it was asked to do
+  1    refused or failed; the reason is on stderr
+  2    wrong arguments, or a selector that matched no single session
+  3    live evidence was refused as stale, partial, or ambiguous
+       (shpool_status --strict-json, --guard-json), or shpool_reaper found its
+       disable sentinel
+  64   the launcher was invoked under a name that is not a Session Kit command
+  69   something required is unavailable: the current-release link, a helper
+       missing from the pinned release, or Bash 4 or newer on macOS
+  74   the picker refused the action it was asked to take
+  75   the picker's attach failed after the action was allowed
+  78   the launcher found a release or manager link outside the install root
+  127  codex_resume_here could not find the codex command
+  143  sp was terminated (SIGTERM or SIGHUP)
+
+A refusal is a status, not a suggestion: nothing partial has happened. Session
+Kit disables a whole action rather than performing part of it.
+EOF
+      ;;
+    completion | complete | tab)
+      cat <<'EOF'
+Tab completion
+
+Session Kit ships one Bash completion file and installs a copy under each
+command name that takes arguments:
+
+  ~/.local/share/bash-completion/completions/sp
+  ~/.local/share/bash-completion/completions/session-kit
+  ~/.local/share/bash-completion/completions/shpool_status
+  ~/.local/share/bash-completion/completions/shpool_reaper
+  ~/.local/share/bash-completion/completions/codex_resume_here
+
+With the bash-completion package present, a new shell loads the right file on
+demand. Without it, source one copy from your own shell startup file:
+
+  source ~/.local/share/bash-completion/completions/sp
+
+It completes verbs, help topics, flags, provider names, color names, and the
+project aliases in your projects file. It never runs a session command and
+never asks the manager for state, so a Tab press cannot change anything or
+block on a snapshot -- which is also why it does not complete terminal numbers.
+
+Set SESSION_KIT_COMPLETION_DIR to install the copies somewhere else, or to
+"none" to skip them. Uninstall removes only files that still carry the kit's
+own marker line, so an edited copy is left alone.
+EOF
+      ;;
+    machine | internal | picker)
+      cat <<'EOF'
+Machine verbs
+
+These exist for the picker and the managed shell, which call them with proof
+arguments a person does not hold. They are not part of the human command set,
+they are not listed in `sp help`, and running one by hand is a good way to be
+refused.
+
+  sp picker-open <session>           the picker's own attach path
+  sp picker-takeover <session>
+  sp picker-close <session>
+  sp picker-recover <session>
+  sp picker-history <session>
+  sp picker-name <session> <title>
+  sp picker-name-reset <session>
+  sp picker-title-refresh <session>
+  sp picker-fork <session>
+  sp picker-account-switch <session> <alias>
+  sp restore-exact <provider> <uuid> <cwd> [launch-key]
+
+A picker verb answers with 74 when it refuses the action and 75 when the attach
+itself failed after the action was allowed, so the picker can tell the two
+apart. Use the human verbs -- `sp go`, `sp close`, `sp name`, `sp recover` --
+for anything you type yourself.
+EOF
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# Help must answer before anything else can refuse. It is the one command that
+# has to work on a machine where shpool was never installed, or was installed
+# and later broke, because it is where the instructions for fixing that live.
+sp_help() {
+  local topic=${1:-}
+  if (($# > 1)); then
+    usage >&2
+    return 2
+  fi
+  if [[ -z $topic ]]; then
+    sp_help_overview
+    return 0
+  fi
+  sp_help_topic "$topic" && return 0
+  printf 'sp: no help topic named %s\n' "$topic" >&2
+  printf 'topics: sessions names messages accounts history selectors exit-codes completion machine\n' >&2
+  return 2
 }
 
 # sp's action implementations live beside this program under ../lib/sh, in a
@@ -94,6 +411,17 @@ trap 'cleanup_snapshot; trap - INT; kill -INT "$$"' INT
 trap 'cleanup_snapshot; exit 143' TERM HUP
 
 command=${1:-list}
+# Help is answered before shpool is required. `sp --help` on a machine where
+# shpool is missing, half-installed, or broken used to print "shpool executable
+# unavailable" and nothing else -- the one moment the reference is most needed
+# was the one moment it could not be reached.
+case "$command" in
+  help | -h | --help)
+    shift
+    sp_help "$@"
+    exit $?
+    ;;
+esac
 sk_require_shpool || exit 1
 case "$command" in
   list)
@@ -139,6 +467,21 @@ case "$command" in
   close|kill)
     [[ $# -eq 2 ]] || { usage >&2; exit 2; }
     close_target "$2"
+    ;;
+  teardown)
+    shift
+    [[ $# -gt 0 ]] || { usage >&2; exit 2; }
+    teardown_target "$@"
+    ;;
+  worktree)
+    shift
+    [[ $# -gt 0 ]] || { usage >&2; exit 2; }
+    exec python3 "$INVENTORY_CORE" worktree "$@"
+    ;;
+  receipt)
+    shift
+    [[ $# -gt 0 ]] || { usage >&2; exit 2; }
+    exec python3 "$INVENTORY_CORE" receipt "$@"
     ;;
   prune)
     [[ $# -eq 1 ]] || { usage >&2; exit 2; }
@@ -226,9 +569,6 @@ case "$command" in
   restore-exact)
     [[ $# -eq 4 || $# -eq 5 ]] || { usage >&2; exit 2; }
     restore_exact "$2" "$3" "$4" "${5:-}"
-    ;;
-  help|-h|--help)
-    usage
     ;;
   *)
     usage >&2

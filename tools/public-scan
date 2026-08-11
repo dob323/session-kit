@@ -85,7 +85,7 @@ def scan_text(
                 for part in parts
                 if part
             ):
-                failures.append(f"{label}: private marker")
+                failures.append(f"{label}{MARKER_FAILURE}")
                 break
     return failures
 
@@ -139,6 +139,43 @@ def scan_tree(
     return failures
 
 
+MARKER_FAILURE = ": private marker"
+BASELINE_ENTRY = re.compile(r"^([0-9a-f]{40})(?:\s+(\S.*))?$")
+
+
+class BaselineError(Exception):
+    """The grandfathered-history list could not be read exactly."""
+
+
+def load_baseline(path: Path) -> frozenset[str]:
+    """Read the reviewed history blobs the private-marker rule may skip.
+
+    Every failure mode here is fatal on purpose. A baseline that silently
+    parses to nothing would turn the history scan back into a pass with no
+    evidence behind it, which is the one outcome a fail-closed check must
+    never produce.
+    """
+    try:
+        payload = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise BaselineError(f"baseline is unreadable: {exc}") from exc
+    blobs: set[str] = set()
+    for number, line in enumerate(payload.splitlines(), 1):
+        entry = line.split("#", 1)[0].strip()
+        if not entry:
+            continue
+        match = BASELINE_ENTRY.fullmatch(entry)
+        if match is None:
+            raise BaselineError(f"malformed baseline line {number}: {line!r}")
+        blob = match.group(1)
+        if blob in blobs:
+            raise BaselineError(f"duplicate baseline blob on line {number}: {blob}")
+        blobs.add(blob)
+    if not blobs:
+        raise BaselineError("baseline lists no blobs")
+    return frozenset(blobs)
+
+
 def git(root: Path, *args: str, text: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["git", "-C", str(root), *args],
@@ -154,6 +191,8 @@ def scan_history(
     patterns: dict[str, re.Pattern[str]],
     *,
     private_markers: bool,
+    baseline: frozenset[str] = frozenset(),
+    applied: set[str] | None = None,
 ) -> list[str]:
     try:
         rows = git(root, "rev-list", "--objects", "--all").stdout.splitlines()
@@ -178,15 +217,23 @@ def scan_history(
             failures.append(f"{label}: file exceeds scan limit")
             continue
         payload = git(root, "cat-file", "blob", object_id, text=False).stdout
-        failures.extend(
-            scan_payload(
-                label,
-                path,
-                payload,
-                patterns,
-                private_markers=private_markers,
-            )
+        found = scan_payload(
+            label,
+            path,
+            payload,
+            patterns,
+            private_markers=private_markers,
         )
+        if object_id in baseline:
+            # A baselined blob is exempt from the private-marker rule and from
+            # nothing else. Secrets still fail, so listing a blob can never be
+            # a way to publish a leaked credential: the exemption is keyed to
+            # the exact content, and edited content is a different object.
+            excused = [item for item in found if item.endswith(MARKER_FAILURE)]
+            if excused and applied is not None:
+                applied.add(object_id)
+            found = [item for item in found if not item.endswith(MARKER_FAILURE)]
+        failures.extend(found)
     return failures
 
 
@@ -203,22 +250,41 @@ def main() -> int:
         action="store_true",
         help="also reject repository-specific private markers",
     )
+    parser.add_argument(
+        "--baseline",
+        type=Path,
+        help=(
+            "file listing reviewed history blobs that predate a private marker; "
+            "exempts those exact blobs from the private-marker rule only"
+        ),
+    )
     args = parser.parse_args()
     root = args.root.resolve()
     if not root.is_dir():
         parser.error("root must be a directory")
+    baseline: frozenset[str] = frozenset()
+    if args.baseline is not None:
+        if not args.git_history:
+            parser.error("--baseline applies to --git-history scans")
+        try:
+            baseline = load_baseline(args.baseline)
+        except BaselineError as exc:
+            parser.error(str(exc))
 
     failures = scan_tree(
         root,
         SECRETS,
         private_markers=args.private_markers,
     )
+    applied: set[str] = set()
     if args.git_history:
         failures.extend(
             scan_history(
                 root,
                 SECRETS,
                 private_markers=args.private_markers,
+                baseline=baseline,
+                applied=applied,
             )
         )
     failures = sorted(set(failures))
@@ -228,6 +294,12 @@ def main() -> int:
             print(f"  {failure}")
         return 1
     scope = "tree and Git history" if args.git_history else "tree"
+    if baseline:
+        # Say what the baseline actually did here, not how long the list is.
+        # A gap between the two is how a stale entry becomes visible.
+        scope += (
+            f", {len(applied)} of {len(baseline)} baselined history blob(s) excused"
+        )
     print(f"public scan passed ({scope})")
     return 0
 

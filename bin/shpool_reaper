@@ -35,27 +35,47 @@ INVENTORY_CORE=${SESSION_KIT_INVENTORY_CORE:-"$RELEASE_DIR/lib/session_inventory
 DARWIN_PROC_SNAPSHOT=
 DARWIN_DAEMON_PID=
 
+reaper_usage() {
+  cat <<'EOF'
+usage: shpool_reaper [mode]
+
+  (no mode), --candidates          report terminals that meet every close
+                                   predicate, and change nothing
+  --auto-close                     close the candidates that have held every
+                                   predicate for the full quiet period
+  --verify-candidate <private-json>
+                                   re-prove one candidate from its own record
+
+Statuses: 0 done, 1 refused or failed, 2 wrong arguments, 3 disabled by its
+sentinel file. `sp help exit-codes` documents them all.
+EOF
+}
+
 MODE=report
 VERIFY_FILE=
 case "${1:-}" in
+  -h | --help | help)
+    reaper_usage
+    exit 0
+    ;;
   ""|--candidates) ;;
   --auto-close)
     [[ -z ${2:-} ]] || {
-      echo "usage: shpool_reaper [--candidates|--auto-close|--verify-candidate <private-json>]" >&2
+      reaper_usage >&2
       exit 2
     }
     MODE=auto
     ;;
   --verify-candidate)
     [[ -n ${2:-} && -z ${3:-} ]] || {
-      echo "usage: shpool_reaper [--candidates|--auto-close|--verify-candidate <private-json>]" >&2
+      reaper_usage >&2
       exit 2
     }
     MODE=verify
     VERIFY_FILE=$2
     ;;
   *)
-    echo "usage: shpool_reaper [--candidates|--auto-close|--verify-candidate <private-json>]" >&2
+    reaper_usage >&2
     exit 2
     ;;
 esac

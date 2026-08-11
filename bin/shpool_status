@@ -10,6 +10,46 @@ CORE=${SESSION_KIT_INVENTORY_CORE:-"$SCRIPT_DIR/../lib/session_inventory.py"}
 # it runs on every login picker and every `sp` render, so it sets it here too.
 export PYTHONDONTWRITEBYTECODE=1
 
+# Which modes touch state and which do not is the question a person actually
+# has here: several of these look like reads and are not. A mode that builds a
+# fresh inventory writes the cached snapshot, and the four human render modes
+# additionally fill in provider titles that were still pending. The replay and
+# probe modes are the only genuinely read-only ones.
+status_usage() {
+  cat <<'USAGE'
+usage: shpool_status [mode]
+
+Read-only modes -- nothing on disk changes:
+  --strict-json                        live snapshot, strict identity, no write
+  --guard-json                         live snapshot for mutation guards, no write
+  --render-file <snapshot.json> [--rows]
+                                       render a snapshot file that already exists
+  --lookup-file <snapshot.json> <row|shpool-id>
+                                       resolve a selector inside a snapshot file
+  --recovery-pending-list              list pending recovery records
+
+Modes that refresh the cached inventory as they run:
+  --waiting-count                      how many sessions are waiting for you
+  --detail <session-number>            one session in full, for a person
+
+Modes that refresh the cache and fill pending provider titles:
+  (no mode)                            the dashboard
+  --rows                               dashboard rows only
+  --json                               the whole snapshot as JSON
+  --lookup <row|shpool-id>             resolve one selector to its record
+
+Mode that changes recovery state:
+  --recovery-pending-ack <source-generation-key> <old-shpool-id> <uuid>
+                                       acknowledge one pending recovery record
+
+--json, --strict-json, --guard-json, --lookup, and --lookup-file are the
+machine channels and carry identifiers. The dashboard, --rows, and --detail are
+what a person reads, and never print a shpool ID or a provider UUID.
+Statuses: 0 done, 2 wrong arguments, 3 live evidence refused as stale, partial,
+or ambiguous. `sp help exit-codes` documents them all.
+USAGE
+}
+
 case "${1:-}" in
   ""|--rows|--json|--lookup)
     # Claude stores auto-titles separately from the prompt-bar name. Fill the
@@ -36,21 +76,21 @@ case "${1:-}" in
   --guard-json) exec python3 "$CORE" snapshot --guard-live --no-write ;;
   --lookup)
     [[ -n ${2:-} && -z ${3:-} ]] || {
-      echo "usage: shpool_status --lookup <row|shpool-id>" >&2
+      status_usage >&2
       exit 2
     }
     exec python3 "$CORE" lookup "$2"
     ;;
   --detail)
     [[ -n ${2:-} && -z ${3:-} ]] || {
-      echo "usage: shpool_status --detail <session-number>" >&2
+      status_usage >&2
       exit 2
     }
     exec python3 "$CORE" detail "$2"
     ;;
   --render-file)
     [[ -n ${2:-} && ( -z ${3:-} || ${3:-} == --rows ) && -z ${4:-} ]] || {
-      echo "usage: shpool_status --render-file <snapshot.json> [--rows]" >&2
+      status_usage >&2
       exit 2
     }
     if [[ ${3:-} == --rows ]]; then
@@ -60,27 +100,31 @@ case "${1:-}" in
     ;;
   --lookup-file)
     [[ -n ${2:-} && -n ${3:-} && -z ${4:-} ]] || {
-      echo "usage: shpool_status --lookup-file <snapshot.json> <row|shpool-id>" >&2
+      status_usage >&2
       exit 2
     }
     exec python3 "$CORE" lookup --input "$2" "$3"
     ;;
   --recovery-pending-list)
     [[ -z ${2:-} ]] || {
-      echo "usage: shpool_status --recovery-pending-list" >&2
+      status_usage >&2
       exit 2
     }
     exec python3 "$CORE" recovery-pending list
     ;;
   --recovery-pending-ack)
     [[ -n ${2:-} && -n ${3:-} && -n ${4:-} && -z ${5:-} ]] || {
-      echo "usage: shpool_status --recovery-pending-ack <source-generation-key> <old-shpool-id> <uuid>" >&2
+      status_usage >&2
       exit 2
     }
     exec python3 "$CORE" recovery-pending ack "$2" "$3" "$4"
     ;;
+  -h | --help | help)
+    status_usage
+    exit 0
+    ;;
   *)
-    echo "usage: shpool_status [--rows|--waiting-count|--json|--strict-json|--guard-json|--detail <selector>|--lookup <selector>|--render-file <file> [--rows]|--lookup-file <file> <selector>|--recovery-pending-list|--recovery-pending-ack <generation> <id> <uuid>]" >&2
+    status_usage >&2
     exit 2
     ;;
 esac

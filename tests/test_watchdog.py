@@ -25,6 +25,16 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 WATCHDOG = REPO / "bin" / "session_kit_watchdog"
 
+# A journal monotonic timestamp counts from boot, and the watchdog discards any
+# event that predates the daemon generation it is reasoning about. Deriving
+# fixture timestamps from the host clock made these tests depend on the host's
+# uptime: on a freshly booted CI runner, `time.monotonic()` is smaller than the
+# ages below, every event landed at or before zero, the watchdog correctly
+# dropped the evidence, and the repairs these tests exist to prove never
+# happened. The fixture owns its own boot-relative clock instead, far enough
+# past the oldest age any case uses that no event can fall off the start of it.
+FIXTURE_BOOT_SECONDS = 100_000
+
 
 def write_executable(path: Path, body: str) -> None:
     path.write_text(body, encoding="utf-8")
@@ -58,11 +68,16 @@ def session(
 
 def journal_event(message: str, *, age_seconds: int = 300, pid: int | None = None) -> str:
     """Return one journalctl -o json fixture line."""
+    if age_seconds >= FIXTURE_BOOT_SECONDS:
+        raise ValueError(
+            "journal fixtures must fall after the fixture boot clock; "
+            f"raise FIXTURE_BOOT_SECONDS above {age_seconds}"
+        )
     return json.dumps(
         {
             "_PID": str(os.getpid() if pid is None else pid),
             "__MONOTONIC_TIMESTAMP": str(
-                int((time.monotonic() - age_seconds) * 1_000_000)
+                int((FIXTURE_BOOT_SECONDS - age_seconds) * 1_000_000)
             ),
             "__REALTIME_TIMESTAMP": str(
                 int((time.time() - age_seconds) * 1_000_000)
@@ -103,6 +118,7 @@ class WatchdogFixture:
         serving_threads: int | None = None,
         journal_lines: str = "",
         repair_exit: int = 0,
+        daemon_start_seconds: int = 0,
     ) -> None:
         self.temp = tempfile.TemporaryDirectory(prefix=".watchdog-", dir=REPO)
         self.base = Path(self.temp.name)
@@ -133,7 +149,13 @@ class WatchdogFixture:
                     "warnings": [],
                     "daemon_generation": {
                         "pid": os.getpid(),
-                        "process_start_ticks": 1,
+                        # Boot-relative, on the same clock as the journal
+                        # fixtures above. The default sits before every event
+                        # so ordinary cases are unaffected by it.
+                        "process_start_ticks": max(
+                            1,
+                            int(daemon_start_seconds * os.sysconf("SC_CLK_TCK")),
+                        ),
                     },
                     "sessions": sessions,
                     "outside_agents": [],
@@ -250,6 +272,38 @@ exit 0
 
     def close(self) -> None:
         self.temp.cleanup()
+
+
+class JournalFixtureClockTests(unittest.TestCase):
+    """The fixture clock must never borrow the host's uptime again.
+
+    Every repair proof in this file feeds the watchdog journal evidence, and
+    the watchdog throws away an event that cannot have happened after the
+    daemon started. When the fixture read `time.monotonic()`, that made the
+    evidence a function of how long the machine had been up: correct on a
+    long-lived workstation, at or below zero on a runner minutes past boot,
+    where the repair cases all reported "no evidence" and passed nothing.
+    """
+
+    def test_event_timestamp_is_a_pure_function_of_its_age(self) -> None:
+        first = json.loads(failure_event(age_seconds=300))
+        time.sleep(0.01)
+        second = json.loads(failure_event(age_seconds=300))
+
+        self.assertEqual(
+            first["__MONOTONIC_TIMESTAMP"], second["__MONOTONIC_TIMESTAMP"]
+        )
+        self.assertEqual(
+            str((FIXTURE_BOOT_SECONDS - 300) * 1_000_000),
+            first["__MONOTONIC_TIMESTAMP"],
+        )
+
+    def test_every_supported_age_lands_after_the_daemon_started(self) -> None:
+        oldest = json.loads(failure_event(age_seconds=FIXTURE_BOOT_SECONDS - 1))
+
+        self.assertGreater(int(oldest["__MONOTONIC_TIMESTAMP"]), 0)
+        with self.assertRaises(ValueError):
+            failure_event(age_seconds=FIXTURE_BOOT_SECONDS)
 
 
 class WatchdogSafetyTests(unittest.TestCase):
@@ -494,6 +548,27 @@ class WatchdogRepairTests(unittest.TestCase):
         )
         try:
             fixture.run()
+            self.assertEqual([], fixture.repairs_requested())
+            self.assertEqual([], fixture.recorded())
+        finally:
+            fixture.close()
+
+    def test_marker_from_before_the_daemon_started_is_ignored(self) -> None:
+        """A failure older than the daemon cannot be describing this daemon.
+
+        The watchdog compares journal timestamps against the daemon's own
+        boot-relative start, and both sides of that comparison come from the
+        fixture. Nothing else exercises it, and it is the rule a host-derived
+        fixture clock used to trip by accident on a freshly booted runner.
+        """
+        fixture = WatchdogFixture(
+            sessions=[session(recent_output_age_seconds=300)],
+            journal_lines=failure_event(age_seconds=300),
+            daemon_start_seconds=FIXTURE_BOOT_SECONDS - 100,
+        )
+        try:
+            fixture.run()
+
             self.assertEqual([], fixture.repairs_requested())
             self.assertEqual([], fixture.recorded())
         finally:

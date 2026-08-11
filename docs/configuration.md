@@ -12,6 +12,7 @@ uses XDG locations where available.
 | Session Kit state | `${XDG_STATE_HOME:-$HOME/.local/state}/session-kit` |
 | Optional terminal journals | `${XDG_STATE_HOME:-$HOME/.local/state}/shpool-journal` |
 | Recovery journal archive | `${XDG_STATE_HOME:-$HOME/.local/state}/shpool-journal-recovery` |
+| Journal archive read by `sp find` | `${XDG_STATE_HOME:-$HOME/.local/state}/shpool-archive` |
 | Paired launch records | `${XDG_STATE_HOME:-$HOME/.local/state}/shpool-start` |
 | shpool configuration | `${XDG_CONFIG_HOME:-$HOME/.config}/shpool/config.toml` |
 | Immutable releases | `$HOME/.local/lib/session-kit/releases` |
@@ -175,6 +176,10 @@ sp new codex api
 sp new shell tools
 ```
 
+A row is the host's own shortcut, and adding one is also what lets a project's
+committed `session-kit.toml` decide the provider, account, model, and startup
+command a launch uses. See [Projects](projects.md).
+
 ## shpool settings
 
 Review [the shpool example](../config/shpool.example.toml). Session Kit expects
@@ -277,9 +282,10 @@ the same meaning without it.
 **Session color** gives each Claude Code and Codex session its own identity
 color, so two rows on screen do not look alike. It is derived from the
 conversation's identity, and the two providers draw from separate palettes.
-There is nothing to configure: the palettes are fixed, because Claude Code
-accepts only its own eight color names. See
-[Session colors](usage.md#session-colors) for the behavior and
+The palettes themselves are fixed, because Claude Code accepts only its own
+eight color names, but the choice within a palette is not: `sp color <target>
+<color>` records a per-session override and `sp color <target> reset` removes
+it. See [Session colors](usage.md#session-colors) for the behavior and
 `sp color reconcile` for settling sessions that already share one.
 
 Disable color entirely with either variable:
@@ -291,12 +297,16 @@ export SESSION_KIT_NO_COLOR=1
 
 ## Supported environment overrides
 
+### Locations and commands
+
 ```text
 SESSION_KIT_CONFIG
 SESSION_KIT_STATE_DIR
 SESSION_KIT_JOURNAL_DIR
 SESSION_KIT_ARCHIVE_DIR
+SESSION_KIT_JOURNAL_RECOVERY_DIR
 SESSION_KIT_PROJECTS_FILE
+SESSION_KIT_MSG_UNREAD_DIR
 SESSION_KIT_SHPOOL_CMD
 SESSION_KIT_CLAUDE_CMD
 CLAUDE_CONFIG_DIR
@@ -307,11 +317,83 @@ SESSION_KIT_BOOT_ID_FILE
 SESSION_KIT_AUTO_NAME
 SESSION_KIT_NO_COLOR
 SESSION_KIT_NONINTERACTIVE
-SESSION_KIT_PICKER_REFRESH_SECONDS
 SESSION_KIT_WATCHDOG_NOTIFY
+SESSION_KIT_ATTENTION_NOTIFY
+SESSION_KIT_ATTENTION_ALERT_TYPE
+SESSION_KIT_ATTENTION_NOTIFY_STATE
 SESSION_KIT_WATCHDOG_ALERT_TYPE
 SESSION_KIT_WATCHDOG_MODE
+SESSION_KIT_WATCHDOG_LOG
+SESSION_KIT_WATCHDOG_REPAIRS
+SESSION_KIT_WATCHDOG_BINARY_FINGERPRINT
 ```
 
-Other environment names in the source are internal test or release hooks and
-are not a stable public interface.
+`SESSION_KIT_ARCHIVE_DIR` and `SESSION_KIT_JOURNAL_RECOVERY_DIR` are two
+different places, and both appear in the paths table above:
+`shpool-archive` is what `sp find` searches, `shpool-journal-recovery` is what
+exact recovery reads.
+
+### Operator tunables
+
+These change timing and thresholds. Every one has a working default; set them
+only when the default is wrong for your machine. Values are what the code
+reads today.
+
+| Name | Default | What it changes |
+| --- | --- | --- |
+| `SESSION_KIT_PICKER_REFRESH_SECONDS` | `5` | picker live-refresh interval |
+| `SESSION_KIT_PICKER_GROUP` | `state` | grouping the picker starts in: `state`, `provider`, or `project` |
+| `SESSION_KIT_PICKER_COMPACT` | `0` | `1` starts the picker with compact rows |
+| `SESSION_KIT_PICKER_FILTER_LIVE` | `1` | `0` disables filter-as-you-type; `/text` still searches on Enter |
+| `SESSION_KIT_ATTENTION_NOTIFY_AFTER_SECONDS` | `600` | how long a session must have waited before the opt-in queue notification fires |
+| `SESSION_KIT_ATTENTION_NOTIFY_COOLDOWN_SECONDS` | `3600` | minimum gap before one unbroken wait is announced again |
+| `SESSION_KIT_STALL_SECONDS` | `2700` | silence after which a session stops being described as running (clamped 60–86400) |
+| `SESSION_KIT_AUTO_CLOSE_HOURS` | `72` | continuous quiet hours before the cleanup observer may close a provider-exited terminal |
+| `SESSION_KIT_PRUNE_DAYS` | `7` | age at which the reaper prunes its own records |
+| `SESSION_KIT_REAPER_DRY_RUN` | `0` | `1` makes the reaper report what it would close and close nothing |
+| `SESSION_KIT_WATCHDOG_POLL_SECONDS` | `60` | watchdog pass interval |
+| `SESSION_KIT_WATCHDOG_DEAD_SECONDS` | `2700` | quiet time before a terminal is treated as dead |
+| `SESSION_KIT_WATCHDOG_FLAGGED_QUIET_SECONDS` | `120` | quiet time before an already-flagged terminal is acted on |
+| `SESSION_KIT_WATCHDOG_QUIET_REPORT_COOLDOWN` | `21600` | minimum gap between repeat reports about the same quiet terminal |
+| `SESSION_KIT_WATCHDOG_MANAGER_TIMEOUT` | `20` | seconds the watchdog waits on a service-manager probe |
+| `SESSION_KIT_SUPERVISOR_BRIEF_WAIT_SECONDS` | `15` | wait per attempt for the supervisor's standing brief to land |
+| `SESSION_KIT_SUPERVISOR_BRIEF_ATTEMPTS` | `12` | how many such attempts (15 × 12 is the "about three minutes" budget) |
+| `SESSION_KIT_SUPERVISOR_ENSURE_TIMEOUT` | `20` | seconds the picker waits for `supervisor ensure` |
+| `SESSION_KIT_SUPERVISOR_HANDOFF_WAIT_SECONDS` | `120` | wait for a supervisor handoff to become durable |
+| `SESSION_KIT_PROVIDER_PROOF_ATTEMPTS` | `480` | polls for provider-acceptance proof before giving up |
+| `SESSION_KIT_MSG_CONSOLE_SECONDS` | `2` | message-console refresh interval |
+| `SESSION_KIT_ACCOUNT_ADVICE_MAX_AGE_SECONDS` | `600` | age past which account rotation advice is treated as stale |
+| `SESSION_KIT_WORKER_WORKTREE` | on | `0`, `off`, `false`, or `no` launches delegated workers in the project directory instead of their branch's own git worktree; the run receipt records that it was off |
+| `SESSION_KIT_WORKTREE_ROOT` | `<state>/worktrees` | absolute directory holding materialized worktrees and their registry |
+
+### Off switches
+
+Two behaviors can be turned off by an environment variable or by a file, so
+they can be disabled for one command or for the machine. The file lives under
+the Session Kit state directory.
+
+| Behavior | Variable | File |
+| --- | --- | --- |
+| Session prebake | `SESSION_KIT_NO_PREBAKE=1` | `<state>/prebake-off` |
+| Self-heal on start | `SESSION_KIT_NO_SELF_HEAL=1` | `<state>/self-heal-off` |
+
+The `$HOME` kill switches `.no_shpool_reaper`, `.no_shpool_watchdog`, and
+`.no_shpool_journal` are listed under
+[Optional feature sentinels](#optional-feature-sentinels) and audited by
+`session-kit doctor`.
+
+Closing the managed terminal on a clean provider exit is opt-in per machine:
+touch `~/.sk_autoclose_on_clean_exit`. Without it, any provider exit stops at
+the recovery menu and the terminal stays open.
+
+### Everything else
+
+`SESSION_KIT_TESTING` and the `SESSION_KIT_TEST_*` names are test seams, and
+each one is read only when `SESSION_KIT_TESTING=1`; the same gate covers
+`SESSION_KIT_PROVIDER_PRESENCE_OVERRIDE`. Setting any of them on a normal
+installation changes nothing. The remaining `SESSION_KIT_*` names in the source are
+internal: the installer and release engine pass them between their own
+processes, and provider hooks pass them to the commands they invoke. They are
+not a stable public interface and are not listed here. The message and handoff
+variables a caller may legitimately set are documented where they are used —
+see [messaging](messaging.md) and [usage](usage.md).

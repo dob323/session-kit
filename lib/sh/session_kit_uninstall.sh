@@ -11,6 +11,22 @@
 # Globals the entry script owns are assigned there, not here.
 # shellcheck disable=SC2154
 
+# Only files that still carry the kit's own marker line are removed. A copy the
+# user edited, or a completion for a same-named command from somewhere else,
+# survives an uninstall untouched.
+remove_completions() {
+  local name destination
+  [[ $completion_dir != none ]] || return 0
+  [[ -d $completion_dir && ! -L $completion_dir ]] || return 0
+  for name in "${completion_names[@]}"; do
+    destination=$completion_dir/$name
+    [[ -f $destination && ! -L $destination ]] || continue
+    grep -qxF -- "$completion_marker" "$destination" 2>/dev/null || continue
+    command rm -f -- "$destination"
+  done
+  return 0
+}
+
 uninstall_command() {
   local purge_code=0 purge_config=0 helper
   while (($#)); do
@@ -48,6 +64,7 @@ uninstall_command() {
     command rm -f -- "$bin_dir/$helper"
   done
   command rm -f -- "$bin_dir/session-kit"
+  remove_completions
   if (( purge_config )); then
     [[ ! -e $config_root || ( -d $config_root && ! -L $config_root ) ]] ||
       die "refusing to remove unsafe config directory"

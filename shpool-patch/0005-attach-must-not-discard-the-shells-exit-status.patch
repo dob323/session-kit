@@ -1,0 +1,58 @@
+# Upstream project: shpool -- https://github.com/shell-pool/shpool
+# Upstream license: Apache License, Version 2.0
+#   (Copyright 2023 Google LLC; see ../LICENSES/Apache-2.0.txt)
+# Base revision:    v0.11.0 == fe2d11595ff255810523b0868159dec051e303f1
+#
+# This file is a patch against Apache-2.0 licensed shpool source. The modified
+# source stays subject to the Apache License, Version 2.0 and to upstream's
+# own notices. Session Kit does not vendor, redistribute, or replace the
+# shpool source tree or any shpool binary; only this diff is distributed.
+# Apply with: git apply <this file>   (see README.md in this directory)
+#
+# Change: libshpool/src/protocol.rs. The attach client stamps its fallback
+#   exit status of 1 into the result slot as soon as EITHER pipe thread
+#   finishes. When the terminal closes the client's stdin first -- which the
+#   upstream test suite does on every exit-status assertion, and which a real
+#   terminal does whenever it hangs up before the shell's status arrives --
+#   that discards the ExitStatus frame still in flight and reports 1 instead
+#   of the shell's real status. Waits the existing bounded detach window for
+#   the socket side before defaulting.
+#
+diff --git a/libshpool/src/protocol.rs b/libshpool/src/protocol.rs
+index 109a2e1..9bc0370 100644
+--- a/libshpool/src/protocol.rs
++++ b/libshpool/src/protocol.rs
+@@ -395,6 +395,33 @@ impl Client {
+                     + (sock_to_stdout_h.is_finished() as usize);
+ 
+                 if nfinished_threads > 0 {
++                    // A finished stdin->sock thread only means our local input
++                    // side is done: the terminal closed our stdin. The session
++                    // may still be about to report the shell's exit status, and
++                    // stamping the fallback into the result slot right now makes
++                    // sock->stdout bail on its next wakeup without ever reading
++                    // the ExitStatus frame, so the attach process reports 1
++                    // instead of the shell's real status. Wait a bounded window
++                    // for the socket side first. It returns as soon as the frame
++                    // lands or the daemon closes the connection, so the ordinary
++                    // case costs a poll, not the whole window.
++                    if stdin_to_sock_h.is_finished() && !sock_to_stdout_h.is_finished() {
++                        common::sleep_unless(
++                            MAX_DETACH_WAIT_DUR,
++                            || {
++                                sock_to_stdout_h.is_finished()
++                                    || result_slot.lock().unwrap().is_some()
++                            },
++                            common::PollStrategy::Backoff {
++                                initial_interval: DETACH_BACKOFF_INITIAL_DUR,
++                                factor: 2.0,
++                                max_interval: DETACH_BACKOFF_MAX_STEP_DUR,
++                            },
++                        );
++                        nfinished_threads = (stdin_to_sock_h.is_finished() as usize)
++                            + (sock_to_stdout_h.is_finished() as usize);
++                    }
++
+                     // If one of the threads has exited, but not the other
+                     // make sure that the exit result slot has some contents
+                     // so the other thread will exit the next time it wakes

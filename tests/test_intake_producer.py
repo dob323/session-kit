@@ -40,6 +40,25 @@ from sessionkit_supervisor.intake import (  # noqa: E402
     substantive_prompt,
 )
 
+def remove_sandbox(temporary: tempfile.TemporaryDirectory) -> None:
+    """Remove a sandbox that a detached delivery ask may still be writing into.
+
+    The producer spawns its delivery ask fire-and-forget by design, so a
+    marker write can land between rmtree emptying the directory and removing
+    it. Retry briefly; the writer is a one-shot append and finishes in
+    milliseconds.
+    """
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            temporary.cleanup()
+            return
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.05)
+
+
 CLAUDE_HOOK = REPO / "extras" / "hooks" / "sk_session_events.py"
 CODEX_HOOK = REPO / "extras" / "hooks" / "sk_codex_intake.py"
 CLAUDE_UUID = "dcbdf940-4eda-4967-8e41-23a5760c32b5"
@@ -89,7 +108,7 @@ class ProducerCase(unittest.TestCase):
         )
 
     def tearDown(self) -> None:
-        self.temporary.cleanup()
+        remove_sandbox(self.temporary)
 
     def env(self, **overrides: str) -> dict[str, str]:
         environment = {
@@ -205,8 +224,11 @@ class ClaudeProducerTests(ProducerCase):
         self.claude_prompt()
         self.claude_prompt("and also fix the redirects while you are there")
         self.assertEqual(1, len(self.entries()))
-        self.assertTrue(self.wait_for_delivery(2))
-        self.assertEqual(2, len(self.delivery_requests()))
+        # Three asks, one project. The middle prompt recorded nothing new, and
+        # it still asks for delivery: the arrival notice this sandbox never
+        # lands is owed, and a prompt is the wake that retries it.
+        self.assertTrue(self.wait_for_delivery(3))
+        self.assertEqual(3, len(self.delivery_requests()))
 
     def test_a_subagent_prompt_produces_nothing(self) -> None:
         for marker in ("parent_tool_use_id", "parent_session_id", "isSidechain"):
@@ -546,7 +568,7 @@ class AmendmentDeliveryTests(unittest.TestCase):
         )
 
     def tearDown(self) -> None:
-        self.temporary.cleanup()
+        remove_sandbox(self.temporary)
 
     def deliver(self, *, thread_key: str, text: str, key: str) -> dict:
         self.sends.append({"thread_key": thread_key, "text": text, "key": key})
@@ -562,9 +584,18 @@ class AmendmentDeliveryTests(unittest.TestCase):
         identity.write_text(f"claude:{SUBAGENT_UUID}\n", encoding="utf-8")
         identity.chmod(0o600)
 
-    def flush(self) -> dict:
+    def flush(self, *, after_ms: int = 0) -> dict:
+        """One sweep. ``after_ms`` moves the clock past a relay's backoff."""
+        if not after_ms:
+            return intake_mod.flush(
+                self.spool, deliver=self.deliver, state_dir=self.state
+            )
+        later = time.time() + after_ms / 1000
         return intake_mod.flush(
-            self.spool, deliver=self.deliver, state_dir=self.state
+            self.spool,
+            deliver=self.deliver,
+            state_dir=self.state,
+            clock=lambda: later,
         )
 
     def test_each_amendment_is_delivered_once_and_only_once(self) -> None:
@@ -609,8 +640,16 @@ class AmendmentDeliveryTests(unittest.TestCase):
         self.assertTrue(all(not item["delivered"] for item in entry["amendments"]))
         self.assertEqual("unreachable", entry["amendments"][0]["relay_status"])
 
+        # A failed relay earns the first rung of the backoff, so the sweep
+        # that follows it immediately leaves it alone rather than spending a
+        # send per wake on a supervisor nobody can reach.
+        held = self.flush()
+        self.assertEqual(0, held["attempted"])
+        self.assertEqual(3, held["deferred"])
+        self.assertEqual(3, len(self.sends))
+
         self.status = "delivered-woke"
-        self.assertEqual(3, self.flush()["delivered"])
+        self.assertEqual(3, self.flush(after_ms=intake_mod.RELAY_BACKOFF_MS[0])["delivered"])
         keys = [send["key"] for send in self.sends]
         self.assertEqual(keys[:3], keys[3:])
 
@@ -641,7 +680,7 @@ class ProducerRuleTests(unittest.TestCase):
         self.spool = Spool(self.state)
 
     def tearDown(self) -> None:
-        self.temporary.cleanup()
+        remove_sandbox(self.temporary)
 
     def test_a_prompt_is_a_project_or_it_is_not(self) -> None:
         self.assertEqual(PROJECT, substantive_prompt(PROJECT))

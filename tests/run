@@ -4,6 +4,23 @@ set -euo pipefail
 repo=$(cd -- "$(dirname -- "$0")/.." && pwd)
 export PYTHONDONTWRITEBYTECODE=1
 
+# Fixture sandboxes default into the repository itself, which costs twice: a
+# run that dies without unwinding leaves them behind in the source tree, and
+# the AF_UNIX socket paths built inside them inherit the repo path's length,
+# so a checkout more than ~30 characters deep overruns the 108-byte limit.
+# The fixtures already honour this variable; nothing set it until now.
+own_exec_root=
+if [[ -z ${SESSION_KIT_TEST_EXEC_ROOT:-} ]]; then
+  SESSION_KIT_TEST_EXEC_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/session-kit-exec.XXXXXX")
+  own_exec_root=$SESSION_KIT_TEST_EXEC_ROOT
+fi
+export SESSION_KIT_TEST_EXEC_ROOT
+# shellcheck disable=SC2329  # invoked by the EXIT trap below, not by name
+cleanup_exec_root() {
+  [[ -n $own_exec_root ]] && rm -rf -- "$own_exec_root"
+}
+trap cleanup_exec_root EXIT
+
 if [[ ${GITHUB_ACTIONS:-} == true ]]; then
   log=$(mktemp "${RUNNER_TEMP:-/tmp}/session-kit-tests.log.XXXXXX")
   set +e
@@ -27,4 +44,6 @@ PY
   exit "$status"
 fi
 
-exec python3 -m unittest discover -s "$repo/tests" -t "$repo" -v
+status=0
+python3 -m unittest discover -s "$repo/tests" -t "$repo" -v || status=$?
+exit "$status"

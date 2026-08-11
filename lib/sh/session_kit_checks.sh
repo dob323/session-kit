@@ -345,6 +345,35 @@ check_source() {
     printf 'FAIL  install Claude Code, Codex, or both\n'
     failed=1
   fi
+  # Activation writes one provenance-marked hook into each provider config, and
+  # it refuses a config directory other accounts could write. Reporting that
+  # here, from the same code that enforces it, keeps a directory the operator
+  # can repair in seconds from stopping an install partway through.
+  local hook_tool=$source/lib/sessionkit_supervisor/provider_hooks.py
+  local hook_status= hook_detail=
+  if [[ -f $hook_tool && ! -L $hook_tool ]]; then
+    while IFS=$'\t' read -r hook_status hook_detail; do
+      case $hook_status in
+        ok) printf 'OK    provider config: %s\n' "$hook_detail" ;;
+        *)
+          printf 'FAIL  provider config: %s\n' "$hook_detail"
+          failed=1
+          ;;
+      esac
+    done < <(python3 "$hook_tool" preflight \
+      --claude-settings "$claude_settings" --codex-hooks "$codex_hooks")
+  fi
+  # The theme layout applies its own stricter rule to the Codex home and runs
+  # at the start of the install transaction. Reporting its refusal here, in its
+  # own words, keeps it from stopping an install the preflight called
+  # installable.
+  local codex_detail=
+  if codex_detail=$(codex_theme_layout validate 2>&1); then
+    printf 'OK    Codex home: the theme layout is owner-controlled\n'
+  else
+    printf 'FAIL  Codex home: %s\n' "${codex_detail#session-kit: }"
+    failed=1
+  fi
   for required in \
     bin/sp bin/shpool_login bin/shpool_status bin/shpool_reaper \
     bin/codex_resume_here bin/session_kit_common bin/session-kit \

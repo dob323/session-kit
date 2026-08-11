@@ -4,12 +4,16 @@ One always-on session that knows your whole fleet. It sits first in the
 picker, holds terminal **1** from the next reboot, and answers one question
 better than anything else on the box: *what needs me right now?*
 
-Open it three ways:
+Open it two ways:
 
 ```text
-v          from the picker — jumps straight into the supervisor
-sp msg 34  message it like any session (its number is pinned first)
+v         from the picker — jumps straight into the supervisor
+sp msg 1  message it like any session (it holds terminal 1)
 ```
+
+`supervisor` itself is not installed on `$PATH` — `session-kit` installs
+`kit`, `sp`, `shpool_login`, `shpool_status`, `shpool_reaper`, and
+`codex_resume_here` only. `v` is the supported way in.
 
 Ask it anything about the fleet: who is blocked on you (with the actual
 question and how long it has waited), what finished that you haven't seen,
@@ -40,7 +44,7 @@ you.
 ## The attention queue is yours too
 
 The same ranked queue the supervisor reads is surfaced raw in the picker
-header (`⚑ 2 need you — …`) and via `sp msg queue`. If the supervisor is
+header (`Needs you: 2 · … · a:review`) and via `sp msg queue`. If the supervisor is
 ever down or wrong, the truth is one keypress away — it is never the only
 path.
 
@@ -66,7 +70,7 @@ before the agent's turn — and the installer registers it for you:
 | provider | file | registered in |
 |---|---|---|
 | Claude | `extras/hooks/sk_session_events.py` | `UserPromptSubmit` in `~/.claude/settings.json` |
-| Codex | `extras/hooks/sk_codex_intake.py` | `UserPromptSubmit` in `~/.codex/hooks.json` |
+| Codex | `lib/sessionkit_supervisor/provider_hooks.py codex-hook` | `UserPromptSubmit` in `~/.codex/hooks.json` |
 
 Codex's is a *user-level* hook, which is what makes it general: a user-level
 hook loads even in a project whose folder was never trusted, so a project
@@ -138,9 +142,16 @@ sp msg intake open                          what is still unfinished
 sp msg intake record --msg-id … --source …  a messaged arrival, before planning
 sp msg intake ack --msg-id … --text "…"     answer whoever raised it
 sp msg intake preflight --msg-id …           record analysis and exact worker plan
+             (also requires --analysis --scope --required-expertise
+              --required-tags --worker-plan-json --risks --tests)
 sp msg intake delegate --msg-id … --branch … who is carrying it
 sp msg intake progress --msg-id … --text "…" tell the source how it is going
 sp msg intake complete --msg-id … --text "…" tell the source it is done
+sp msg intake duties [--msg-id …]           every duty and what it has said
+sp msg intake report --msg-id … --branch …  a worker says completed or failed
+sp msg intake retry --msg-id … --branch …   send a failed duty back to launch
+sp msg intake reset --msg-id … --branch …   put a settled duty back to assigned
+sp msg intake cancel --msg-id … --branch …  abandon one duty, with the reason
 ```
 
 A new automatic intake also records a durable, identifier-only arrival notice.
@@ -171,16 +182,41 @@ first, read live from disk on every call.
 
 Worker launch is a separate fail-closed state machine. The supervisor records a
 preflight for the exact current requirements revision and digest before any
-handoff. Automatic intakes require a real multi-agent plan: at least two
-assignments, Claude and Codex both present, distinct requested models, and
-distinct expertise scopes. The complete plan is launched, not merely stored as
-metadata. Every assignment keeps its idempotency key, workstream, scope,
-provider, requested and verified actual model, expertise, rationale, branch,
-exact worker identity, and not_started → dispatching → provider_reconciled →
-verified history. The complete plan is written under the intake lock before any
-launcher callback. A crash leaves a dispatching assignment that retry reconciles
-without relaunch; a new amendment or
-supervisor identity invalidates the old preflight for unstarted work.
+handoff. The preflight names the expertise the project requires, and the plan
+must cover it: one worker for a one-skill project is a complete plan, and four
+workers that between them miss a declared need is not. Nothing else is
+prescribed — provider mix, model mix and worker count are the plan's business.
+The complete plan is launched, not merely stored as metadata. Every assignment
+keeps its idempotency key, workstream, scope, provider, requested and verified
+actual model, expertise, rationale, branch, exact worker identity, and
+not_started → dispatching → provider_reconciled → verified → commissioned
+history. The complete plan is written under the intake lock before any launcher
+callback. A crash leaves a dispatching assignment that retry reconciles without
+relaunch; a new amendment or supervisor identity invalidates the old preflight
+for unstarted work.
+
+Every planned worker carries a duty: the task text it is sent, what finishing
+means, and what it hands back. A verified worker is a proven session, not yet a
+worker — commissioning is the step that delivers that duty to the exact proven
+identity, recorded like any other send (reserved on disk under the key the send
+will use, settled with what the receipt said). A duty that did not land leaves
+the worker `verified`, names it in the delegate result's `undelivered`, and
+makes the verb exit non-zero; the next delegate retries that delivery under the
+same key rather than sending the work twice.
+
+What became of a duty comes back the other way. `sp msg intake report` is the
+worker's own channel: the report is written as a receipt file under
+`intake/receipts/<msg_id>/` before the entry is touched, so a report that
+exists cannot be lost by a failed entry write, and it does not depend on the
+supervisor still being alive to hear it. `sp msg intake duties` is the view over
+both directions — it flags a commissioned worker that has reported nothing for
+half an hour as `silent`, a duty that never landed as `owed`, and a receipt on
+disk with no matching line in the entry as an unfolded receipt. A duty is
+`assigned`, `completed`, `failed` or `abandoned`; a worker reports the middle
+two, `retry` sends a failed duty back to the start line under a new launch key,
+`reset` returns a settled duty to assigned without relaunching, and `cancel`
+abandons one with its reason recorded. Cancelling a duty closes the record for
+that branch, not the worker's session.
 
 Session Kit can gate only its supported delegation API. A provider-native spawn
 or arbitrary Bash command can bypass that API because the cooperative Unix user

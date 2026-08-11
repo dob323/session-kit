@@ -234,6 +234,12 @@ class HumanOutputHasNoIdentifiersTests(unittest.TestCase):
         cls.home.mkdir(mode=0o700)
         cls.state = base / "state"
         cls.state.mkdir(mode=0o700)
+        # Commands refuse to run without a session manager binary, and a CI
+        # runner has none. Nothing below asks the manager a question, so a
+        # stand-in that answers nothing is the whole dependency.
+        cls.shpool = base / "shpool"
+        cls.shpool.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        cls.shpool.chmod(0o755)
         event_root = cls.state / "events"
         event_root.mkdir(mode=0o700)
         (event_root / f"claude:{CLAUDE_UUID}.jsonl").write_text(
@@ -412,6 +418,7 @@ class HumanOutputHasNoIdentifiersTests(unittest.TestCase):
             **os.environ,
             "HOME": os.fspath(self.home),
             "SESSION_KIT_START_DIR": os.fspath(quarantine),
+            "SESSION_KIT_SHPOOL_CMD": os.fspath(self.shpool),
         }
         completed = subprocess.run(
             [os.fspath(SP), "prompt-quarantine", "list"],

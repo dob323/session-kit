@@ -95,7 +95,7 @@ source through this same delivery path. Docs: `docs/supervisor.md`.
 
 `✉` marks a reply you have not opened; unreplied targets sort first. Opening a
 thread clears its `✉` — the same mark the picker counts, so the picker's
-"✉ N new replies" header cue and the centre never disagree. `sp msg report
+unread-reply count and the centre never disagree. `sp msg report
 [id]` opens the centre on a specific message; in a pipe, a cron, or with
 `SESSION_KIT_MSG_CONSOLE=0` it prints one static report and exits.
 

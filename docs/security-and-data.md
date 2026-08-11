@@ -42,7 +42,15 @@ is recorded as non-cryptographic. Agent messages and copied prose are notices,
 not source authority. A prompt that begins as a harness envelope — a
 `<task-notification`, `<cross-session-message`, `<system-reminder`, or another
 machine wrapper — is machine text that reached the same hook, and is refused
-both when it is recorded and when it is verified.
+both when it is recorded and when it is verified. So is an automation wake,
+screened on the `RUNTIME FOR THIS WAKE` banner stem rather than on any one
+full sentence, because the sentence changes with the provider and the version.
+
+A launcher may also declare the machine that started a conversation, in
+`SESSION_KIT_MACHINE_ORIGIN`. Any process can set that variable, so it is read
+in one direction only: a declared origin is recorded in the event and removes
+authority from every prompt in that conversation, and it can never grant
+authority to a prompt that would not otherwise have it.
 
 Kit-owned state is verified under the strict owner-private rule: this uid owns
 it and it carries no group or other bit. A provider transcript is not

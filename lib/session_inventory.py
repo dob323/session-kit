@@ -1121,7 +1121,7 @@ def collect_live(
         apply_provider_title_states=apply_provider_title_states,
         apply_retained_setup_attributions=apply_retained_setup_attributions,
     )
-    return _apply_account_bindings(inventory, config)
+    return _apply_worktree_labels(_apply_account_bindings(inventory, config), config)
 
 
 def _read_state_json(path: Path) -> Any:
@@ -2500,6 +2500,35 @@ def _apply_account_bindings(
     return inventory
 
 
+def _apply_worktree_labels(
+    inventory: dict[str, Any], config: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Name the branch a session is isolated on, from the worktree registry.
+
+    Display only, and matched on the session's own directory: a row says
+    "worktree p2/foo" because the kit recorded that directory as that branch's
+    worktree, never because a path looked like one.
+    """
+    if "state_dir" not in config:
+        return inventory
+    try:
+        from sessionkit_supervisor import worktrees as _worktrees
+
+        registry = _worktrees.labels(config["state_dir"], os.environ)
+    except (CollectionError, OSError, ValueError, ImportError):
+        return inventory
+    if not registry:
+        return inventory
+    for group in ("sessions", "outside_agents"):
+        for item in inventory.get(group, ()):
+            if not isinstance(item, dict):
+                continue
+            label = registry.get(clean_text(item.get("cwd"), 4096))
+            if label:
+                item["worktree"] = dict(label)
+    return inventory
+
+
 def snapshot(*, write_state: bool = True, config: dict[str, Any] | None = None) -> dict[str, Any]:
     settings = config if config is not None else load_config()
     inventory = _snapshot.snapshot(
@@ -3047,6 +3076,182 @@ def _account_command(args: argparse.Namespace, config: dict[str, Any]) -> int:
     return 0
 
 
+def _worktree_command(args: argparse.Namespace, config: dict[str, Any]) -> int:
+    """One worktree-isolation verb; prints its JSON result."""
+    from sessionkit_supervisor import worktrees as _worktrees
+
+    state_dir = Path(config["state_dir"])
+    if args.worktree_action == "materialize":
+        _json_print(
+            _worktrees.materialize(
+                repo=args.repo,
+                branch=args.branch,
+                state_dir=state_dir,
+                start_ref=args.start_ref,
+                environ=os.environ,
+            )
+        )
+        return 0
+    if args.worktree_action == "bind":
+        _json_print(
+            _worktrees.bind(
+                state_dir=state_dir,
+                path=args.path,
+                shpool_id=args.shpool_id,
+                launch_key=args.launch_key,
+                environ=os.environ,
+            )
+        )
+        return 0
+    if args.worktree_action == "list":
+        found = _worktrees.records(state_dir, os.environ)
+        if args.as_json:
+            _json_print({"schema_version": SCHEMA_VERSION, "worktrees": found})
+        else:
+            print(_worktrees.render(found), end="")
+        return 0
+    if args.worktree_action == "lookup":
+        record = _worktrees.lookup(
+            state_dir,
+            path=args.path,
+            repo=args.repo,
+            branch=args.branch,
+            environ=os.environ,
+        )
+        _json_print(record or {})
+        return 0 if record else 2
+    _json_print(
+        _worktrees.teardown(
+            state_dir=state_dir,
+            path=args.path,
+            repo=args.repo,
+            branch=args.branch,
+            merged_into_ref=args.merged_into,
+            force=args.force,
+            environ=os.environ,
+        )
+    )
+    return 0
+
+
+def _receipt_command(args: argparse.Namespace, config: dict[str, Any]) -> int:
+    """One run-receipt verb. Exit 3 means a plan reached its cap and stopped."""
+    from sessionkit_supervisor import receipts as _receipts
+
+    state_dir = Path(config["state_dir"])
+    if args.receipt_action == "cap":
+        cap = _receipts.set_cap(
+            state_dir=state_dir,
+            msg_id=args.msg_id,
+            max_usd_est=args.max_usd,
+            soft_usd_est=args.soft_usd,
+            max_tokens=args.max_tokens,
+            max_iterations=args.max_iterations,
+            note=args.note,
+        )
+        # The approval line is the point of the verb: a cap nobody is shown is
+        # not a cap the operator approved.
+        print(_receipts.format_cap(cap), file=sys.stderr)
+        _json_print(cap)
+        return 0
+    if args.receipt_action == "gate":
+        state = _receipts.gate(state_dir, args.msg_id)
+        _json_print(state)
+        return 0 if state["allowed"] else 3
+    if args.receipt_action == "open":
+        _json_print(
+            _receipts.open_run(
+                state_dir=state_dir,
+                msg_id=args.msg_id,
+                branch=args.branch,
+                provider=args.provider,
+                model=args.model,
+                launch_key=args.launch_key,
+                isolation_mode=args.isolation,
+                isolation_path=args.isolation_path,
+                isolation_reason=args.isolation_reason,
+            )
+        )
+        return 0
+    if args.receipt_action == "spend":
+        record = _receipts.record_spend(
+            state_dir=state_dir,
+            receipt_id=args.receipt,
+            usd_est=args.usd,
+            tokens=args.tokens,
+            iterations=args.iterations,
+            source=args.source,
+        )
+        _json_print(record)
+        if record.get("stop_reason") == "cap_breached":
+            print(_receipts.render_run(record), file=sys.stderr, end="")
+            return 3
+        for warning in record.get("cap_state", {}).get("warnings", []):
+            print(f"cost cap warning: {warning}", file=sys.stderr)
+        return 0
+    if args.receipt_action == "verifier":
+        _json_print(
+            _receipts.record_verifier(
+                state_dir=state_dir,
+                receipt_id=args.receipt,
+                result=args.result,
+                command=args.verifier_command,
+                exit_code=args.exit_code,
+                evidence=args.evidence,
+            )
+        )
+        return 0
+    if args.receipt_action == "files":
+        _json_print(
+            _receipts.record_changed_files(
+                state_dir=state_dir,
+                receipt_id=args.receipt,
+                repo=args.repo,
+                since=args.since,
+            )
+        )
+        return 0
+    if args.receipt_action == "close":
+        _json_print(
+            _receipts.close_run(
+                state_dir=state_dir,
+                receipt_id=args.receipt,
+                stop_reason=args.stop_reason,
+                stop_detail=args.detail,
+                worker_identity=args.worker_identity,
+                allow_unverified=args.allow_unverified,
+            )
+        )
+        return 0
+    if args.receipt_action == "list":
+        runs = (
+            _receipts.runs_for(state_dir, args.msg_id)
+            if args.msg_id
+            else _receipts.all_runs(state_dir)
+        )
+        _json_print({"schema_version": SCHEMA_VERSION, "receipts": runs})
+        return 0
+    if args.receipt and args.msg_id:
+        raise CollectionError("show one receipt or one plan, not both")
+    if args.receipt:
+        shown = _receipts.read_run(state_dir, args.receipt)
+        if shown is None:
+            print(f"no run receipt {args.receipt}", file=sys.stderr)
+            return 2
+        if args.as_json:
+            _json_print(shown)
+        else:
+            print(_receipts.render_run(shown), end="")
+        return 0
+    if not args.msg_id:
+        raise CollectionError("receipt show needs --receipt or --msg-id")
+    if args.as_json:
+        _json_print(_receipts.cap_state(state_dir, args.msg_id))
+    else:
+        print(_receipts.render_plan(state_dir, args.msg_id), end="")
+    return 0
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -3293,6 +3498,9 @@ def _parser() -> argparse.ArgumentParser:
     # already-running supervisor after the durable intake write.
     intake_subparsers.add_parser("flush")
     intake_subparsers.add_parser("dismiss-machine")
+    # What the spool still owes the supervisor: the count first, then the
+    # notices themselves. Read-only — `flush` is the verb that delivers.
+    intake_subparsers.add_parser("pending")
     intake_ack = intake_subparsers.add_parser("ack")
     intake_ack.add_argument("--msg-id", dest="msg_id", required=True)
     intake_ack.add_argument("--text", required=True)
@@ -3302,6 +3510,14 @@ def _parser() -> argparse.ArgumentParser:
     intake_preflight.add_argument("--analysis", required=True)
     intake_preflight.add_argument("--scope", required=True)
     intake_preflight.add_argument("--required-expertise", dest="required_expertise", required=True)
+    # The plan's shape is the plan's business; what it must cover is not.
+    intake_preflight.add_argument(
+        "--required-tags",
+        dest="required_tags",
+        action="append",
+        required=True,
+        help="expertise this project needs; repeat or comma-separate",
+    )
     intake_preflight.add_argument("--worker-plan-json", dest="worker_plan_json", required=True)
     intake_preflight.add_argument("--risks", required=True)
     intake_preflight.add_argument("--tests", required=True)
@@ -3311,11 +3527,128 @@ def _parser() -> argparse.ArgumentParser:
     intake_delegate.add_argument(
         "--branch", dest="branches", action="append", required=True
     )
+    intake_report = intake_subparsers.add_parser("report")
+    intake_report.add_argument("--msg-id", dest="msg_id", required=True)
+    intake_report.add_argument("--branch", required=True)
+    intake_report.add_argument(
+        "--state", dest="duty_state", required=True, choices=("completed", "failed")
+    )
+    intake_report.add_argument("--summary", required=True)
+    intake_report.add_argument("--reporter", dest="reporter_identity")
+    intake_retry = intake_subparsers.add_parser("retry")
+    intake_retry.add_argument("--msg-id", dest="msg_id", required=True)
+    intake_retry.add_argument("--branch", required=True)
+    intake_retry.add_argument(
+        "--launch-key", dest="idempotency_key", required=True
+    )
+    intake_reset = intake_subparsers.add_parser("reset")
+    intake_reset.add_argument("--msg-id", dest="msg_id", required=True)
+    intake_reset.add_argument("--branch", required=True)
+    intake_reset.add_argument("--summary")
+    intake_cancel = intake_subparsers.add_parser("cancel")
+    intake_cancel.add_argument("--msg-id", dest="msg_id", required=True)
+    intake_cancel.add_argument("--branch", required=True)
+    intake_cancel.add_argument("--summary", required=True)
+    intake_duties = intake_subparsers.add_parser("duties")
+    intake_duties.add_argument("--msg-id", dest="msg_id")
     for intake_relay in ("progress", "complete"):
         intake_note = intake_subparsers.add_parser(intake_relay)
         intake_note.add_argument("--msg-id", dest="msg_id", required=True)
         intake_note.add_argument("--text", required=True)
     intake_subparsers.add_parser("open")
+    worktree_parser = subparsers.add_parser("worktree")
+    worktree_subparsers = worktree_parser.add_subparsers(
+        dest="worktree_action", required=True
+    )
+    worktree_materialize = worktree_subparsers.add_parser("materialize")
+    worktree_materialize.add_argument("--repo", required=True)
+    worktree_materialize.add_argument("--branch", required=True)
+    worktree_materialize.add_argument("--start-ref", dest="start_ref", default="HEAD")
+    worktree_bind = worktree_subparsers.add_parser("bind")
+    worktree_bind.add_argument("--path", required=True)
+    worktree_bind.add_argument("--shpool-id", dest="shpool_id", default="")
+    worktree_bind.add_argument("--launch-key", dest="launch_key", default="")
+    worktree_list = worktree_subparsers.add_parser("list")
+    worktree_list.add_argument("--json", dest="as_json", action="store_true")
+    worktree_lookup = worktree_subparsers.add_parser("lookup")
+    worktree_lookup.add_argument("--path")
+    worktree_lookup.add_argument("--repo")
+    worktree_lookup.add_argument("--branch")
+    worktree_teardown = worktree_subparsers.add_parser("teardown")
+    worktree_teardown.add_argument("--path")
+    worktree_teardown.add_argument("--repo")
+    worktree_teardown.add_argument("--branch")
+    worktree_teardown.add_argument(
+        "--merged-into", dest="merged_into", default="HEAD"
+    )
+    worktree_teardown.add_argument("--force", action="store_true")
+    receipt_parser = subparsers.add_parser("receipt")
+    receipt_subparsers = receipt_parser.add_subparsers(
+        dest="receipt_action", required=True
+    )
+    receipt_cap = receipt_subparsers.add_parser("cap")
+    receipt_cap.add_argument("--msg-id", dest="msg_id", required=True)
+    receipt_cap.add_argument("--max-usd", dest="max_usd", type=float)
+    receipt_cap.add_argument("--soft-usd", dest="soft_usd", type=float)
+    receipt_cap.add_argument("--max-tokens", dest="max_tokens", type=int)
+    receipt_cap.add_argument("--max-iterations", dest="max_iterations", type=int)
+    receipt_cap.add_argument("--note", default="")
+    receipt_gate = receipt_subparsers.add_parser("gate")
+    receipt_gate.add_argument("--msg-id", dest="msg_id", required=True)
+    receipt_open = receipt_subparsers.add_parser("open")
+    receipt_open.add_argument("--msg-id", dest="msg_id", required=True)
+    receipt_open.add_argument("--branch", default="")
+    receipt_open.add_argument("--provider", default="")
+    receipt_open.add_argument("--model", default="")
+    receipt_open.add_argument("--launch-key", dest="launch_key", default="")
+    receipt_open.add_argument(
+        "--isolation", choices=("worktree", "none"), default="none"
+    )
+    receipt_open.add_argument("--isolation-path", dest="isolation_path", default="")
+    receipt_open.add_argument(
+        "--isolation-reason", dest="isolation_reason", default=""
+    )
+    receipt_spend = receipt_subparsers.add_parser("spend")
+    receipt_spend.add_argument("--receipt", required=True)
+    receipt_spend.add_argument("--usd", type=float, default=0.0)
+    receipt_spend.add_argument("--tokens", type=int, default=0)
+    receipt_spend.add_argument("--iterations", type=int, default=0)
+    receipt_spend.add_argument("--source", required=True)
+    receipt_verifier = receipt_subparsers.add_parser("verifier")
+    receipt_verifier.add_argument("--receipt", required=True)
+    receipt_verifier.add_argument(
+        "--result", required=True, choices=("passed", "failed", "unverified")
+    )
+    # dest is deliberately not "command": the top-level subparser stores the
+    # chosen verb there, and a plain --command would overwrite it mid-parse.
+    receipt_verifier.add_argument(
+        "--command", dest="verifier_command", default=""
+    )
+    receipt_verifier.add_argument("--exit-code", dest="exit_code", type=int)
+    receipt_verifier.add_argument("--evidence", default="")
+    receipt_files = receipt_subparsers.add_parser("files")
+    receipt_files.add_argument("--receipt", required=True)
+    receipt_files.add_argument("--repo")
+    receipt_files.add_argument("--since", default="")
+    receipt_close = receipt_subparsers.add_parser("close")
+    receipt_close.add_argument("--receipt", required=True)
+    receipt_close.add_argument(
+        "--stop-reason",
+        dest="stop_reason",
+        required=True,
+        choices=("completed", "cap_breached", "failed", "abandoned", "cancelled"),
+    )
+    receipt_close.add_argument("--detail", default="")
+    receipt_close.add_argument("--worker-identity", dest="worker_identity", default="")
+    receipt_close.add_argument(
+        "--allow-unverified", dest="allow_unverified", action="store_true"
+    )
+    receipt_show = receipt_subparsers.add_parser("show")
+    receipt_show.add_argument("--receipt")
+    receipt_show.add_argument("--msg-id", dest="msg_id")
+    receipt_show.add_argument("--json", dest="as_json", action="store_true")
+    receipt_list = receipt_subparsers.add_parser("list")
+    receipt_list.add_argument("--msg-id", dest="msg_id")
     return parser
 
 
@@ -3332,6 +3665,71 @@ def _messages_run(action: str, config: dict[str, Any], **fields: Any) -> tuple[i
         max_proc_nodes=int(config.get("max_proc_nodes", DEFAULT_MAX_PROC_NODES)),
         **fields,
     )
+
+
+def _worker_worktree_branch(
+    assignment: Mapping[str, Any],
+    *,
+    cwd: Path,
+    environ: Mapping[str, str],
+) -> str:
+    """The branch a delegated worker should be isolated on, or "" for none.
+
+    Isolation is the default for delegated work: the plan already recorded a
+    branch per worker, so the worker gets that branch as its own worktree and
+    two workers on one project stop editing the same files. Two cases answer "no"
+    honestly instead of failing a launch — a project that is not a git
+    repository, and an operator who set SESSION_KIT_WORKER_WORKTREE=0. The run
+    receipt records which it was.
+    """
+    from sessionkit_supervisor.worktrees import repository_root, valid_branch
+
+    choice = environ.get("SESSION_KIT_WORKER_WORKTREE", "").strip().casefold()
+    if choice in ("0", "off", "false", "no"):
+        return ""
+    branch = str(assignment.get("branch") or "").strip()
+    if not branch:
+        return ""
+    if repository_root(cwd) is None:
+        return ""
+    return valid_branch(branch)
+
+
+def _refuse_unlaunchable_delegation(
+    msg_id: str,
+    *,
+    branches: Sequence[str],
+    cwd: Path,
+    state_dir: Path,
+) -> None:
+    """Refuse a delegation that cannot succeed, before anything is reserved.
+
+    Both refusals here are knowable in advance: the plan is already at its cost
+    cap, or a branch it wants is checked out somewhere else. Discovering either
+    one inside the launcher would be worse than useless — by then the worker row
+    says dispatching, and the refusal reads as an uncertain dispatch that a
+    person has to reconcile by hand.
+    """
+    from sessionkit_supervisor import receipts as _receipts
+    from sessionkit_supervisor import worktrees as _worktrees
+
+    if not msg_id:
+        return
+    allowed = _receipts.gate(state_dir, msg_id)
+    if not allowed["allowed"]:
+        raise CollectionError(
+            f"plan {msg_id} reached its cost cap; no worker starts: {allowed['reason']}"
+        )
+    for branch in branches:
+        if not _worker_worktree_branch({"branch": branch}, cwd=cwd, environ=os.environ):
+            continue
+        planned = _worktrees.preflight(
+            repo=cwd, branch=branch, state_dir=state_dir, environ=os.environ
+        )
+        if planned["blocked_by"]:
+            raise CollectionError(
+                f"worker branch {branch} cannot be isolated: {planned['reason']}"
+            )
 
 
 def _launch_intake_worker(
@@ -3374,6 +3772,9 @@ def _launch_intake_worker(
         os.fspath(sp_path), "new", provider,
         "--model", model, "--launch-key", launch_key,
     ]
+    worktree_branch = _worker_worktree_branch(assignment, cwd=cwd, environ=environ)
+    if worktree_branch:
+        argv.extend(("--worktree", worktree_branch))
     if provider == "codex":
         # A new Codex process has no conversation identity until its first
         # submitted prompt creates a rollout.  Reconciliation deliberately
@@ -3390,7 +3791,9 @@ def _launch_intake_worker(
                 handle.write(
                     "Session Kit initialized this managed worker. Do not inspect, "
                     "change, or execute anything yet. Wait for the Fleet Supervisor "
-                    "to send the scoped assignment.\n"
+                    "to send the scoped assignment. It arrives as a Session Kit "
+                    "operator message carrying your task, its acceptance criteria, "
+                    "the deliverable, and the command you report back with.\n"
                 )
                 handle.flush()
                 os.fsync(handle.fileno())
@@ -3542,10 +3945,17 @@ def _intake_command(args: argparse.Namespace, config: dict[str, Any]) -> int:
         if not isinstance(hook_payload, Mapping):
             raise MessageError("a hook payload must be a JSON object")
     worker_plan = ()
+    required_tags: tuple[str, ...] = ()
     if args.intake_action == "preflight":
         worker_plan = json.loads(args.worker_plan_json)
         if not isinstance(worker_plan, list):
             raise MessageError("worker plan JSON must be an array")
+        required_tags = tuple(
+            tag.strip()
+            for raw in (args.required_tags or ())
+            for tag in str(raw).split(",")
+            if tag.strip()
+        )
     launcher: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None
     reconciler: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None
     if args.intake_action == "delegate":
@@ -3561,11 +3971,72 @@ def _intake_command(args: argparse.Namespace, config: dict[str, Any]) -> int:
         entry = spool.read_entry(primary) if primary else None
         cwd_raw = entry.get("source_cwd") if isinstance(entry, Mapping) else None
         launch_cwd = Path(cwd_raw) if isinstance(cwd_raw, str) and cwd_raw else Path("")
+        _refuse_unlaunchable_delegation(
+            primary,
+            branches=getattr(args, "branches", None) or (),
+            cwd=launch_cwd,
+            state_dir=Path(config["state_dir"]),
+        )
 
         def launch(assignment: Mapping[str, Any]) -> Mapping[str, Any]:
-            return _launch_intake_worker(
+            # Everything that can refuse this worker refuses it before the
+            # provider process exists: the plan's cost cap, then the worktree
+            # its branch needs. A failure after the launch would leave a live
+            # worker behind an "uncertain dispatch", which costs a person a
+            # manual reconcile; a failure here costs nothing.
+            from sessionkit_supervisor import receipts as _receipts
+            from sessionkit_supervisor import worktrees as _worktrees
+
+            state_dir = Path(config["state_dir"])
+            allowed = _receipts.gate(state_dir, primary)
+            if not allowed["allowed"]:
+                raise CollectionError(
+                    f"plan {primary} reached its cost cap; no worker starts: "
+                    + allowed["reason"]
+                )
+            branch = _worker_worktree_branch(
                 assignment, cwd=launch_cwd, environ=os.environ
             )
+            isolation_path = ""
+            isolation_reason = ""
+            if branch:
+                isolation_path = str(
+                    _worktrees.materialize(
+                        repo=launch_cwd,
+                        branch=branch,
+                        state_dir=state_dir,
+                        environ=os.environ,
+                    )["path"]
+                )
+            elif _worktrees.repository_root(launch_cwd) is None:
+                isolation_reason = "project directory is not a git repository"
+            else:
+                isolation_reason = "SESSION_KIT_WORKER_WORKTREE is off"
+            receipt = _receipts.open_run(
+                state_dir=state_dir,
+                msg_id=primary,
+                branch=str(assignment.get("branch") or ""),
+                provider=str(assignment.get("provider") or ""),
+                model=str(assignment.get("requested_model") or ""),
+                launch_key=str(assignment.get("idempotency_key") or ""),
+                isolation_mode="worktree" if branch else "none",
+                isolation_path=isolation_path,
+                isolation_reason=isolation_reason,
+            )
+            try:
+                result = _launch_intake_worker(
+                    assignment, cwd=launch_cwd, environ=os.environ
+                )
+            except BaseException as exc:
+                _receipts.close_run(
+                    state_dir=state_dir,
+                    receipt_id=str(receipt["receipt_id"]),
+                    stop_reason="failed",
+                    stop_detail=f"launch failed: {exc}",
+                    allow_unverified=True,
+                )
+                raise
+            return {**result, "receipt_id": receipt["receipt_id"]}
 
         def reconcile(assignment: Mapping[str, Any]) -> Mapping[str, Any]:
             return _reconcile_intake_worker(
@@ -3595,6 +4066,11 @@ def _intake_command(args: argparse.Namespace, config: dict[str, Any]) -> int:
         analysis=getattr(args, "analysis", None),
         scope=getattr(args, "scope", None),
         required_expertise=getattr(args, "required_expertise", None),
+        required_expertise_tags=required_tags,
+        branch=getattr(args, "branch", None),
+        duty_state=getattr(args, "duty_state", None),
+        reporter_identity=getattr(args, "reporter_identity", None),
+        idempotency_key=getattr(args, "idempotency_key", None),
         risks=getattr(args, "risks", None),
         tests=getattr(args, "tests", None),
         manual_policy_exception=getattr(args, "manual_policy_exception", None),
@@ -3929,6 +4405,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _account_command(args, config)
         if args.command == "msg":
             return _msg_command(args, config)
+        if args.command == "worktree":
+            return _worktree_command(args, config)
+        if args.command == "receipt":
+            return _receipt_command(args, config)
         if args.command == "recovery-pending":
             if args.pending_action == "list":
                 _json_print(list_pending(config))

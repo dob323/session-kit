@@ -124,6 +124,16 @@ scanner itself stays safe to publish, and it tests each underscore-separated
 part of an identifier as well as the whole token — `operator_confirmed` is
 fine, a name in that position is not.
 
+The rule reaches published history too, and history published before the rule
+existed cannot be rewritten out of clones and forks that already hold it.
+`tools/public-scan-history-baseline` lists the blob object ids that were read
+and accepted, and `tools/public-scan --git-history --baseline` skips those
+exact objects. It skips nothing else: a credential in a listed blob still
+fails, the working-tree scan ignores the baseline entirely, and an edited file
+is a different object that fails again. Append to that list only after reading
+the blob and only for something already published — a failure on a blob that
+has not shipped means the tree still has to be fixed.
+
 Adding a new blocked word means adding its digest, not the word:
 
 ```

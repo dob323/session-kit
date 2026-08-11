@@ -176,6 +176,8 @@ EXPECTED_TOP_LEVEL_COMMANDS = (
     "recovery-manifest",
     "lifecycle",
     "msg",
+    "worktree",
+    "receipt",
 )
 
 

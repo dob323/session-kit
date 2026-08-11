@@ -16,6 +16,14 @@ from .common import _positive_int, clean_text
 DEFAULT_STALL_SECONDS = 2700
 
 
+def _worktree_branch(row: Mapping[str, Any]) -> str:
+    """The branch a session is isolated on, as the collector recorded it."""
+    worktree = row.get("worktree")
+    if not isinstance(worktree, Mapping):
+        return ""
+    return clean_text(worktree.get("branch"), 128)
+
+
 def _timestamp(value: object) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         return None
@@ -264,6 +272,11 @@ def render_inventory(
                     status_parts.append(
                         f"{agent_count} subagent{'s' if agent_count != 1 else ''}"
                     )
+                # An isolated worker's row says which branch it is isolated on;
+                # without it a delegated fleet is a list of identical projects.
+                branch = _worktree_branch(item)
+                if branch:
+                    status_parts.append(f"worktree {branch}")
                 selector = item.get("terminal_number")
                 if (
                     isinstance(selector, bool)
@@ -382,6 +395,7 @@ def render_detail(
             "Project",
             _short_path(clean_text(row.get("cwd"), 4096), home_factory=home_factory),
         ),
+        ("Worktree", _worktree_branch(row)),
         ("Color", clean_text(row.get("display_color") or row.get("color"), 40)),
         (
             "Conversation",

@@ -34,6 +34,12 @@ case "$(uname -s 2>/dev/null || true)" in
     ;;
 esac
 bashrc_path=${SESSION_KIT_BASHRC:-"$HOME/.bashrc"}
+# One completion file, installed under each command name that takes
+# arguments, in the directory bash-completion loads user files from. Set
+# SESSION_KIT_COMPLETION_DIR to none to skip installing them entirely.
+completion_dir=${SESSION_KIT_COMPLETION_DIR:-"${XDG_DATA_HOME:-"$HOME/.local/share"}/bash-completion/completions"}
+completion_names=(sp session-kit shpool_status shpool_reaper codex_resume_here)
+completion_marker='# session-kit managed bash completion v1'
 bash_profile_path=${SESSION_KIT_BASH_PROFILE:-"$HOME/.bash_profile"}
 zshrc_path=${SESSION_KIT_ZSHRC:-"$HOME/.zshrc"}
 integration_marker=${SESSION_KIT_INTEGRATION_MARKER:-"$state_root/integration-ready-v1"}
@@ -91,6 +97,7 @@ shell_modules=(
   lib/sh/sp_picker.sh
   lib/sh/sp_provider_bounce.sh
   lib/sh/sp_sessions.sh
+  lib/sh/sp_completion.bash
 )
 
 die() {
@@ -100,22 +107,44 @@ die() {
 
 usage() {
   cat <<'EOF'
-Usage:
-  session-kit doctor [--json]
+session-kit installs and maintains this machine's Session Kit installation.
+
+usage: session-kit <command> [arguments]
+
+Check and repair
+  session-kit doctor [--json]      check every installed part and report
+  session-kit doctor --authority [--json] [--days N] [--session PROVIDER:UUID]
+                                   report the evidence behind source authority
+  session-kit services <enable|disable|status>
+                                   the user services: manager, reaper, watchdog
+
+Projects
   session-kit projects <discover|import|list>
+                                   find, adopt, and show project shortcuts
   session-kit projects add ALIAS <claude|codex|shell> /absolute/path
   session-kit projects ignore /absolute/path
+
+Releases
   session-kit update [--source PATH] [--enable-login|--disable-login] [--journal on|off]
+                                   install a newer release from a source tree
   session-kit rollback [--to COMMIT]
-  session-kit services <enable|disable|status>
-  session-kit disable-login
-  session-kit enable-login
+                                   return to a release already on this machine
+
+Login integration
+  session-kit enable-login         open the picker on interactive SSH logins
+  session-kit disable-login        stop opening it; sessions are untouched
+
+Removal
   session-kit uninstall [--purge-code] [--purge-config]
 
 From a cloned repository:
   ./install.sh --check
   ./install.sh [--enable-login|--disable-login] [--journal on|off]
-               [--import-projects|--no-import-projects]
+               [--import-projects|--no-import-projects] [--non-interactive]
+
+Day-to-day session commands are `sp`; run `sp help` for those, `sp help
+exit-codes` for the statuses every Session Kit command returns, and `sp help
+completion` for tab completion.
 
 Session Kit keeps transcripts, journals, and status data on this machine. It
 does not send telemetry. Uninstalling never deletes journals or archives.

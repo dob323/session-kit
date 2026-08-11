@@ -50,13 +50,45 @@ MANAGER_PROBE_TIMEOUT=${SESSION_KIT_WATCHDOG_MANAGER_TIMEOUT:-20}
 # means the check is skipped, so nothing breaks if it was never recorded.
 BINARY_FINGERPRINT=${SESSION_KIT_WATCHDOG_BINARY_FINGERPRINT:-"$STATE_ROOT/session-kit/shpool-binary.sha256"}
 REPORT_STATE=${SESSION_KIT_WATCHDOG_REPORT_STATE:-"$STATE_ROOT/session-kit/watchdog-reported.json"}
+# Attention notifications: OFF unless asked for. The picker's Needs You screen
+# is the guaranteed record and always has been; this only carries the same
+# facts to a desktop for someone who is not looking at a picker. It reuses the
+# notifier this watchdog already has, so there is one place to configure and
+# one place that can be muted.
+ATTENTION_NOTIFY=${SESSION_KIT_ATTENTION_NOTIFY:-0}
+[[ $ATTENTION_NOTIFY == 1 ]] || ATTENTION_NOTIFY=0
+ATTENTION_ALERT_TYPE=${SESSION_KIT_ATTENTION_ALERT_TYPE:-session-kit.attention}
+# Long enough that a session which asks and is answered in the same minute is
+# never announced at all.
+ATTENTION_AFTER_SECONDS=${SESSION_KIT_ATTENTION_NOTIFY_AFTER_SECONDS:-600}
+[[ $ATTENTION_AFTER_SECONDS =~ ^[0-9]+$ ]] || ATTENTION_AFTER_SECONDS=600
+ATTENTION_COOLDOWN_SECONDS=${SESSION_KIT_ATTENTION_NOTIFY_COOLDOWN_SECONDS:-3600}
+[[ $ATTENTION_COOLDOWN_SECONDS =~ ^[0-9]+$ ]] || ATTENTION_COOLDOWN_SECONDS=3600
+ATTENTION_STATE=${SESSION_KIT_ATTENTION_NOTIFY_STATE:-"$STATE_ROOT/session-kit/attention-notified.json"}
 ONCE=0
+
+watchdog_usage() {
+  cat <<'EOF'
+usage: session_kit_watchdog [--once]
+
+  (no mode)   run continuously, checking on the interval its service sets
+  --once      run one check and exit; this is what the installed service calls
+
+SESSION_KIT_WATCHDOG_MODE selects report (the default, evidence only) or the
+Linux-only repair mode. Statuses: 0 done, 1 refused or failed, 2 wrong
+arguments. `sp help exit-codes` documents them all.
+EOF
+}
 
 case "${1:-}" in
   "") ;;
   --once) ONCE=1 ;;
+  -h | --help | help)
+    watchdog_usage
+    exit 0
+    ;;
   *)
-    echo "usage: session_kit_watchdog [--once]" >&2
+    watchdog_usage >&2
     exit 2
     ;;
 esac
@@ -124,7 +156,7 @@ PY
 # Always "warning": an automatic repair, successful or not, must never fire a
 # critical and wake a phone. The picker banner is the guaranteed record.
 notify() {
-  local subject=$1 body=$2
+  local subject=$1 body=$2 alert_type=${3:-$ALERT_TYPE}
   # An unset notifier is a configuration gap, not a broken path. Reporting it
   # as "'' is not executable" reads like a permissions problem and hides the
   # fact that NOTHING is wired up: on 2026-08-06 the watchdog correctly
@@ -140,11 +172,219 @@ notify() {
     return 0
   fi
   "$NOTIFY_CMD" \
-    "--type=$ALERT_TYPE" \
+    "--type=$alert_type" \
     "--severity=warning" \
     "--title=$subject" \
     "--body=$body" >/dev/null 2>&1 ||
-    log "notify not delivered for $ALERT_TYPE (hub down or non-critical drop)"
+    log "notify not delivered for $alert_type (hub down or non-critical drop)"
+}
+
+# ---- attention notifications (opt-in) ----------------------------------
+# Which sessions have been waiting long enough to be worth saying out loud,
+# and have not already been said. Takes the path to a collected inventory and
+# answers with:
+#
+#   line 1  subject
+#   line 2  body
+#   line 3+ one thread key and the wait it belongs to, per announced session
+#
+# Nothing is recorded here: a notifier that fails must not consume the
+# announcement, so the keys are written back only after delivery.
+attention_pending() {
+  python3 - "$ATTENTION_STATE" "$ATTENTION_AFTER_SECONDS" \
+    "$ATTENTION_COOLDOWN_SECONDS" "$SK_STATE_DIR" "$SCRIPT_DIR/../lib" "$1" <<'PY'
+import json
+from pathlib import Path
+import sys
+import time
+import unicodedata
+
+state_path, after_text, cooldown_text, state_dir, library_dir, snapshot_path = (
+    sys.argv[1:7]
+)
+after_ms = int(after_text) * 1000
+cooldown_ms = int(cooldown_text) * 1000
+try:
+    with open(snapshot_path, encoding="utf-8") as handle:
+        inventory = json.load(handle)
+except (OSError, ValueError):
+    raise SystemExit(0)
+if not isinstance(inventory, dict):
+    raise SystemExit(0)
+# A cached list cannot prove anybody is waiting now.
+if inventory.get("stale") or inventory.get("source") != "live":
+    raise SystemExit(0)
+
+sys.path.insert(0, library_dir)
+try:
+    from sessionkit_events.queue import build_attention_queue
+except ImportError:
+    raise SystemExit(0)
+
+now_ms = int(time.time() * 1000)
+try:
+    # Read-only: a notification must never be what synthesizes an event.
+    queue = build_attention_queue(
+        inventory, Path(state_dir), now_ms=now_ms, mutate=False
+    )
+except Exception:
+    raise SystemExit(0)
+
+try:
+    with open(state_path, encoding="utf-8") as handle:
+        seen = json.load(handle)["announced"]
+    if not isinstance(seen, dict):
+        seen = {}
+except (OSError, ValueError, KeyError, TypeError):
+    seen = {}
+
+
+def clean(value, limit=60):
+    text = "".join(
+        " " if unicodedata.category(character).startswith("C") else character
+        for character in str(value or "")
+    )
+    return " ".join(text.split())[:limit]
+
+
+def duration(milliseconds):
+    minutes = max(0, milliseconds // 60000)
+    if minutes < 60:
+        return f"{minutes} min"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours} hr"
+    return f"{hours // 24} day{'s' if hours // 24 != 1 else ''}"
+
+
+fresh = []
+for item in queue.get("items", []):
+    if not isinstance(item, dict) or item.get("bucket") != "needs_you":
+        continue
+    key = item.get("thread_key")
+    waiting = item.get("waiting_ms")
+    if not isinstance(key, str) or not key:
+        continue
+    if isinstance(waiting, bool) or not isinstance(waiting, int):
+        continue
+    if waiting < after_ms:
+        continue
+    record = seen.get(key)
+    if isinstance(record, dict):
+        # One announcement per wait. The same session waiting on a NEW
+        # question is a new wait and is announced again; the cooldown only
+        # bounds how often one unbroken wait can repeat.
+        since = record.get("waiting_since_unix_ms")
+        announced = record.get("at_unix_ms")
+        same_wait = since == item.get("waiting_since_unix_ms")
+        recent = (
+            isinstance(announced, (int, float))
+            and now_ms - announced < cooldown_ms
+        )
+        if same_wait and recent:
+            continue
+    fresh.append(item)
+
+if not fresh:
+    raise SystemExit(0)
+
+count = len(fresh)
+subject = f"{count} session{'s' if count != 1 else ''} " + (
+    "need" if count != 1 else "needs"
+) + " you"
+parts = []
+for item in fresh[:3]:
+    provider = clean(item.get("provider"), 12).title() or "Session"
+    title = clean(item.get("title"), 60) or "a session"
+    parts.append(f"{provider} {title} waiting {duration(item.get('waiting_ms') or 0)}")
+if count > 3:
+    parts.append(f"and {count - 3} more")
+print(subject)
+print(" · ".join(parts))
+for item in fresh:
+    # key<TAB>the wait this announcement is for, so the next run can tell
+    # a continuing wait from a new question by the same session.
+    print(f"{item['thread_key']}\t{item.get('waiting_since_unix_ms') or 0}")
+PY
+}
+
+# Record what was actually delivered, keyed by the wait it belongs to. Called
+# only after the notifier ran, so a failed delivery is announced again rather
+# than silently swallowed.
+attention_remember() {
+  python3 - "$ATTENTION_STATE" "$@" <<'REMEMBER'
+import json
+import os
+import sys
+import time
+
+state_path = sys.argv[1]
+pairs = []
+for argument in sys.argv[2:]:
+    key, _, since = argument.partition("\t")
+    if key:
+        pairs.append((key, int(since) if since.isdigit() else 0))
+if not pairs:
+    raise SystemExit(0)
+now_ms = int(time.time() * 1000)
+try:
+    with open(state_path, encoding="utf-8") as handle:
+        entries = json.load(handle)["announced"]
+    if not isinstance(entries, dict):
+        entries = {}
+except (OSError, ValueError, KeyError, TypeError):
+    entries = {}
+for key, since in pairs:
+    entries[key] = {"at_unix_ms": now_ms, "waiting_since_unix_ms": since}
+# A key that can never match a live session again costs nothing to forget.
+if len(entries) > 200:
+    entries = dict(
+        sorted(
+            entries.items(),
+            key=lambda item: (item[1] or {}).get("at_unix_ms", 0),
+        )[-200:]
+    )
+tmp = f"{state_path}.tmp.{os.getpid()}"
+descriptor = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+    json.dump({"schema_version": 1, "announced": entries}, handle, sort_keys=True)
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+os.replace(tmp, state_path)
+REMEMBER
+}
+
+attention_check() {
+  (( ATTENTION_NOTIFY == 1 )) || return 0
+  [[ -e $SENTINEL ]] && return 0
+  if [[ -z $NOTIFY_CMD || ! -x $NOTIFY_CMD ]]; then
+    log "attention notify skipped: SESSION_KIT_ATTENTION_NOTIFY is on but no usable SESSION_KIT_WATCHDOG_NOTIFY is set"
+    return 0
+  fi
+  local snapshot answer subject body
+  local -a keys=()
+  # The collected list goes to an owner-private file rather than a pipe: the
+  # helper's own program arrives on standard input, so an inventory sent that
+  # way would be read as part of the program and silently ignored.
+  snapshot=$(mktemp "$SK_STATE_DIR/attention-snapshot.XXXXXX") || return 0
+  chmod 600 "$snapshot" 2>/dev/null || true
+  if ! sk_timeout "$MANAGER_PROBE_TIMEOUT" "$STATUS_CMD" --json \
+       >"$snapshot" 2>/dev/null; then
+    command rm -f -- "$snapshot"
+    return 0
+  fi
+  answer=$(attention_pending "$snapshot") || answer=""
+  command rm -f -- "$snapshot"
+  [[ -n $answer ]] || return 0
+  mapfile -t keys <<<"$answer"
+  (( ${#keys[@]} >= 3 )) || return 0
+  subject=${keys[0]}
+  body=${keys[1]}
+  keys=("${keys[@]:2}")
+  log "attention: ${#keys[@]} session(s) waiting past ${ATTENTION_AFTER_SECONDS}s"
+  notify "$subject" "$body" "$ATTENTION_ALERT_TYPE"
+  attention_remember "${keys[@]}" || true
 }
 
 # Timestamped attach outcomes from the current journal window. The daemon's
@@ -593,14 +833,16 @@ health_check() {
 
 if (( ONCE )); then
   health_check
+  attention_check
   sweep "${SESSION_KIT_WATCHDOG_SINCE:--60 min}"
   exit 0
 fi
 
-log "watchdog started (mode=${WATCHDOG_MODE} poll=${POLL_SECONDS}s flagged_quiet=${FLAGGED_QUIET_SECONDS}s dead_quiet=${DEAD_QUIET_SECONDS}s)"
+log "watchdog started (mode=${WATCHDOG_MODE} poll=${POLL_SECONDS}s flagged_quiet=${FLAGGED_QUIET_SECONDS}s dead_quiet=${DEAD_QUIET_SECONDS}s attention_notify=${ATTENTION_NOTIFY})"
 trap 'log "watchdog stopping"; exit 0' HUP INT TERM
 while true; do
   health_check
+  attention_check
   sweep "-$(( (POLL_SECONDS * 3 + 59) / 60 )) min"
   sleep "$POLL_SECONDS"
 done

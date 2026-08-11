@@ -1,6 +1,6 @@
 # Install Session Kit
 
-Session Kit `v0.2.1` is a public beta for Linux with systemd and macOS 14 or
+Session Kit `v0.3.0` is a public beta for Linux with systemd and macOS 14 or
 newer. Install the accepted release artifact under a single-user account where
 provider conversations are recoverable.
 
@@ -12,7 +12,7 @@ are named by source commit rather than by version.
 ```bash
 mkdir session-kit-download
 cd session-kit-download
-gh release download v0.2.1 --repo dob323/session-kit
+gh release download v0.3.0 --repo dob323/session-kit
 if command -v sha256sum >/dev/null; then
   sha256sum --check session-kit-*.sha256
 else
@@ -24,6 +24,25 @@ cd session-kit-*/
 ./install.sh
 session-kit doctor
 ```
+
+The installer puts its commands in `$HOME/.local/bin`. On Debian and Ubuntu,
+`~/.profile` adds that directory to `PATH` only if it already existed when you
+logged in — so if you have never had one, `session-kit` is `command not found`
+until you start a new login shell.
+
+That first `session-kit doctor` run then exits **1**, on a perfectly good
+install, with these two lines:
+
+```text
+FAIL  watchdog  installed but not enabled (disabled) … enable it with: session-kit services enable
+FAIL  units     shpool.socket disabled/inactive; shpool-reaper.timer disabled/inactive …
+```
+
+That is the expected result at this point, not a broken install: the installer
+writes the unit files and deliberately never enables them, and doctor gates on
+the services being live. It turns green after
+[Activate safely](#activate-safely) below. Everything else doctor checks —
+files, permissions, provider readers, kill switches — is meaningful right now.
 
 On the first interactive install, Session Kit reads the project paths already
 recorded by Claude Code and Codex, shows the existing directories it found,
@@ -44,7 +63,7 @@ an install or update.
 
 Without the GitHub CLI, download the `.tar.gz`, `.sha256`, and
 `.provenance.json` assets from the
-[`v0.2.1` release](https://github.com/dob323/session-kit/releases/tag/v0.2.1),
+[`v0.3.0` release](https://github.com/dob323/session-kit/releases/tag/v0.3.0),
 and put them in one empty directory. The checksum file covers the archive. Use
 `sha256sum --check` on Linux or
 `shasum -a 256 --check` on macOS. The provenance file records the exact source
@@ -58,8 +77,9 @@ definitions but does not start, stop, restart, or enable a service.
 
 ## Requirements
 
-- shpool 0.11.0;
-- Claude Code, Codex, or both;
+- shpool 0.11.0 — see [shpool](#shpool) for the two supported ways to get it,
+  including a route that needs no compiler on the target machine;
+- Claude Code, Codex, or both — see [Provider CLIs](#provider-clis);
 - a single trusted Unix account;
 - enough local access to run per-user services.
 
@@ -85,6 +105,39 @@ own source record.
 Other init systems, macOS before 14, and a missing process view stop before
 installation. There is no preview switch that bypasses these checks.
 
+### Provider CLIs
+
+Session Kit manages provider conversations; it does not install or update the
+providers. The preflight **fails** with `install Claude Code, Codex, or both`
+until at least one provider command is on `PATH`, so install one first, from its
+vendor's own instructions. Either provider alone is enough. The commands below are the vendors' documented ones — check the
+linked page if a command fails, since these change.
+
+**Claude Code** ([install guide](https://code.claude.com/docs/en/setup)):
+
+```bash
+curl -fsSL https://claude.ai/install.sh | bash   # macOS, Linux, WSL
+claude --version                                 # confirm it runs
+```
+
+Anthropic also publishes `brew install --cask claude-code`, signed apt/dnf/apk
+repositories, and `npm install -g @anthropic-ai/claude-code`. The native
+installer keeps itself updated; the package-manager routes do not. Claude Code
+requires a Pro, Max, Team, Enterprise, or Console account.
+
+**Codex** ([install guide](https://learn.chatgpt.com/docs/codex/cli)):
+
+```bash
+curl -fsSL https://chatgpt.com/codex/install.sh | sh   # macOS, Linux
+codex --version                                        # confirm it runs
+```
+
+OpenAI also publishes `brew install --cask codex` and
+`npm install -g @openai/codex`. Sign in on the first `codex` run in a project.
+
+Sign in to each provider once before installing Session Kit. The picker lists
+sessions it can prove; a provider that has never authenticated has none.
+
 ### Linux prerequisites
 
 A minimal server image usually lacks several tools the preflight requires. On
@@ -93,24 +146,44 @@ Debian or Ubuntu:
 ```bash
 sudo apt-get update
 sudo apt-get install -y python3 procps diffutils findutils util-linux \
-  bsdextrautils coreutils curl
+  bsdutils coreutils curl git
 ```
 
-`procps` supplies `ps` and `pgrep`, `diffutils` supplies `cmp`, and `script` and
-`flock` come from the util-linux packages. The preflight names anything still
-missing rather than failing part-way through an install.
-
-shpool is not packaged by any distribution, so build it with a current Rust
-toolchain:
+On Fedora, RHEL, or a RHEL rebuild:
 
 ```bash
+sudo dnf install -y python3 procps-ng diffutils findutils util-linux \
+  coreutils curl git
+```
+
+`procps` (`procps-ng` on the RPM side) supplies `ps` and `pgrep`, `diffutils`
+supplies `cmp`, `bsdutils` supplies `script`, and `flock` comes from
+`util-linux`. `git` is only needed for a checkout install, and is absent from
+every minimal image tested. The preflight names anything still missing rather
+than failing part-way through an install.
+
+shpool is not packaged by any distribution, so it has to be built. Building it
+needs a Rust toolchain **and** a C compiler and linker, which the prerequisites
+above do not include:
+
+```bash
+sudo apt-get install -y build-essential   # Debian or Ubuntu
+sudo dnf install -y gcc                   # Fedora or RHEL
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
 cargo install shpool --version 0.11.0 --locked
 ```
 
-Read the [shpool](#shpool) section below before running that on a machine you
-intend to rely on.
+Without one the build stops at ``error: linker `cc` not found``.
+
+**No compiler on the target machine?** You do not need one.
+[Getting a static shpool binary](../extras/build-static-binary.md) builds a
+fully static musl binary inside a throwaway container and copies it out;
+nothing is installed on the host, and the result runs on any x86-64 Linux
+regardless of glibc version.
+
+Read the [shpool](#shpool) section below before running either route on a
+machine you intend to rely on.
 
 #### Keep user services running after you log out
 
@@ -163,6 +236,10 @@ With a current Rust toolchain:
 ```bash
 cargo install shpool --version 0.11.0 --locked
 ```
+
+Without one, use the container build in
+[Getting a static shpool binary](../extras/build-static-binary.md). Both routes
+produce the same 0.11.0 binary; the container route leaves no toolchain behind.
 
 Replacing a running shpool binary normally requires a daemon restart, which
 ends its managed terminal processes. The Session Kit installer never replaces
@@ -280,3 +357,13 @@ macOS CI runs its native adapter checks plus focused installer, export, release,
 privacy, and documentation tests on Apple Silicon and Intel. Real acceptance
 also requires a disposable shpool session because GitHub-hosted CI does not
 load a user LaunchAgent or start provider TUIs.
+
+## Provider config directory permissions
+
+Activation writes one hook into `~/.claude/settings.json` and
+`~/.codex/hooks.json`, so it refuses a config directory another account could
+write. Group-writable is allowed only when the directory is yours and its group
+is your own single-member private group, which is what a private-group
+distribution with a 002 umask creates; a shared group or a world-writable
+directory is refused. `./install.sh --check` reports this before anything is
+written and prints the repair to run, such as `chmod g-w ~/.claude`.

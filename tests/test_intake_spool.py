@@ -144,6 +144,9 @@ class IntakeCase(unittest.TestCase):
                 "requested_model": "gpt-test",
                 "expertise": "testing",
                 "rationale": "isolated test assignment",
+                "task_text": f"carry out the {branch} fixture work",
+                "acceptance_criteria": "the fixture assertions pass",
+                "deliverable": "a note saying what the fixture proved",
             }
             for index, branch in enumerate(dict.fromkeys(branches), 1)
         ]
@@ -154,6 +157,7 @@ class IntakeCase(unittest.TestCase):
             analysis="analyzed the complete intake and current state",
             scope="the exact fixture scope",
             required_expertise="test worker expertise",
+            required_expertise_tags=("testing",),
             worker_plan=plan,
             risks="duplicate launch and incomplete work",
             tests="verify durable lifecycle state",
@@ -668,7 +672,13 @@ class FacadeIntakeTests(unittest.TestCase):
         completed = self.run_intake("flush")
         self.assertEqual(0, completed.returncode, completed.stderr)
         self.assertEqual(
-            {"delivered": 0, "pending": 0, "reason": "nothing is owed"},
+            {
+                "delivered": 0,
+                "attempted": 0,
+                "pending": 0,
+                "deferred": 0,
+                "reason": "nothing is owed",
+            },
             json.loads(completed.stdout),
         )
 

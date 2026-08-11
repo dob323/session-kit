@@ -102,11 +102,18 @@ class Console:
         self.status: int | None = None
         self.pid, self.descriptor = pty.fork()
         if self.pid == 0:  # pragma: no cover - the child execs immediately
-            os.chdir(REPO)
-            argv = [os.fspath(SP), "msg", *args]
-            if os.environ.get("SESSION_KIT_TEST_EXEC_ROOT"):
-                os.execve("/usr/bin/bash", ["/usr/bin/bash", *argv], environment)
-            os.execve(SP, argv, environment)
+            # A child that cannot exec must never return: it is a forked copy
+            # of the test runner, and returning resumes the suite from here.
+            try:
+                os.chdir(REPO)
+                argv = [os.fspath(SP), "msg", *args]
+                if os.environ.get("SESSION_KIT_TEST_EXEC_ROOT"):
+                    os.execve(
+                        "/usr/bin/bash", ["/usr/bin/bash", *argv], environment
+                    )
+                os.execve(SP, argv, environment)
+            finally:
+                os._exit(127)
 
     def _pump(self, timeout: float) -> None:
         ready, _, _ = select.select([self.descriptor], [], [], timeout)

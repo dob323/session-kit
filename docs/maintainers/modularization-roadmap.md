@@ -3,10 +3,11 @@
 `lib/session_inventory.py` remains the executable compatibility entry point
 while implementation moves into `lib/sessionkit_inventory/`.
 
-The current facade still combines configuration, Linux process inspection,
-provider discovery, inventory assembly, state, naming, recovery, rendering, and
-CLI parsing. Moving one bounded responsibility at a time makes review and
-testing easier without changing installed command paths.
+That move is done. Configuration, Linux process inspection, provider
+discovery, inventory assembly, state, naming, recovery, and rendering all live
+in the package; the facade is CLI parsing plus 155 `return _<module>.`
+delegations over 22 modules. It stays in place because installed command paths
+name it. `docs/architecture.md` describes the shipped layout.
 
 ## Compatibility contract
 
@@ -112,14 +113,17 @@ them looked like a documentation case by every rule available (consumed only
 in-module, unpinned, unread by any test) and turned out to change behavior when
 patched. Patch it and watch; do not reason about whether it matters.
 
-## Target package
+## The package as shipped
+
+Fourteen modules were the original target; twenty-two shipped. The eight below
+the first fourteen were extracted after this roadmap was written.
 
 | Module | Responsibility |
 | --- | --- |
 | `common.py` | constants, paths, normalization, configuration, command runner |
 | `state_io.py` | private reads, locks, atomic writes, JSON and checksums |
 | `processes.py` | Linux process table, ancestry, generations, boot identity |
-| `providers.py` | shpool, Claude Code, and Codex readers |
+| `providers.py` | shared provider helpers and the shpool snapshot reader |
 | `model.py` | session records, titles, reply and provider-exit state |
 | `collector.py` | bounded read-only joins |
 | `names.py` | manual and automatic names |
@@ -130,6 +134,14 @@ patched. Patch it and watch; do not reason about whether it matters.
 | `snapshot.py` | collection and private-state orchestration |
 | `render.py` | width, semantic color, dashboard, detail, JSON, and lookup |
 | `self_name.py` | caller proof and automatic naming |
+| `accounts.py` | subscription account profiles, roster, rotation advice |
+| `colors.py` | provider palettes and per-session color state |
+| `lifecycle.py` | managed-shell lifecycle events |
+| `migration.py` | state migrations between releases |
+| `names_push.py` | pushing local titles back to the providers |
+| `projects.py` | project shortcut discovery and management |
+| `providers_claude.py` | read-only Claude Code readers |
+| `providers_codex.py` | read-only Codex readers |
 
 The dependency graph must stay acyclic. Recovery and cleanup accept explicit
 callbacks rather than importing the facade.

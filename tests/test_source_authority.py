@@ -28,6 +28,7 @@ from sessionkit_supervisor.source_authority import (  # noqa: E402
     CODEX_ROLLOUT_MAX_DEPTH,
     INTAKE_COMMIT_PATH_ENV,
     MACHINE_ENVELOPE_PREFIXES,
+    MACHINE_ORIGIN_ENV,
     MANAGED_GENERATION_ENV,
     OPERATOR_ENVELOPE_PREFIXES,
     SourceAuthorityError,
@@ -1047,6 +1048,230 @@ class MachineEnvelopeTests(SourceAuthorityCase):
         result = verify_source_event(self.state, event["event_id"])
         self.assertFalse(result["verified"])
         self.assertIn("not direct source authority", result["reason"])
+
+
+class CodexPreambleTests(SourceAuthorityCase):
+    """Codex opens a session with its own user-role records; they are not prompts."""
+
+    PLUGINS = (
+        "<recommended_plugins>\nHere is a list of plugins that are available "
+        "but not installed.\n</recommended_plugins>"
+    )
+    AGENTS = "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nrules\n</INSTRUCTIONS>"
+    ENVIRONMENT = "<environment_context>\n  <cwd>/tmp</cwd>\n</environment_context>"
+
+    def write_rollout(self, *rows: dict) -> None:
+        records = (
+            {"type": "session_meta", "payload": {"id": UUID}},
+            {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn-1"}},
+            *rows,
+        )
+        self.transcript.write_text(
+            "".join(json.dumps(row) + "\n" for row in records), encoding="utf-8"
+        )
+        self.transcript.chmod(0o600)
+
+    @staticmethod
+    def user(text: str) -> dict:
+        return {"type": "user_message", "payload": {"text": text}}
+
+    def test_preamble_before_the_prompt_no_longer_blocks_verification(self) -> None:
+        event = self.capture("the operator's own first prompt of the session")
+        self.write_rollout(
+            self.user(self.PLUGINS),
+            self.user(self.AGENTS),
+            self.user(self.ENVIRONMENT),
+            self.user(event["raw_prompt"]),
+        )
+        result = verify_source_event(self.state, event["event_id"])
+        self.assertTrue(result["verified"])
+        self.assertEqual("transcript", result["basis"])
+
+    def test_each_preamble_kind_is_skipped_on_its_own(self) -> None:
+        for index, preamble in enumerate((self.PLUGINS, self.AGENTS, self.ENVIRONMENT)):
+            with self.subTest(preamble=preamble[:24]), tempfile.TemporaryDirectory(
+                prefix=".codex-preamble-", dir=REPO
+            ) as raw:
+                self.state = Path(raw) / "state"
+                self.state.mkdir(mode=0o700)
+                transcript_root = self.state / "test-transcripts"
+                transcript_root.mkdir(mode=0o700)
+                self.transcript = transcript_root / "rollout.jsonl"
+                event = self.capture(f"operator prompt number {index}")
+                self.write_rollout(
+                    self.user(preamble), self.user(event["raw_prompt"])
+                )
+                self.assertEqual(
+                    "transcript",
+                    verify_source_event(self.state, event["event_id"])["basis"],
+                )
+
+    def test_an_unnamed_preamble_kind_still_fails_closed(self) -> None:
+        event = self.capture("the operator's own first prompt of the session")
+        self.write_rollout(
+            self.user("<some_future_codex_block>\nunknown\n</some_future_codex_block>"),
+            self.user(event["raw_prompt"]),
+        )
+        result = verify_source_event(self.state, event["event_id"])
+        self.assertFalse(result["verified"])
+        self.assertIn("prompt digest mismatch", result["reason"])
+
+    def test_a_competing_prompt_after_the_preamble_still_disqualifies(self) -> None:
+        """The load-bearing property: once the preamble is past, any
+        non-matching user text at this turn refuses. That is what stops an
+        appended record from being accepted behind a real one."""
+        event = self.capture("the operator's own first prompt of the session")
+        self.write_rollout(
+            self.user(self.PLUGINS),
+            self.user("a different prompt nobody typed here"),
+            self.user(event["raw_prompt"]),
+        )
+        result = verify_source_event(self.state, event["event_id"])
+        self.assertFalse(result["verified"])
+        self.assertIn("prompt digest mismatch", result["reason"])
+
+    def test_preamble_mixed_with_other_text_in_one_record_is_not_preamble(self) -> None:
+        event = self.capture("the operator's own first prompt of the session")
+        self.write_rollout(
+            {
+                "type": "user_message",
+                "payload": {"content": [self.PLUGINS, "smuggled alongside it"]},
+            },
+            self.user(event["raw_prompt"]),
+        )
+        result = verify_source_event(self.state, event["event_id"])
+        self.assertFalse(result["verified"])
+        self.assertIn("prompt digest mismatch", result["reason"])
+
+    def test_preamble_written_before_the_prompt_lands_is_lag_not_mismatch(self) -> None:
+        event = self.capture("the operator's own first prompt of the session")
+        self.write_rollout(self.user(self.PLUGINS), self.user(self.ENVIRONMENT))
+        result = verify_source_event(self.state, event["event_id"])
+        self.assertTrue(result["verified"])
+        self.assertEqual("hook-ledger", result["basis"])
+        self.assertTrue(result["non_cryptographic"])
+
+
+class MachineOriginTests(SourceAuthorityCase):
+    """A launcher-declared machine origin removes authority and never grants it."""
+
+    # The watcher's live banner, its shorter historical form, and the
+    # delivery-bot line. None is a prefix of another; all share the stem.
+    WAKE_BANNERS = (
+        "RUNTIME FOR THIS WAKE (ground truth, read off the machine): Codex CLI "
+        "0.9.9, model gpt-x, read-only sandbox, activated fresh for this message.",
+        "RUNTIME FOR THIS WAKE (ground truth, read off the machine): Claude, model "
+        "sonnet, activated fresh for this message. This is a FALLBACK.",
+        "RUNTIME FOR THIS WAKE (ground truth): Codex CLI, activated fresh.",
+        "RUNTIME FOR THIS WAKE: You are a fixed Session Kit delivery bot.",
+    )
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.transcript.write_text(
+            json.dumps({"type": "session_meta", "payload": {"id": UUID}}) + "\n",
+            encoding="utf-8",
+        )
+        self.transcript.chmod(0o600)
+
+    def origin_capture(self, origin: str, **fields: object) -> dict:
+        return capture_hook_event(
+            self.payload("a prompt submitted inside a machine wake", **fields),
+            state_dir=self.state,
+            environ={MACHINE_ORIGIN_ENV: origin},
+        )
+
+    def test_a_declared_origin_removes_authority_and_names_itself(self) -> None:
+        event = self.origin_capture("discord-watcher")
+        self.assertFalse(event["authority_capable"])
+        self.assertEqual(
+            "machine-origin launch (discord-watcher) is not direct source authority",
+            event["authority_limit_reason"],
+        )
+        self.assertEqual("discord-watcher", event["machine_origin"])
+        result = verify_source_event(self.state, event["event_id"])
+        self.assertFalse(result["verified"])
+        self.assertIn("machine-origin launch (discord-watcher)", result["reason"])
+
+    def test_the_recorded_origin_survives_into_verification(self) -> None:
+        """Recorded verbatim, inside the hashed body, and still refused later."""
+        event = self.origin_capture("discord-watcher wake 41")
+        stored = SourceEventStore(self.state).read(event["event_id"])
+        self.assertEqual("discord-watcher wake 41", stored["machine_origin"])
+        self.assertFalse(verify_source_event(self.state, event["event_id"])["verified"])
+
+    def test_no_origin_leaves_an_ordinary_prompt_untouched(self) -> None:
+        for value in ("", "   "):
+            with self.subTest(value=repr(value)), tempfile.TemporaryDirectory(
+                prefix=".source-origin-", dir=REPO
+            ) as raw:
+                self.state = Path(raw) / "state"
+                self.state.mkdir(mode=0o700)
+                transcript_root = self.state / "test-transcripts"
+                transcript_root.mkdir(mode=0o700)
+                self.transcript = transcript_root / "rollout.jsonl"
+                self.transcript.write_text("", encoding="utf-8")
+                self.transcript.chmod(0o600)
+                event = self.origin_capture(value)
+                self.assertTrue(event["authority_capable"])
+                self.assertNotIn("machine_origin", event)
+                self.transcript.write_text(
+                    json.dumps({"type": "session_meta", "payload": {"id": UUID}})
+                    + "\n"
+                    + json.dumps(
+                        {
+                            "session_id": UUID,
+                            "turn_id": "turn-1",
+                            "type": "user",
+                            "text": event["raw_prompt"],
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                self.transcript.chmod(0o600)
+                result = verify_source_event(self.state, event["event_id"])
+                self.assertTrue(result["verified"])
+                self.assertEqual("transcript", result["basis"])
+
+    def test_an_origin_can_only_remove_authority_never_grant_it(self) -> None:
+        """Any process can set the variable, so it is read downward only."""
+        event = capture_hook_event(
+            self.payload(
+                "<task-notification>machine text</task-notification>",
+                turn_id="origin-envelope",
+            ),
+            state_dir=self.state,
+            environ={MACHINE_ORIGIN_ENV: ""},
+        )
+        self.assertFalse(event["authority_capable"])
+        self.assertEqual(
+            "machine/operator envelope is not direct source authority",
+            event["authority_limit_reason"],
+        )
+
+    def test_every_automation_wake_banner_is_refused_by_prompt_alone(self) -> None:
+        """No environment variable needed: the banner itself disqualifies, so
+        wakes already on disk fail the verify-time re-screen too."""
+        for index, banner in enumerate(self.WAKE_BANNERS):
+            with self.subTest(banner=banner[:44]):
+                event = self.capture(banner, turn_id=f"wake-{index}")
+                self.assertFalse(event["authority_capable"])
+                self.assertEqual(
+                    "machine/operator envelope is not direct source authority",
+                    event["authority_limit_reason"],
+                )
+                self.assertFalse(
+                    verify_source_event(self.state, event["event_id"])["verified"]
+                )
+
+    def test_a_control_character_origin_is_flattened_and_bounded(self) -> None:
+        event = self.origin_capture("discord\x00-\nwatcher\t" + "x" * 400)
+        recorded = event["machine_origin"]
+        self.assertNotIn("\n", recorded)
+        self.assertNotIn("\x00", recorded)
+        self.assertLessEqual(len(recorded.encode("utf-8")), 200)
+        self.assertFalse(event["authority_capable"])
 
 
 if __name__ == "__main__":

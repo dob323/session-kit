@@ -21,6 +21,7 @@ SK_PROJECTS_FILE=${SESSION_KIT_PROJECTS_FILE:-${XDG_CONFIG_HOME:-"$HOME/.config"
 SK_CONFIG_FILE=${SESSION_KIT_CONFIG:-${XDG_CONFIG_HOME:-"$HOME/.config"}/session-kit/inventory.json}
 SK_SHPOOL=${SESSION_KIT_SHPOOL_CMD:-}
 SK_INVENTORY_CORE=${SESSION_KIT_INVENTORY_CORE:-"$SESSION_KIT_RELEASE_DIR/lib/session_inventory.py"}
+SK_PROJECTS_CORE=${SESSION_KIT_PROJECTS_CORE:-"$SESSION_KIT_RELEASE_DIR/lib/sessionkit_projects/cli.py"}
 SK_ACTION_LOG="$SK_STATE_DIR/action-events.jsonl"
 
 if [[ -z $SK_SHPOOL ]]; then
@@ -795,6 +796,28 @@ sk_project_lookup() {
     }
     END { if (!found) exit 1 }
   ' "$SK_PROJECTS_FILE"
+}
+
+sk_project_plan() {
+  # One line for `sp new`: root, provider, account, model, startup state.
+  # The resolver applies a committed session-kit.toml only for a project on
+  # this host's list, so what comes back is already what the host agreed to
+  # launch. Flags given here still win: they are passed in and returned
+  # unchanged.
+  local target=$1 provider=$2 account=$3 model=$4
+  local -a options=(--projects-file "$SK_PROJECTS_FILE" --state-dir "$SK_STATE_DIR"
+                    launch-plan "$target" --format tsv)
+  [[ -z $provider ]] || options+=(--provider "$provider")
+  [[ -z $account ]] || options+=(--account "$account")
+  [[ -z $model ]] || options+=(--model "$model")
+  if [[ -t 0 ]]; then options+=(--interactive); fi
+  # Say which of the two things went wrong. Without this the caller's "unknown
+  # or invalid project" would blame a perfectly good alias for a missing file.
+  [[ -f $SK_PROJECTS_CORE && ! -L $SK_PROJECTS_CORE ]] || {
+    printf 'session-kit: the project resolver is missing at %s\n' "$SK_PROJECTS_CORE" >&2
+    return 1
+  }
+  python3 "$SK_PROJECTS_CORE" "${options[@]}"
 }
 
 sk_allocate_id() {

@@ -45,7 +45,7 @@ an explicit search when diagnosis requires exact identity.
 ## Install the beta release
 
 Download the archive, checksum, and provenance files attached to the
-[`v0.2.1` release](https://github.com/dob323/session-kit/releases/tag/v0.2.1).
+[`v0.3.0` release](https://github.com/dob323/session-kit/releases/tag/v0.3.0).
 Beta releases are published as GitHub prereleases, so `releases/latest` does not
 resolve to them; browse [all releases](https://github.com/dob323/session-kit/releases)
 or name the tag explicitly, as below. Release assets are named by commit, not by
@@ -54,7 +54,7 @@ version. With the GitHub CLI:
 ```bash
 mkdir session-kit-download
 cd session-kit-download
-gh release download v0.2.1 --repo dob323/session-kit
+gh release download v0.3.0 --repo dob323/session-kit
 if command -v sha256sum >/dev/null; then
   sha256sum --check session-kit-*.sha256
 else
@@ -170,6 +170,7 @@ watchdog log. See [Watchdog alerts](docs/configuration.md#watchdog-alerts).
 - [Install](docs/install.md)
 - [Configure](docs/configuration.md)
 - [Use Session Kit](docs/usage.md)
+- [Projects](docs/projects.md)
 - [Message your sessions](docs/messaging.md)
 - [The Fleet Supervisor](docs/supervisor.md)
 - [Claude Code and Codex integration](docs/provider-integration.md)

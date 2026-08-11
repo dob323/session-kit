@@ -1,0 +1,29 @@
+# Matrix image for RPM-family distributions (Fedora, and by extension RHEL
+# derivatives). docs/install.md documents prerequisites for Debian and Ubuntu
+# only; the dnf list here is the equivalent set the preflight actually needs.
+ARG BASE_IMAGE=fedora:41
+FROM ${BASE_IMAGE}
+
+# Scaffolding, not prerequisites (see Dockerfile.apt).
+RUN dnf -y install systemd dbus-daemon && dnf clean all
+
+# Prerequisite equivalents of the documented Debian/Ubuntu list.
+RUN dnf -y install python3 procps-ng diffutils findutils util-linux-core \
+      util-linux coreutils curl git && dnf clean all
+
+ARG MATRIX_USER=tester
+RUN if id -u 1000 >/dev/null 2>&1; then userdel -r "$(id -un 1000)" || true; fi \
+ && useradd -m -u 1000 -s /bin/bash "${MATRIX_USER}"
+
+USER ${MATRIX_USER}
+RUN curl -fsSL https://claude.ai/install.sh -o /tmp/claude-install.sh \
+ && bash /tmp/claude-install.sh \
+ && rm -f /tmp/claude-install.sh \
+ && "$HOME/.local/bin/claude" --version
+USER root
+
+# Kept last so editing it never rebuilds the layers above.
+COPY cgroup-init.sh /usr/local/sbin/matrix-init
+
+STOPSIGNAL SIGRTMIN+3
+CMD ["/usr/local/sbin/matrix-init"]

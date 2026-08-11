@@ -1,0 +1,72 @@
+# Reviewed history blobs that predate the private-marker rule.
+#
+# What this is
+#   tools/public-scan --git-history --private-markers rejects any blob holding
+#   a repository-private word. The rule was added after those words had already
+#   been published, so it also condemns commits that shipped before it existed.
+#   The published history cannot be rewritten: the repository is public, clones
+#   and forks already carry these objects, and rewriting would break every
+#   reference to them while removing nothing from anyone's copy. Each blob below
+#   was read, classified, and accepted as history that stays.
+#
+# What it is not
+#   A blob listed here is exempt from the private-marker rule and from nothing
+#   else. Credential and key patterns still fail for every blob, listed or not.
+#   The exemption is keyed to the exact object id, and an object id is a digest
+#   of the content, so it cannot be stretched to cover anything but the reviewed
+#   bytes. Editing a listed file produces a different object that fails again.
+#
+# What was reviewed (2026-08-11)
+#   33 blobs  a maintainer's personal name, written before shipped files were
+#             required to name roles rather than people. The working tree was
+#             cleaned; these are the pre-cleanup copies.
+#    4 blobs  a private word appearing only inside a longer underscore-joined
+#             identifier, which the rule tests part by part.
+#   No blob in this list holds a credential, key, token, or host secret.
+#
+# The rule for changing this file
+#   Additive only, and only after review. Append an entry when a blob already
+#   published is confirmed to hold nothing worse than the classes above, and say
+#   so in the commit. Never add a blob to make a new failure go away: a failure
+#   on an unpublished blob means the working tree still has to be fixed. Removing
+#   an entry is safe at any time and only ever makes the scan stricter.
+#
+# Format: <40-character blob object id>  <path the blob was found at>
+
+05f1bd57302b0860397688195407f8b0b11fad9d  bashrc/shpool.bashrc
+51a70d2e38050dd8681844d9562beb848368cd6c  bashrc/shpool.bashrc
+6d80b18e5e6946cdf0cc0d85891e5ffa2751b7b9  bashrc/shpool.bashrc
+da83b3cdfec89ae9585ad977e2756411ff303253  bashrc/shpool.bashrc
+dbae8f92dde394d60085694985baf4909fec4af7  bashrc/shpool.bashrc
+25a9dc712a6a174bb88cdf10c427a063d5b635f5  bin/session_kit_common
+2f7f50f4a7947c0a088ab87b86628698892ac422  bin/session_kit_common
+3a195f5604f26328907c470ba0d6d1b1f1c09ed6  bin/session_kit_common
+560cb67ded811ccd867a4fb0d3ab2c3f8c7bc381  bin/session_kit_common
+cb23301b122a7c30d25f7f5ed5df18d65be836da  bin/session_kit_common
+cb7e063333e2e1039b44a8cc4b952ef370c06dd0  bin/session_kit_common
+e5e496fd61cd3bd5ab5fdd75a016bc4b8d813f39  bin/session_kit_common
+376e4030962e68cf4d0c0c25d56791a67e09ec40  config/claude/statusline.sh
+11f1616a89daa4f48a63609fe54ff315188924f5  lib/session_inventory.py
+442583cb3cfad5843d18123780a731d64074b7e7  lib/session_inventory.py
+6fb74a3dc8b19d2dcbb8dfe4c1885b2c48340431  lib/session_inventory.py
+74224027810d01702750fc8cc25efa5d5819c563  lib/session_inventory.py
+a45221591cc16ac2c56302a31620c75ad75ccc9c  lib/session_inventory.py
+a8832a4ab160a3cdfbbf3e125742ef581e6e3976  lib/session_inventory.py
+b61a8c24b5d1a39122fc5fc8e2882496a0926de6  lib/session_inventory.py
+b97ffc53bee08c753397c304adcb567101ed67b7  lib/session_inventory.py
+d18a280938d938a0de62f0a6fbda1bdc82cd2b9f  lib/session_inventory.py
+d3fe2f2b103a7eb637e37bbd6a037053e118f942  lib/sessionkit_inventory/terminal.py
+5d2dd2cbed4e1c01b6bec688bf353eff2d5ab52a  tests/test_commands.py
+bcb9a89458b56b34bf22efd4867a804cd4925e9b  tests/test_commands.py
+c84aaef09fabe0c24d4ad47e83e075cdcf9055d3  tests/test_commands.py
+d58ebbfe24f6e712512814a28c03ef68841d3ca3  tests/test_commands.py
+e8d1702726252b14a4fd2223c132162600cc0550  tests/test_commands.py
+49785d456e41cf00205d756241200e3e0e41f349  tests/test_inventory.py
+513516d56508d8b638c98c5ab7ddcaa372979ad4  tests/test_inventory.py
+927d4efa6fbd9e77dd625a024eaf2d69bad16787  tests/test_inventory.py
+ae57de10c78b00429926cded071942a4b5765cdc  tests/test_inventory.py
+0b11f8c44064679f4637087b67e56036ca59d04e  tests/test_provider_title_push.py
+17be116429f9364bb8c2edf2ec6fa57df82b3475  tests/test_provider_title_push.py
+85a068d5f516125b31fb9c3e3b627e27787c879c  tests/test_provider_title_push.py
+ba79a2d4ee38274299ba8d7255787661dd2f9287  tests/test_provider_title_push.py
+ef52617b1295576a54da447ffa570f3bb9db01fa  tests/test_provider_title_push.py

@@ -3,10 +3,10 @@
 Session Kit uses official shpool 0.11.0 by default. This directory contains
 optional source patches: `0001` for a heartbeat failure, `0002` for
 input-mode loss on reattach, `0003` for sessions that become unkillable once
-their shell dies on its own, and `0004` for a daemon-wide deadlock in the
-detach handler. Apply them in numeric order; `0002`, `0003` and `0004` each
-touch an independent region and apply cleanly to pristine `v0.11.0` on their
-own.
+their shell dies on its own, `0004` for a daemon-wide deadlock in the detach
+handler, and `0005` for an attach client that reports the wrong exit status.
+Apply them in numeric order; `0002`, `0003`, `0004` and `0005` each touch an
+independent region and apply cleanly to pristine `v0.11.0` on their own.
 
 **Start with `0004`.** It is the only patch here backed by a reproduced
 production outage, and it is the only one whose failure mode is daemon-wide
@@ -63,10 +63,21 @@ with the next heartbeat:
 - the acknowledgement channel has one buffer slot, so a late ack cannot block
   the shell-to-client thread;
 - a timed-out request is abandoned without ending the session scope;
-- a late ack for an abandoned request is discarded by ID.
+- a late ack for an abandoned request is discarded by ID;
+- the shell-to-client thread deposits its ack without blocking, and the
+  heartbeat thread drains stale acks before each request, so neither side can
+  park on the other.
 
 A disconnected channel still returns normally. A dead client is still detected
 by the existing client-stream write failure.
+
+The last point is not decoration. The buffer slot introduced above can still
+hold an ack the heartbeat thread gave up waiting for, and the receiving half
+lives in the long-lived control struct, so it never disconnects. A blocking
+send into a full slot would therefore park the shell-to-client thread with
+nobody left to drain it — the same wedge this patch exists to prevent, reached
+through a different door. Dropping an ack is safe precisely because requests
+carry IDs: the heartbeat thread times out and asks again under a fresh one.
 
 ## Limits
 
@@ -96,12 +107,26 @@ sha256sum target/release/shpool
 ```
 
 `patched-binary.sha256` is the reference checksum from the reviewed build with
-all four patches applied in numeric order. A different Rust toolchain, target,
-or build environment can produce different bytes. Record the upstream tag,
-patch checksums, Rust version, target triple, build command, and resulting
-binary checksum for your own artifact.
+all five patches applied in numeric order. A different Rust toolchain, target,
+or build environment can produce different bytes, so the checksum is worthless
+without the environment that produced it. The recorded value came from:
 
-The CI patch job applies all four patches to the pinned upstream tag, runs the
+| | |
+|---|---|
+| upstream tag | `v0.11.0` == `fe2d11595ff255810523b0868159dec051e303f1` |
+| patches | `0001`–`0005`, applied in numeric order |
+| rustc | 1.97.1 (8bab26f4f 2026-07-14) |
+| cargo | 1.97.1 (c980f4866 2026-06-30) |
+| target triple | `x86_64-unknown-linux-gnu` |
+| build image | `docker.io/library/rust:bookworm` |
+| build command | `cargo build --locked --release --bin shpool` |
+| sha256 | `ca8d28aa52da0b9ee45f7d7ef24aac41bccaa316a2a959ed6804db3b8a5b1e45` |
+
+Record the same set for your own artifact. A checksum recorded without its
+build environment cannot later be reproduced or refuted, which is the same as
+not having recorded it.
+
+The CI patch job applies all five patches to the pinned upstream tag, runs the
 workspace tests, and builds the release binary.
 
 ## Activation and rollback
@@ -271,6 +296,89 @@ Build, activation and rollback are the same as for `0001`, including the
 daemon-restart requirement. Because a restart ends every managed terminal
 process, capture exact provider recovery identities first — after the restart
 they are recoverable only through the login chooser's recovery review.
+
+## Exit-status patch (0005)
+
+`shpool attach` exits 1 instead of the shell's real exit status whenever the
+terminal closes the client's stdin before the status frame arrives.
+
+The attach client runs two threads over the daemon socket — `stdin->sock` and
+`sock->stdout` — with a coordinator loop that watches both. The moment
+**either** finishes, the coordinator stamps its fallback status of 1 into the
+shared result slot so the other thread will notice and stop:
+
+```rust
+if nfinished_threads > 0 {
+    let mut res = result_slot.lock().unwrap();
+    if res.is_none() {
+        *res = Some(PipeBytesResult::Exit(1));   // protocol.rs:405
+    }
+    ...
+```
+
+A finished `stdin->sock` thread only means the local input side is done: our
+stdin hit EOF. It says nothing about the session, which may be about to report
+the shell's status. But `sock->stdout` checks that slot at the top of its loop,
+so it returns without ever reading the `ExitStatus` frame, and the client
+reports 1.
+
+Captured from an attach client log at the moment of failure:
+
+```text
+stdin->sock: read 8 bytes
+stdin->sock: close time.busy=34.4µs     <- stdin EOF, thread returns
+sock->stdout: chunk='prompt> ' kind=Data len=8
+sock->stdout: close                      <- bails, slot already poisoned
+pipe_bytes: close                        <- process::exit(1)
+```
+
+and on the daemon side, the status arriving with nobody left to send it to:
+
+```text
+shell->client: client_stream write err, assuming hangup: BrokenPipe
+shell->client: pty master hung up, exiting shell->client thread
+child_watcher: child exited with status 19
+```
+
+Note the ordering on the daemon side: the broken pipe sets the connection to
+`Disconnect`, so the hangup path's `if let ClientConnectionMsg::New(conn)`
+no longer matches and the exit chunk is never written at all.
+
+`0005-attach-must-not-discard-the-shells-exit-status.patch` waits the
+**existing** `MAX_DETACH_WAIT_DUR` (300ms) window for the socket side before
+defaulting, and only when the stdin side is the one that finished.
+`common::sleep_unless` evaluates its predicate before sleeping and returns as
+soon as the frame lands or the daemon closes the connection, so the ordinary
+case costs one predicate call rather than the whole window.
+
+### Evidence
+
+Upstream's own `exits_with_same_status_as_shell` is the reproducer. Measured
+over 50 full `-p shpool --test attach` runs per tree, in a container matched to
+the CI runner (`rust:bookworm` plus `zsh less bsdextrautils`, 4 CPUs — without
+`less` and `hexdump` the suite runs three times slower and the load profile
+this race depends on no longer matches):
+
+| tree | failures |
+|---|---|
+| pristine `v0.11.0`, no patches | 4 / 50 |
+| `0001`–`0004` | 10 / 50 and 3 / 50 across two identical containers |
+| pristine + `0005` alone | **0 / 50** |
+| `0001`–`0005` | **0 / 50** |
+
+The full workspace suite is green on the patched tree, including
+`detaches_on_null_stdin` and `client_eof_does_not_spin`, the two tests that
+depend on the current early-exit behaviour.
+
+### Limits
+
+The wait is bounded by a constant upstream already uses for this purpose, so a
+session that genuinely never reports a status still exits after 300ms rather
+than hanging. The patch does not change what the daemon sends, only whether
+the client is still listening when it arrives.
+
+This is an upstream defect, not a Session Kit one, and belongs upstream. Prefer
+an accepted upstream fix over carrying this patch.
 
 ## License and upstream
 

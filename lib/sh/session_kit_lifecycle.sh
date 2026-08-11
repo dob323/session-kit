@@ -48,10 +48,55 @@ codex_theme_layout() {
   python3 - "$action" "$HOME" \
     "${SESSION_KIT_CODEX_HOME:-${CODEX_HOME:-$HOME/.codex}}" \
     "$custom" "${codex_theme_names[@]}" <<'PY'
+import grp
 import os
 import pathlib
+import pwd
 import stat
 import sys
+
+
+# One rule, applied wherever this file decides whether a provider directory may
+# be written through, and the same rule
+# lib/sessionkit_supervisor/provider_hooks.py applies: no other account may be
+# able to write it. A distribution that gives every account a private group and
+# a 002 umask leaves a provider's own config directory group-writable, which
+# exposes it to nobody, so that one shape is allowed. Every condition must hold
+# and any lookup failure refuses.
+def private_group(gid):
+    try:
+        account = pwd.getpwuid(os.geteuid())
+        group = grp.getgrgid(gid)
+        accounts = pwd.getpwall()
+    except (KeyError, OSError):
+        return False
+    if gid != account.pw_gid or group.gr_name != account.pw_name or list(group.gr_mem):
+        return False
+    covered = False
+    for other in accounts:
+        if other.pw_name == account.pw_name:
+            covered = other.pw_gid == gid
+        elif other.pw_gid == gid:
+            return False
+    return covered
+
+
+def mode_permits(info):
+    mode = stat.S_IMODE(info.st_mode)
+    if mode & 0o002:
+        return False
+    if not mode & 0o020:
+        return True
+    return info.st_uid == os.geteuid() and private_group(info.st_gid)
+
+
+def write_repair(path, info):
+    """Name the chmod that repairs a directory the caller owns."""
+    mode = stat.S_IMODE(info.st_mode)
+    if stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid() and mode & 0o022:
+        return f"; run: chmod {'go-w' if mode & 0o002 else 'g-w'} {path}"
+    return ""
+
 
 action, home_raw, root_raw, custom, *colors = sys.argv[1:]
 home = pathlib.Path(home_raw)
@@ -71,9 +116,11 @@ def directory_info(path: pathlib.Path):
         stat.S_ISDIR(info.st_mode)
         and not stat.S_ISLNK(info.st_mode)
         and info.st_uid in {0, os.geteuid()}
-        and stat.S_IMODE(info.st_mode) & 0o022 == 0
+        and mode_permits(info)
     ):
-        raise SystemExit(f"session-kit: unsafe Codex path ancestor: {path}")
+        raise SystemExit(
+            f"session-kit: unsafe Codex path ancestor: {path}{write_repair(path, info)}"
+        )
     return info
 
 
@@ -140,14 +187,59 @@ PY
 lifecycle_transaction() {
   python3 - "$@" <<'PY'
 import base64
+import grp
 import json
 import os
 import pathlib
+import pwd
 import stat
 import sys
 import tempfile
 import time
 import uuid
+
+
+# One rule, applied wherever this file decides whether a provider directory may
+# be written through, and the same rule
+# lib/sessionkit_supervisor/provider_hooks.py applies: no other account may be
+# able to write it. A distribution that gives every account a private group and
+# a 002 umask leaves a provider's own config directory group-writable, which
+# exposes it to nobody, so that one shape is allowed. Every condition must hold
+# and any lookup failure refuses.
+def private_group(gid):
+    try:
+        account = pwd.getpwuid(os.geteuid())
+        group = grp.getgrgid(gid)
+        accounts = pwd.getpwall()
+    except (KeyError, OSError):
+        return False
+    if gid != account.pw_gid or group.gr_name != account.pw_name or list(group.gr_mem):
+        return False
+    covered = False
+    for other in accounts:
+        if other.pw_name == account.pw_name:
+            covered = other.pw_gid == gid
+        elif other.pw_gid == gid:
+            return False
+    return covered
+
+
+def mode_permits(info):
+    mode = stat.S_IMODE(info.st_mode)
+    if mode & 0o002:
+        return False
+    if not mode & 0o020:
+        return True
+    return info.st_uid == os.geteuid() and private_group(info.st_gid)
+
+
+def write_repair(path, info):
+    """Name the chmod that repairs a directory the caller owns."""
+    mode = stat.S_IMODE(info.st_mode)
+    if stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid() and mode & 0o022:
+        return f"; run: chmod {'go-w' if mode & 0o002 else 'g-w'} {path}"
+    return ""
+
 
 operation, journal_raw, *values = sys.argv[1:]
 journal = pathlib.Path(journal_raw)
@@ -275,10 +367,11 @@ elif operation == "recover":
                 not stat.S_ISDIR(ancestor.st_mode)
                 or stat.S_ISLNK(ancestor.st_mode)
                 or ancestor.st_uid not in {0, os.geteuid()}
-                or stat.S_IMODE(ancestor.st_mode) & 0o022
+                or not mode_permits(ancestor)
             ):
                 raise SystemExit(
-                    f"session-kit: unsafe recorded provider hook ancestor: {current}"
+                    "session-kit: unsafe recorded provider hook ancestor: "
+                    f"{current}{write_repair(current, ancestor)}"
                 )
 
     core_count = base_count
@@ -340,9 +433,12 @@ elif operation == "recover":
                 not stat.S_ISDIR(ancestor.st_mode)
                 or stat.S_ISLNK(ancestor.st_mode)
                 or ancestor.st_uid not in {0, os.geteuid()}
-                or stat.S_IMODE(ancestor.st_mode) & 0o022
+                or not mode_permits(ancestor)
             ):
-                raise SystemExit(f"session-kit: unsafe recorded theme ancestor: {current}")
+                raise SystemExit(
+                    "session-kit: unsafe recorded theme ancestor: "
+                    f"{current}{write_repair(current, ancestor)}"
+                )
     for entry in reversed(entries):
         if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
             raise SystemExit("session-kit: invalid lifecycle transaction entry")

@@ -203,11 +203,64 @@ picker_modal_read() {
   done
 }
 
+# Filter-as-you-type, built on the search the picker already had. A `/` line
+# that pauses mid-typing previews its own result; Enter on the same line runs
+# the identical search it always did. Nothing else in the picker knows this
+# happened: QUERY is the one filter, and it is restored the moment the line
+# stops being a search.
+PICKER_QUERY_BASE=""
+PICKER_FILTER_ACTIVE=0
+
+picker_filter_live_enabled() {
+  [[ ${SESSION_KIT_PICKER_FILTER_LIVE:-1} != 0 ]]
+}
+
+# Show what the half-typed line would select. Returns 0 only when the visible
+# list actually changed, so an unchanged view never costs a repaint.
+picker_filter_preview() {
+  local buffer=$1 wanted previous=$QUERY
+  if [[ $buffer == /* ]]; then
+    wanted=${buffer#/}
+  else
+    wanted=$PICKER_QUERY_BASE
+  fi
+  [[ $wanted != "$QUERY" ]] || return 1
+  QUERY=$wanted
+  PAGE=1
+  if ! build_view; then
+    # A preview that cannot be built changes nothing at all: the previous
+    # list stays on screen and the typed line is left alone.
+    QUERY=$previous
+    build_view || true
+    return 1
+  fi
+  PICKER_FILTER_ACTIVE=1
+  return 0
+}
+
+# A previewed filter belongs to the line that was being typed. If that line
+# turned out to be something else -- n, a number, a close -- the preview is
+# undone before the command runs, so no action ever executes against a list
+# the person only glanced at.
+picker_filter_finish() {
+  local buffer=$1
+  (( PICKER_FILTER_ACTIVE )) || return 0
+  [[ $buffer != /* ]] || return 0
+  PICKER_FILTER_ACTIVE=0
+  [[ $QUERY != "$PICKER_QUERY_BASE" ]] || return 0
+  QUERY=$PICKER_QUERY_BASE
+  PAGE=1
+  build_view || true
+}
+
 # Read and echo one character at a time. The picker owns the visible buffer, so
 # a repaint can redraw the exact half-typed command instead of erasing its echo.
 picker_read_live() {
   local __sk_live_var=$1 __sk_live_prompt=$2
-  local seconds waited=0 buffer="" character="" read_status collect_status
+  local seconds buffer="" character="" read_status collect_status
+  local filter_pending=0 read_timeout=1 elapsed_tenths=0
+  PICKER_QUERY_BASE=$QUERY
+  PICKER_FILTER_ACTIVE=0
   seconds=$(picker_live_seconds)
   if (( seconds == 0 )) || [[ ! -t 0 ]]; then
     picker_read "$__sk_live_var" "$__sk_live_prompt"
@@ -237,7 +290,7 @@ picker_read_live() {
     fi
     picker_exit input_closed
   fi
-  waited=1
+  elapsed_tenths=10
 
   PICKER_TTY_STATE=$(stty -g < /dev/tty 2>/dev/null || true)
   if [[ -z $PICKER_TTY_STATE ]] ||
@@ -257,20 +310,30 @@ picker_read_live() {
       printf -v "$__sk_live_var" '%s' "$buffer"
       echo
       picker_input_restore
+      picker_filter_finish "$buffer"
       return 0
     fi
     buffer+=$character
   done
+  if picker_filter_live_enabled && [[ -n $buffer ]]; then
+    filter_pending=1
+  fi
 
   while true; do
     character=""
+    # A line being typed as a search is answered while it is typed: short
+    # waits until the person pauses, then one preview. Everything else keeps
+    # the original one-second cadence, so the live refresh below is unchanged.
+    read_timeout=1
+    (( filter_pending == 0 )) || read_timeout=0.25
     # shellcheck disable=SC2229
-    if IFS= read -r -s -n 1 -t 1 character; then
+    if IFS= read -r -s -n 1 -t "$read_timeout" character; then
       # `read -n 1` returns an empty value for the newline delimiter.
       if [[ -z $character || $character == $'\r' ]]; then
         printf -v "$__sk_live_var" '%s' "$buffer"
         echo
         picker_input_restore
+        picker_filter_finish "$buffer"
         return 0
       fi
       case "$character" in
@@ -278,6 +341,7 @@ picker_read_live() {
           if [[ -n $buffer ]]; then
             buffer=${buffer%?}
             printf '\b \b'
+            picker_filter_live_enabled && filter_pending=1
           fi
           ;;
         $'\004')
@@ -287,11 +351,13 @@ picker_read_live() {
           printf -v "$__sk_live_var" '%s' "$buffer"
           echo
           picker_input_restore
+          picker_filter_finish "$buffer"
           return 0
           ;;
         *)
           buffer+=$character
           printf '%s' "$character"
+          picker_filter_live_enabled && filter_pending=1
           ;;
       esac
       continue
@@ -308,6 +374,18 @@ picker_read_live() {
       picker_input_restore
       picker_exit input_closed
     fi
+    # The person stopped typing. If the line is a search, show what it
+    # selects before they commit to it; the same frame batching the live
+    # refresh uses keeps the redraw from flickering the half-typed line.
+    if (( filter_pending )); then
+      filter_pending=0
+      if picker_filter_preview "$buffer"; then
+        printf '\033[?2026h\033[H\033[J'
+        render_main
+        printf '%s%s' "$__sk_live_prompt" "$buffer"
+        printf '\033[?2026l'
+      fi
+    fi
     if picker_live_ready; then
       picker_live_collect
       collect_status=$?
@@ -323,9 +401,16 @@ picker_read_live() {
         printf '\033[?2026l'
       fi
     fi
-    waited=$(( waited + 1 ))
-    if (( waited >= seconds )); then
-      waited=0
+    # Counted in tenths of a second because the wait is no longer always one
+    # second: a short filter wait must not make the live refresh five times
+    # more frequent than the operator asked for.
+    if [[ $read_timeout == 1 ]]; then
+      elapsed_tenths=$(( elapsed_tenths + 10 ))
+    else
+      elapsed_tenths=$(( elapsed_tenths + 3 ))
+    fi
+    if (( elapsed_tenths >= seconds * 10 )); then
+      elapsed_tenths=0
       picker_live_start || true
     fi
   done
@@ -356,6 +441,9 @@ refresh_snapshot() {
   SNAPSHOT=$fresh
   QUERY=""
   PAGE=1
+  # A jump marker points at a row in the list it was computed from. The next
+  # list is a different list, so the marker goes with the old one.
+  PICKER_JUMP_NUMBER=""
   refresh_pending_cache
   build_view
 }

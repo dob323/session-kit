@@ -97,6 +97,57 @@ close_target() {
   printf 'Closed %s\n' "$(sk_human_label "${title:-}" "${provider:-}")"
 }
 
+teardown_target() {
+  # Close one delegated worker and prune the worktree it ran in -- the pair
+  # that leaves a merged workstream with nothing of its own left behind. The
+  # directory goes only when git agrees the branch is merged and nothing is
+  # uncommitted; the branch and its commits are never deleted here.
+  local selector= merged_into=HEAD force=
+  while (($#)); do
+    case "$1" in
+      --merged-into)
+        [[ -n ${2:-} ]] || { sk_die "--merged-into requires one git ref"; return 2; }
+        merged_into=$2
+        shift 2
+        ;;
+      --force)
+        force=1
+        shift
+        ;;
+      --*) sk_die "unknown teardown option: $1"; return 2 ;;
+      *)
+        [[ -z $selector ]] || { sk_die "teardown takes one session"; return 2; }
+        selector=$1
+        shift
+        ;;
+    esac
+  done
+  [[ -n $selector ]] || { sk_die "teardown needs one session"; return 2; }
+  resolve_target "$selector" || return 1
+  local cwd=$SK_CWD record= branch=
+  record=$(python3 "$INVENTORY_CORE" worktree lookup --path "$cwd") || {
+    sk_die "that session does not run in a Session Kit worktree; use 'sp close $selector'"
+    return 1
+  }
+  branch=$(printf '%s' "$record" | python3 -c '
+import json,sys
+print(json.load(sys.stdin).get("branch") or "")
+') || return 1
+  [[ -n $branch ]] || {
+    sk_die "the worktree record for $cwd names no branch; nothing was closed"
+    return 1
+  }
+  close_target "$selector" || return 1
+  local -a teardown_argv=(python3 "$INVENTORY_CORE" worktree teardown
+    --path "$cwd" --merged-into "$merged_into")
+  [[ -z $force ]] || teardown_argv+=(--force)
+  "${teardown_argv[@]}" >/dev/null || {
+    sk_die "the worker is closed; its $branch worktree at $cwd was kept for the reason above"
+    return 1
+  }
+  printf 'Closed the worker and pruned the %s worktree at %s\n' "$branch" "$cwd"
+}
+
 show_prune() {
   local candidate_file="$SK_STATE_DIR/prune-candidates.json"
   "$SCRIPT_DIR/shpool_reaper" --candidates >/dev/null || return 1

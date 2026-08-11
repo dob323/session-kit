@@ -118,7 +118,26 @@ doctor_linux_service_truth() {
   fi
 }
 
+# The source-authority evidence report: what actually proved this machine's
+# recorded operator turns, and how much of it a delegation gate could stand
+# on. Read-only — it writes no verification receipts and changes no state —
+# so it is safe against a live installation at any time. It lives in Python
+# because it reads the source ledger and re-runs the same verifier a gate
+# would. `$module_dir` is `<release>/lib/sh` in an installed release and in a
+# Git checkout alike, so its parent is the library either way.
+doctor_authority() {
+  local library=$module_dir/..
+  [[ -d $library/sessionkit_supervisor ]] ||
+    die "source-authority reporting needs the release library at $library"
+  PYTHONPATH=$library python3 -m sessionkit_supervisor.authority_doctor "$@"
+}
+
 doctor_command() {
+  if [[ ${1:-} == --authority ]]; then
+    shift
+    doctor_authority "$@"
+    return
+  fi
   local json=0
   [[ ${1:-} != --json ]] || { json=1; shift; }
   (($# == 0)) || die "unknown doctor option: $1"

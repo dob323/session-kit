@@ -667,8 +667,13 @@ class MsgConfirmTerminalTests(unittest.TestCase):
         environment = self.fixture.env(SESSION_KIT_NONINTERACTIVE="0")
         pid, descriptor = pty.fork()
         if pid == 0:  # pragma: no cover - the child execs immediately
-            os.chdir(REPO)
-            os.execvpe("bash", ["bash", "-c", script], environment)
+            # A child that cannot exec must never return: it is a forked copy
+            # of the test runner, and returning resumes the suite from here.
+            try:
+                os.chdir(REPO)
+                os.execvpe("bash", ["bash", "-c", script], environment)
+            finally:
+                os._exit(127)
         os.write(descriptor, keys)
         output = bytearray()
         probed = False

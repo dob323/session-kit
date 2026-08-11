@@ -4,6 +4,186 @@ Session Kit follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-11
+
+### Fixed
+
+- An intake notice that fails to deliver is retried instead of abandoned.
+  `flush()` now sweeps every undelivered arrival notice and amendment under its
+  own relay key with per-notice backoff (1m/5m/15m/1h/6h, last rung repeating),
+  `supervisor ensure` and prompt wakes trigger the sweep, and nothing is ever
+  written off. `msg intake pending` reports what is owed — count, due now,
+  deferred, oldest wait — and `msg intake open` carries the same block, so the
+  read the supervisor already makes every turn now says what never reached it.
+  Before this, delivery ran once from the recording hook and a lost send was
+  marked and left, with no command able to say so.
+
+- The supervisor's MCP definition survives a release activation. The pin is
+  written through the install root's `current` pointer when the release is the
+  current one (proven live over a real stdio handshake), `supervisor ensure`
+  rewrites the definition on every wake so an already-drifted install repairs
+  itself, and a new `supervisor mcp-config` verb regenerates it without
+  creating, resuming, or messaging anything. This was the third recurrence of
+  the drift; the pin now moves with activations instead of breaking on them.
+
+- A delegated worker now receives its assignment. Workers were started with no
+  prompt (Claude) or a deliberate no-work bootstrap (Codex), and nothing ever
+  sent the task afterwards — delegation ended at a verified but idle worker.
+  Every plan row now carries `task_text`, `acceptance_criteria`, and
+  `deliverable`; `delegate()` gained a `commissioned` state that delivers the
+  duty to the worker's proven identity, reserved on disk under the send key
+  and settled from the receipt, so a duty that does not land is named in
+  `undelivered` and finished by the next delegate under the same key rather
+  than lost. Reports come back as owner-private disk receipts written before
+  the intake entry, `sp msg intake duties` flags silent, owed, and unfolded
+  work, and over-long duties are refused at plan time because the messaging
+  core silently truncates. The two-provider/two-model composition rule is
+  replaced by declared expertise: a preflight names `required_expertise_tags`
+  and the only rule is that the plan covers every declared tag.
+
+### Added
+
+- Account selection reads real quota evidence, labelled by how it knows.
+  Three readers feed the proposal: Codex rate limits parsed from the
+  provider's own rollouts (`measured`), Claude per-hour load rates and refusal
+  text from transcripts (`observed`, since Claude publishes no allowance
+  locally), and the account roster's `u5h`/`u7d` fields for both providers
+  (`feed`, yielding nothing when no roster is configured). Refusals are
+  parsed for what they actually say: a weekly refusal no longer expires as a
+  5-hour one, a model-scoped limit benches that model rather than the whole
+  account, and a refusal already recovered from (a billed turn since) stops
+  counting. Along the way two live defects in account advice fell: advice was
+  consulted only for Claude, so a healthy Codex account could never be
+  recommended, and the feed's explanation was read under the wrong key, so
+  every recommendation arrived with a blank reason.
+
+- A project is one thing. A canonical root directory is the single identity a
+  shortcut names, a committed `session-kit.toml` describes, an intake arrives
+  from inside, and a session runs in; one membership rule (deepest root at or
+  above the working directory) is implemented once and shared by resolution,
+  grouping, and `sp new`. The manifest travels with a clone and can carry
+  provider, account, model, a startup command, and a `[[team]]` worker plan —
+  but its launch fields apply only for a project this host has deliberately
+  listed, `root` cannot escape the manifest's own directory, account and model
+  only select among what the host already has through the existing validation,
+  and startup commands are approval-gated by content digest, withdrawn on any
+  edit, and surfaced rather than executed. `session-kit projects
+  resolve|list|launch-plan|approve-startup|context|group-sessions|check` is
+  the machine surface, and `launch-plan` names the source of every applied
+  value so a session that differs from what was typed is always explainable.
+  One strict TOML-subset reader runs identically on every supported Python, so
+  a manifest cannot mean different things on different machines.
+
+- Every command answers `--help`, and answers it before requiring shpool.
+  `sp help` is a grouped reference covering every verb the dispatcher accepts
+  (a test parses the dispatcher to keep it that way), nine `sp help <topic>`
+  pages cover sessions, names, messages, accounts, history, selectors,
+  exit codes, completion, and the machine verbs, and the exit-code table is
+  documented once and scanned for drift. `-h`/`--help` prints to stdout and
+  exits 0 across all seven entry points; an argument mistake prints a
+  five-line synopsis to stderr and exits 2. Bash tab completion ships as
+  `lib/sh/sp_completion.bash` (Bash 3.2-safe, never shells out, installed and
+  removed with the release), and `shpool_status --help` now separates
+  read-only modes from the ones that refresh caches, fill titles, or change
+  recovery state — matched against the source by a test.
+
+- `tools/install-matrix` proves the documented Linux install in clean-room
+  containers: ubuntu 22.04 and 24.04, debian 12, and fedora 41 each clone the
+  repository, follow `docs/install.md` as written, and must finish with
+  services genuinely live and `session-kit doctor` reporting no failures. The
+  tool runs from a plain checkout, a worktree, or a post-merge tree without
+  dirtying any of them.
+
+- Delegated work runs isolated and leaves a receipt. `sp new --worktree
+  <branch>` materialises the branch as a git worktree under the kit's own
+  state directory and starts the session there — idempotent per repository
+  and branch, refused before anything moves when the branch is checked out
+  elsewhere or the project is not a repository — and delegated workers get it
+  by default. Rows name the branch in the picker, `sp list`, and `sp detail`;
+  `sp teardown` closes the worker and prunes only a merged, clean worktree,
+  never deleting the branch. Every run writes a receipt: cap snapshot,
+  reported spend with the source that claimed each sample, verifier evidence,
+  changed files including committed work, isolation mode, stop reason, and a
+  SHA-256 integrity digest that turns outside edits into `tamper_detected`.
+  A hard cap closes the run as `cap_breached` and the delegate launcher's
+  gate refuses further workers; closing as `completed` requires a passing
+  verifier or an explicit `--allow-unverified` written onto the record. Duty
+  receipts carry the same `launch_key` as run receipts, so the two families
+  join directly. A forked test child that cannot exec now exits instead of
+  resuming the suite, and test sandboxes live outside the repository.
+
+- The picker answers without attaching. `i<n>` peeks at what a session asked,
+  how long it has waited, and the tail of its thread — read-only, nothing
+  marked seen — and a reply typed there rides the ordinary `sp msg` delivery
+  with its ledger and receipts. `/text` filters the list as you type and a
+  preview belongs only to the line being typed: erase it or turn it into
+  another command and the full list is back before that command runs. `g`
+  jumps to the next session waiting on you, `group` buckets by state,
+  provider, or project, `c` compacts rows, and one table now feeds the `?`
+  screen, the footer, and the docs — with a test that parses the picker's own
+  key dispatch so an undocumented key fails. An opt-in attention notifier
+  rides the existing watchdog plumbing: off by default, never critical,
+  nothing under a ten-minute wait, one alert per unbroken wait, with
+  `extras/notify-desktop` as a working example. The default view is
+  byte-identical to before.
+
+- A stock Ubuntu machine installs. Ubuntu's per-user-group scheme leaves the
+  provider homes group-writable (775), and the installer refused any
+  group-writable ancestor with a raw traceback partway through the install.
+  The safety check now accepts a directory whose group is provably the
+  caller's own single-member private group — owner matches, gid is the
+  primary gid, the group carries the account's name, lists no members, and
+  no other account holds it; any lookup failure still refuses — applied
+  identically at the hook path, the Codex home, and transaction recovery
+  (without which an interrupted install on such a machine could never be
+  finished). Refusals now name the offending directory and the exact chmod,
+  `install.sh --check` reports the condition before anything is written, and
+  `--non-interactive` appears in the installer's help.
+
+- `shpool attach` keeps the shell's exit status. An upstream race poisoned
+  the client's result slot with exit 1 whenever stdin closed early — visible
+  as a rare test flake, real in the field for any caller that closes stdin —
+  fixed by waiting the existing detach window for the status frame before
+  defaulting. Patch 0001's heartbeat ack channel also no longer parks the
+  shell-to-client thread on an abandoned, never-drained ack. Fifty full
+  attach-suite runs pass on both the patched and pristine-plus-fix trees
+  (previously about one run in eight failed), and the recorded binary
+  checksum now names the toolchain that produced it.
+
+- The public repository's CI is self-contained. The legacy-generation install
+  fixture no longer pins a commit only the private history holds, the
+  watchdog fixture owns its own boot clock instead of reading the host's
+  uptime (which went non-positive on fresh runners and silently passed every
+  repair proof on nothing), a quarantine test uses the shpool stand-in seam
+  instead of requiring a real binary, and the history scan carries a
+  fail-closed baseline of 37 grandfathered pre-cleanup blobs — excused by
+  exact id for the private-marker rule only, never for the tree, with the
+  summary reporting matched-of-listed so a stale entry shows instead of
+  lasting forever.
+
+### Security
+
+- Source authority sees every transcript this machine holds, and says how it
+  knows. Claude evidence roots now cover `$CLAUDE_CONFIG_DIR` and every kit
+  account profile, with a bounded Codex-shaped discovery walk (unique-or-
+  refuse, symlink-skipping) behind them; each verified event carries an
+  additive authority tier naming the strength of its evidence, and
+  `session-kit doctor --authority` reports the ladder read-only — including
+  which sessions have a transcript their events never recorded. An
+  `authority_for_intake()` policy surface exists with a fail-closed policy
+  file but is wired to nothing: delegation still gates on no part of this,
+  and a test fails the moment that changes without a decision. Harness
+  machine envelopes can no longer become intake amendments at capture time.
+
+- Source authority now verifies Codex sessions whose first record is the
+  CLI's synthetic preamble, refuses text that begins with any variant of the
+  fleet watcher's machine banner by its shared stem, and screens
+  `SESSION_KIT_MACHINE_ORIGIN` at capture so a machine-originated wake can
+  never become authority-capable — ANDed into capability, stored only when
+  declared, and refused again at verify time. Live effect on this estate: 33
+  of 38 stored Codex events verify end to end, up from zero before this
+  release series; an unnamed future preamble kind still fails closed.
+
 ## [0.2.1] - 2026-08-11
 
 

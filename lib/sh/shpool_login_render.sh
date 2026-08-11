@@ -12,7 +12,8 @@
 # shellcheck disable=SC2154
 
 render_page() {
-  python3 - "$VIEW" "$PAGE" "$PAGE_SIZE" "$PICKER_STYLE" <<'PY'
+  python3 - "$VIEW" "$PAGE" "$PAGE_SIZE" "$PICKER_STYLE" \
+    "${PICKER_COMPACT:-0}" "${PICKER_JUMP_NUMBER:-}" <<'PY'
 import json
 from datetime import datetime
 import os
@@ -22,9 +23,11 @@ import sys
 import time
 import unicodedata
 
-path, page_text, size_text, style_text = sys.argv[1:5]
+path, page_text, size_text, style_text, compact_text, jump_text = sys.argv[1:7]
 page, page_size = int(page_text), int(size_text)
 style_enabled = style_text == "1"
+compact = compact_text == "1"
+jump_number = int(jump_text) if jump_text.isdigit() else 0
 with open(path, encoding="utf-8") as handle:
     data = json.load(handle)
 rows = data.get("sessions", [])
@@ -332,6 +335,16 @@ if selected:
         )
         if agents:
             details.append(f"{agents} subagent{'s' if agents != 1 else ''}")
+        # Delegated workers all sit in the same project. The branch each one is
+        # isolated on is what tells their rows apart.
+        worktree = row.get("worktree")
+        worktree_branch = (
+            clean_display(worktree.get("branch"))[:60]
+            if isinstance(worktree, dict)
+            else ""
+        )
+        if worktree_branch:
+            details.append(f"worktree {worktree_branch}")
         # Narrow terminals drop the subagent count first. Primary state and
         # login age remain the only fallback context, never an identifier.
         compact_details = [
@@ -339,6 +352,14 @@ if selected:
             for detail in details
             if not detail.endswith("subagent") and not detail.endswith("subagents")
         ]
+        # Compact mode keeps the primary state, and for a row that is waiting
+        # on a person, how long it has waited. Nothing else earns a column
+        # when the whole point of the mode is more sessions on one screen.
+        if compact:
+            details = [primary_status]
+            if needs_attention and age_detail:
+                details.append(age_detail)
+            compact_details = list(details)
         rendered_rows.append(
             (
                 row,
@@ -380,25 +401,27 @@ if selected:
         detail_reserve = min(ideal_detail_width, max(18, available_width // 3))
         label_width = max(8, available_width - 3 - detail_reserve)
 
-    previous_availability = None
+    previous_label = None
     for row, number, title, detail_parts, compact_parts, status_parts, needs_attention, warning_status in rendered_rows:
-        availability = row.get("availability")
         provider = provider_label(row)
         account = account_label(row)
         details = aligned_details(detail_parts)
         compact_details = aligned_details(compact_parts)
         status_details = aligned_details(status_parts)
+        # The heading text is decided once, in the projection, so the page
+        # sizing and the page itself can never disagree about how many
+        # heading lines this page has.
+        label = row.get("_picker_group_label") or (
+            "Ready to open"
+            if row.get("availability") == "ready"
+            else "Open elsewhere"
+        )
         if row.get("_picker_supervisor_pin"):
             print("  " + style("Pinned", BOLD))
-            previous_availability = None
-        elif availability != previous_availability:
-            heading = (
-                "Ready to open"
-                if availability == "ready"
-                else "Open elsewhere"
-            )
-            print("  " + style(heading, BOLD))
-            previous_availability = availability
+            previous_label = None
+        elif not compact and label != previous_label:
+            print("  " + style(label, BOLD))
+            previous_label = label
         number_text = f"{number:>{number_width}}"
         prefix = f"      {number_text}  "
         compact_label = shorten(title, label_width)
@@ -425,7 +448,10 @@ if selected:
         detail_text = shorten_aligned(details, detail_room)
         if warning_status:
             detail_text = style(detail_text, BOLD, YELLOW)
-        styled_prefix = "    " + style(number_text, BOLD, GREEN) + "  "
+        # The jump marker replaces two leading spaces, so a marked row is
+        # exactly as wide as an unmarked one and no column moves under it.
+        marker = "  ▸ " if number == jump_number else "    "
+        styled_prefix = marker + style(number_text, BOLD, GREEN) + "  "
         provider_text = style(provider, BOLD, provider_color(row))
         account_text = account + " " * max(0, account_width - display_width(account))
         print(
@@ -936,6 +962,14 @@ try:
             row["_picker_waiting_since_unix_ms"] = item.get(
                 "waiting_since_unix_ms"
             )
+            # What "needs you" means on this row, recorded once here so the
+            # jump key and the peek card agree with the counter in the footer
+            # instead of each deciding for themselves.
+            bucket = item.get("bucket")
+            if bucket in {"needs_you", "finished_unseen"}:
+                row["_picker_attention_bucket"] = bucket
+            else:
+                row.pop("_picker_attention_bucket", None)
             view_changed = True
 except BaseException:
     needs = []
@@ -1004,7 +1038,9 @@ render_main() {
     done
     printf '  Needs you: %s · %s · %s\n' "$attention_total" "$joined" "$(picker_green 'a:review')"
   fi
-  echo
+  # Compact mode buys its extra rows from the group headings and this spacer.
+  # page_size() subtracts the same line, so the two stay in step.
+  [[ ${PICKER_COMPACT:-0} == 1 ]] || echo
   local cols=${COLUMNS:-}
   [[ $cols =~ ^[0-9]+$ ]] || cols=$(tput cols 2>/dev/null || printf '80')
   [[ $cols =~ ^[0-9]+$ ]] || cols=80
@@ -1100,7 +1136,7 @@ show_attention_menu() {
       echo
     fi
     echo "  Open: session number · Reply: r number · Prompt: q number · Dismiss repair: d number"
-    echo "  Messages: s · Enter: back"
+    echo "  Peek: i number · Messages: s · Help: ? · Enter: back"
     echo
     picker_modal_read answer "  needs ❯ " || return 0
     case "$answer" in
@@ -1110,6 +1146,7 @@ show_attention_menu() {
       q[0-9]*|Q[0-9]*) choose_prompt_quarantine "${answer#[qQ]}" ;;
       d[0-9]*|D[0-9]*) dismiss_repair_failure "${answer#[dD]}" ;;
       s|S) compose_message ;;
+      \?) show_help ;;
       [0-9]*)
         if [[ $answer =~ ^[0-9]+$ ]] && grep -qxF "$answer" <<<"$session_numbers"; then
           saved_page=$PAGE
@@ -1163,6 +1200,7 @@ show_more_menu() {
     if (( other_count == 0 && pending == 0 && unavailable_count == 0 )); then
       echo "  Nothing else right now."
     fi
+    printf '  %s  Help: every picker key on one screen\n' "$(picker_green '?')"
     echo "  Enter  Back"
     echo
     local answer
@@ -1189,39 +1227,70 @@ show_more_menu() {
       p|P)
         show_projects_menu
         ;;
-      *) echo "  Unknown choice. Use o, u, p, or Enter." ;;
+      \?) show_help ;;
+      *) echo "  Unknown choice. Use o, u, p, ?, or Enter." ;;
     esac
   done
+}
+
+# One key table for the whole picker. The `?` screen prints it, the footer
+# advertises a subset of it, and tests/test_picker_ux.py fails when a key the
+# main loop dispatches is missing from it -- which is how the help and the
+# menu stopped agreeing in the first place: `a` and `m` were on the footer of
+# every screen and in no help text anywhere.
+#
+# Emitted as section<TAB>key<TAB>meaning so one list serves both surfaces.
+picker_help_rows() {
+  cat <<'ROWS'
+Sessions	number	Open an available session or show actions for one open elsewhere
+Sessions	i<n>	Peek: what a session asked, its latest messages, and a reply — without opening it
+Sessions	n	Guided Claude, Codex, or managed-shell creation
+Sessions	k <numbers>	Close displayed sessions: k 5 · k 5, 6, 8 · k 4-7 · k all
+Sessions	x <number>	Compatibility alias for k
+Sessions	name <number>	Rename an exact Claude or Codex conversation
+Sessions	name reset #	Remove the local name and show the provider name
+Sessions	fork <number>	Start a separate fork of an exact Claude or Codex conversation
+Sessions	action 4	Change the subscription account for an exact Claude or Codex thread
+Sessions	action 5	Apply a pending Codex bar title only when the provider is proven idle
+Needs you	a	Review everything waiting on you: sessions, replies, prompts, repairs
+Needs you	g	Jump to the next session waiting on you, marking it with ▸
+Needs you	r<n>	Open the report a listed new reply belongs to: r1 · r2
+Needs you	q<n>	Resolve a listed prompt delivery needing attention: q1 · q2
+Needs you	qp	Prune prompt records after their 30-day recovery window
+Needs you	s	Message centre: write to sessions and watch the replies
+Needs you	v	Open the fleet supervisor
+The list	/text	Filter names, providers, projects, IDs, and UUIDs as you type; Enter keeps it
+The list	group	Cycle grouping: state, provider, project (group provider sets one)
+The list	c	Compact rows: no headings, more sessions on the screen
+The list	next / prev	Move between pages; only visible page numbers accept actions
+The list	r	Refresh live state and clear the filter
+The list	m	More: other-provider sessions, recovery, projects, unavailable records
+The list	o	View detectable provider roots outside the session manager (read-only)
+The list	u	Review exact conversation recovery; opening it changes nothing
+Leaving	Enter / EOF	Return to a regular terminal without a session action
+Leaving	q / p	Leave the picker for a regular terminal
+Leaving	Ctrl-C	Redraw this menu (never exits; use Enter for a terminal)
+ROWS
 }
 
 show_help() {
   echo
   echo "  Session picker help"
-  echo
-  echo "  number        Open an available session or show actions for one open elsewhere"
-  echo "  n             Guided Claude, Codex, or managed-shell creation"
-  echo "  s             Message centre: write to sessions and watch the replies"
-  echo "  r<n>          Open the report a listed new reply belongs to: r1 · r2"
-  echo "  q<n>          Resolve a listed prompt delivery needing attention: q1 · q2"
-  echo "  qp            Prune prompt records after their 30-day recovery window"
-  echo "  v             Open the fleet supervisor"
-  echo "  k <numbers>   Close displayed sessions: k 5 · k 5, 6, 8 · k 4-7 · k all"
-  echo "  x <number>    Compatibility alias for k"
-  echo "  /text         Search names, providers, projects, IDs, and conversation UUIDs"
-  echo "  r             Refresh live state and clear search"
-  echo "  o             View detectable provider roots outside the session manager (read-only)"
-  echo "  u             Review exact conversation recovery; opening it changes nothing"
-  echo "  name <number> Rename an exact Claude or Codex conversation"
-  echo "  name reset #  Remove the local name and show the provider name"
-  echo "  fork <number> Start a separate fork of an exact Claude or Codex conversation"
-  echo "  action 4      Change the subscription account for an exact Claude or Codex thread"
-  echo "  action 5      Apply a pending Codex bar title only when the provider is proven idle"
-  echo "  next / prev   Move between pages; only visible page numbers accept actions"
-  echo "  Enter / EOF   Return to a regular terminal without a session action"
-  echo "  Ctrl-C        Redraw this menu (never exits; use Enter for a terminal)"
+  local section previous="" key meaning
+  while IFS=$'\t' read -r section key meaning; do
+    [[ -n $key ]] || continue
+    if [[ $section != "$previous" ]]; then
+      echo
+      printf '  %s\n' "$(picker_bold "$section")"
+      previous=$section
+    fi
+    printf '  %-13s %s\n' "$key" "$meaning"
+  done < <(picker_help_rows)
   echo
   echo "  Inside a managed session: use bye to close it, or disconnect SSH to leave it running."
   echo "  Full raw terminal history is available from an open-session action menu."
+  echo "  Grouping and compact rows last for this window; SESSION_KIT_PICKER_GROUP and"
+  echo "  SESSION_KIT_PICKER_COMPACT set how it starts."
   echo
   local ignored
   picker_modal_read ignored "  Enter: Back ❯ " || return 0

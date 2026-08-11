@@ -11,8 +11,8 @@ sp list
 Before sharing output, remove titles, UUIDs, working directories, process
 details, service logs, and journal content.
 
-`session-kit doctor` also audits provider version output, all eight installed
-Codex theme files, the user-level self-name instructions, Claude title-hook
+`session-kit doctor` also audits provider version output, all fourteen
+installed Codex theme files, the user-level self-name instructions, Claude title-hook
 coverage, active kill switches, and the private
 `release-acceptance.json` record. These migration checks are warnings: they do
 not alter provider state or make an otherwise healthy installation fail.
@@ -27,6 +27,16 @@ they can fail an installation that installed cleanly:
 | `units` | the enabled and active state of each Session Kit unit; the socket-activated and timer-activated units are reported without being required | `session-kit services enable` |
 | `linger` | whether logind keeps your user manager alive after logout | `loginctl enable-linger "$USER"` |
 | `hook-files` | whether each registered intake hook command resolves to a runnable file | `session-kit update` |
+
+`session-kit doctor --authority [--json] [--days N] [--session PROVIDER:UUID]`
+is a separate, read-only report on source authority: how many recorded events
+reach each authority tier, which sessions have a provider transcript on this
+machine that their events never recorded, and which stored operator intakes
+would pass or be refused today. It changes nothing and gates nothing; tier
+numbers only accumulate for events captured after the evidence roots landed,
+so an existing install reports its pre-existing history as tier 0
+permanently — those events recorded no transcript anchor and the ledger is
+append-only — while a fresh install simply reports no events at all.
 
 `watchdog`, `units`, and `linger` read live state only when the systemd user
 manager answers on its own socket. When it is reachable only through the

@@ -1,0 +1,49 @@
+# Matrix image for Debian-family distributions.
+#
+# Layer order is deliberate: container scaffolding first, then the documented
+# prerequisites verbatim from docs/install.md, so a missing documented package
+# shows up as a preflight failure instead of being hidden by scaffolding.
+ARG BASE_IMAGE=debian:12
+FROM ${BASE_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Scaffolding, not prerequisites. A real Linux machine boots systemd and has a
+# login session; a base container image has neither. systemd and dbus are
+# installed here to reproduce that machine state, never to satisfy a check the
+# kit makes about the kit itself.
+RUN apt-get update \
+ && apt-get install -y systemd dbus dbus-user-session \
+ && rm -rf /var/lib/apt/lists/*
+
+# The documented Linux prerequisites, copied from docs/install.md. Recommends
+# are left enabled because the documented command does not disable them.
+RUN apt-get update \
+ && apt-get install -y python3 procps diffutils findutils util-linux \
+      bsdextrautils coreutils curl \
+ && rm -rf /var/lib/apt/lists/*
+
+# docs/install.md: "A Git checkout also requires Git."
+RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
+
+# One unprivileged operator account. UID 1000 matches the mounted source
+# checkout's owner, so Git reads it without an ownership override.
+ARG MATRIX_USER=tester
+RUN if id -u 1000 >/dev/null 2>&1; then userdel -r "$(id -un 1000)" || true; fi \
+ && useradd -m -u 1000 -s /bin/bash "${MATRIX_USER}"
+
+# A provider CLI is a documented requirement ("Claude Code, Codex, or both")
+# and the preflight fails without one. docs/install.md does not say how to get
+# one; this uses the vendor's own installer.
+USER ${MATRIX_USER}
+RUN curl -fsSL https://claude.ai/install.sh -o /tmp/claude-install.sh \
+ && bash /tmp/claude-install.sh \
+ && rm -f /tmp/claude-install.sh \
+ && "$HOME/.local/bin/claude" --version
+USER root
+
+# Kept last so editing it never rebuilds the layers above.
+COPY cgroup-init.sh /usr/local/sbin/matrix-init
+
+STOPSIGNAL SIGRTMIN+3
+CMD ["/usr/local/sbin/matrix-init"]

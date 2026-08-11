@@ -221,6 +221,9 @@ class DelegateWiringCase(unittest.TestCase):
                 "requested_model": CLAUDE_MODEL,
                 "expertise": "implementation",
                 "rationale": "one worker is enough to prove the launch wiring",
+                "task_text": "implement the bounded change and run the suite",
+                "acceptance_criteria": "the suite passes and the change is committed",
+                "deliverable": "commits on the branch plus the test output",
             }
         ]
 
@@ -236,6 +239,9 @@ class DelegateWiringCase(unittest.TestCase):
                 "requested_model": CLAUDE_MODEL,
                 "expertise": "implementation",
                 "rationale": "implementation expertise for the code itself",
+                "task_text": "implement the bounded change and run the suite",
+                "acceptance_criteria": "the suite passes and the change is committed",
+                "deliverable": "commits on the branch plus the test output",
             },
             {
                 "branch": "agent-research",
@@ -246,6 +252,9 @@ class DelegateWiringCase(unittest.TestCase):
                 "requested_model": CODEX_MODEL,
                 "expertise": "security",
                 "rationale": "a separate model family for independent review",
+                "task_text": "audit the requirements and name every failure mode",
+                "acceptance_criteria": "every declared risk has a named mitigation",
+                "deliverable": "a written risk analysis on the branch",
             },
         ]
 
@@ -274,6 +283,7 @@ class DelegateWiringCase(unittest.TestCase):
         *,
         source_event_id: str = "",
         exception: str = "",
+        required_tags: str = "",
     ) -> None:
         argv = [
             "msg",
@@ -287,6 +297,10 @@ class DelegateWiringCase(unittest.TestCase):
             "the current source event and this intake's requirements",
             "--required-expertise",
             "Python implementation and verification",
+            "--required-tags",
+            required_tags or ",".join(
+                dict.fromkeys(str(row["expertise"]) for row in plan)
+            ),
             "--worker-plan-json",
             json.dumps(plan),
             "--risks",

@@ -44,6 +44,7 @@ from typing import (
 )
 
 from sessionkit_messages.envelope import (
+    MAX_OPERATOR_TEXT,
     landed,
     new_msg_id,
     valid_idempotency_key,
@@ -84,9 +85,35 @@ ACTIONS = (
     "progress",
     "complete",
     "open",
+    "pending",
+    "report",
+    "retry",
+    "reset",
+    "cancel",
+    "duties",
 )
 
-MAX_ENTRY_BYTES = 256 * 1024
+# What one worker's launch has proved so far. `verified` is an exact provider
+# identity running the exact model; `commissioned` adds the one thing that
+# makes it a worker rather than an idle session — its duty, delivered.
+LAUNCH_STATES = (
+    "not_started",
+    "dispatching",
+    "provider_reconciled",
+    "verified",
+    "commissioned",
+)
+# What became of the duty itself. The worker reports completed or failed; only
+# the supervisor abandons one, and only through `cancel`.
+DUTY_STATES = ("assigned", "completed", "failed", "abandoned")
+WORKER_REPORT_STATES = ("completed", "failed")
+DUTY_DELIVERY_STATES = ("undelivered", "delivered", "failed")
+
+# One entry holds every worker's duty text and every reviewed revision of the
+# plan, so the ceiling is generous; it exists to bound a runaway file, not to
+# ration the record.
+MAX_ENTRY_BYTES = 1024 * 1024
+MAX_RECEIPT_BYTES = 16 * 1024
 MAX_POINTER_BYTES = 64
 MAX_SUMMARY = 500
 MAX_TITLE = 200
@@ -95,6 +122,11 @@ MAX_NOTE_TEXT = 2000
 MAX_NOTES = 100
 MAX_AMENDMENTS = 200
 MAX_WORKERS = 32
+MAX_TASK_TEXT = 6000
+MAX_ACCEPTANCE = 2000
+MAX_DELIVERABLE = 1000
+MAX_DUTY_SUMMARY = 1000
+MAX_DUTY_REPORTS = 20
 MAX_PREFLIGHTS = 50
 MAX_ALIASES = 16
 MAX_OPEN = 50
@@ -162,6 +194,25 @@ SIDECHAIN_MARKERS = (
 # How long one asked-for `supervisor ensure` covers every other root that
 # starts behind it. `ensure` is idempotent and one supervisor serves the fleet.
 ENSURE_COOLDOWN_MS = 60_000
+# A commissioned worker that has said nothing for this long is not "probably
+# fine": it is the exact shape of a worker that finished and never reported.
+# The duties view flags it; nothing is decided for you.
+SILENT_DUTY_MS = 30 * 60 * 1000
+DUTY_KEY_PREFIX = "intake-duty"
+# The commissioned message names the worker's own thread key, which a plan row
+# cannot know yet. The plan-time length check reserves room for it so a duty
+# that fits as a plan cannot stop fitting the moment it has a worker.
+DUTY_IDENTITY_RESERVE = 160
+
+# What a relay that did not land waits before a sweep tries it again. The
+# first attempt is immediate; each failure moves the notice one rung down and
+# the last rung repeats forever. A supervisor that is mid-turn, between
+# sessions, or whose harness queue is full is a condition that passes, so a
+# failed relay is owed, not refused — it just stops costing a send per wake.
+RELAY_BACKOFF_MS = (60_000, 5 * 60_000, 15 * 60_000, 60 * 60_000, 6 * 60 * 60_000)
+# How many undelivered relays one pending report names before it stops
+# listing them. The count is always exact; the list is for a person to read.
+MAX_PENDING_LISTED = 50
 
 
 class IntakeError(ValueError):
@@ -268,6 +319,36 @@ def _stamp(value: object, label: str) -> int | None:
     return value
 
 
+def _attempts(value: object) -> int:
+    """How many times one relay has actually been tried.
+
+    Read leniently: an entry written before relays counted their attempts is
+    not a corrupt entry, it is an entry that has tried an unknown number of
+    times and may be tried now.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
+
+
+def next_attempt_unix_ms(attempts: int, now: int) -> int:
+    """When a relay that has failed ``attempts`` times may be tried again."""
+    rung = min(max(attempts, 1), len(RELAY_BACKOFF_MS)) - 1
+    return now + RELAY_BACKOFF_MS[rung]
+
+
+def relay_due(item: Mapping[str, Any], now: int) -> bool:
+    """Whether a sweep may try this undelivered relay now.
+
+    An item with no schedule has never failed, so it is due: a brand-new
+    amendment is delivered on the spot exactly as before.
+    """
+    scheduled = item.get("next_attempt_unix_ms")
+    if isinstance(scheduled, bool) or not isinstance(scheduled, int):
+        return True
+    return scheduled <= now
+
+
 def _terminal_number(value: object) -> int | None:
     if value is None:
         return None
@@ -325,6 +406,191 @@ def _expertise(value: object) -> str:
             "worker expertise must be one of: " + ", ".join(EXPERTISE_TAGS)
         )
     return str(value)
+
+
+def _block(value: object, *, limit: int, label: str, required: bool = True) -> str:
+    """Bounded prose that keeps its line breaks.
+
+    A duty is written for a worker to read, so paragraphs and checklists have
+    to survive the trip. Only the characters a terminal or a transcript would
+    misread are dropped; everything a human wrote stays where they put it.
+    """
+    if value is None:
+        if required:
+            raise IntakeError(f"{label} is required")
+        return ""
+    if not isinstance(value, str):
+        raise IntakeError(f"{label} must be a string")
+    kept = "".join(
+        character
+        for character in value.replace("\r\n", "\n").replace("\r", "\n")
+        if character >= " " or character == "\n" or character == "\t"
+    )
+    lines = [line.rstrip() for line in kept.split("\n")]
+    body = "\n".join(lines).strip("\n")
+    if required and not body.strip():
+        raise IntakeError(f"{label} is required")
+    return body[:limit]
+
+
+def _duty(value: Mapping[str, Any], *, required: bool) -> dict[str, str]:
+    """The three things a worker needs before it can start: what, done, hand back.
+
+    `required` is the difference between reading an entry written before duties
+    existed and recording a new plan. Old records stay readable; nothing new is
+    planned without saying what the worker is actually for.
+    """
+    return {
+        "task_text": _block(
+            value.get("task_text"),
+            limit=MAX_TASK_TEXT,
+            label="worker task text",
+            required=required,
+        ),
+        "acceptance_criteria": _block(
+            value.get("acceptance_criteria"),
+            limit=MAX_ACCEPTANCE,
+            label="worker acceptance criteria",
+            required=required,
+        ),
+        "deliverable": _block(
+            value.get("deliverable"),
+            limit=MAX_DELIVERABLE,
+            label="worker deliverable",
+            required=required,
+        ),
+    }
+
+
+def _validated_duty_report(value: object, index: int) -> dict[str, Any]:
+    """One entry in a worker's ordered duty history."""
+    if not isinstance(value, Mapping):
+        raise IntakeError("a duty report must be an object")
+    sequence = value.get("seq")
+    if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence != index:
+        raise IntakeError("duty reports must be numbered in the order they arrived")
+    state = value.get("state")
+    if state not in DUTY_STATES:
+        raise IntakeError(f"unknown duty report state: {state!r}")
+    reporter = value.get("reporter_identity")
+    if reporter is not None and reporter != "" and not valid_thread_key(reporter):
+        raise IntakeError("a duty report reporter is not an exact thread key")
+    attempt = value.get("duty_attempt")
+    if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
+        raise IntakeError("a duty report attempt must be a positive integer")
+    return {
+        "seq": sequence,
+        "state": state,
+        "summary": _block(
+            value.get("summary"), limit=MAX_DUTY_SUMMARY, label="duty report summary"
+        ),
+        "reporter_identity": str(reporter or ""),
+        "duty_attempt": attempt,
+        "receipt": _text(
+            value.get("receipt"), limit=200, label="duty receipt", required=False
+        ),
+        "recorded_unix_ms": _stamp(value.get("recorded_unix_ms"), "recorded_unix_ms"),
+    }
+
+
+def _validated_duty_delivery(value: object) -> dict[str, Any] | None:
+    """What became of the one message that carried the duty to the worker."""
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise IntakeError("a duty delivery record must be an object")
+    state = value.get("state")
+    if state not in DUTY_DELIVERY_STATES:
+        raise IntakeError(f"unknown duty delivery state: {state!r}")
+    relay_key = valid_idempotency_key(value.get("relay_key"))
+    if not relay_key:
+        raise IntakeError("a duty delivery needs its exact relay key")
+    relay_msg_id = value.get("relay_msg_id")
+    if relay_msg_id is not None and not valid_msg_id(relay_msg_id):
+        raise IntakeError("a duty delivery relay message id is not exact")
+    return {
+        "state": state,
+        "relay_key": relay_key,
+        "relay_msg_id": relay_msg_id,
+        "relay_status": _text(
+            value.get("relay_status"),
+            limit=200,
+            label="duty delivery status",
+            required=False,
+        ),
+        "relay_detail": _text(
+            value.get("relay_detail"),
+            limit=300,
+            label="duty delivery detail",
+            required=False,
+        ),
+        "delivered_unix_ms": _stamp(
+            value.get("delivered_unix_ms"), "delivered_unix_ms"
+        ),
+    }
+
+
+def branch_token(branch: object) -> str:
+    """A branch name as an idempotency-key fragment.
+
+    Branch names carry slashes; idempotency keys do not. The digest keeps one
+    branch's duty key stable across restarts without inventing a second name
+    for the branch itself.
+    """
+    return hashlib.sha256(str(branch).encode("utf-8")).hexdigest()[:16]
+
+
+def duty_key(msg_id: str, branch: str, attempt: int) -> str:
+    """The key the duty for one attempt at one branch is always sent under."""
+    return f"{DUTY_KEY_PREFIX}:{msg_id}:{branch_token(branch)}:{int(attempt)}"
+
+
+def _validated_receipt(value: object) -> dict[str, Any]:
+    """One worker report as it is written to, and read back from, disk."""
+    if not isinstance(value, Mapping):
+        raise IntakeError("a worker receipt must be an object")
+    msg_id = valid_msg_id(value.get("msg_id"))
+    if not msg_id:
+        raise IntakeError("a worker receipt needs its intake's exact message id")
+    sequence = value.get("seq")
+    if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 1:
+        raise IntakeError("a worker receipt needs a positive sequence number")
+    state = value.get("state")
+    if state not in DUTY_STATES:
+        raise IntakeError(f"unknown worker receipt state: {state!r}")
+    attempt = value.get("duty_attempt")
+    if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
+        raise IntakeError("a worker receipt attempt must be a positive integer")
+    reporter = value.get("reporter_identity")
+    if reporter is not None and reporter != "" and not valid_thread_key(reporter):
+        raise IntakeError("a worker receipt reporter is not an exact thread key")
+    # The launch this duty was sent to. A retry mints a new key, so this is
+    # what lines one report up with the run that produced it — without the
+    # reader having to open the intake entry to translate an attempt number.
+    launch_key = value.get("launch_key")
+    if launch_key is not None and launch_key != "" and not valid_idempotency_key(
+        launch_key
+    ):
+        raise IntakeError("a worker receipt launch key is not an idempotency key")
+    return {
+        "msg_id": msg_id,
+        "launch_key": str(launch_key or ""),
+        "branch": _valid_branch(value.get("branch")),
+        "seq": sequence,
+        "state": state,
+        "summary": _block(
+            value.get("summary"), limit=MAX_DUTY_SUMMARY, label="worker receipt summary"
+        ),
+        "reporter_identity": str(reporter or ""),
+        "duty_attempt": attempt,
+        "requirements_digest": _text(
+            value.get("requirements_digest"),
+            limit=64,
+            label="worker receipt requirements digest",
+            required=False,
+        ),
+        "recorded_unix_ms": _stamp(value.get("recorded_unix_ms"), "recorded_unix_ms"),
+    }
 
 
 def _validated_note(value: object, index: int) -> dict[str, Any]:
@@ -424,6 +690,13 @@ def _validated_amendment(value: object, index: int) -> dict[str, Any]:
         "source_event_id": _source_event_id(
             value.get("source_event_id"), required=True
         ),
+        "delivery_attempts": _attempts(value.get("delivery_attempts")),
+        "last_attempt_unix_ms": _stamp(
+            value.get("last_attempt_unix_ms"), "last_attempt_unix_ms"
+        ),
+        "next_attempt_unix_ms": _stamp(
+            value.get("next_attempt_unix_ms"), "next_attempt_unix_ms"
+        ),
     }
 
 
@@ -472,6 +745,13 @@ def _validated_arrival_notice(
         "delivered": bool(value["delivered"]),
         "delivered_unix_ms": _stamp(
             value.get("delivered_unix_ms"), "delivered_unix_ms"
+        ),
+        "delivery_attempts": _attempts(value.get("delivery_attempts")),
+        "last_attempt_unix_ms": _stamp(
+            value.get("last_attempt_unix_ms"), "last_attempt_unix_ms"
+        ),
+        "next_attempt_unix_ms": _stamp(
+            value.get("next_attempt_unix_ms"), "next_attempt_unix_ms"
         ),
     }
 
@@ -522,14 +802,39 @@ def _validated_worker(value: object) -> dict[str, Any]:
                 label="worker requirements digest",
             ),
             authority_verifications=value.get("authority_verifications"),
+            duty_state=value.get("duty_state") or "assigned",
+            duty_attempt=value.get("duty_attempt", 1),
+            duty_delivery=_validated_duty_delivery(value.get("duty_delivery")),
+            duty_reports=[
+                _validated_duty_report(row, index)
+                for index, row in enumerate(value.get("duty_reports") or (), start=1)
+            ],
+            **_duty(value, required=False),
         )
         if not result["idempotency_key"]:
             raise IntakeError("a worker needs an exact idempotency key")
-        if result["launch_state"] not in (
-            "not_started", "dispatching", "provider_reconciled", "verified"
-        ):
+        if result["launch_state"] not in LAUNCH_STATES:
             raise IntakeError("a worker launch state is invalid")
-        if result["launch_state"] in ("provider_reconciled", "verified") and (
+        if result["duty_state"] not in DUTY_STATES:
+            raise IntakeError("a worker duty state is invalid")
+        if (
+            not isinstance(result["duty_attempt"], int)
+            or isinstance(result["duty_attempt"], bool)
+            or result["duty_attempt"] < 1
+        ):
+            raise IntakeError("a worker duty attempt must be a positive integer")
+        if len(result["duty_reports"]) > MAX_DUTY_REPORTS:
+            raise IntakeError("a worker already records its duty report limit")
+        if result["launch_state"] == "commissioned" and (
+            not result["task_text"]
+            or (result["duty_delivery"] or {}).get("state") != "delivered"
+        ):
+            raise IntakeError(
+                "a commissioned worker needs its duty text and a landed delivery"
+            )
+        if result["launch_state"] in (
+            "provider_reconciled", "verified", "commissioned"
+        ) and (
             not result["worker_identity"]
             or not result["verified_actual_model"]
             or result["reconciled_unix_ms"] is None
@@ -563,7 +868,7 @@ def _validated_worker(value: object) -> dict[str, Any]:
     return result
 
 
-def _validated_worker_plan(value: object) -> dict[str, str]:
+def _validated_worker_plan(value: object, *, require_duty: bool = False) -> dict[str, str]:
     if not isinstance(value, Mapping):
         raise IntakeError("a preflight worker plan row must be an object")
     provider = value.get("provider")
@@ -581,16 +886,37 @@ def _validated_worker_plan(value: object) -> dict[str, str]:
         "requested_model": _model(provider, value.get("requested_model")),
         "expertise": _expertise(value.get("expertise")),
         "rationale": _text(value.get("rationale"), limit=1000, label="worker rationale"),
+        **_duty(value, required=require_duty),
     }
 
 
-def _automatic_plan_compliant(plan: Sequence[Mapping[str, Any]]) -> bool:
-    return (
-        len(plan) >= 2
-        and {str(row.get("provider")) for row in plan} == {"claude", "codex"}
-        and len({str(row.get("requested_model")) for row in plan}) >= 2
-        and len({str(row.get("expertise")) for row in plan}) >= 2
-    )
+def _required_expertise_tags(value: object, *, required: bool) -> list[str]:
+    """The expertise this project needs, named from the fixed tag set.
+
+    This is the plan's stated need, and the only composition rule left: a plan
+    is whatever shape covers it. One worker for a one-skill project is a
+    complete plan; four workers that between them miss a declared need is not.
+    """
+    if value is None:
+        if required:
+            raise IntakeError("a preflight needs the expertise this project requires")
+        return []
+    if not isinstance(value, (list, tuple)):
+        raise IntakeError("required expertise tags must be an array")
+    tags = [_expertise(item) for item in value]
+    if len(set(tags)) != len(tags):
+        raise IntakeError("required expertise tags cannot repeat")
+    if required and not tags:
+        raise IntakeError("a preflight needs the expertise this project requires")
+    return tags
+
+
+def _uncovered_expertise(
+    plan: Sequence[Mapping[str, Any]], tags: Sequence[str]
+) -> list[str]:
+    """Declared needs no planned worker brings, in the order they were declared."""
+    covered = {str(row.get("expertise")) for row in plan}
+    return [tag for tag in tags if tag not in covered]
 
 
 def _validated_preflight(value: object, revision: int) -> dict[str, Any]:
@@ -631,12 +957,18 @@ def _validated_preflight(value: object, revision: int) -> dict[str, Any]:
         label="manual policy exception",
         required=False,
     )
-    if source_event is not None and not _automatic_plan_compliant(plan):
+    # An entry written before needs were declared carried the old fixed-shape
+    # rule instead, and passed it. It stays readable; nothing new is recorded
+    # without saying what the project needs.
+    required_tags = _required_expertise_tags(
+        value.get("required_expertise_tags"), required=False
+    )
+    missing = _uncovered_expertise(plan, required_tags)
+    if missing:
         raise IntakeError(
-            "automatic intake preflight needs Claude and Codex workers with distinct models and expertise"
+            "the worker plan does not cover the required expertise: "
+            + ", ".join(missing)
         )
-    if source_event is None and not _automatic_plan_compliant(plan) and not exception:
-        raise IntakeError("a reduced manual intake plan needs an explicit recorded exception")
     return {
         "revision": revision,
         "intake_generation": generation,
@@ -649,6 +981,7 @@ def _validated_preflight(value: object, revision: int) -> dict[str, Any]:
         "required_expertise": _text(
             value.get("required_expertise"), limit=2000, label="required expertise"
         ),
+        "required_expertise_tags": required_tags,
         "worker_plan": plan,
         "risks": _text(value.get("risks"), limit=4000, label="project risks"),
         "tests": _text(value.get("tests"), limit=4000, label="required tests"),
@@ -792,6 +1125,7 @@ class Spool:
         self.entries = self.root / "entries"
         self.keys = self.root / "keys"
         self.aliases = self.root / "aliases"
+        self.receipts = self.root / "receipts"
         self.lock_path = self.root / "intake.lock"
 
     # ---- structure -----------------------------------------------------
@@ -799,7 +1133,7 @@ class Spool:
     def ensure(self) -> None:
         _private_directory(self.root.parent)
         _private_directory(self.root)
-        for directory in (self.entries, self.keys, self.aliases):
+        for directory in (self.entries, self.keys, self.aliases, self.receipts):
             _private_directory(directory)
 
     @contextlib.contextmanager
@@ -933,6 +1267,66 @@ class Spool:
             return exact
         return self.msg_id_for_alias(exact)
 
+    # ---- worker receipts -------------------------------------------------
+
+    def receipt_dir(self, msg_id: object) -> Path:
+        exact = valid_msg_id(msg_id)
+        if not exact:
+            raise IntakeError("a receipt belongs to an exact 8-hex message id")
+        return self.receipts / exact
+
+    def receipt_path(self, msg_id: object, branch: str, sequence: int) -> Path:
+        safe = re.sub(r"[^A-Za-z0-9._-]", "_", _valid_branch(branch))[:64]
+        return self.receipt_dir(msg_id) / f"{safe}.{branch_token(branch)}.{sequence}.json"
+
+    def write_receipt(self, receipt: Mapping[str, Any]) -> Path:
+        """Put one worker's report on disk before anything else can fail.
+
+        The entry is the supervisor's record; this is the worker's. They are
+        written in that order on purpose: a receipt with no matching report in
+        the entry is a visible fault, and a report the worker never made is
+        impossible.
+        """
+        checked = _validated_receipt(receipt)
+        self.ensure()
+        _private_directory(self.receipt_dir(checked["msg_id"]))
+        path = self.receipt_path(
+            checked["msg_id"], checked["branch"], checked["seq"]
+        )
+        payload = (json.dumps(checked, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        _atomic_private_write(path, payload)
+        return path
+
+    def read_receipts(self, msg_id: object) -> list[dict[str, Any]]:
+        """Every report one intake's workers wrote down, oldest first."""
+        directory = self.receipt_dir(msg_id)
+        try:
+            names = sorted(
+                item.name
+                for item in os.scandir(directory)
+                if item.is_file(follow_symlinks=False) and item.name.endswith(".json")
+            )
+        except FileNotFoundError:
+            return []
+        except OSError as exc:
+            raise IntakeError("cannot list this intake's worker receipts") from exc
+        rows: list[dict[str, Any]] = []
+        for name in names[:MAX_ENTRIES_SCANNED]:
+            raw = _read_private_bytes(directory / name, MAX_RECEIPT_BYTES)
+            if raw is None:
+                continue
+            try:
+                value = json.loads(raw.decode("utf-8"))
+            except (UnicodeError, ValueError) as exc:
+                raise IntakeError(f"worker receipt is not valid JSON: {name}") from exc
+            checked = _validated_receipt(value)
+            # The file name is how a report in the entry points back here, so
+            # the reader keeps it alongside the record it names.
+            checked["file"] = name
+            rows.append(checked)
+        rows.sort(key=lambda row: (row["recorded_unix_ms"] or 0, row["branch"], row["seq"]))
+        return rows
+
     # ---- views and retention -------------------------------------------
 
     def open_entries(self, limit: int = MAX_OPEN) -> list[dict[str, Any]]:
@@ -966,6 +1360,13 @@ class Spool:
             with contextlib.suppress(OSError):
                 self.entry_path(msg_id).unlink()
                 dropped.append(msg_id)
+            directory = self.receipt_dir(msg_id)
+            with contextlib.suppress(OSError):
+                for item in os.scandir(directory):
+                    if item.is_file(follow_symlinks=False):
+                        with contextlib.suppress(OSError):
+                            Path(item.path).unlink()
+                directory.rmdir()
         return {"entries": dropped, "pointers": self._prune_pointers()}
 
     def _prune_pointers(self) -> list[str]:
@@ -1320,6 +1721,7 @@ def preflight(
     analysis: str,
     scope: str,
     required_expertise: str,
+    required_expertise_tags: Sequence[str] = (),
     worker_plan: Sequence[Mapping[str, Any]],
     risks: str,
     tests: str,
@@ -1327,7 +1729,13 @@ def preflight(
     state_dir: Path | str,
     clock: Callable[[], float] = time.time,
 ) -> dict[str, Any]:
-    """Record the supervisor's reviewed plan for the current intake generation."""
+    """Record the supervisor's reviewed plan for the current intake generation.
+
+    The plan's shape is the plan's business: any composition that covers the
+    declared required expertise is a complete plan. What is not optional is
+    the duty — every planned worker says what it is for, what finishing means,
+    and what it hands back, because that text is what the worker is sent.
+    """
     from .source_authority import verify_source_event
 
     primary = _require(spool, msg_id)
@@ -1354,9 +1762,32 @@ def preflight(
         basis = str(verification["basis"])
     else:
         basis = "manual-intake"
-    checked_plan = [_validated_worker_plan(row) for row in worker_plan]
+    checked_plan = [
+        _validated_worker_plan(row, require_duty=True) for row in worker_plan
+    ]
     if not checked_plan:
         raise IntakeError("preflight needs at least one planned worker")
+    if len(checked_plan) > MAX_WORKERS:
+        raise IntakeError(f"a preflight plans at most {MAX_WORKERS} workers")
+    if len({row["branch"] for row in checked_plan}) != len(checked_plan):
+        raise IntakeError("a preflight worker plan cannot repeat a branch")
+    if len({row["idempotency_key"] for row in checked_plan}) != len(checked_plan):
+        raise IntakeError("a preflight worker plan cannot repeat an idempotency key")
+    for row in checked_plan:
+        # The messaging core truncates an over-long operator message instead of
+        # refusing it, so a duty that cannot travel whole is refused here,
+        # while it is still a plan and not a worker waiting on half a brief.
+        if len(duty_text(primary, row)) + DUTY_IDENTITY_RESERVE > MAX_OPERATOR_TEXT:
+            raise IntakeError(
+                f"worker {row['branch']} duty is longer than one message can carry"
+            )
+    tags = _required_expertise_tags(list(required_expertise_tags), required=True)
+    missing = _uncovered_expertise(checked_plan, tags)
+    if missing:
+        raise IntakeError(
+            "the worker plan does not cover the required expertise: "
+            + ", ".join(missing)
+        )
     now = now_unix_ms(clock)
 
     def append(record: dict[str, Any]) -> dict[str, Any]:
@@ -1380,6 +1811,7 @@ def preflight(
                 "analysis": analysis,
                 "scope": scope,
                 "required_expertise": required_expertise,
+                "required_expertise_tags": tags,
                 "worker_plan": checked_plan,
                 "risks": risks,
                 "tests": tests,
@@ -1395,6 +1827,48 @@ def preflight(
     return {"recorded": True, "preflight": updated["preflights"][-1], "entry": updated}
 
 
+def duty_text(msg_id: str, worker: Mapping[str, Any]) -> str:
+    """The message a worker actually receives when it is commissioned.
+
+    It carries the work, what finishing means, what to hand back, and the one
+    command that closes the loop — a worker that never learns how to report is
+    the finished-but-silent worker this whole channel exists to prevent.
+    """
+    branch = str(worker["branch"])
+    # Naming its own key in the command is how the worker's report ends up
+    # attributed to it: nothing here proves who ran the verb, but a report that
+    # says which session made it is the difference between a record and a rumour.
+    identity = valid_thread_key(worker.get("worker_identity"))
+    reporter = f" --reporter {identity}" if identity else ""
+    lines = [
+        f"Fleet Supervisor duty for intake {msg_id}, branch {branch}.",
+        f"Workstream: {worker.get('workstream') or 'unstated'}",
+        "",
+        "TASK",
+        str(worker.get("task_text") or ""),
+        "",
+        "ACCEPTANCE CRITERIA",
+        str(worker.get("acceptance_criteria") or ""),
+        "",
+        "DELIVERABLE",
+        str(worker.get("deliverable") or ""),
+        "",
+        "REPORT WHEN DONE (or when you cannot finish):",
+        f"  sp msg intake report --msg-id {msg_id} --branch {branch} "
+        f"--state completed|failed --summary '<what happened>'{reporter}",
+        "A duty with no report reads as an abandoned worker, whatever you did.",
+    ]
+    return "\n".join(lines)
+
+
+def duty_owed(worker: Mapping[str, Any]) -> bool:
+    """True when this worker has a duty its session has not been sent."""
+    if not worker.get("task_text"):
+        return False
+    delivery = worker.get("duty_delivery") or {}
+    return delivery.get("state") != "delivered"
+
+
 def delegate(
     spool: Spool,
     *,
@@ -1403,10 +1877,19 @@ def delegate(
     workers: Sequence[Mapping[str, Any]] = (),
     launcher: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
     reconciler: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
+    deliver: Callable[..., Mapping[str, Any]] | None = None,
     state_dir: Path | str | None = None,
     clock: Callable[[], float] = time.time,
 ) -> dict[str, Any]:
-    """Reverify, reserve, dispatch, inventory-reconcile, and verify workers."""
+    """Reverify, reserve, dispatch, reconcile, verify, and commission workers.
+
+    A verified worker is a proven session, not yet a worker: until its duty
+    has actually landed in it, it is an idle process holding a branch name.
+    Commissioning is that last step, and it is recorded like every other
+    delivery here — reserved on disk under the key the send will use, settled
+    with what the receipt said. A duty that did not land leaves the worker
+    verified and named in `undelivered`, never quietly counted as launched.
+    """
     from .source_authority import verify_source_event
 
     primary = _require(spool, msg_id)
@@ -1502,7 +1985,7 @@ def delegate(
             and set(new_branches) != set(plan)
         ):
             raise IntakeError(
-                "automatic intake delegation must launch the complete multi-provider plan"
+                "automatic intake delegation must launch the complete reviewed plan"
             )
         for request in requested:
             branch = str(request["branch"])
@@ -1548,6 +2031,12 @@ def delegate(
                     verified_actual_model="",
                     expertise=planned["expertise"],
                     rationale=planned["rationale"],
+                    task_text=planned["task_text"],
+                    acceptance_criteria=planned["acceptance_criteria"],
+                    deliverable=planned["deliverable"],
+                    duty_state="assigned",
+                    duty_attempt=int(row.get("duty_attempt") or 1) + 1,
+                    duty_delivery=None,
                     worker_identity="",
                     launch_state="not_started",
                     dispatch_unix_ms=None,
@@ -1579,6 +2068,13 @@ def delegate(
                     "verified_actual_model": "",
                     "expertise": planned["expertise"],
                     "rationale": planned["rationale"],
+                    "task_text": planned["task_text"],
+                    "acceptance_criteria": planned["acceptance_criteria"],
+                    "deliverable": planned["deliverable"],
+                    "duty_state": "assigned",
+                    "duty_attempt": 1,
+                    "duty_delivery": None,
+                    "duty_reports": [],
                     "worker_identity": "",
                     "launch_state": "not_started",
                     "dispatch_unix_ms": None,
@@ -1601,7 +2097,10 @@ def delegate(
     verified: list[str] = []
     for branch in wanted:
         assignment = next(row for row in entry["workers"] if row["branch"] == branch)
-        if assignment["launch_state"] == "verified":
+        settled = assignment["launch_state"] in ("verified", "commissioned")
+        if assignment["launch_state"] == "commissioned" or (
+            settled and not duty_owed(assignment)
+        ):
             continue
         if assignment["requirements_digest"] != reviewed_digest:
             raise IntakeError(f"worker {branch} reservation belongs to stale requirements")
@@ -1657,7 +2156,9 @@ def delegate(
 
             def reconciled(record: dict[str, Any]) -> dict[str, Any]:
                 row = next(item for item in record["workers"] if item["branch"] == branch)
-                if row["launch_state"] in ("provider_reconciled", "verified"):
+                if row["launch_state"] in (
+                    "provider_reconciled", "verified", "commissioned"
+                ):
                     if (
                         row.get("worker_identity") != worker_identity
                         or row.get("verified_actual_model") != actual_model
@@ -1682,7 +2183,7 @@ def delegate(
 
         def confirm(record: dict[str, Any]) -> dict[str, Any]:
             row = next(item for item in record["workers"] if item["branch"] == branch)
-            if row["launch_state"] == "verified":
+            if row["launch_state"] in ("verified", "commissioned"):
                 return record
             if row["launch_state"] != "provider_reconciled":
                 raise IntakeError(f"worker {branch} is not provider-reconciled")
@@ -1693,11 +2194,483 @@ def delegate(
             return _advance(record, "delegated", verified_at)
 
         entry = spool.update_entry(primary, confirm)
-        verified.append(branch)
+        # A worker that arrived here already verified was launched by an
+        # earlier call; re-delivering its duty does not make this the call
+        # that launched it.
+        if not settled:
+            verified.append(branch)
+
+    undelivered: list[str] = []
+    for branch in wanted:
+        assignment = next(row for row in entry["workers"] if row["branch"] == branch)
+        if not duty_owed(assignment):
+            continue
+        if deliver is None:
+            raise IntakeError(
+                f"worker {branch} has a duty and no courier to deliver it with"
+            )
+        entry, landed_duty = _commission(
+            spool,
+            primary=primary,
+            branch=branch,
+            deliver=deliver,
+            clock=clock,
+        )
+        if not landed_duty:
+            undelivered.append(branch)
     return {
         "delegated": verified,
         "already_recorded": [branch for branch in wanted if branch not in verified],
+        "undelivered": undelivered,
         "entry": entry,
+    }
+
+
+def _commission(
+    spool: Spool,
+    *,
+    primary: str,
+    branch: str,
+    deliver: Callable[..., Mapping[str, Any]],
+    clock: Callable[[], float],
+) -> tuple[dict[str, Any], bool]:
+    """Deliver one verified worker's duty and record what became of it.
+
+    The delivery record is on disk before the send leaves, under the key the
+    send will use, so a crash mid-commission leaves a duty that is owed rather
+    than one nobody knows about.
+    """
+    reserved_at = now_unix_ms(clock)
+
+    def reserve_duty(record: dict[str, Any]) -> dict[str, Any]:
+        row = next(item for item in record["workers"] if item["branch"] == branch)
+        if row["launch_state"] not in ("verified", "commissioned"):
+            raise IntakeError(f"worker {branch} is not verified; its duty cannot be sent")
+        row["duty_delivery"] = {
+            "state": "undelivered",
+            "relay_key": duty_key(record["msg_id"], branch, row.get("duty_attempt") or 1),
+            "relay_msg_id": None,
+            "relay_status": "unsent",
+            "relay_detail": "the duty is recorded; its delivery has not returned",
+            "delivered_unix_ms": None,
+        }
+        record["updated_unix_ms"] = reserved_at
+        return record
+
+    entry = spool.update_entry(primary, reserve_duty)
+    worker = next(row for row in entry["workers"] if row["branch"] == branch)
+    target = str(worker["worker_identity"])
+    outcome = _delivery_outcome(
+        deliver(
+            thread_key=target,
+            text=duty_text(primary, worker),
+            key=str(worker["duty_delivery"]["relay_key"]),
+        ),
+        target,
+    )
+    settled = now_unix_ms(clock)
+
+    def settle_duty(record: dict[str, Any]) -> dict[str, Any]:
+        row = next(item for item in record["workers"] if item["branch"] == branch)
+        delivery = dict(row["duty_delivery"] or {})
+        delivery.update(
+            state="delivered" if outcome.landed else "failed",
+            relay_msg_id=outcome.msg_id,
+            relay_status=outcome.status,
+            relay_detail=outcome.detail,
+            delivered_unix_ms=settled if outcome.landed else None,
+        )
+        row["duty_delivery"] = delivery
+        if outcome.landed:
+            row["launch_state"] = "commissioned"
+        record["updated_unix_ms"] = settled
+        return record
+
+    return spool.update_entry(primary, settle_duty), outcome.landed
+
+
+def _live_worker(record: Mapping[str, Any], branch: object) -> dict[str, Any]:
+    """The worker row a duty verb may act on, or an exact refusal.
+
+    A row recorded before duties existed carries only its branch and the moment
+    it was reserved. Writing a duty state onto it would be dropped by the
+    validator on the way to disk, so it is refused here instead of quietly
+    losing a worker's report.
+    """
+    exact = _valid_branch(branch)
+    for row in record.get("workers", ()):
+        if row.get("branch") == exact:
+            if "launch_state" not in row:
+                raise IntakeError(
+                    f"worker {exact} was recorded before duties existed; "
+                    "re-delegate it against a current preflight to give it one"
+                )
+            return row
+    raise IntakeError(f"intake {record['msg_id']} has no worker on branch {exact}")
+
+
+def _worker_row(entry: Mapping[str, Any], branch: object) -> dict[str, Any]:
+    return dict(_live_worker(entry, branch))
+
+
+def _append_duty_report(
+    record: dict[str, Any],
+    *,
+    branch: str,
+    state: str,
+    summary: str,
+    reporter_identity: str,
+    receipt: str,
+    now: int,
+) -> dict[str, Any]:
+    row = _live_worker(record, branch)
+    reports = row.setdefault("duty_reports", [])
+    if len(reports) >= MAX_DUTY_REPORTS:
+        raise IntakeError(
+            f"worker {branch} already records {MAX_DUTY_REPORTS} duty reports"
+        )
+    sequence = len(reports) + 1
+    reports.append(
+        {
+            "seq": sequence,
+            "state": state,
+            "summary": summary,
+            "reporter_identity": reporter_identity,
+            "duty_attempt": int(row.get("duty_attempt") or 1),
+            "receipt": receipt,
+            "recorded_unix_ms": now,
+        }
+    )
+    row["duty_state"] = state
+    record["updated_unix_ms"] = now
+    return record
+
+
+def report(
+    spool: Spool,
+    *,
+    msg_id: str,
+    branch: str,
+    state: str,
+    summary: str,
+    reporter_identity: str = "",
+    clock: Callable[[], float] = time.time,
+) -> dict[str, Any]:
+    """A worker says what became of its duty, on disk, in the spool.
+
+    This is the channel that makes a finished-but-silent worker impossible to
+    miss: the report is a file the worker wrote, not a message somebody has to
+    still be alive to receive. The receipt lands before the entry is touched,
+    so a report that exists is never a report the record can lose.
+    """
+    if state not in WORKER_REPORT_STATES:
+        raise IntakeError(
+            "a worker reports one of: " + ", ".join(WORKER_REPORT_STATES)
+        )
+    primary = _require(spool, msg_id)
+    exact_branch = _valid_branch(branch)
+    body = _block(summary, limit=MAX_DUTY_SUMMARY, label="duty report summary")
+    reporter = ""
+    if reporter_identity:
+        reporter = valid_thread_key(reporter_identity)
+        if not reporter:
+            raise IntakeError("a duty report reporter is not an exact thread key")
+    now = now_unix_ms(clock)
+    written: list[str] = []
+
+    def record_report(record: dict[str, Any]) -> dict[str, Any]:
+        row = _live_worker(record, exact_branch)
+        if row["launch_state"] == "not_started":
+            raise IntakeError(
+                f"worker {exact_branch} has not been launched; there is no duty to report"
+            )
+        if row["duty_state"] == "abandoned":
+            raise IntakeError(
+                f"worker {exact_branch} duty was cancelled; reset it before reporting"
+            )
+        sequence = len(row.get("duty_reports") or ()) + 1
+        path = spool.write_receipt(
+            {
+                "msg_id": record["msg_id"],
+                "branch": exact_branch,
+                "seq": sequence,
+                "state": state,
+                "summary": body,
+                "reporter_identity": reporter,
+                "duty_attempt": int(row.get("duty_attempt") or 1),
+                "launch_key": row.get("idempotency_key") or "",
+                "requirements_digest": row.get("requirements_digest") or "",
+                "recorded_unix_ms": now,
+            }
+        )
+        written.append(path.name)
+        return _append_duty_report(
+            record,
+            branch=exact_branch,
+            state=state,
+            summary=body,
+            reporter_identity=reporter,
+            receipt=path.name,
+            now=now,
+        )
+
+    entry = spool.update_entry(primary, record_report)
+    return {
+        "reported": True,
+        "msg_id": primary,
+        "branch": exact_branch,
+        "state": state,
+        "receipt": written[-1] if written else "",
+        "worker": _worker_row(entry, exact_branch),
+        "entry": entry,
+    }
+
+
+def retry(
+    spool: Spool,
+    *,
+    msg_id: str,
+    branch: str,
+    idempotency_key: str,
+    clock: Callable[[], float] = time.time,
+) -> dict[str, Any]:
+    """Send a failed duty back to the start line for one more launch.
+
+    A retry is a new launch, so it takes a new launch key: reusing the old one
+    would let the reconciler bind this attempt to the dead attempt's inventory
+    row. The reviewed preflight still decides what the work is; `delegate`
+    runs the attempt.
+    """
+    primary = _require(spool, msg_id)
+    exact_branch = _valid_branch(branch)
+    fresh_key = valid_idempotency_key(idempotency_key)
+    if not fresh_key:
+        raise IntakeError("a duty retry needs an exact new idempotency key")
+    now = now_unix_ms(clock)
+
+    def rewind(record: dict[str, Any]) -> dict[str, Any]:
+        row = _live_worker(record, exact_branch)
+        delivery_failed = (row.get("duty_delivery") or {}).get("state") == "failed"
+        if row["duty_state"] != "failed" and not delivery_failed:
+            raise IntakeError(
+                f"worker {exact_branch} has not failed; reset or cancel its duty instead"
+            )
+        if fresh_key == row.get("idempotency_key"):
+            raise IntakeError(
+                f"worker {exact_branch} retry needs a launch key the last attempt did not use"
+            )
+        row.update(
+            idempotency_key=fresh_key,
+            verified_actual_model="",
+            worker_identity="",
+            launch_state="not_started",
+            dispatch_unix_ms=None,
+            reconciled_unix_ms=None,
+            launched_unix_ms=None,
+            verified_unix_ms=None,
+            duty_state="assigned",
+            duty_attempt=int(row.get("duty_attempt") or 1) + 1,
+            duty_delivery=None,
+        )
+        record["updated_unix_ms"] = now
+        return _append_duty_report(
+            record,
+            branch=exact_branch,
+            state="assigned",
+            summary=f"duty retried as attempt {row['duty_attempt']}",
+            reporter_identity="",
+            receipt="",
+            now=now,
+        )
+
+    entry = spool.update_entry(primary, rewind)
+    return {
+        "retried": True,
+        "msg_id": primary,
+        "branch": exact_branch,
+        "worker": _worker_row(entry, exact_branch),
+        "entry": entry,
+    }
+
+
+def reset(
+    spool: Spool,
+    *,
+    msg_id: str,
+    branch: str,
+    summary: str = "",
+    clock: Callable[[], float] = time.time,
+) -> dict[str, Any]:
+    """Put a settled duty back to assigned without relaunching the worker.
+
+    The session and its proven identity stay exactly as they are; only what
+    the record believes about the duty changes. The history is kept — a reset
+    is another line in it, never an erasure.
+    """
+    primary = _require(spool, msg_id)
+    exact_branch = _valid_branch(branch)
+    body = _block(
+        summary or "duty reset by the supervisor",
+        limit=MAX_DUTY_SUMMARY,
+        label="duty reset summary",
+    )
+    now = now_unix_ms(clock)
+
+    def rewind(record: dict[str, Any]) -> dict[str, Any]:
+        row = _live_worker(record, exact_branch)
+        if row["duty_state"] == "assigned":
+            raise IntakeError(
+                f"worker {exact_branch} duty is already assigned; there is nothing to reset"
+            )
+        return _append_duty_report(
+            record,
+            branch=exact_branch,
+            state="assigned",
+            summary=body,
+            reporter_identity="",
+            receipt="",
+            now=now,
+        )
+
+    entry = spool.update_entry(primary, rewind)
+    return {
+        "reset": True,
+        "msg_id": primary,
+        "branch": exact_branch,
+        "worker": _worker_row(entry, exact_branch),
+        "entry": entry,
+    }
+
+
+def cancel(
+    spool: Spool,
+    *,
+    msg_id: str,
+    branch: str,
+    summary: str,
+    clock: Callable[[], float] = time.time,
+) -> dict[str, Any]:
+    """Abandon one duty, with the reason recorded against it.
+
+    Only the supervisor abandons a duty, and only here. This closes the record
+    for that branch; it does not close the worker's session — a live session
+    with an abandoned duty is exactly what the duties view is for.
+    """
+    primary = _require(spool, msg_id)
+    exact_branch = _valid_branch(branch)
+    body = _block(summary, limit=MAX_DUTY_SUMMARY, label="duty cancellation reason")
+    now = now_unix_ms(clock)
+
+    def abandon(record: dict[str, Any]) -> dict[str, Any]:
+        row = _live_worker(record, exact_branch)
+        if row["duty_state"] == "abandoned":
+            raise IntakeError(f"worker {exact_branch} duty is already abandoned")
+        return _append_duty_report(
+            record,
+            branch=exact_branch,
+            state="abandoned",
+            summary=body,
+            reporter_identity="",
+            receipt="",
+            now=now,
+        )
+
+    entry = spool.update_entry(primary, abandon)
+    return {
+        "cancelled": True,
+        "msg_id": primary,
+        "branch": exact_branch,
+        "worker": _worker_row(entry, exact_branch),
+        "entry": entry,
+    }
+
+
+def _duty_row(
+    entry: Mapping[str, Any],
+    worker: Mapping[str, Any],
+    receipts: Sequence[Mapping[str, Any]],
+    now: int,
+) -> dict[str, Any]:
+    delivery = worker.get("duty_delivery") or {}
+    reports = list(worker.get("duty_reports") or ())
+    last = reports[-1] if reports else None
+    delivered_at = delivery.get("delivered_unix_ms")
+    mine = [row for row in receipts if row["branch"] == worker["branch"]]
+    folded = {str(row.get("receipt")) for row in reports if row.get("receipt")}
+    unfolded = [
+        str(row.get("file") or row["seq"])
+        for row in mine
+        if str(row.get("file") or "") not in folded
+    ]
+    silent_for = (
+        now - int(delivered_at)
+        if delivered_at and worker.get("duty_state") == "assigned"
+        else 0
+    )
+    return {
+        "msg_id": entry["msg_id"],
+        "branch": worker["branch"],
+        "workstream": worker.get("workstream", ""),
+        "provider": worker.get("provider", ""),
+        "requested_model": worker.get("requested_model", ""),
+        "worker_identity": worker.get("worker_identity", ""),
+        "launch_state": worker.get("launch_state", ""),
+        "duty_state": worker.get("duty_state", "assigned"),
+        "duty_attempt": worker.get("duty_attempt", 1),
+        "has_duty_text": bool(worker.get("task_text")),
+        "duty_delivery_state": delivery.get("state", "none"),
+        "duty_delivered_unix_ms": delivered_at,
+        "duty_owed": duty_owed(worker),
+        "reports": len(reports),
+        "last_report": last,
+        "receipts_on_disk": len(mine),
+        "unfolded_receipts": unfolded,
+        "silent_for_ms": silent_for,
+        "silent": bool(
+            worker.get("launch_state") == "commissioned"
+            and worker.get("duty_state") == "assigned"
+            and delivered_at
+            and silent_for >= SILENT_DUTY_MS
+        ),
+    }
+
+
+def duties(
+    spool: Spool,
+    *,
+    msg_id: str | None = None,
+    clock: Callable[[], float] = time.time,
+    limit: int = MAX_OPEN,
+) -> dict[str, Any]:
+    """Every commissioned duty and what it has said for itself.
+
+    One intake when named, otherwise every open intake. A worker that was sent
+    its duty and has reported nothing since is flagged `silent`; a receipt on
+    disk with no matching line in the entry is flagged too. Neither is decided
+    for you — they are the two ways a worker goes quiet, made visible.
+    """
+    now = now_unix_ms(clock)
+    if msg_id:
+        primary = _require(spool, msg_id)
+        entry = spool.read_entry(primary)
+        assert entry is not None
+        entries = [entry]
+    else:
+        entries = spool.open_entries(limit)
+    rows: list[dict[str, Any]] = []
+    for entry in entries:
+        receipts = spool.read_receipts(entry["msg_id"])
+        for worker in entry.get("workers", ()):
+            rows.append(_duty_row(entry, worker, receipts, now))
+    return {
+        "as_of_unix_ms": now,
+        "count": len(rows),
+        "silent": [row["branch"] for row in rows if row["silent"]],
+        "owed": [row["branch"] for row in rows if row["duty_owed"]],
+        "unfolded_receipts": [
+            row["branch"] for row in rows if row["unfolded_receipts"]
+        ],
+        "duties": rows,
     }
 
 
@@ -1963,6 +2936,9 @@ def _new_auto_entry(
                 "relay_status": "not delivered yet",
                 "delivered": False,
                 "delivered_unix_ms": None,
+                "delivery_attempts": 0,
+                "last_attempt_unix_ms": None,
+                "next_attempt_unix_ms": None,
             },
             "workers": [],
             "notes": [],
@@ -2017,6 +2993,8 @@ def produce(
     The claim `auto-intake:<provider>:<uuid>` always names the thread's one
     OPEN intake, so every path above is decided by a single pointer read.
     """
+    from .source_authority import machine_envelope_prompt
+
     now = now_unix_ms(clock)
     thread = valid_thread_key(thread_key)
     if not thread:
@@ -2024,6 +3002,18 @@ def produce(
     if supervisor_key and thread == supervisor_key:
         # The supervisor's own standing brief is not a project it was handed.
         return {"action": REFUSED, "reason": "supervisor thread", "entry": None}
+    if machine_envelope_prompt(prompt):
+        # The harness submits its own envelopes down the same channel a person
+        # types into. Source authority already refuses them as authority, and
+        # the intake ledger is append-only — so letting one become a
+        # requirement of an open project would make that project permanently
+        # uncertifiable over something nobody asked for. The event is still
+        # captured and still auditable; it simply is not a requirement.
+        return {
+            "action": REFUSED,
+            "reason": "a harness envelope is not a project requirement",
+            "entry": None,
+        }
     body = substantive_prompt(prompt)
     if not body and amendment_only:
         body = _text(prompt, limit=MAX_SUMMARY, label="prompt", required=False)
@@ -2106,6 +3096,9 @@ def produce(
                 "relay_msg_id": None,
                 "relay_status": "not delivered yet",
                 "delivered": False,
+                "delivery_attempts": 0,
+                "last_attempt_unix_ms": None,
+                "next_attempt_unix_ms": None,
             }
         )
         open_entry["updated_unix_ms"] = now
@@ -2245,6 +3238,111 @@ def request_delivery(
     return {"requested": True, "reason": "delivery started detached"}
 
 
+def undelivered_relays(
+    rows: Sequence[Mapping[str, Any]], *, now_ms: int
+) -> list[dict[str, Any]]:
+    """Every notice these intakes owe the supervisor, oldest first.
+
+    One flat list of two kinds: the arrival notice that wakes a resident for a
+    new project, and each amendment that added to one already open. Both are
+    machine notices carrying identifiers, and both are lost silently today
+    when their single delivery attempt fails.
+    """
+    pending: list[dict[str, Any]] = []
+    for entry in rows:
+        notice = entry.get("arrival_notice")
+        if (
+            entry.get("origin") == AUTO_ORIGIN
+            and isinstance(notice, Mapping)
+            and not notice.get("delivered")
+        ):
+            pending.append(
+                {
+                    "msg_id": str(entry["msg_id"]),
+                    "kind": "arrival",
+                    "seq": 0,
+                    "recorded_unix_ms": int(entry["received_unix_ms"]),
+                    "waiting_ms": max(0, now_ms - int(entry["received_unix_ms"])),
+                    "relay_status": str(notice.get("relay_status") or ""),
+                    "delivery_attempts": _attempts(notice.get("delivery_attempts")),
+                    "next_attempt_unix_ms": notice.get("next_attempt_unix_ms"),
+                    "due": relay_due(notice, now_ms),
+                    "source_thread_key": str(entry.get("source_thread_key") or ""),
+                }
+            )
+        for item in entry.get("amendments", ()):
+            if item.get("delivered"):
+                continue
+            recorded = int(item["recorded_unix_ms"])
+            pending.append(
+                {
+                    "msg_id": str(entry["msg_id"]),
+                    "kind": "amendment",
+                    "seq": int(item["seq"]),
+                    "recorded_unix_ms": recorded,
+                    "waiting_ms": max(0, now_ms - recorded),
+                    "relay_status": str(item.get("relay_status") or ""),
+                    "delivery_attempts": _attempts(item.get("delivery_attempts")),
+                    "next_attempt_unix_ms": item.get("next_attempt_unix_ms"),
+                    "due": relay_due(item, now_ms),
+                    "source_thread_key": str(entry.get("source_thread_key") or ""),
+                }
+            )
+    pending.sort(key=lambda item: (item["recorded_unix_ms"], item["msg_id"], item["seq"]))
+    return pending
+
+
+def pending_relays(
+    spool: Spool,
+    *,
+    clock: Callable[[], float] = time.time,
+    limit: int = MAX_OPEN,
+    rows: Sequence[Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """How much the spool still owes the supervisor, and for how long.
+
+    Nothing surfaced this before, so five real operator messages could sit
+    undelivered for days with every screen in the fleet reading normal. The
+    count is the point: whoever reads it learns that something is owed without
+    having to open the state files to find out.
+    """
+    now = now_unix_ms(clock)
+    items = undelivered_relays(
+        rows if rows is not None else spool.open_entries(limit), now_ms=now
+    )
+    return {
+        "as_of_unix_ms": now,
+        "count": len(items),
+        "due_now": sum(1 for item in items if item["due"]),
+        "deferred": sum(1 for item in items if not item["due"]),
+        "oldest_waiting_ms": items[0]["waiting_ms"] if items else 0,
+        "truncated": len(items) > MAX_PENDING_LISTED,
+        "items": items[:MAX_PENDING_LISTED],
+    }
+
+
+def _settle_relay(
+    row: dict[str, Any], outcome: Delivery, settled: int
+) -> dict[str, Any]:
+    """Record one relay attempt's fate on the item that owed it.
+
+    A landed relay is finished. One that did not land keeps its place in the
+    queue and earns the next rung of the backoff, so the sweep that follows
+    tries it again instead of writing it off.
+    """
+    row["relay_msg_id"] = outcome.msg_id
+    row["relay_status"] = outcome.status
+    row["delivered"] = outcome.landed
+    row["delivered_unix_ms"] = settled if outcome.landed else None
+    attempts = _attempts(row.get("delivery_attempts")) + 1
+    row["delivery_attempts"] = attempts
+    row["last_attempt_unix_ms"] = settled
+    row["next_attempt_unix_ms"] = (
+        None if outcome.landed else next_attempt_unix_ms(attempts, settled)
+    )
+    return row
+
+
 def flush(
     spool: Spool,
     *,
@@ -2253,7 +3351,7 @@ def flush(
     clock: Callable[[], float] = time.time,
     limit: int = MAX_OPEN,
 ) -> dict[str, Any]:
-    """Deliver every intake notice the supervisor has not been told about, once.
+    """Deliver every intake notice the supervisor is owed and may be tried now.
 
     Exactly once is held in two places at different timescales. The stored
     `delivered` flag rules out a second send of an amendment already known to
@@ -2261,98 +3359,101 @@ def flush(
     send is still in flight — the messaging core resumes that key's message and
     skips a target the ledger already shows as landed. The lock stops two
     deliveries from starting at all, which is cheaper than either.
+
+    A relay that does not land stays owed. This verb is therefore the sweep as
+    well as the first attempt: run it again — every supervisor wake does — and
+    whatever the fleet still owes is tried again, on a backoff so that a
+    supervisor nobody can reach costs one send per rung rather than one per
+    wake.
     """
     supervisor = supervisor_identity(state_dir)
-    pending_arrivals = [
-        entry
-        for entry in spool.open_entries(limit)
-        if entry["origin"] == AUTO_ORIGIN
-        and entry.get("arrival_notice")
-        and not entry["arrival_notice"]["delivered"]
-    ]
-    pending_amendments = [
-        (entry, item)
-        for entry in spool.open_entries(limit)
-        for item in entry["amendments"]
-        if not item["delivered"]
-    ]
-    pending_count = len(pending_arrivals) + len(pending_amendments)
-    if not pending_count:
-        return {"delivered": 0, "pending": 0, "reason": "nothing is owed"}
+    now = now_unix_ms(clock)
+    rows = spool.open_entries(limit)
+    by_id = {str(entry["msg_id"]): entry for entry in rows}
+    owed = undelivered_relays(rows, now_ms=now)
+    due = [item for item in owed if item["due"]]
+    if not owed:
+        return {
+            "delivered": 0,
+            "attempted": 0,
+            "pending": 0,
+            "deferred": 0,
+            "reason": "nothing is owed",
+        }
     if not supervisor:
         return {
             "delivered": 0,
-            "pending": pending_count,
+            "attempted": 0,
+            "pending": len(owed),
+            "deferred": len(owed) - len(due),
             "reason": "no supervisor identity to deliver to yet",
+        }
+    if not due:
+        return {
+            "delivered": 0,
+            "attempted": 0,
+            "pending": len(owed),
+            "deferred": len(owed),
+            "reason": "every undelivered notice is waiting out its backoff",
         }
     spool.ensure()
     flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(spool.root / "flush.lock", flags, 0o600)
     delivered = 0
+    attempted = 0
     try:
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return {
                 "delivered": 0,
-                "pending": pending_count,
+                "attempted": 0,
+                "pending": len(owed),
+                "deferred": len(owed) - len(due),
                 "reason": "another delivery is already running",
             }
-        for entry in pending_arrivals:
-            notice = entry["arrival_notice"]
+        for item in due:
+            entry = by_id[item["msg_id"]]
+            arrival = item["kind"] == "arrival"
+            if arrival:
+                notice = entry["arrival_notice"]
+                key = str(notice["relay_key"])
+                text = arrival_text(
+                    str(entry["msg_id"]), str(entry["source_event_id"])
+                )
+            else:
+                amendment = entry["amendments"][item["seq"] - 1]
+                key = str(amendment["relay_key"])
+                text = amendment_text(
+                    str(entry["msg_id"]),
+                    int(amendment["seq"]),
+                    str(amendment["source_event_id"]),
+                )
             outcome = _delivery_outcome(
-                deliver(
-                    thread_key=supervisor,
-                    text=arrival_text(
-                        str(entry["msg_id"]), str(entry["source_event_id"])
-                    ),
-                    key=str(notice["relay_key"]),
-                ),
+                deliver(thread_key=supervisor, text=text, key=key),
                 supervisor,
             )
             settled = now_unix_ms(clock)
 
-            def settle_arrival(record: dict[str, Any]) -> dict[str, Any]:
-                current = record.get("arrival_notice")
-                if current is None:
-                    return record
-                current["relay_msg_id"] = outcome.msg_id
-                current["relay_status"] = outcome.status
-                current["delivered"] = outcome.landed
-                current["delivered_unix_ms"] = settled if outcome.landed else None
-                record["updated_unix_ms"] = settled
-                return record
-
-            spool.update_entry(str(entry["msg_id"]), settle_arrival)
-            delivered += 1 if outcome.landed else 0
-        for entry, item in pending_amendments:
-            outcome = _delivery_outcome(
-                deliver(
-                    thread_key=supervisor,
-                    text=amendment_text(
-                        str(entry["msg_id"]),
-                        int(item["seq"]),
-                        str(item["source_event_id"]),
-                    ),
-                    key=str(item["relay_key"]),
-                ),
-                supervisor,
-            )
-            settled = now_unix_ms(clock)
-
-            def settle(record: dict[str, Any], seq: int = int(item["seq"])) -> dict[str, Any]:
-                for row in record["amendments"]:
-                    if row["seq"] != seq:
-                        continue
-                    row["relay_msg_id"] = outcome.msg_id
-                    row["relay_status"] = outcome.status
-                    row["delivered"] = outcome.landed
-                    row["delivered_unix_ms"] = settled if outcome.landed else None
+            def settle(
+                record: dict[str, Any],
+                seq: int = int(item["seq"]),
+                is_arrival: bool = arrival,
+            ) -> dict[str, Any]:
+                if is_arrival:
+                    current = record.get("arrival_notice")
+                    if current is not None:
+                        _settle_relay(current, outcome, settled)
+                else:
+                    for row in record["amendments"]:
+                        if row["seq"] == seq:
+                            _settle_relay(row, outcome, settled)
                 record["updated_unix_ms"] = settled
                 return record
 
             spool.update_entry(str(entry["msg_id"]), settle)
+            attempted += 1
             delivered += 1 if outcome.landed else 0
     finally:
         with contextlib.suppress(OSError):
@@ -2360,7 +3461,9 @@ def flush(
         os.close(descriptor)
     return {
         "delivered": delivered,
-        "pending": pending_count - delivered,
+        "attempted": attempted,
+        "pending": len(owed) - delivered,
+        "deferred": len(owed) - len(due),
         "reason": "delivered" if delivered else "nothing landed",
     }
 
@@ -2472,6 +3575,12 @@ def from_hook(
                 "reason": str(exc),
             }
     if action not in CHANGED:
+        # This prompt added nothing, but an earlier one may still be owed to
+        # the supervisor: a relay that failed is retried on the next wake, and
+        # a prompt IS a wake. The scan is the open entries already on disk, and
+        # nothing is sent from here — `flush` decides, behind the prompt.
+        if pending_relays(store, clock=clock)["due_now"]:
+            outcome["delivery"] = request_delivery(environ, spawn=spawn)
         return outcome
     try:
         asked = request_supervisor(state_dir, environ=environ, spawn=spawn, clock=clock)
@@ -2506,6 +3615,10 @@ def open_intakes(
         "as_of_unix_ms": now_unix_ms(clock),
         "count": len(rows),
         "truncated": len(rows) >= limit,
+        # What the fleet still owes this reader. A resident that reads its
+        # open intakes and sees `undelivered.count` above zero knows some of
+        # what it is looking at never reached it as a message.
+        "undelivered": pending_relays(spool, clock=clock, limit=limit, rows=rows),
         "open": rows,
     }
 
@@ -2562,9 +3675,14 @@ def run(
     analysis: str | None = None,
     scope: str | None = None,
     required_expertise: str | None = None,
+    required_expertise_tags: Sequence[str] = (),
     risks: str | None = None,
     tests: str | None = None,
     manual_policy_exception: str | None = None,
+    branch: str | None = None,
+    duty_state: str | None = None,
+    reporter_identity: str | None = None,
+    idempotency_key: str | None = None,
     launcher: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
     reconciler: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
     payload: Mapping[str, Any] | None = None,
@@ -2577,6 +3695,8 @@ def run(
         raise IntakeError(f"unknown intake verb {action!r}")
     if action == "open":
         return 0, open_intakes(spool, clock=clock)
+    if action == "pending":
+        return 0, pending_relays(spool, clock=clock)
     if action == "dismiss-machine":
         return 0, dismiss_machine_intakes(spool, clock=clock)
     if action == "record":
@@ -2607,15 +3727,55 @@ def run(
             spawn=spawn,
             clock=clock,
         )
+    if action == "duties":
+        return 0, duties(spool, msg_id=msg_id, clock=clock)
     if action == "delegate":
-        return 0, delegate(
+        result = delegate(
             spool,
             msg_id=msg_id or "",
             branches=branches,
             workers=workers,
             launcher=launcher,
             reconciler=reconciler,
+            deliver=deliver,
             state_dir=state_dir if state_dir is not None else spool.state_dir,
+            clock=clock,
+        )
+        # A worker whose duty never landed is a launched session with nothing
+        # to do. The record says so and so does the exit code.
+        return (1 if result["undelivered"] else 0), result
+    if action == "report":
+        return 0, report(
+            spool,
+            msg_id=msg_id or "",
+            branch=branch or "",
+            state=duty_state or "",
+            summary=summary or "",
+            reporter_identity=reporter_identity or "",
+            clock=clock,
+        )
+    if action == "retry":
+        return 0, retry(
+            spool,
+            msg_id=msg_id or "",
+            branch=branch or "",
+            idempotency_key=idempotency_key or "",
+            clock=clock,
+        )
+    if action == "reset":
+        return 0, reset(
+            spool,
+            msg_id=msg_id or "",
+            branch=branch or "",
+            summary=summary or "",
+            clock=clock,
+        )
+    if action == "cancel":
+        return 0, cancel(
+            spool,
+            msg_id=msg_id or "",
+            branch=branch or "",
+            summary=summary or "",
             clock=clock,
         )
     if action == "preflight":
@@ -2626,6 +3786,7 @@ def run(
             analysis=analysis or "",
             scope=scope or "",
             required_expertise=required_expertise or "",
+            required_expertise_tags=required_expertise_tags,
             worker_plan=worker_plan,
             risks=risks or "",
             tests=tests or "",

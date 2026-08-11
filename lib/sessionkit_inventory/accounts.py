@@ -713,6 +713,32 @@ def _load_optional_json(path: Path, max_bytes: int) -> Mapping[str, Any] | None:
     return value if isinstance(value, Mapping) else None
 
 
+def _provider_advice(advice: Mapping[str, Any], provider: str) -> Any:
+    """Return the rotation advice addressed to one provider.
+
+    Advice started out Claude-only: one top-level ``use_now``, with no way to
+    say which provider it meant. The roster beside it has always carried both
+    providers, so a Codex account could be healthy, serving, and still never
+    recommended — the audit finding this fixes.
+
+    A feed that covers both says so, either as ``use_now_<provider>`` or under
+    ``providers.<provider>.use_now``. The bare top-level key keeps its original
+    meaning, Claude, because that is what every feed writing it means today;
+    reading it for Codex would recommend a Claude account for a Codex session.
+    """
+    keyed = advice.get(f"use_now_{provider}")
+    if isinstance(keyed, Mapping):
+        return keyed
+    providers = advice.get("providers")
+    if isinstance(providers, Mapping):
+        section = providers.get(provider)
+        if isinstance(section, Mapping) and isinstance(section.get("use_now"), Mapping):
+            return section["use_now"]
+    if provider == "claude":
+        return advice.get("use_now")
+    return None
+
+
 def account_choices(config: Mapping[str, Any], provider: str) -> dict[str, Any]:
     if provider not in PROVIDERS:
         raise CollectionError("account provider is invalid")
@@ -752,11 +778,15 @@ def account_choices(config: Mapping[str, Any], provider: str) -> dict[str, Any]:
     advice_reason = ""
     advice_ts = advice.get("ts") if advice else None
     advice_fresh = isinstance(advice_ts, int) and 0 <= now - advice_ts <= max_age
-    if provider == "claude" and advice is not None and advice_fresh:
-        use_now = advice.get("use_now")
+    if advice is not None and advice_fresh:
+        use_now = _provider_advice(advice, provider)
         if isinstance(use_now, Mapping):
             recommended_email = clean_text(use_now.get("account"), 254).casefold()
-            advice_reason = clean_text(use_now.get("why"), 240)
+            # Feeds have shipped the explanation under both spellings. Taking
+            # either beats showing a recommendation with no stated reason.
+            advice_reason = clean_text(
+                use_now.get("why") or use_now.get("reason"), 240
+            )
     choices: list[dict[str, Any]] = []
     for item in list_profiles(config, provider):
         health = health_by_email.get(item["email"])

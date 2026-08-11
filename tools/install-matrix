@@ -1,0 +1,278 @@
+#!/usr/bin/env bash
+# Prove the documented Linux install on clean distribution images.
+#
+# For each distribution the matrix builds an image carrying only the documented
+# prerequisites, boots systemd inside it, clones this repository from the local
+# path, and runs the documented sequence: ./install.sh --check, a
+# non-interactive ./install.sh, session-kit services enable, session-kit
+# doctor. Nothing reaches the network for the source, so a run proves the
+# checkout in front of you rather than whatever GitHub currently serves.
+#
+# What a container cannot prove is recorded in the report, never faked. The
+# matrix sets SESSION_KIT_TESTING nowhere; every check runs for real.
+#
+# Usage:
+#   tools/install-matrix [options] [distro ...]
+#
+# Options:
+#   --results-dir DIR   Write logs and the summary here (default: a temp dir).
+#   --shpool PATH       Use an existing static shpool 0.11.0 binary.
+#   --jobs N            Distributions to run at once (default: 2).
+#   --keep              Leave containers running for inspection.
+#   --no-build          Reuse existing matrix images; do not rebuild.
+#   --list              Print the known distributions and exit.
+#   --help              This text.
+#
+# Requirements: Docker, and enough privilege to run a container with
+# CAP_SYS_ADMIN. Containers are named sk-install-matrix-<distro>, are capped at
+# 2 CPUs and 2 GiB, never use host networking or host bind mounts beyond a
+# read-only view of this repository, and are removed at the end of a run.
+set -uo pipefail
+
+program=${0##*/}
+repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+assets_dir=$repo_dir/tools/install-matrix.d
+name_prefix=sk-install-matrix
+shpool_version=0.11.0
+
+# distro  base image
+DISTROS=(
+  "ubuntu-2204 ubuntu:22.04 apt"
+  "ubuntu-2404 ubuntu:24.04 apt"
+  "debian-12   debian:12    apt"
+  "fedora-41   fedora:41    dnf"
+)
+
+die() {
+  printf '%s: %s\n' "$program" "$*" >&2
+  exit 1
+}
+
+note() {
+  printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*"
+}
+
+usage() {
+  sed -n '2,/^set -uo/p' "$repo_dir/tools/install-matrix" |
+    sed -e 's/^# \{0,1\}//' -e '/^set -uo/d'
+}
+
+distro_field() {
+  local wanted=$1 field=$2 row name image family
+  for row in "${DISTROS[@]}"; do
+    read -r name image family <<<"$row"
+    [[ $name == "$wanted" ]] || continue
+    case $field in
+      image) printf '%s\n' "$image" ;;
+      family) printf '%s\n' "$family" ;;
+    esac
+    return 0
+  done
+  return 1
+}
+
+results_dir=
+shpool_binary=
+jobs=2
+keep=0
+build=1
+selected=()
+while (($#)); do
+  case $1 in
+    --results-dir) results_dir=${2:?--results-dir needs a path}; shift 2 ;;
+    --shpool) shpool_binary=${2:?--shpool needs a path}; shift 2 ;;
+    --jobs) jobs=${2:?--jobs needs a number}; shift 2 ;;
+    --keep) keep=1; shift ;;
+    --no-build) build=0; shift ;;
+    --list)
+      printf '%s\n' "${DISTROS[@]}" | awk '{printf "%-12s %s\n", $1, $2}'
+      exit 0
+      ;;
+    --help|-h) usage; exit 0 ;;
+    -*) die "unknown option: $1" ;;
+    *) selected+=("$1"); shift ;;
+  esac
+done
+
+[[ $jobs =~ ^[1-9][0-9]*$ ]] || die "--jobs takes a positive number"
+if ((${#selected[@]} == 0)); then
+  for row in "${DISTROS[@]}"; do
+    selected+=("${row%% *}")
+  done
+fi
+for name in "${selected[@]}"; do
+  distro_field "$name" image >/dev/null ||
+    die "unknown distribution: $name (see --list)"
+done
+
+command -v docker >/dev/null 2>&1 || die "docker is required"
+docker version >/dev/null 2>&1 || die "docker is not usable by this account"
+# A linked worktree keeps a .git file rather than a directory, so both count.
+[[ -e $repo_dir/.git ]] || die "install-matrix runs from a Git checkout"
+[[ -r $assets_dir/user-phase.sh ]] || die "missing $assets_dir/user-phase.sh"
+
+if [[ -z $results_dir ]]; then
+  results_dir=$(mktemp -d -t install-matrix-XXXXXX) || die "cannot create a results directory"
+else
+  mkdir -p "$results_dir" || die "cannot create $results_dir"
+  results_dir=$(cd -- "$results_dir" && pwd -P)
+fi
+
+source_commit=$(git -C "$repo_dir" rev-parse HEAD)
+source_branch=$(git -C "$repo_dir" rev-parse --abbrev-ref HEAD)
+note "source $source_branch @ $source_commit"
+note "results $results_dir"
+
+# Containers clone from a staged copy of this checkout rather than from the
+# checkout itself. A linked worktree keeps its objects in the main repository,
+# which a container cannot reach through one read-only mount, and staging on the
+# host resolves that for every checkout shape. The staged copy carries the
+# committed HEAD, so an uncommitted edit is never silently proved.
+source_stage=$results_dir/source
+rm -rf "$source_stage"
+git clone --no-hardlinks --quiet "$repo_dir" "$source_stage" ||
+  die "cannot stage a clone of $repo_dir"
+note "staged clone $source_stage @ $(git -C "$source_stage" rev-parse HEAD)"
+
+# shpool is not packaged by any distribution. Build the static binary once with
+# the container route in extras/build-static-binary.md and reuse it in every
+# leg, which is what a maintainer or a CI cache would do.
+shpool_dir=$results_dir/shpool
+mkdir -p "$shpool_dir"
+if [[ -n $shpool_binary ]]; then
+  [[ -x $shpool_binary ]] || die "shpool binary is not executable: $shpool_binary"
+  install -m 755 "$shpool_binary" "$shpool_dir/shpool" || die "cannot stage shpool"
+  note "shpool staged from $shpool_binary"
+else
+  note "building static shpool $shpool_version (rust:alpine, one container)"
+  docker run --rm --name "$name_prefix-shpool-build" --cpus 2 --memory 3g \
+    -v "$shpool_dir:/out" rust:alpine sh -c "
+      apk add -q musl-dev &&
+      cargo install shpool --version $shpool_version --locked --quiet &&
+      cp /usr/local/cargo/bin/shpool /out/ &&
+      /out/shpool version
+    " >"$results_dir/shpool-build.log" 2>&1 ||
+    die "static shpool build failed; see $results_dir/shpool-build.log"
+  chmod 755 "$shpool_dir/shpool"
+fi
+"$shpool_dir/shpool" version >"$results_dir/shpool-version.txt" 2>&1 || true
+
+build_image() {
+  local distro=$1 image family dockerfile
+  image=$(distro_field "$distro" image)
+  family=$(distro_field "$distro" family)
+  dockerfile=$assets_dir/Dockerfile.$family
+  note "build $distro from $image"
+  docker build --quiet \
+    --file "$dockerfile" \
+    --build-arg "BASE_IMAGE=$image" \
+    --tag "$name_prefix:$distro" \
+    "$assets_dir" >"$results_dir/$distro-build.log" 2>&1
+}
+
+run_leg() {
+  local distro=$1
+  local container=$name_prefix-$distro
+  local log=$results_dir/$distro.log
+  local status=0
+  docker rm -f "$container" >/dev/null 2>&1
+  {
+    printf 'distro: %s\nimage: %s\nsource: %s @ %s\nstarted: %s\n' \
+      "$distro" "$(distro_field "$distro" image)" "$source_branch" \
+      "$source_commit" "$(date -u +%FT%TZ)"
+  } >"$log"
+  # A private cgroup namespace plus CAP_SYS_ADMIN is what systemd needs inside
+  # a container. No host cgroup mount, no host network, no privileged mode.
+  if ! docker run -d --name "$container" \
+      --memory 2g --cpus 2 \
+      --cgroupns=private --cap-add SYS_ADMIN \
+      --security-opt seccomp=unconfined \
+      --tmpfs /run --tmpfs /run/lock \
+      -v "$source_stage:/src:ro" \
+      -v "$assets_dir:/matrix:ro" \
+      -v "$results_dir/shpool:/shpool:ro" \
+      "$name_prefix:$distro" >>"$log" 2>&1; then
+    printf 'MATRIX_OVERALL 2\ncontainer failed to start\n' >>"$log"
+    return 2
+  fi
+  local waited=0
+  until docker exec "$container" systemctl is-system-running >/dev/null 2>&1; do
+    ((waited += 1))
+    if ((waited > 30)); then
+      printf 'systemd did not reach a running state within 30s\n' >>"$log"
+      break
+    fi
+    sleep 1
+  done
+  docker exec --env MATRIX_USER=tester "$container" \
+    bash /matrix/root-phase.sh >>"$log" 2>&1 || status=$?
+  docker cp "$container:/home/tester/doctor.json" \
+    "$results_dir/$distro-doctor.json" >/dev/null 2>&1 || true
+  if ((keep == 0)); then
+    docker rm -f "$container" >/dev/null 2>&1
+  fi
+  return "$status"
+}
+
+if ((build)); then
+  pids=()
+  for distro in "${selected[@]}"; do
+    build_image "$distro" &
+    pids+=("$!:$distro")
+  done
+  build_failed=0
+  for entry in "${pids[@]}"; do
+    if ! wait "${entry%%:*}"; then
+      note "image build FAILED for ${entry#*:} (see $results_dir/${entry#*:}-build.log)"
+      build_failed=1
+    fi
+  done
+  ((build_failed == 0)) || die "one or more images failed to build"
+fi
+
+declare -A leg_status=()
+running=0
+pids=()
+for distro in "${selected[@]}"; do
+  run_leg "$distro" &
+  pids+=("$!:$distro")
+  ((running += 1))
+  if ((running >= jobs)); then
+    entry=${pids[0]}
+    pids=("${pids[@]:1}")
+    wait "${entry%%:*}"
+    leg_status[${entry#*:}]=$?
+    ((running -= 1))
+  fi
+done
+for entry in "${pids[@]}"; do
+  wait "${entry%%:*}"
+  leg_status[${entry#*:}]=$?
+done
+
+summary=$results_dir/summary.tsv
+: >"$summary"
+overall=0
+for distro in "${selected[@]}"; do
+  status=${leg_status[$distro]:-3}
+  printf '%s\t%s\t%s\n' "$distro" "$(distro_field "$distro" image)" \
+    "$( ((status == 0)) && printf pass || printf "fail(%s)" "$status")" \
+    >>"$summary"
+  ((status == 0)) || overall=1
+done
+
+printf '\n== install matrix ==\n'
+printf 'source: %s @ %s\n' "$source_branch" "$source_commit"
+printf 'results: %s\n\n' "$results_dir"
+while IFS=$'\t' read -r distro image verdict; do
+  printf '%-12s %-14s %s\n' "$distro" "$image" "$verdict"
+  grep -h '^MATRIX_RESULT ' "$results_dir/$distro.log" 2>/dev/null |
+    awk '{ printf "               %-24s rc=%s\n", $2, $3 }'
+done <"$summary"
+
+if ((overall == 0)); then
+  printf '\nall legs passed\n'
+else
+  printf '\nat least one leg failed; read the per-distro logs above\n'
+fi
+exit "$overall"

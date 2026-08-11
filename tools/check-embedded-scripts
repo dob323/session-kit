@@ -35,6 +35,7 @@ DEFAULT_TARGETS = (
     "bashrc/shpool.bashrc",
     "deploy/session-kit-launcher",
     "tests/run",
+    "extras/notify-desktop",
 )
 
 # `<<` starts a heredoc; `<<<` is a here-string and `<<=` is an assignment, so

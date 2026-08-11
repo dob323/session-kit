@@ -48,6 +48,41 @@ install_launchers() {
   fi
 }
 
+# The shipped Bash completion, copied once per command name into the directory
+# bash-completion loads user files from. Copies rather than symlinks: the file
+# lives in a read-only release that a rollback replaces, and a dangling symlink
+# in a completion directory makes every new shell print an error.
+#
+# It is never fatal. A machine without the target directory writable, or with a
+# name already taken by something that is not ours, keeps its completion as it
+# was and the rest of the installation proceeds -- completion is a convenience,
+# and refusing an install over it would be the wrong trade.
+install_completions() {
+  local release_id=$1 source name destination temporary
+  [[ $completion_dir != none ]] || return 0
+  source=$install_root/releases/$release_id/lib/sh/sp_completion.bash
+  [[ -f $source && ! -L $source ]] || return 0
+  [[ ! -e $completion_dir || ( -d $completion_dir && ! -L $completion_dir ) ]] ||
+    return 0
+  mkdir -p -- "$completion_dir" 2>/dev/null || return 0
+  for name in "${completion_names[@]}"; do
+    destination=$completion_dir/$name
+    # Anything already there that is not a kit copy belongs to the user or to
+    # a package: leave it exactly as it is.
+    if [[ -e $destination || -L $destination ]]; then
+      [[ -f $destination && ! -L $destination ]] || continue
+      grep -qxF -- "$completion_marker" "$destination" 2>/dev/null || continue
+    fi
+    temporary=$(mktemp "$completion_dir/.${name}.XXXXXX" 2>/dev/null) || continue
+    if install -m 0644 "$source" "$temporary" 2>/dev/null &&
+       mv -f -- "$temporary" "$destination" 2>/dev/null; then
+      continue
+    fi
+    rm -f -- "$temporary"
+  done
+  return 0
+}
+
 install_codex_themes() {
   local release_id=$1 codex_theme_root theme_name theme_file destination temporary
   if [[ ! -d $install_root/releases/$release_id/config/codex-themes ]]; then
@@ -471,6 +506,7 @@ install_command() {
   atomic_symlink "$install_root/releases/$release_id" "$install_root/current"
   lifecycle_failpoint current
   install_launchers "$release_id"
+  install_completions "$release_id"
   install_defaults "$release_id"
   configure_provider_hooks "$release_id"
   lifecycle_failpoint provider-hooks
@@ -619,6 +655,7 @@ PY
   # remains capable of restoring the transaction even though `current` now
   # names the rollback target.
   install_launchers "$target"
+  install_completions "$target"
   lifecycle_failpoint rollback-precommit
   commit_transaction
   rollback_transaction_pending=0

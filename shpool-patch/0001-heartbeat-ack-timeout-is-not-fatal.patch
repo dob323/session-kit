@@ -13,15 +13,18 @@
 #   shpool/tests/regression.rs. Gives the heartbeat ack channel one buffered
 #   slot instead of a rendezvous and tags each heartbeat with a request id, so
 #   an ack abandoned by a timed-out heartbeat is discarded on the next pass
-#   rather than wedging the shell->client thread. Adds a regression test.
+#   rather than wedging the shell->client thread. The shell->client thread
+#   deposits its ack without blocking and the heartbeat thread drains stale
+#   acks before each request, so neither side can ever park on the other.
+#   Adds a regression test.
 #
 diff --git a/libshpool/src/daemon/server.rs b/libshpool/src/daemon/server.rs
-index 20814ea..a5e1bfd 100644
+index 7e59d9a..8bf55d7 100644
 --- a/libshpool/src/daemon/server.rs
 +++ b/libshpool/src/daemon/server.rs
-@@ -1111,13 +1111,18 @@ impl Server {
+@@ -1102,13 +1102,18 @@ impl Server {
          let (tty_size_change_ack_tx, tty_size_change_ack_rx) = crossbeam_channel::bounded(0);
-
+ 
          let (heartbeat_tx, heartbeat_rx) = crossbeam_channel::bounded(0);
 -        let (heartbeat_ack_tx, heartbeat_ack_rx) = crossbeam_channel::bounded(0);
 +        // One slot rather than a rendezvous, so the shell->client thread can
@@ -29,21 +32,21 @@ index 20814ea..a5e1bfd 100644
 +        // heartbeat thread gave up waiting, the ack it abandoned sits here and
 +        // is discarded by request id on the next pass.
 +        let (heartbeat_ack_tx, heartbeat_ack_rx) = crossbeam_channel::bounded(1);
-
+ 
          // We make this buffered to avoid blocking during a broadcast. There is
          // no ack chan so we can afford to buffer a bit.
          let (maybe_switch_tx, maybe_switch_rx) = crossbeam_channel::bounded(10);
-
+ 
          let shell_to_client_ctl = Arc::new(Mutex::new(shell::ShellToClientCtl {
 +            next_heartbeat_id: std::sync::atomic::AtomicU64::new(0),
              client_connection: client_connection_tx,
              client_connection_ack: client_connection_ack_rx,
              tty_size_change: tty_size_change_tx,
 diff --git a/libshpool/src/daemon/shell.rs b/libshpool/src/daemon/shell.rs
-index ad65b0f..dd0e2e2 100644
+index cc3ab28..6984893 100644
 --- a/libshpool/src/daemon/shell.rs
 +++ b/libshpool/src/daemon/shell.rs
-@@ -245,10 +245,12 @@ pub struct ShellToClientArgs {
+@@ -210,10 +210,12 @@ pub struct ShellToClientArgs {
      pub client_connection_ack: crossbeam_channel::Sender<ClientConnectionStatus>,
      pub tty_size_change: crossbeam_channel::Receiver<TtySize>,
      pub tty_size_change_ack: crossbeam_channel::Sender<()>,
@@ -58,8 +61,8 @@ index ad65b0f..dd0e2e2 100644
 +    pub heartbeat_ack: crossbeam_channel::Sender<(u64, bool)>,
      pub child_exit_notifier: Arc<ExitNotifier>,
  }
-
-@@ -410,7 +412,7 @@ impl SessionInner {
+ 
+@@ -375,7 +377,7 @@ impl SessionInner {
                              }
                          }
                      }
@@ -68,30 +71,59 @@ index ad65b0f..dd0e2e2 100644
                          let client_present = if let ClientConnectionMsg::New(conn) = &mut client_conn {
                              let chunk = Chunk { kind: ChunkKind::Heartbeat, buf: &[] };
                              match chunk.write_to(&mut conn.sink).and_then(|_| conn.sink.flush()) {
-@@ -431,7 +433,9 @@ impl SessionInner {
+@@ -396,8 +398,29 @@ impl SessionInner {
                              false
                          };
-
+ 
 -                        args.heartbeat_ack.send(client_present)
+-                            .context("sending heartbeat ack")?;
 +                        test_hooks::emit("daemon-wrote-heartbeat");
 +
-+                        args.heartbeat_ack.send((request_id.unwrap_or(0), client_present))
-                             .context("sending heartbeat ack")?;
++                        // Never block here. The one buffer slot can still hold
++                        // an ack the heartbeat thread gave up waiting for, and
++                        // the receiving half lives in the long-lived ctl struct,
++                        // so it never disconnects and a blocking send would park
++                        // this thread with nobody left to drain it -- the wedge
++                        // this patch exists to prevent, through another door.
++                        // Dropping an ack is safe because requests carry ids:
++                        // the heartbeat thread times out and asks again under a
++                        // fresh id.
++                        match args
++                            .heartbeat_ack
++                            .try_send((request_id.unwrap_or(0), client_present))
++                        {
++                            Ok(()) => {}
++                            Err(crossbeam_channel::TrySendError::Full(_)) => {
++                                trace!("heartbeat ack slot still full, dropping ack");
++                            }
++                            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
++                                return Err(anyhow!("sending heartbeat ack: disconnected"));
++                            }
++                        }
                      }
                      recv(args.maybe_switch) -> maybe_switch => {
-@@ -956,7 +960,7 @@ impl SessionInner {
+                         let maybe_switch = match maybe_switch {
+@@ -921,7 +944,7 @@ impl SessionInner {
              .spawn_scoped(scope, move || -> anyhow::Result<()> {
                  let _s1 = span!(Level::INFO, "heartbeat", s = self.name, cid = conn_id).entered();
-
+ 
 -                loop {
 +                'heartbeat: loop {
                      trace!("checking stop_rx");
                      let stop_early = common::sleep_unless(
                          consts::HEARTBEAT_DURATION,
-@@ -969,9 +973,14 @@ impl SessionInner {
+@@ -934,9 +957,22 @@ impl SessionInner {
                      }
                      {
                          let shell_to_client_ctl = self.shell_to_client_ctl.lock();
++
++                        // Discard any ack left over from a request we already
++                        // gave up on, so the shell->client thread always finds
++                        // the slot free. The id check below stays as the second
++                        // line of defence for an ack that lands after this.
++                        while shell_to_client_ctl.heartbeat_ack.try_recv().is_ok() {
++                            trace!("discarded a stale heartbeat ack");
++                        }
 +
 +                        let request_id = shell_to_client_ctl
 +                            .next_heartbeat_id
@@ -104,7 +136,7 @@ index ad65b0f..dd0e2e2 100644
                          {
                              // If the channel is disconnected, it means that the shell exited and
                              // the shell->client process exited cleanly. We should not raise a
-@@ -989,16 +998,28 @@ impl SessionInner {
+@@ -954,16 +990,28 @@ impl SessionInner {
                              }
                              _ => {}
                          }
@@ -143,9 +175,9 @@ index ad65b0f..dd0e2e2 100644
                          };
                          if !client_present {
                              // Bail from the thread to get the rest of the
-@@ -1100,11 +1121,19 @@ pub struct ShellToClientCtl {
+@@ -1065,11 +1113,19 @@ pub struct ShellToClientCtl {
      pub tty_size_change_ack: crossbeam_channel::Receiver<()>,
-
+ 
      // A control channel telling the shell->client thread to issue
 -    // a heartbeat to check if the client is still listening.
 -    pub heartbeat: crossbeam_channel::Sender<()>,
@@ -165,17 +197,17 @@ index ad65b0f..dd0e2e2 100644
 +
 +    /// The id to give the next heartbeat request.
 +    pub next_heartbeat_id: std::sync::atomic::AtomicU64,
-
+ 
      /// A control channel telling the shell->client thread to
      /// broadcast the given MaybeSwitch. There is no ack channel
 diff --git a/shpool/tests/regression.rs b/shpool/tests/regression.rs
-index e8a8e14..286f9a5 100644
+index e8a8e14..770c1dc 100644
 --- a/shpool/tests/regression.rs
 +++ b/shpool/tests/regression.rs
 @@ -301,6 +301,98 @@ fn concurrent_attach_to_existing_session_race() -> anyhow::Result<()> {
      Ok(())
  }
-
+ 
 +/// Regression test for a slow heartbeat ack killing the session. The
 +/// shell->client thread can be busy when the heartbeat thread asks it for an
 +/// ack (generating a large session restore buffer is the usual cause). Treating

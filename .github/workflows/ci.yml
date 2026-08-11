@@ -113,6 +113,9 @@ jobs:
             tests.test_provider_title_push.ClaudeAiTitleTests \
             tests.test_inventory.ProviderLifecycleStateTests.test_claude_reopen_passes_hydrated_name_to_native_cli \
             tests.test_projects \
+            tests.test_projects_context \
+            tests.test_projects_identity \
+            tests.test_projects_manifest \
             tests.test_public_export \
             tests.test_release_artifact \
             tests.test_public_scan \
@@ -137,7 +140,7 @@ jobs:
       - name: Check shell
         run: |
           shellcheck install.sh bin/* lib/sh/* bashrc/shpool.bashrc \
-            deploy/session-kit-launcher tests/run
+            deploy/session-kit-launcher tests/run extras/notify-desktop
       - name: Check Python
         env:
           RUFF_CACHE_DIR: ${{ runner.temp }}/ruff-cache
@@ -170,8 +173,17 @@ jobs:
             lib/sessionkit_inventory/snapshot.py \
             lib/sessionkit_inventory/terminal.py \
             lib/sessionkit_inventory/validation.py \
+            lib/sessionkit_projects/__init__.py \
+            lib/sessionkit_projects/cli.py \
+            lib/sessionkit_projects/context.py \
+            lib/sessionkit_projects/identity.py \
+            lib/sessionkit_projects/launch.py \
+            lib/sessionkit_projects/manifest.py \
             tests/test_doc_links.py tests/test_facade.py \
             tests/test_projects.py \
+            tests/test_projects_context.py \
+            tests/test_projects_identity.py \
+            tests/test_projects_manifest.py \
             tests/test_public_export.py tests/test_public_scan.py \
             tests/test_release_artifact.py tests/support.py
           ruff format --check tools/build-public-tree tools/build-release-artifact \
@@ -188,7 +200,7 @@ jobs:
           mypy --ignore-missing-imports \
             lib/session_inventory.py lib/sessionkit_inventory \
             lib/sessionkit_supervisor lib/sessionkit_messages \
-            lib/sessionkit_events extras/hooks
+            lib/sessionkit_events lib/sessionkit_projects extras/hooks
           # Extensionless scripts have no module name to infer, so they need
           # --scripts-are-modules. tools/render-readme-dashboard is excluded:
           # it imports the login test fixture, which pulls the whole test tree
@@ -203,7 +215,11 @@ jobs:
         run: |
           tools/public-scan .
           if [[ -f SOURCE.json ]]; then
-            tools/public-scan . --git-history --private-markers
+            # Commits published before the private-marker rule existed cannot
+            # be rewritten out of a public history. tools/public-scan-history-baseline
+            # names the reviewed blobs; every other blob still fails.
+            tools/public-scan . --git-history --private-markers \
+              --baseline tools/public-scan-history-baseline
           else
             tools/public-scan . --git-history
           fi
@@ -262,7 +278,8 @@ jobs:
             0001-heartbeat-ack-timeout-is-not-fatal.patch \
             0002-restore-input-modes-on-reattach.patch \
             0003-kill-tolerates-an-already-dead-shell.patch \
-            0004-detach-must-not-hold-the-shells-lock.patch; do
+            0004-detach-must-not-hold-the-shells-lock.patch \
+            0005-attach-must-not-discard-the-shells-exit-status.patch; do
             git -C "$RUNNER_TEMP/shpool" apply --check \
               "$GITHUB_WORKSPACE/shpool-patch/$patch"
             git -C "$RUNNER_TEMP/shpool" apply \

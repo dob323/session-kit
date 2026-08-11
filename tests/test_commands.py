@@ -733,7 +733,7 @@ class CommandTests(unittest.TestCase):
         )
         refused = run([SP, "new", "shell", "fixture"], env=env, check=False)
         self.assertNotEqual(0, refused.returncode)
-        self.assertIn("unknown or invalid project alias", refused.stderr)
+        self.assertIn("unknown or invalid project", refused.stderr)
         self.assertFalse(self.fixture.shpool_log.exists())
 
     def test_ai_startup_proof_failure_keeps_session_and_record_without_kill(self) -> None:
@@ -3110,7 +3110,12 @@ class PickerProofTests(unittest.TestCase):
         env["FAKE_EXPECT_CREATE_LOCK"] = "unlocked"
         pid, descriptor = pty.fork()
         if pid == 0:
-            os.execvpe(str(SP), [str(SP), "picker-open", str(proof)], env)
+            # A child that cannot exec must never return: it is a forked copy
+            # of the test runner, and returning resumes the suite from here.
+            try:
+                os.execvpe(str(SP), [str(SP), "picker-open", str(proof)], env)
+            finally:
+                os._exit(127)
         output = bytearray()
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
@@ -3234,8 +3239,13 @@ class ConfirmExactDrainTests(unittest.TestCase):
         )
         pid, descriptor = pty.fork()
         if pid == 0:
-            os.chdir(REPO)
-            os.execvp("bash", ["bash", "-c", script])
+            # A child that cannot exec must never return: it is a forked copy
+            # of the test runner, and returning resumes the suite from here.
+            try:
+                os.chdir(REPO)
+                os.execvp("bash", ["bash", "-c", script])
+            finally:
+                os._exit(127)
         os.write(descriptor, b"PROBE\n")
         output = bytearray()
         deadline = time.monotonic() + 10

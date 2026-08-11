@@ -67,6 +67,7 @@ REQUIRED = {
     "tools/build-release-artifact",
     "tools/check-doc-links",
     "tools/public-scan",
+    "tools/public-scan-history-baseline",
 }
 
 

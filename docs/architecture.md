@@ -54,6 +54,7 @@ lives in `lib/sessionkit_inventory/`.
 | `snapshot` | one exact refresh, or a documented fallback |
 | `migration` | one-time legacy transitions |
 | `projects` | discover and manage project shortcuts |
+| `accounts` | subscription account profiles, roster, and rotation advice |
 
 Two rules keep this safe to change. No package module imports the facade, and
 the dependency graph stays acyclic. Every symbol an existing test patches on the

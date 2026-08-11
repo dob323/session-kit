@@ -10,6 +10,7 @@ source "$SCRIPT_DIR/session_kit_common"
 STATUS_CMD=${SESSION_KIT_STATUS_CMD:-"$SCRIPT_DIR/shpool_status"}
 SP_CMD=${SESSION_KIT_SP_CMD:-"$SCRIPT_DIR/sp"}
 PROJECTS_TOOL=${SESSION_KIT_PROJECTS_TOOL:-"$SCRIPT_DIR/../lib/sessionkit_inventory/projects.py"}
+PEEK_TOOL=${SESSION_KIT_PEEK_TOOL:-"$SCRIPT_DIR/../lib/sessionkit_events/peek.py"}
 
 if [[ ! -t 0 || ! -t 1 || ${SESSION_KIT_NONINTERACTIVE:-0} == 1 ]]; then
   # Still a picker exit: without a logged reason, a window that lands in a
@@ -35,6 +36,19 @@ PROMPT_QUARANTINE_INDEX=""
 # The d-number to watchdog repair array index, built only inside Needs you.
 REPAIR_INDEX=""
 PAGE_SIZE=1
+# How the list is grouped, whether rows are drawn compact, and which row the
+# jump key last landed on. All three are view-only: they change what the
+# screen shows, never which sessions exist or what a number does. The two
+# environment variables let a person keep a preference; the defaults are the
+# list this picker has always drawn.
+PICKER_GROUP_MODE=${SESSION_KIT_PICKER_GROUP:-state}
+case "$PICKER_GROUP_MODE" in
+  state | provider | project) ;;
+  *) PICKER_GROUP_MODE=state ;;
+esac
+PICKER_COMPACT=${SESSION_KIT_PICKER_COMPACT:-0}
+[[ $PICKER_COMPACT == 1 ]] || PICKER_COMPACT=0
+PICKER_JUMP_NUMBER=""
 PICKER_REFUSED_STATUS=74
 PICKER_ATTACH_FAILED_STATUS=75
 TEMP_FILES=()
@@ -168,6 +182,27 @@ while true; do
       ;;
     a|A)
       show_attention_menu
+      ;;
+    g|G)
+      jump_next_attention
+      ;;
+    c|C|compact|COMPACT|Compact)
+      toggle_compact
+      ;;
+    group|GROUP|Group)
+      cycle_grouping
+      ;;
+    group\ *|GROUP\ *|Group\ *)
+      cycle_grouping "${choice#* }"
+      ;;
+    i|I)
+      echo "  Use i followed by a session number, such as i3. Nothing changed."
+      ;;
+    i[0-9]*|I[0-9]*)
+      peek_row "${choice#[iI]}"
+      ;;
+    i\ *|I\ *)
+      peek_row "${choice#* }"
       ;;
     v|V)
       open_supervisor

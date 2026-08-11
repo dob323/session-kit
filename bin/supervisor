@@ -4,7 +4,15 @@ set -u
 set -o pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
-RELEASE_DIR=$(cd -- "$SCRIPT_DIR/.." && pwd -P)
+# The physical release this script belongs to. The override exists so a repair
+# or a test can regenerate release-derived files for an install other than the
+# one it is running from; it is never resolved with -P, because the caller may
+# deliberately be naming the `current` pointer.
+if [[ -n ${SESSION_KIT_RELEASE_DIR:-} ]]; then
+  RELEASE_DIR=${SESSION_KIT_RELEASE_DIR%/}
+else
+  RELEASE_DIR=$(cd -- "$SCRIPT_DIR/.." && pwd -P)
+fi
 SP=${SESSION_KIT_SP:-"$SCRIPT_DIR/sp"}
 STATUS=${SESSION_KIT_SHPOOL_STATUS:-"$SCRIPT_DIR/shpool_status"}
 STATE_DIR=${SESSION_KIT_STATE_DIR:-${XDG_STATE_HOME:-"${HOME:-}/.local/state"}/session-kit}
@@ -25,7 +33,7 @@ SUPERVISOR_CWD=${SESSION_KIT_SUPERVISOR_CWD:-${HOME:-}}
 # read the request, and return a structured handoff. The exact idempotency key
 # prevents a repeat from sending twice while this bounded wait stays patient.
 HANDOFF_WAIT_SECONDS=${SESSION_KIT_SUPERVISOR_HANDOFF_WAIT_SECONDS:-120}
-INVENTORY_CORE=$RELEASE_DIR/lib/session_inventory.py
+INVENTORY_CORE=${SESSION_KIT_INVENTORY_CORE:-"$RELEASE_DIR/lib/session_inventory.py"}
 # How long each attempt waits for the newborn to prove it took the brief, and
 # how many attempts a brief that never lands is given.
 BRIEF_WAIT_SECONDS=${SESSION_KIT_SUPERVISOR_BRIEF_WAIT_SECONDS:-15}
@@ -36,7 +44,20 @@ BRIEF_ATTEMPTS=${SESSION_KIT_SUPERVISOR_BRIEF_ATTEMPTS:-12}
 BRIEF_MARKER='Treat the standing brief below as binding session instructions.'
 
 usage() {
-  printf 'usage: supervisor {ensure|refresh|open}\n' >&2
+  cat <<'EOF'
+usage: supervisor <ensure|refresh|open|mcp-config>
+
+  ensure      create the permanent Fleet Supervisor session if it is absent,
+              and prove it took its standing brief
+  refresh     hand the running supervisor over to a new session, carrying its
+              handoff, and close the old one
+  open        ensure the session exists, then attach this terminal to it
+  mcp-config  regenerate the supervisor's MCP definition and print its path;
+              creates, resumes, and messages nothing
+
+The supervisor always holds terminal 1. Statuses: 0 done, 1 refused or failed,
+2 wrong arguments. `sp help exit-codes` documents them all.
+EOF
 }
 
 die() {
@@ -211,6 +232,39 @@ brief_proven() {
   [[ $recorded == "$thread_key" && $message_id =~ ^[0-9a-f]{8}$ ]]
 }
 
+# The import path the supervisor's MCP server must be started with.
+#
+# A versioned release directory is the wrong thing to write into a config file
+# that outlives the release: every activation moves `current` and leaves the
+# pin naming code nobody is running any more, which is how the fleet's policing
+# session ended up on stale code within hours of each install, three times.
+#
+# `current` is the install's own atomic pointer (`atomic_symlink` in
+# lib/sh/session_kit_install.sh writes it, and the watchdog service unit
+# already runs through it), and PYTHONPATH is resolved by each newly spawned
+# python process, not stored resolved by whoever read this file. So pinning
+# through the pointer survives every activation and costs nothing: the next
+# MCP server process started for a supervisor picks up the active release.
+#
+# A tree that is not an installed release — a git checkout, a test fixture —
+# has no pointer to speak of and keeps its own lib, which is what a developer
+# running from a checkout means.
+stable_release_lib() {
+  local root pointer
+  if [[ $(basename -- "$(dirname -- "$RELEASE_DIR")") != releases ]]; then
+    printf '%s\n' "$RELEASE_DIR/lib"
+    return 0
+  fi
+  root=$(dirname -- "$(dirname -- "$RELEASE_DIR")")
+  pointer=$root/current
+  if [[ -L $pointer && -d $pointer/lib ]] &&
+     [[ $(cd -- "$pointer" && pwd -P) == "$(cd -- "$RELEASE_DIR" && pwd -P)" ]]; then
+    printf '%s\n' "$pointer/lib"
+    return 0
+  fi
+  printf '%s\n' "$RELEASE_DIR/lib"
+}
+
 write_mcp_config() {
   local temporary
   temporary=$(mktemp "$SUPERVISOR_DIR/.mcp.json.XXXXXX") || return 1
@@ -218,7 +272,7 @@ write_mcp_config() {
     rm -f -- "$temporary"
     return 1
   }
-  if ! python3 - "$RELEASE_DIR/lib" > "$temporary" <<'PY'
+  if ! python3 - "$(stable_release_lib)" > "$temporary" <<'PY'
 import json
 import sys
 
@@ -525,8 +579,40 @@ inject_brief() {
   printf '%s\n' "$shpool_id"
 }
 
+# Redeliver every intake notice the spool still owes, behind the caller.
+#
+# The relay from a source thread to the supervisor is one-shot: a notice that
+# could not be delivered — the supervisor was mid-turn, its harness queue was
+# full, it was between sessions — was marked and never tried again, so real
+# operator instructions sat undelivered for days with nothing saying so. A
+# wake is exactly the moment that is worth retrying, and `msg intake flush`
+# already owns delivery, holds its own lock, and skips whatever landed.
+#
+# Detached, because a Claude send takes about a minute and a wake must not
+# wait for one. Synchronous only under the testing gate, where determinism
+# matters more than latency.
+sweep_intake_delivery() {
+  [[ -f $INVENTORY_CORE && ! -L $INVENTORY_CORE ]] || return 0
+  if [[ ${SESSION_KIT_TESTING:-0} == 1 ]]; then
+    python3 "$INVENTORY_CORE" msg intake flush >/dev/null 2>&1 || true
+    return 0
+  fi
+  ( python3 "$INVENTORY_CORE" msg intake flush >/dev/null 2>&1 & ) </dev/null
+  return 0
+}
+
 ensure_supervisor() {
   local shpool_id thread_key lookup_status
+  # Repair release drift on every wake. The MCP definition names the code the
+  # supervisor's tools run, the release under it moves on every activation,
+  # and until now only a brand-new supervisor ever rewrote it. Never fatal: a
+  # live, briefed supervisor is ensured whatever this file says.
+  if prepare_state; then
+    write_mcp_config ||
+      printf 'supervisor: the MCP definition could not be refreshed\n' >&2
+  else
+    printf 'supervisor: the supervisor state directory could not be prepared\n' >&2
+  fi
   shpool_id=$(current_supervisor)
   lookup_status=$?
   if (( lookup_status == 0 )); then
@@ -692,19 +778,37 @@ open_supervisor() {
   exec "$SP" go "$shpool_id"
 }
 
+case "${1:-}" in
+  -h | --help | help)
+    usage
+    exit 0
+    ;;
+esac
 if (( $# != 1 )); then
-  usage
+  usage >&2
   exit 2
 fi
 case "$1" in
   ensure)
     ensure_supervisor >/dev/null || exit $?
+    sweep_intake_delivery
     printf '%s\n' "Fleet Supervisor is ready."
+    ;;
+  mcp-config)
+    # Regenerate the supervisor's MCP definition and say where it went. No
+    # session is created, resumed, or messaged: this is the repair path for an
+    # install whose definition drifted, and it is safe to run at any time.
+    prepare_state || exit 1
+    write_mcp_config || {
+      die "the MCP definition could not be written"
+      exit 1
+    }
+    printf '%s\n' "$MCP_CONFIG"
     ;;
   refresh)
     refresh_supervisor >/dev/null || exit $?
     printf '%s\n' "Fleet Supervisor refreshed."
     ;;
   open) open_supervisor ;;
-  *) usage; exit 2 ;;
+  *) usage >&2; exit 2 ;;
 esac

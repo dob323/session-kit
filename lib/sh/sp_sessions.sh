@@ -350,7 +350,7 @@ sk_quarantine_launch_request() {
 start_new() {
   sk_require_integration || return 1
   local requested_provider= requested_project= prompt_file= requested_model= launch_key=
-  local requested_account= account_profile_json=
+  local requested_account= account_profile_json= requested_worktree=
   local -a positional=()
   while (($#)); do
     case "$1" in
@@ -386,6 +386,14 @@ start_new() {
         requested_account=$2
         shift 2
         ;;
+      --worktree)
+        [[ -z $requested_worktree && -n ${2:-} ]] || {
+          sk_die "--worktree requires one branch name"
+          return 2
+        }
+        requested_worktree=$2
+        shift 2
+        ;;
       --*) sk_die "unknown new-session option: $1"; return 2 ;;
       *) positional+=("$1"); shift ;;
     esac
@@ -406,14 +414,38 @@ start_new() {
   fi
 
   if [[ -n $requested_project ]]; then
-    project_row=$(sk_project_lookup "$requested_project") || {
-      sk_die "unknown or invalid project alias: $requested_project"
+    # A project carries more than a directory now: a committed session-kit.toml
+    # can name the provider, account, and model this project is worked on with,
+    # so `sp new <project>` starts what the project says instead of what the
+    # person happened to remember. Flags passed here still win, and the
+    # account and model returned go through the same validation below as one
+    # typed on the command line.
+    project_row=$(sk_project_plan "$requested_project" "$requested_provider" \
+      "$requested_account" "$requested_model") || {
+      sk_die "unknown or invalid project: $requested_project"
       return 1
     }
-    local alias configured_provider configured_cwd
-    IFS=$'\t' read -r alias configured_provider configured_cwd <<<"$project_row"
-    cwd=$configured_cwd
-    if [[ -z $requested_provider ]]; then provider=$configured_provider; fi
+    local planned_cwd planned_provider planned_account planned_model startup_state
+    IFS=$'\t' read -r planned_cwd planned_provider planned_account planned_model \
+      startup_state <<<"$project_row"
+    [[ -n $planned_cwd && -n $planned_provider ]] || {
+      sk_die "the project plan for $requested_project was incomplete"
+      return 1
+    }
+    cwd=$planned_cwd
+    provider=$planned_provider
+    [[ -n $requested_account || -z $planned_account ]] || requested_account=$planned_account
+    [[ -n $requested_model || -z $planned_model ]] || requested_model=$planned_model
+    case "$startup_state" in
+      unapproved)
+        printf 'This project declares a startup command that has not been approved here.\n'
+        printf 'Review it with: session-kit projects launch-plan %s\n' "$requested_project"
+        ;;
+      changed)
+        printf 'This project changed its startup command since it was approved here.\n'
+        printf 'Review it with: session-kit projects launch-plan %s\n' "$requested_project"
+        ;;
+    esac
   fi
 
   [[ -d $cwd ]] || {
@@ -421,6 +453,35 @@ start_new() {
     return 1
   }
   cwd=$(cd -- "$cwd" && pwd -P) || return 1
+
+  # Worktree isolation: the branch is already decided elsewhere -- a delegated
+  # worker's plan records it, a person names it here -- and this materializes
+  # it as a directory of its own. Idempotent by (repository, branch), so a
+  # retried launch reuses the worktree instead of forking a second one.
+  if [[ -n $requested_worktree ]]; then
+    local worktree_record= worktree_path=
+    worktree_record=$(python3 "$INVENTORY_CORE" worktree materialize \
+      --repo "$cwd" --branch "$requested_worktree") || {
+      sk_die "no worktree for branch $requested_worktree; no session was created"
+      return 1
+    }
+    worktree_path=$(printf '%s' "$worktree_record" | python3 -c '
+import json,sys
+record = json.load(sys.stdin)
+path = record.get("path") or ""
+if not isinstance(path, str) or not path.startswith("/"):
+    raise SystemExit(1)
+print(path)
+') || {
+      sk_die "the worktree record did not name an absolute directory"
+      return 1
+    }
+    [[ -d $worktree_path ]] || {
+      sk_die "the recorded worktree directory is missing: $worktree_path"
+      return 1
+    }
+    cwd=$(cd -- "$worktree_path" && pwd -P) || return 1
+  fi
 
   if [[ -n $prompt_file && $provider != codex ]]; then
     sk_die "--prompt-file is available only for a new Codex session"
@@ -548,6 +609,18 @@ PY
   if [[ -n $prompt_handoff ]] &&
      ! sk_finalize_prompt_source "$prompt_file" "$SK_STAGED_PROMPT_IDENTITY"; then
     sk_log_action prompt_handoff source-retained >/dev/null 2>&1 || true
+  fi
+  if [[ -n $requested_worktree ]]; then
+    # The session exists either way; an unbound record only costs the picker
+    # its session label, so this reports rather than unwinds a live launch.
+    local -a bind_argv=(python3 "$INVENTORY_CORE" worktree bind
+      --path "$cwd" --shpool-id "$id")
+    [[ -z $launch_key ]] || bind_argv+=(--launch-key "$launch_key")
+    if ! "${bind_argv[@]}" >/dev/null; then
+      printf 'warning: session %s runs in %s, but its worktree record was not updated\n' \
+        "$id" "$cwd" >&2
+    fi
+    printf 'Isolated on branch %s\n' "$requested_worktree"
   fi
   printf 'Starting a %s session in %s\n' "$provider" "$cwd"
   local creation_floor_ms

@@ -1,18 +1,20 @@
 from __future__ import annotations
 
 import base64
+import grp
+import hashlib
 import json
-import io
 import os
+import pwd
 from pathlib import Path
 import plistlib
+import re
 import signal
 import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
-import tarfile
 import time
 import unittest
 
@@ -22,7 +24,43 @@ from tests.support import THEME_COLORS
 REPO = Path(__file__).resolve().parents[1]
 RELEASE_A = "1" * 40
 RELEASE_B = "2" * 40
-LEGACY_PRE_HOOK_COMMIT = "5ff810b0d00ec4717184f0a1fadab541adf2b4ca"
+# Files that only exist in releases from provider-hook activation onwards. A
+# release without them is what `install_legacy_generation` reproduces, and
+# `configure_provider_hooks` keys its automatic enable on the second one.
+LEGACY_RETIRED_RELEASE_FILES = (
+    "config/codex/hooks.json",
+    "lib/sessionkit_supervisor/provider_hooks.py",
+)
+# Launchers are compared byte for byte to prove which release a rollback took
+# them from. A fixture release built out of this checkout would otherwise carry
+# launchers identical to the release under test, and the comparison would hold
+# no matter which one the code picked.
+LEGACY_LAUNCHER_STAMP = "# Session Kit legacy generation fixture.\n"
+
+
+def host_group_is_private() -> bool:
+    """Report whether this host gives the test account a private group.
+
+    A group-writable provider directory is installable only where the group
+    belongs to one account, which is how a private-group distribution creates
+    it. Hosts with a shared primary group cannot stage that fixture.
+    """
+    try:
+        account = pwd.getpwuid(os.geteuid())
+        group = grp.getgrgid(os.getegid())
+        accounts = pwd.getpwall()
+    except (KeyError, OSError):  # pragma: no cover - directory service failure
+        return False
+    return bool(
+        os.getegid() == account.pw_gid
+        and group.gr_name == account.pw_name
+        and not group.gr_mem
+        and accounts
+        and all(
+            other.pw_gid != account.pw_gid or other.pw_name == account.pw_name
+            for other in accounts
+        )
+    )
 
 
 class InstallerTests(unittest.TestCase):
@@ -205,34 +243,128 @@ class InstallerTests(unittest.TestCase):
         )
         return source
 
-    def legacy_source_fixture(self) -> Path:
-        """A committed source snapshot from before provider-hook activation."""
-        source = self.temp / "legacy-source"
-        source.mkdir()
-        archived = subprocess.check_output(
-            ["git", "archive", "--format=tar", LEGACY_PRE_HOOK_COMMIT], cwd=REPO
-        )
-        with tarfile.open(fileobj=io.BytesIO(archived), mode="r:") as archive:
-            archive.extractall(source, filter="data")
-        subprocess.run(["git", "init", "-q", source], check=True)
-        subprocess.run(["git", "-C", source, "add", "."], check=True)
+    def helper_launcher_names(self) -> list[str]:
+        """The helper commands the installer keeps, read from the source."""
+        source = (REPO / "bin/session-kit").read_text(encoding="utf-8")
+        match = re.search(r"^helpers=\((?P<names>[^)]*)\)$", source, re.MULTILINE)
+        assert match is not None, "bin/session-kit no longer declares helpers"
+        return match.group("names").split()
+
+    def unseal_release(self, release: Path) -> None:
+        for directory in sorted(
+            (path for path in release.rglob("*") if path.is_dir()), reverse=True
+        ):
+            directory.chmod(0o755)
+        release.chmod(0o755)
+
+    def seal_release(self, release: Path) -> None:
+        """Restore the modes and manifest `write_release_manifest` leaves.
+
+        `verify_release` recomputes every digest and refuses a release whose
+        directories are writable, so a fixture that edits a sealed release has
+        to leave it exactly as the installer would have.
+        """
+        manifest = release / "MANIFEST.sha256"
+        manifest.chmod(0o644)
+        lines = [
+            f"{hashlib.sha256(path.read_bytes()).hexdigest()}  "
+            f"{path.relative_to(release).as_posix()}"
+            for path in sorted(release.rglob("*"))
+            if path.is_file() and path != manifest
+        ]
+        manifest.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        for path in sorted(release.rglob("*")):
+            if path.is_file():
+                path.chmod(0o555 if path.stat().st_mode & 0o111 else 0o444)
+        for directory in sorted(
+            (path for path in release.rglob("*") if path.is_dir()), reverse=True
+        ):
+            directory.chmod(0o555)
+        release.chmod(0o555)
+
+    def install_legacy_generation(self) -> None:
+        """Leave the installation a pre-provider-hook release left behind.
+
+        The rollback proofs below all begin from an installation created by a
+        release older than provider-hook activation. That generation differed
+        in exactly four ways that this installer still has to cope with: the
+        release carries neither provider-hook file, nothing anchors management
+        to a release, the management command is a copy of the release's own
+        `bin/session-kit` rather than the stable launcher, and no provider hook
+        is registered in the user's configuration.
+
+        The fixture reproduces that state instead of installing the old source
+        tree, which is reachable from no public clone, so the proofs run
+        everywhere. Every property the later assertions depend on is checked
+        here, so a future change to the installer cannot quietly turn these
+        into tests of an ordinary modern installation.
+        """
+        self.run_installer("--non-interactive")
+        root = self.home / ".local/lib/session-kit"
+        release = root / "releases" / RELEASE_A
+
+        self.unseal_release(release)
+        for relative in LEGACY_RETIRED_RELEASE_FILES:
+            retired = release / relative
+            retired.chmod(0o644)
+            retired.unlink()
+        # An older release also carries older launchers. Stamping them keeps
+        # the byte comparisons that prove which release a launcher came from
+        # able to tell the two releases apart.
+        for relative in ("bin/session-kit", "deploy/session-kit-launcher"):
+            stamped = release / relative
+            stamped.chmod(0o755)
+            shebang, _, body = stamped.read_text(encoding="utf-8").partition("\n")
+            stamped.write_text(
+                f"{shebang}\n{LEGACY_LAUNCHER_STAMP}{body}", encoding="utf-8"
+            )
+        self.seal_release(release)
+
+        (root / "manager").unlink()
+        launcher = self.home / ".local/bin/session-kit"
+        launcher.write_bytes((release / "bin/session-kit").read_bytes())
+        launcher.chmod(0o755)
+        for helper in self.helper_launcher_names():
+            helper_path = self.home / ".local/bin" / helper
+            if not helper_path.exists():
+                continue
+            helper_path.write_bytes(
+                (release / "deploy/session-kit-launcher").read_bytes()
+            )
+            helper_path.chmod(0o755)
         subprocess.run(
             [
-                "git",
-                "-C",
-                source,
-                "-c",
-                "user.name=Session Kit Tests",
-                "-c",
-                "user.email=session-kit-tests@invalid.example",
-                "commit",
-                "-q",
-                "-m",
-                "legacy fixture",
+                sys.executable,
+                str(REPO / "lib/sessionkit_supervisor/provider_hooks.py"),
+                "disable",
+                "--claude-settings",
+                str(self.home / ".claude/settings.json"),
+                "--codex-hooks",
+                str(self.home / ".codex/hooks.json"),
             ],
             check=True,
         )
-        return source
+        for directory in (self.home / ".claude", self.home / ".codex"):
+            if directory.is_dir() and not any(directory.iterdir()):
+                directory.rmdir()
+
+        # The state the rollback proofs are written against, asserted rather
+        # than assumed.
+        for relative in LEGACY_RETIRED_RELEASE_FILES:
+            self.assertFalse(
+                (release / relative).exists(),
+                f"legacy release must not carry {relative}",
+            )
+        self.assertFalse((root / "manager").exists())
+        self.assertFalse((self.home / ".codex/hooks.json").exists())
+        self.assertEqual(RELEASE_A, (root / "current").resolve().name)
+        self.assertEqual(
+            (release / "bin/session-kit").read_bytes(), launcher.read_bytes()
+        )
+        self.assertNotEqual(
+            (release / "deploy/session-kit-launcher").read_bytes(),
+            (REPO / "deploy/session-kit-launcher").read_bytes(),
+        )
 
     def write_systemctl_probe_fixture(self) -> Path:
         log = self.temp / "systemctl-probes.log"
@@ -337,6 +469,104 @@ class InstallerTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(f"source file missing: {relative}", result.stdout)
                 path.write_bytes(payload)
+
+    @unittest.skipUnless(
+        host_group_is_private(), "this host does not give the account a private group"
+    )
+    def test_install_accepts_a_group_writable_provider_directory(self) -> None:
+        # A private-group distribution with a 002 umask leaves the provider
+        # config directory at 0775, which exposes it to no other account.
+        claude = self.home / ".claude"
+        claude.mkdir(mode=0o775)
+        claude.chmod(0o775)
+
+        checked = self.run_installer("--check")
+        self.assertIn("OK    provider config:", checked.stdout)
+        self.run_installer("--non-interactive")
+
+        settings = json.loads((claude / "settings.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            '"$HOME/.local/lib/session-kit/current/extras/hooks/sk_session_events.py"',
+            settings["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"],
+        )
+        self.assertEqual(0o775, claude.stat().st_mode & 0o777)
+
+    @unittest.skipUnless(
+        host_group_is_private(), "this host does not give the account a private group"
+    )
+    def test_install_accepts_a_group_writable_codex_home(self) -> None:
+        # The Codex CLI leaves ~/.codex group-writable on the same
+        # private-group distributions, and the theme layout owns that path.
+        codex = self.home / ".codex"
+        codex.mkdir(mode=0o700)
+        codex.chmod(0o775)
+
+        checked = self.run_installer("--check")
+        self.assertIn("OK    Codex home:", checked.stdout)
+        self.run_installer("--non-interactive")
+
+        self.assertTrue((codex / "themes/sk-red.tmTheme").is_file())
+        self.assertTrue((codex / "hooks.json").is_file())
+        self.assertEqual(0o775, codex.stat().st_mode & 0o777)
+
+    @unittest.skipUnless(
+        host_group_is_private(), "this host does not give the account a private group"
+    )
+    def test_interrupted_install_recovers_through_group_writable_directories(
+        self,
+    ) -> None:
+        # Recovery revalidates every recorded provider hook and theme ancestor.
+        # Reaching the hook step at all is new, so recovery has to accept the
+        # same directories the install accepted or an interrupted install can
+        # never be finished.
+        claude = self.home / ".claude"
+        claude.mkdir(mode=0o700)
+        claude.chmod(0o775)
+        codex = self.home / ".codex"
+        codex.mkdir(mode=0o700)
+        codex.chmod(0o775)
+        journal = self.home / ".local/state/session-kit/lifecycle-transaction.json"
+
+        self.env["SESSION_KIT_TEST_FAILPOINT"] = "provider-hooks-claude"
+        interrupted = self.run_installer("--non-interactive", check=False)
+        self.assertNotEqual(0, interrupted.returncode)
+        self.assertTrue(journal.is_file())
+
+        self.env.pop("SESSION_KIT_TEST_FAILPOINT")
+        recovered = self.run_installer("--non-interactive")
+
+        self.assertIn(
+            "Recovered interrupted Session Kit install transaction", recovered.stdout
+        )
+        self.assertFalse(journal.exists())
+        self.assertTrue((self.home / ".local/lib/session-kit/current").is_symlink())
+        self.assertTrue((claude / "settings.json").is_file())
+        self.assertEqual(0o775, claude.stat().st_mode & 0o777)
+        self.assertEqual(0o775, codex.stat().st_mode & 0o777)
+
+    def test_world_writable_provider_directory_stops_install_before_any_write(
+        self,
+    ) -> None:
+        claude = self.home / ".claude"
+        claude.mkdir(mode=0o700)
+        claude.chmod(0o777)
+
+        checked = self.run_installer("--check", check=False)
+        self.assertNotEqual(0, checked.returncode)
+        self.assertIn("FAIL  provider config:", checked.stdout)
+        self.assertIn(f"chmod go-w {claude}", checked.stdout)
+
+        refused = self.run_installer("--non-interactive", check=False)
+        self.assertNotEqual(0, refused.returncode)
+        self.assertIn(f"chmod go-w {claude}", refused.stdout)
+        # Nothing was installed, so no release tree, launcher, or transaction
+        # journal is left for the operator to recover.
+        self.assertFalse((self.home / ".local/lib/session-kit").exists())
+        self.assertFalse((self.home / ".local/bin/sp").exists())
+        self.assertFalse(
+            (self.home / ".local/state/session-kit/lifecycle-transaction.json").exists()
+        )
+        self.assertFalse((claude / "settings.json").exists())
 
     def test_noninteractive_install_is_local_and_login_opt_in(self) -> None:
         self.run_installer("--non-interactive")
@@ -496,21 +726,7 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(current.resolve().name, RELEASE_A)
 
     def test_legacy_rollback_keeps_modern_manager_for_forward_update(self) -> None:
-        legacy = self.legacy_source_fixture()
-        installed_legacy = subprocess.run(
-            [str(legacy / "install.sh"), "--non-interactive"],
-            cwd=legacy,
-            env=self.env,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
-        self.assertEqual(
-            0,
-            installed_legacy.returncode,
-            installed_legacy.stdout + installed_legacy.stderr,
-        )
+        self.install_legacy_generation()
         self.env["SESSION_KIT_RELEASE_ID"] = RELEASE_B
         self.run_installer("--non-interactive")
         root = self.home / ".local/lib/session-kit"
@@ -527,6 +743,10 @@ class InstallerTests(unittest.TestCase):
         self.assertFalse((self.home / ".codex/hooks.json").exists())
         self.assertEqual(
             (release_b / "deploy/session-kit-launcher").read_bytes(),
+            launcher.read_bytes(),
+        )
+        self.assertNotEqual(
+            (root / "releases" / RELEASE_A / "deploy/session-kit-launcher").read_bytes(),
             launcher.read_bytes(),
         )
 
@@ -557,17 +777,7 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual("ok", checks["provider-hooks"]["status"])
 
     def test_direct_manager_rollback_pins_preflip_launcher_source(self) -> None:
-        legacy = self.legacy_source_fixture()
-        installed_legacy = subprocess.run(
-            [str(legacy / "install.sh"), "--non-interactive"],
-            cwd=legacy,
-            env=self.env,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
-        self.assertEqual(0, installed_legacy.returncode)
+        self.install_legacy_generation()
         self.env["SESSION_KIT_RELEASE_ID"] = RELEASE_B
         self.run_installer("--non-interactive")
         root = self.home / ".local/lib/session-kit"
@@ -583,6 +793,10 @@ class InstallerTests(unittest.TestCase):
             (release_b / "deploy/session-kit-launcher").read_bytes(),
             launcher.read_bytes(),
         )
+        self.assertNotEqual(
+            (root / "releases" / RELEASE_A / "deploy/session-kit-launcher").read_bytes(),
+            launcher.read_bytes(),
+        )
         self.installed("doctor", "--json")
 
     def test_management_launcher_fails_closed_without_manager_anchor(self) -> None:
@@ -596,19 +810,7 @@ class InstallerTests(unittest.TestCase):
         self.assertIn("unsafe manager link", result.stderr)
 
     def test_rollback_to_release_without_provider_hooks_and_next_recovery_succeed(self) -> None:
-        legacy = self.legacy_source_fixture()
-        installed_legacy = subprocess.run(
-            [str(legacy / "install.sh"), "--non-interactive"],
-            cwd=legacy,
-            env=self.env,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
-        self.assertEqual(
-            0, installed_legacy.returncode, installed_legacy.stdout + installed_legacy.stderr
-        )
+        self.install_legacy_generation()
         legacy_release = self.home / ".local/lib/session-kit/releases" / RELEASE_A
         self.assertFalse(
             (legacy_release / "lib/sessionkit_supervisor/provider_hooks.py").exists()
@@ -639,19 +841,7 @@ class InstallerTests(unittest.TestCase):
         self.assertFalse(journal.exists())
 
     def test_sigkill_before_rollback_commit_uses_pinned_recovery_release(self) -> None:
-        legacy = self.legacy_source_fixture()
-        installed_legacy = subprocess.run(
-            [str(legacy / "install.sh"), "--non-interactive"],
-            cwd=legacy,
-            env=self.env,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
-        self.assertEqual(
-            0, installed_legacy.returncode, installed_legacy.stdout + installed_legacy.stderr
-        )
+        self.install_legacy_generation()
         self.env["SESSION_KIT_RELEASE_ID"] = RELEASE_B
         self.run_installer("--non-interactive")
 
@@ -677,19 +867,7 @@ class InstallerTests(unittest.TestCase):
         self.assertFalse(journal.exists())
 
     def test_sigkill_immediately_after_rollback_commit_keeps_stable_launcher(self) -> None:
-        legacy = self.legacy_source_fixture()
-        installed_legacy = subprocess.run(
-            [str(legacy / "install.sh"), "--non-interactive"],
-            cwd=legacy,
-            env=self.env,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
-        self.assertEqual(
-            0, installed_legacy.returncode, installed_legacy.stdout + installed_legacy.stderr
-        )
+        self.install_legacy_generation()
         self.env["SESSION_KIT_RELEASE_ID"] = RELEASE_B
         self.run_installer("--non-interactive")
 
@@ -1209,7 +1387,9 @@ class InstallerTests(unittest.TestCase):
         self.env["CODEX_HOME"] = "relative-codex-home"
         relative = self.run_installer("--non-interactive", check=False)
         self.assertNotEqual(relative.returncode, 0)
-        self.assertIn("absolute normalized path", relative.stderr)
+        # Preflight reports it on stdout; the transaction would repeat it on
+        # stderr. Either layer refusing before any write is the contract.
+        self.assertIn("absolute normalized path", relative.stdout + relative.stderr)
         self.assertFalse((self.home / ".local/lib/session-kit").exists())
 
         target = self.temp / "codex-target"
@@ -1219,7 +1399,7 @@ class InstallerTests(unittest.TestCase):
         self.env["CODEX_HOME"] = str(link)
         linked = self.run_installer("--non-interactive", check=False)
         self.assertNotEqual(linked.returncode, 0)
-        self.assertIn("unsafe Codex path ancestor", linked.stderr)
+        self.assertIn("unsafe Codex path ancestor", linked.stdout + linked.stderr)
         self.assertFalse((target / "themes").exists())
 
     def test_install_and_doctor_reject_unsafe_codex_ancestors(self) -> None:
@@ -1233,7 +1413,7 @@ class InstallerTests(unittest.TestCase):
         rejected = self.run_installer("--non-interactive", check=False)
 
         self.assertNotEqual(rejected.returncode, 0)
-        self.assertIn("unsafe Codex path ancestor", rejected.stderr)
+        self.assertIn("unsafe Codex path ancestor", rejected.stdout + rejected.stderr)
         self.assertFalse((codex_home / "themes").exists())
 
         self.env.pop("CODEX_HOME")

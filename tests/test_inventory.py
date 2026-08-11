@@ -4226,8 +4226,10 @@ class WorkerLaunchGateTests(unittest.TestCase):
                 environ={"SESSION_KIT_SP_CMD": os.fspath(executable)}, runner=runner,
             )
         self.assertTrue(result["dispatched"])
+        # The temporary directory sits inside this repository, so the launcher's
+        # default applies: the worker's recorded branch becomes its worktree.
         self.assertEqual(
-            [os.fspath(executable), "new", "codex", "--model", "gpt-codex-test", "--launch-key", "worker:implementation:1", "--prompt-file"],
+            [os.fspath(executable), "new", "codex", "--model", "gpt-codex-test", "--launch-key", "worker:implementation:1", "--worktree", "w5c/picker-audit", "--prompt-file"],
             calls[0][0][:-1],
         )
         self.assertFalse(Path(calls[0][0][-1]).exists())

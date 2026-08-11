@@ -23,6 +23,19 @@ from tests.support import REPO
 sys.path.insert(0, os.fspath(REPO / "lib"))
 
 from sessionkit_messages import verbs  # noqa: E402
+
+
+def exec_root() -> Path:
+    """Where this module's sandboxes live.
+
+    These sandboxes hold app-server Unix sockets, and a socket path is capped
+    at 108 bytes. Pinned under the repository, that budget is spent on however
+    deep the checkout happens to sit — past about 43 characters every socket
+    test fails for a reason unrelated to what it tests. `tests/run` exports a
+    short root precisely so the sockets have room; the repository is only the
+    fallback for someone running this module by hand from a short path.
+    """
+    return Path(os.environ.get("SESSION_KIT_TEST_EXEC_ROOT", os.fspath(REPO)))
 from sessionkit_messages.envelope import MessageError  # noqa: E402
 from sessionkit_messages.ledger import Ledger  # noqa: E402
 
@@ -129,7 +142,7 @@ STATUS_MIX = inventory(
 class Sandbox:
     def __init__(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(
-            prefix=".session-kit-msgverbs-", dir=REPO
+            prefix=".session-kit-msgverbs-", dir=exec_root()
         )
         self.base = Path(self.temporary.name)
         self.state = self.base / "state"
@@ -1139,7 +1152,7 @@ class FacadeCommandTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(
-            prefix=".session-kit-msgcli-", dir=REPO
+            prefix=".session-kit-msgcli-", dir=exec_root()
         )
         self.base = Path(self.temporary.name)
         self.home = self.base / "home"

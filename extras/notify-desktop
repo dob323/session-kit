@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Example desktop notifier for SESSION_KIT_WATCHDOG_NOTIFY.
+#
+# Session Kit never picks a notification channel for you: the watchdog calls
+# whatever executable SESSION_KIT_WATCHDOG_NOTIFY names, with
+#
+#   --type=<alert type>  --severity=<warning>  --title=<subject>  --body=<text>
+#
+# This is the smallest useful implementation of that contract — a desktop
+# popup through notify-send on Linux or osascript on macOS. Copy it, point the
+# variable at your copy, and change the last few lines to reach a phone, a
+# chat room, or an alert hub instead.
+#
+#   export SESSION_KIT_WATCHDOG_NOTIFY="$HOME/.local/bin/notify-desktop"
+#   export SESSION_KIT_ATTENTION_NOTIFY=1        # opt in to the queue alerts
+#
+# Unknown flags are ignored rather than refused: the contract may grow, and a
+# notifier that starts failing on a new flag would silence every alert.
+
+set -u
+
+title="Session Kit"
+body=""
+severity="warning"
+alert_type="session-kit"
+
+for argument in "$@"; do
+  case "$argument" in
+    --title=*) title=${argument#--title=} ;;
+    --body=*) body=${argument#--body=} ;;
+    --severity=*) severity=${argument#--severity=} ;;
+    --type=*) alert_type=${argument#--type=} ;;
+    *) ;;
+  esac
+done
+
+# Both fields reach a desktop as data, never as a command line: they carry
+# session titles and question text written by another process.
+case "$(uname -s 2>/dev/null || true)" in
+  Darwin)
+    if command -v terminal-notifier >/dev/null 2>&1; then
+      exec terminal-notifier -title "$title" -message "$body" \
+        -group "$alert_type"
+    fi
+    exec osascript -e 'on run {t, b}
+display notification b with title t
+end run' -- "$title" "$body"
+    ;;
+  *)
+    command -v notify-send >/dev/null 2>&1 || {
+      printf 'notify-desktop: notify-send is not installed\n' >&2
+      exit 1
+    }
+    urgency=normal
+    [[ $severity != critical ]] || urgency=critical
+    exec notify-send --app-name="Session Kit" --urgency="$urgency" \
+      -- "$title" "$body"
+    ;;
+esac

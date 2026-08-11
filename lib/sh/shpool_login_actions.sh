@@ -790,6 +790,194 @@ open_reply_row() {
   CONFIRM_FORGIVE=1
 }
 
+# ---- peek, jump, and view toggles --------------------------------------
+# A row says a session needs a reply. It does not say what the session asked,
+# and finding that out meant attaching to it -- which marks it seen, moves the
+# window, and loses the list. Peek shows the question and the last messages in
+# place, and answers from there through the same `sp msg` the message centre
+# uses, so there is no second delivery path to keep in step.
+peek_row() {
+  local wanted=$1 cols answer status
+  [[ $wanted =~ ^[0-9]+$ ]] || {
+    echo "  Choose a session number shown here, such as i3. Nothing changed."
+    return
+  }
+  number_on_page "$wanted" || {
+    echo "  Choose a number shown here. Nothing changed."
+    return
+  }
+  cols=${COLUMNS:-}
+  [[ $cols =~ ^[0-9]+$ ]] || cols=$(tput cols 2>/dev/null || printf '100')
+  [[ $cols =~ ^[0-9]+$ ]] || cols=100
+  while true; do
+    local card=""
+    status=0
+    card=$(python3 "$PEEK_TOOL" --view "$VIEW" --snapshot "$SNAPSHOT" \
+      --state "$SK_STATE_DIR" --number "$wanted" --width "$cols" 2>/dev/null) ||
+      status=$?
+    if (( status != 0 )) || [[ -z $card ]]; then
+      echo "  That session's details could not be read. Nothing changed."
+      return
+    fi
+    printf '%s\n' "$card"
+    echo
+    echo "  Type a reply and press Enter · o: open the session · Enter: back"
+    echo
+    picker_modal_read answer "  peek $wanted ❯ " || return 0
+    case "$answer" in
+      "")
+        # The card owned the screen; hand the list back a clean frame, the
+        # same way the message report and the message centre do. A reply is
+        # deliberately NOT cleared: its receipts are worth reading.
+        picker_clear_screen
+        return 0
+        ;;
+      o|O)
+        choose_number "$wanted"
+        return 0
+        ;;
+      *)
+        peek_reply "$wanted" "$answer"
+        return 0
+        ;;
+    esac
+  done
+}
+
+# The reply itself is `sp msg <number> "text"` and nothing else: the same
+# resolution, the same ledger, the same receipts a person sees when they write
+# from the message centre or the command line.
+peek_reply() {
+  local number=$1 text=$2
+  require_live_actions || return 0
+  if ! "$SP_CMD" msg "$number" "$text"; then
+    echo "  The message was not sent. Nothing changed."
+    return 0
+  fi
+  printf '  Sent to session %s.\n' "$number"
+  CONFIRM_FORGIVE=1
+}
+
+# Every listed session that is waiting on a person or has finished unopened,
+# in the order the page shows them, with the row's position so the caller can
+# turn to the page it is on.
+picker_attention_numbers() {
+  python3 - "$VIEW" 2>/dev/null <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        rows = json.load(handle).get("sessions", [])
+except (OSError, ValueError):
+    raise SystemExit(0)
+for index, row in enumerate(rows):
+    if not isinstance(row, dict):
+        continue
+    number = row.get("terminal_number")
+    if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
+        continue
+    if (
+        row.get("needs_you")
+        or row.get("setup_incomplete")
+        or row.get("_picker_attention_bucket")
+    ):
+        print(f"{number}\t{index}")
+PY
+}
+
+# Move to the next session that wants a person, wrapping at the end. The row
+# is marked rather than selected: nothing is opened, attached, or acknowledged
+# by finding it.
+jump_next_attention() {
+  local line number index chosen="" chosen_index=0 first="" first_index=0
+  local seen_current=0
+  while IFS=$'\t' read -r number index; do
+    [[ $number =~ ^[0-9]+$ && $index =~ ^[0-9]+$ ]] || continue
+    if [[ -z $first ]]; then
+      first=$number
+      first_index=$index
+    fi
+    if [[ -z $PICKER_JUMP_NUMBER ]]; then
+      chosen=$number
+      chosen_index=$index
+      break
+    fi
+    if (( seen_current )) && [[ -z $chosen ]]; then
+      chosen=$number
+      chosen_index=$index
+      break
+    fi
+    [[ $number == "$PICKER_JUMP_NUMBER" ]] && seen_current=1
+  done < <(picker_attention_numbers)
+  if [[ -z $chosen ]]; then
+    if [[ -z $first ]]; then
+      PICKER_JUMP_NUMBER=""
+      echo "  No listed session is waiting on you."
+      return
+    fi
+    # Past the last one, or the marked row is gone: start again at the top.
+    chosen=$first
+    chosen_index=$first_index
+  fi
+  PICKER_JUMP_NUMBER=$chosen
+  (( PAGE_SIZE >= 1 )) || PAGE_SIZE=1
+  PAGE=$(( chosen_index / PAGE_SIZE + 1 ))
+  clamp_page
+  printf '  Session %s wants you — open with %s, peek with %s.\n' \
+    "$chosen" "$(picker_green "$chosen")" "$(picker_green "i$chosen")"
+}
+
+# Grouping decides which rows sit together, never which rows exist. State is
+# the default the picker has always drawn; the other two are opt-in for one
+# session of the picker and reset when it is next started.
+cycle_grouping() {
+  local requested=${1:-} mode previous
+  case "${requested,,}" in
+    "")
+      case "$(picker_group_mode)" in
+        state) mode=provider ;;
+        provider) mode=project ;;
+        *) mode=state ;;
+      esac
+      ;;
+    state) mode=state ;;
+    provider) mode=provider ;;
+    project) mode=project ;;
+    *)
+      echo "  Grouping is state, provider, or project. Nothing changed."
+      return
+      ;;
+  esac
+  previous=${PICKER_GROUP_MODE:-state}
+  PICKER_GROUP_MODE=$mode
+  if ! build_view; then
+    PICKER_GROUP_MODE=$previous
+    build_view || {
+      sk_log_action picker_refresh failed || true
+      echo "  The list could not be rebuilt; showing the previous view."
+      return
+    }
+    echo "  The list could not be regrouped. The grouping is unchanged."
+    return
+  fi
+  PAGE=1
+  printf '  Grouping by %s.\n' "$mode"
+}
+
+# Compact rows drop the group headings and the trailing spacer, and keep only
+# the primary state beside each name. Same rows, same numbers, more of them.
+toggle_compact() {
+  if [[ ${PICKER_COMPACT:-0} == 1 ]]; then
+    PICKER_COMPACT=0
+    echo "  Compact rows off."
+  else
+    PICKER_COMPACT=1
+    echo "  Compact rows on."
+  fi
+  PAGE=1
+}
+
 # Hand the window to the message centre. Writing a message, watching the
 # answers, and going back to an older one all live there, in one surface that
 # the command line reaches the same way -- this menu entry only opens it, so

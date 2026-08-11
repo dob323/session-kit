@@ -47,6 +47,7 @@ class PreflightCase(unittest.TestCase):
             source_digest=self.event["prompt_sha256"],
         )
         self.msg_id = outcome["entry"]["msg_id"]
+        self.delivered: list[dict] = []
         self.name_supervisor(SUPERVISOR_UUID)
 
     def tearDown(self) -> None:
@@ -83,6 +84,9 @@ class PreflightCase(unittest.TestCase):
                 "requested_model": "claude-opus-test",
                 "expertise": "security",
                 "rationale": "independent analysis before integration",
+                "task_text": "audit the requirements and name every failure mode",
+                "acceptance_criteria": "every declared risk has a named mitigation",
+                "deliverable": "a written risk analysis on the branch",
             },
             {
                 "branch": "agent-implementation",
@@ -93,6 +97,9 @@ class PreflightCase(unittest.TestCase):
                 "requested_model": "gpt-codex-test",
                 "expertise": "implementation",
                 "rationale": "separate implementation expertise and model family",
+                "task_text": "implement the approved change and its tests",
+                "acceptance_criteria": "the full suite passes on the branch",
+                "deliverable": "commits on the branch plus the test output",
             },
         ]
 
@@ -101,6 +108,7 @@ class PreflightCase(unittest.TestCase):
             "analysis": "read the exact source event and inspected current intake state",
             "scope": "the current source event and its complete ordered requirements",
             "required_expertise": "security analysis plus Python state-machine implementation",
+            "required_expertise_tags": ("security", "implementation"),
             "worker_plan": plan if plan is not None else self.plan(),
             "risks": "duplicate launch, stale authority, provider drift, and incomplete tests",
             "tests": "identity, mismatch, crash, concurrency, amendment, and full-suite tests",
@@ -133,7 +141,17 @@ class PreflightCase(unittest.TestCase):
     def launch(_assignment: dict) -> None:
         return None
 
-    def delegate(self, launcher=None, reconciler=None, branches=None, workers=()):
+    def courier(self, *, thread_key: str, text: str, key: str) -> dict:
+        """A send that lands, recording what the worker was actually told."""
+        self.delivered.append({"thread_key": thread_key, "text": text, "key": key})
+        return {
+            "msg_id": "cc33dd44",
+            "targets": [{"thread_key": thread_key, "status": "delivered-woke"}],
+        }
+
+    def delegate(
+        self, launcher=None, reconciler=None, branches=None, workers=(), deliver=None
+    ):
         return intake.delegate(
             self.spool,
             msg_id=self.msg_id,
@@ -141,6 +159,7 @@ class PreflightCase(unittest.TestCase):
             workers=workers,
             launcher=launcher or self.launch,
             reconciler=reconciler or self.inventory_proof,
+            deliver=deliver or self.courier,
             state_dir=self.state,
         )
 
@@ -177,20 +196,55 @@ class PreflightPolicyTests(PreflightCase):
         self.assertEqual(f"claude:{SUPERVISOR_UUID}", row["supervisor_thread_key"])
         self.assertEqual("hook-ledger", row["verification_basis"])
 
-    def test_automatic_plan_requires_two_providers_models_and_expertise_scopes(self) -> None:
+    def test_a_plan_of_any_composition_that_covers_the_declared_needs_is_accepted(
+        self,
+    ) -> None:
+        """Composition is the plan's business; covering the stated need is not."""
+        one_claude_worker = [
+            {**self.plan()[0], "expertise": "implementation"},
+        ]
+        two_claude_workers = [
+            {**self.plan()[0]},
+            {
+                **self.plan()[1],
+                "provider": "claude",
+                "requested_model": "claude-opus-test",
+                "expertise": "implementation",
+            },
+        ]
         cases = (
-            self.plan()[:1],
-            [{**row, "provider": "codex"} for row in self.plan()],
-            [{**row, "requested_model": "same-model"} for row in self.plan()],
-            [{**row, "expertise": "same expertise"} for row in self.plan()],
+            (one_claude_worker, ("implementation",)),
+            (two_claude_workers, ("security", "implementation")),
+            (self.plan(), ("implementation",)),
         )
-        for plan in cases:
-            with self.subTest(plan=plan), self.assertRaises(intake.IntakeError):
+        for plan, tags in cases:
+            with self.subTest(size=len(plan), tags=tags):
+                result = self.preflight(plan=plan, required_expertise_tags=tags)
+                self.assertEqual(list(tags), result["preflight"]["required_expertise_tags"])
+                self.assertEqual(len(plan), len(result["preflight"]["worker_plan"]))
+
+    def test_a_plan_that_misses_a_declared_need_is_refused(self) -> None:
+        with self.assertRaisesRegex(intake.IntakeError, "does not cover"):
+            self.preflight(required_expertise_tags=("security", "operations"))
+        with self.assertRaisesRegex(intake.IntakeError, "needs the expertise"):
+            self.preflight(required_expertise_tags=())
+        with self.assertRaises(intake.IntakeError):
+            self.preflight(required_expertise_tags=("security", "security"))
+        with self.assertRaises(intake.IntakeError):
+            self.preflight(required_expertise_tags=("wizardry",))
+
+    def test_a_planned_worker_without_a_duty_is_refused(self) -> None:
+        for field in ("task_text", "acceptance_criteria", "deliverable"):
+            plan = [dict(row) for row in self.plan()]
+            plan[1][field] = ""
+            with self.subTest(field=field), self.assertRaisesRegex(
+                intake.IntakeError, "required"
+            ):
                 self.preflight(plan=plan)
 
     def test_automatic_delegate_must_launch_the_complete_plan(self) -> None:
         self.preflight()
-        with self.assertRaisesRegex(intake.IntakeError, "complete multi-provider"):
+        with self.assertRaisesRegex(intake.IntakeError, "complete reviewed plan"):
             self.delegate(branches=("agent-research",))
 
     def test_new_amendment_invalidates_preflight_for_future_workers(self) -> None:
@@ -303,7 +357,7 @@ class LaunchLifecycleTests(PreflightCase):
         workers = result["entry"]["workers"]
         self.assertEqual("dispatching", workers[0]["launch_state"])
         self.assertEqual(old_first_key, workers[0]["idempotency_key"])
-        self.assertEqual("verified", workers[1]["launch_state"])
+        self.assertEqual("commissioned", workers[1]["launch_state"])
         self.assertTrue(workers[1]["idempotency_key"].endswith(":revision-1"))
         self.assertEqual(1, workers[1]["intake_generation"])
         self.assertEqual(intake.requirements_digest(result["entry"]), workers[1]["requirements_digest"])
@@ -323,7 +377,7 @@ class LaunchLifecycleTests(PreflightCase):
         self.assertEqual([["dispatching", "not_started"], ["verified", "dispatching"]], observed)
         self.assertEqual(["agent-research", "agent-implementation"], result["delegated"])
         for row in result["entry"]["workers"]:
-            self.assertEqual("verified", row["launch_state"])
+            self.assertEqual("commissioned", row["launch_state"])
             self.assertEqual(row["requested_model"], row["verified_actual_model"])
             self.assertTrue(row["worker_identity"])
             self.assertTrue(row["idempotency_key"])

@@ -17,10 +17,29 @@ class PublicScanTests(unittest.TestCase):
         self.root = Path(
             tempfile.mkdtemp(prefix="session-kit-public-scan.", dir=REPO.parent)
         )
+        # Auxiliary files live outside the scanned root so a baseline fixture
+        # never becomes part of the tree or history under test.
+        self.workspace = Path(
+            tempfile.mkdtemp(prefix="session-kit-public-scan-aux.", dir=REPO.parent)
+        )
         (self.root / "README.md").write_text("public fixture\n", encoding="utf-8")
 
     def tearDown(self) -> None:
         shutil.rmtree(self.root)
+        shutil.rmtree(self.workspace)
+
+    def write_baseline(self, body: str, name: str = "baseline") -> Path:
+        path = self.workspace / name
+        path.write_text(body, encoding="utf-8")
+        return path
+
+    def blob_id(self, relative: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(self.root), "hash-object", relative],
+            check=True,
+            stdout=subprocess.PIPE,
+            text=True,
+        ).stdout.strip()
 
     def run_scan(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -203,6 +222,150 @@ class PublicScanTests(unittest.TestCase):
         self.assertEqual(tree_only.returncode, 0, tree_only.stdout + tree_only.stderr)
         self.assertNotEqual(history.returncode, 0)
         self.assertIn("binary file is not allowed", history.stdout)
+
+    def test_baseline_excuses_only_the_exact_blob_it_names(self) -> None:
+        marker = "restricted" + "fixture"
+        self.init_git()
+        (self.root / "reviewed.txt").write_text(marker + "\n", encoding="utf-8")
+        (self.root / "novel.txt").write_text(marker + " two\n", encoding="utf-8")
+        reviewed = self.blob_id("reviewed.txt")
+        novel = self.blob_id("novel.txt")
+        self.commit("add fixtures")
+        (self.root / "reviewed.txt").unlink()
+        (self.root / "novel.txt").unlink()
+        self.commit("remove fixtures")
+        baseline = self.write_baseline(
+            f"# reviewed on a date\n{reviewed}  reviewed.txt\n"
+        )
+
+        unlisted = self.run_scan("--git-history", "--private-markers")
+        listed = self.run_scan(
+            "--git-history", "--private-markers", "--baseline", str(baseline)
+        )
+
+        self.assertNotEqual(unlisted.returncode, 0)
+        self.assertIn(reviewed[:12], unlisted.stdout)
+        self.assertIn(novel[:12], unlisted.stdout)
+        # The reviewed blob is forgiven; the one nobody reviewed still fails.
+        self.assertNotEqual(listed.returncode, 0)
+        self.assertNotIn(reviewed[:12], listed.stdout)
+        self.assertIn(novel[:12], listed.stdout)
+        self.assertNotIn(marker, listed.stdout)
+
+    def test_baseline_scan_passes_when_every_flagged_blob_is_reviewed(self) -> None:
+        marker = "restricted" + "fixture"
+        self.init_git()
+        (self.root / "reviewed.txt").write_text(marker + "\n", encoding="utf-8")
+        reviewed = self.blob_id("reviewed.txt")
+        self.commit("add fixture")
+        (self.root / "reviewed.txt").unlink()
+        self.commit("remove fixture")
+        baseline = self.write_baseline(f"{reviewed}  reviewed.txt\n")
+
+        result = self.run_scan(
+            "--git-history", "--private-markers", "--baseline", str(baseline)
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("1 of 1 baselined history blob(s) excused", result.stdout)
+
+    def test_baseline_never_excuses_a_secret(self) -> None:
+        marker = "restricted" + "fixture"
+        secret = "ghp_" + ("b" * 20)
+        self.init_git()
+        (self.root / "both.txt").write_text(f"{marker}\n{secret}\n", encoding="utf-8")
+        both = self.blob_id("both.txt")
+        self.commit("add fixture")
+        (self.root / "both.txt").unlink()
+        self.commit("remove fixture")
+        baseline = self.write_baseline(f"{both}  both.txt\n")
+
+        result = self.run_scan(
+            "--git-history", "--private-markers", "--baseline", str(baseline)
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("GitHub token", result.stdout)
+        self.assertNotIn(secret, result.stdout)
+
+    def test_baseline_does_not_reach_the_working_tree(self) -> None:
+        """Forgiving a published blob must not let the same bytes live on."""
+        marker = "restricted" + "fixture"
+        self.init_git()
+        (self.root / "kept.txt").write_text(marker + "\n", encoding="utf-8")
+        kept = self.blob_id("kept.txt")
+        self.commit("add fixture")
+        baseline = self.write_baseline(f"{kept}  kept.txt\n")
+
+        result = self.run_scan(
+            "--git-history", "--private-markers", "--baseline", str(baseline)
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("kept.txt: private marker", result.stdout)
+
+    def test_baseline_requires_the_history_scan(self) -> None:
+        baseline = self.write_baseline(f"{'a' * 40}  somewhere.txt\n")
+
+        result = self.run_scan("--private-markers", "--baseline", str(baseline))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--baseline applies to --git-history scans", result.stderr)
+
+    def test_unusable_baseline_fails_closed(self) -> None:
+        blob = "a" * 40
+        cases = {
+            "missing": (None, "baseline is unreadable"),
+            "empty": ("# nothing but a comment\n", "baseline lists no blobs"),
+            "malformed": ("not-a-blob-id  somewhere.txt\n", "malformed baseline line"),
+            "short": (f"{blob[:39]}  somewhere.txt\n", "malformed baseline line"),
+            "uppercase": (
+                f"{blob.upper()}  somewhere.txt\n",
+                "malformed baseline line",
+            ),
+            "duplicate": (
+                f"{blob}  one.txt\n{blob}  two.txt\n",
+                "duplicate baseline blob",
+            ),
+        }
+        for name, (body, reason) in cases.items():
+            with self.subTest(baseline=name):
+                if body is None:
+                    path = self.workspace / "absent"
+                else:
+                    path = self.write_baseline(body, name=name)
+
+                result = self.run_scan(
+                    "--git-history", "--private-markers", "--baseline", str(path)
+                )
+
+                # The refusal has to name what is wrong; argparse prints the
+                # option in its usage line whatever happens, so matching the
+                # word "baseline" alone would pass for the wrong reason.
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(reason, result.stderr)
+
+    def test_shipped_baseline_is_parsable_and_additive_only(self) -> None:
+        """The committed baseline must survive the parser it is written for."""
+        shipped = REPO / "tools" / "public-scan-history-baseline"
+        self.init_git()
+        self.commit("empty history")
+
+        result = self.run_scan(
+            "--git-history", "--private-markers", "--baseline", str(shipped)
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        # None of the shipped blobs exist in this fixture's history, and the
+        # summary has to say so rather than claim the whole list was used.
+        self.assertIn("0 of 37 baselined history blob(s) excused", result.stdout)
+        entries = [
+            line.split("#", 1)[0].strip()
+            for line in shipped.read_text(encoding="utf-8").splitlines()
+        ]
+        blobs = [entry.split()[0] for entry in entries if entry]
+        self.assertEqual(sorted(set(blobs)), sorted(blobs))
+        self.assertTrue(blobs)
 
 
 if __name__ == "__main__":

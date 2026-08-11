@@ -134,6 +134,7 @@ ${XDG_CONFIG_HOME:-$HOME/.config}/session-kit/
 ${XDG_STATE_HOME:-$HOME/.local/state}/session-kit/
 ${XDG_STATE_HOME:-$HOME/.local/state}/shpool-journal/
 ${XDG_STATE_HOME:-$HOME/.local/state}/shpool-journal-recovery/
+${XDG_STATE_HOME:-$HOME/.local/state}/shpool-archive/
 ${XDG_STATE_HOME:-$HOME/.local/state}/shpool-start/
 ```
 

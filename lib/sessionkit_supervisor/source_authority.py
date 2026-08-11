@@ -79,10 +79,36 @@ MACHINE_ENVELOPE_PREFIXES = (
     "<teammate-message",
 )
 # Machine transport this kit or the provider itself submits as a prompt.
+#
+# "RUNTIME FOR THIS WAKE" is the automation-wake banner, screened on the
+# stem all of its variants share rather than on any one full literal. Three
+# are in use right now — the watcher's Codex and Claude-fallback lines
+# (`intake.AUTOMATION_WAKE_PREFIX`), a shorter historical `(ground truth):`
+# form, and the delivery-bot line in `sessionkit_inventory.self_name` — and
+# matching a full literal is what let a fallback wake through when the
+# primary provider errored. The stem cannot drift with the sentence after it.
 OPERATOR_ENVELOPE_PREFIXES = (
     "[session-kit operator message",
     "Continue from where you left off.",
+    "RUNTIME FOR THIS WAKE",
     "You are a Session Kit delivery runner.",
+)
+# A launcher states the machine that started this conversation. Any process
+# can set it, so it may only ever REMOVE authority, never grant it, and it is
+# never consulted to decide that a prompt IS the operator's.
+MACHINE_ORIGIN_ENV = "SESSION_KIT_MACHINE_ORIGIN"
+MAX_MACHINE_ORIGIN_BYTES = 200
+# Codex opens a session by writing its own synthetic user-role records before
+# the operator's first prompt, and those records carry no turn id of their own,
+# so they land on the first real turn. They are Codex's text, not the person's,
+# and they must not be read as a competing prompt for that turn. The list is
+# exact and evidence-driven — every entry was observed blocking a real event on
+# this install — so a preamble kind not named here still fails closed to a
+# refusal rather than being waved through.
+CODEX_PREAMBLE_PREFIXES = (
+    "# AGENTS.md instructions",
+    "<environment_context",
+    "<recommended_plugins",
 )
 # Codex names one rollout `rollout-<timestamp>-<session id>.jsonl` under a
 # `CODEX_HOME/sessions/YYYY/MM/DD` directory. The depth and entry bounds keep
@@ -105,6 +131,35 @@ PROVIDER_TRANSCRIPT_MODE_MASK = 0o022
 CODEX_ROLLOUT_MAX_DEPTH = 4
 CODEX_ROLLOUT_MAX_ENTRIES = 50_000
 CODEX_ROLLOUT_TIMESTAMP = r"\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}"
+# Claude names one transcript `<session id>.jsonl` under a per-project
+# directory inside a `projects` root. Two levels reach it; the third is slack
+# for a provider that nests further, and the entry bound keeps a prompt hook
+# from walking an unexpectedly large or looping tree.
+CLAUDE_TRANSCRIPT_MAX_DEPTH = 3
+CLAUDE_TRANSCRIPT_MAX_ENTRIES = 50_000
+ACCOUNT_ROOT_ENV = "SESSION_KIT_ACCOUNT_ROOT"
+AUTHORITY_POLICY_ENV = "SESSION_KIT_AUTHORITY_POLICY_PATH"
+TESTING_ENV = "SESSION_KIT_TESTING"
+# The evidence ladder. `verified` stays "tier >= 1", so nothing that reads the
+# boolean changes meaning; the tier is what lets a policy tell corroborated
+# evidence from the kit's own word for it.
+TIER_UNVERIFIED = 0
+TIER_LEDGER_ONLY_LAG = 1
+TIER_HOOK_LEDGER = 2
+TIER_TRANSCRIPT = 3
+TIER_NAMES = {
+    TIER_UNVERIFIED: "unverified",
+    TIER_LEDGER_ONLY_LAG: "ledger-only-lag",
+    TIER_HOOK_LEDGER: "hook-ledger",
+    TIER_TRANSCRIPT: "transcript",
+}
+AUTHORITY_ACTIONS = (
+    "preflight",
+    "delegate",
+    "send_lane3",
+    "broadcast",
+    "raise_budget",
+)
 
 
 class SourceAuthorityError(ValueError):
@@ -345,6 +400,42 @@ def _direct_source_prompt(prompt: str) -> bool:
     )
 
 
+def _machine_origin(environ: Mapping[str, str]) -> str:
+    """The declared machine origin, flattened and bounded, or "".
+
+    Whatever a launcher put in the environment ends up in a stored event and
+    in an operator-visible reason, so it is stripped of control characters and
+    bounded here. A value too long to store still counts as an origin: it is
+    reported as `declared` rather than silently becoming an ordinary prompt.
+    """
+    raw = environ.get(MACHINE_ORIGIN_ENV, "")
+    if not isinstance(raw, str) or not raw.strip():
+        return ""
+    flattened = " ".join(
+        "".join(character for character in raw if character >= " ").split()
+    )
+    if not flattened:
+        return "declared"
+    if len(flattened.encode("utf-8")) > MAX_MACHINE_ORIGIN_BYTES:
+        return flattened.encode("utf-8")[:MAX_MACHINE_ORIGIN_BYTES].decode(
+            "utf-8", "ignore"
+        )
+    return flattened
+
+
+def machine_envelope_prompt(value: object) -> bool:
+    """Whether a prompt is harness or kit transport, not a person's own words.
+
+    The public form of the screen `_direct_source_prompt` applies to source
+    events, exposed because the intake requirement chain needs the same answer:
+    an envelope is already refused as authority, so recording one as a
+    requirement can only make the intake it lands on permanently undelegatable.
+    """
+    if not isinstance(value, str):
+        return False
+    return not _direct_source_prompt(value)
+
+
 def _turn(value: object) -> tuple[str, bool]:
     if not isinstance(value, str):
         return "", False
@@ -374,6 +465,127 @@ def _codex_sessions_root() -> Path:
         Path(os.environ.get("CODEX_HOME", os.fspath(home / ".codex"))).resolve()
         / "sessions"
     )
+
+
+def _account_profile_root() -> Path:
+    """`<data>/session-kit/accounts`, by the rule `accounts.account_root` uses.
+
+    Repeated rather than imported: this runs inside a prompt hook, and the
+    supervisor package must not pull the inventory package in to answer one
+    path question. `lib/sessionkit_inventory/accounts.py` owns the rule; if it
+    moves, this moves with it and `AccountRootTests` fails until it does.
+    """
+    override = os.environ.get(ACCOUNT_ROOT_ENV)
+    if override and Path(override).is_absolute():
+        return Path(override)
+    data_home = os.environ.get("XDG_DATA_HOME")
+    base = Path(data_home) if data_home else Path.home() / ".local" / "share"
+    return base / "session-kit" / "accounts"
+
+
+def _claude_transcript_roots() -> list[Path]:
+    """Every directory a Claude transcript this kit can vouch for may live in.
+
+    `HOME/.claude/projects` is the provider default. The other two exist
+    because the kit itself moves the file: account rotation exports
+    `CLAUDE_CONFIG_DIR=<accounts>/claude/<alias>` (`accounts._provider_environment`,
+    `bashrc/shpool.bashrc`), and the provider then writes its transcripts under
+    that profile instead. A verifier that knows only the default root calls the
+    kit's own feature unverifiable — which is exactly what it did.
+
+    Listing a root is not trusting it. Every path found under one still passes
+    the same ownership, mode, symlink, and containment screen in
+    `_transcript_path` before a byte is read, and a session id that resolves
+    under two roots refuses rather than choosing (see `_claude_transcript_path`).
+    """
+    home = Path(os.environ.get("HOME", os.fspath(Path.home()))).resolve()
+    roots = [(home / ".claude" / "projects").resolve()]
+    configured = os.environ.get("CLAUDE_CONFIG_DIR")
+    if configured and Path(configured).is_absolute():
+        roots.append((Path(configured) / "projects").resolve())
+    accounts = _account_profile_root() / "claude"
+    try:
+        with os.scandir(accounts) as entries:
+            profiles = sorted(
+                entry.path
+                for entry in entries
+                if entry.is_dir(follow_symlinks=False) and not entry.is_symlink()
+            )
+    except OSError:
+        profiles = []
+    for profile in profiles:
+        roots.append((Path(profile) / "projects").resolve())
+    ordered: list[Path] = []
+    for root in roots:
+        if root not in ordered:
+            ordered.append(root)
+    return ordered
+
+
+def _transcript_roots(provider: str, state_dir: Path) -> list[Path]:
+    """The allowed containment roots for one provider's transcript evidence."""
+    roots = [(Path(state_dir) / "test-transcripts").resolve()]
+    if provider == "claude":
+        roots.extend(_claude_transcript_roots())
+    elif provider == "codex":
+        roots.append(_codex_sessions_root())
+    return roots
+
+
+def _claude_transcript_path(session_id: str, state_dir: Path) -> str:
+    """The one transcript Claude wrote for this session, or "".
+
+    The same shape as `_codex_rollout_path`, for the same reason: an event
+    whose payload named no reachable file would otherwise be permanently
+    unverifiable even though the provider's own record is sitting on this disk.
+    The file name must be exactly `<session id>.jsonl` — anchored, never a
+    prefix or a substring of a longer id — and it must be reached without
+    crossing a symlink at any level. Zero matches, more than one, or a tree
+    larger than the bound all return "", which leaves exactly the unsafe result
+    the unreachable payload produces today. Uniqueness counts distinct paths,
+    so a decoy planted under a second root can only refuse authority; it can
+    never redirect it at a real transcript's expense.
+    """
+    exact = valid_uuid(session_id)
+    if not exact:
+        return ""
+    name = exact + ".jsonl"
+    found: list[str] = []
+    budget = CLAUDE_TRANSCRIPT_MAX_ENTRIES
+    pending: list[tuple[Path, int]] = [
+        (root, 0) for root in _transcript_roots("claude", state_dir)
+    ]
+    while pending:
+        directory, depth = pending.pop()
+        if depth == 0 and directory.is_symlink():
+            continue
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    budget -= 1
+                    if budget <= 0:
+                        return ""
+                    if entry.is_symlink():
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        if depth < CLAUDE_TRANSCRIPT_MAX_DEPTH:
+                            pending.append((Path(entry.path), depth + 1))
+                    elif entry.is_file(follow_symlinks=False) and entry.name == name:
+                        if entry.path not in found:
+                            found.append(entry.path)
+                        if len(found) > 1:
+                            return ""
+        except OSError:
+            continue
+    return found[0] if len(found) == 1 else ""
+
+
+def _evidence_root(provider: str, state_dir: Path, path: Path) -> str:
+    """Which allowed root the verified transcript actually came from."""
+    for root in _transcript_roots(str(provider), Path(state_dir)):
+        if _inside(path, root):
+            return os.fspath(root)
+    return ""
 
 
 def _codex_rollout_path(session_id: str) -> str:
@@ -445,16 +657,7 @@ def _transcript_path(
     # keeps the strict mask. Ownership is exact for both: a file this uid does
     # not own is foreign evidence no matter what its mode bits say.
     mask = PROVIDER_TRANSCRIPT_MODE_MASK if provider == "codex" else PRIVATE_MODE_MASK
-    home = Path(os.environ.get("HOME", os.fspath(Path.home()))).resolve()
-    test_root = (state_dir / "test-transcripts").resolve()
-    roots = [test_root]
-    if provider == "claude":
-        roots.append((home / ".claude" / "projects").resolve())
-    elif provider == "codex":
-        roots.append(
-            Path(os.environ.get("CODEX_HOME", os.fspath(home / ".codex"))).resolve()
-            / "sessions"
-        )
+    roots = _transcript_roots(provider, state_dir)
     try:
         canonical_parent = path.parent.resolve(strict=True)
     except OSError:
@@ -666,6 +869,7 @@ class SourceEventStore:
         raw_prompt: object,
         transcript_path: object = None,
         clock: Callable[[], float] = time.time,
+        environ: Mapping[str, str] = os.environ,
     ) -> dict[str, Any]:
         exact_session = valid_uuid(session_id)
         if provider not in ("claude", "codex") or not exact_session:
@@ -685,6 +889,23 @@ class SourceEventStore:
         safe_transcript, transcript_safe, transcript_anchor = _transcript_path(
             provider, transcript_path, self.state_dir
         )
+        if provider == "claude" and not transcript_safe:
+            # Claude's own payload path is authoritative whenever it passes.
+            # When it is empty, or lands outside every allowed root — which is
+            # exactly what an account-profile session produced before those
+            # roots were known — the session's own transcript stands in, and
+            # only when it is unmistakable. A discovery that does not itself
+            # pass the full screen changes nothing, so a named-but-unwritten
+            # first-turn path keeps the missing-file result it has today.
+            discovered = _claude_transcript_path(exact_session, self.state_dir)
+            if discovered and discovered != safe_transcript:
+                found, found_safe, found_anchor = _transcript_path(
+                    provider, discovered, self.state_dir
+                )
+                if found_safe:
+                    safe_transcript = found
+                    transcript_safe = found_safe
+                    transcript_anchor = found_anchor
         digest = hashlib.sha256(raw_bytes).hexdigest()
         submission_key, valid_submission = _submission_key(
             provider, turn_id, transcript_anchor, digest
@@ -708,7 +929,13 @@ class SourceEventStore:
                 return existing
             previous = str(self.ledger.scan()["head_event_hash"])
             direct_source = _direct_source_prompt(raw_prompt)
-            capable = bool(valid_submission and transcript_safe and direct_source)
+            origin = _machine_origin(environ)
+            capable = bool(
+                valid_submission
+                and transcript_safe
+                and direct_source
+                and not origin
+            )
             event: dict[str, Any] = {
                 "schema": 2,
                 "event_id": event_id,
@@ -724,6 +951,8 @@ class SourceEventStore:
                 "authority_capable": capable,
                 "authority_limit_reason": (
                     "" if capable else
+                    f"machine-origin launch ({origin}) is not direct source authority"
+                    if origin else
                     "missing or malformed provider submission key" if not valid_submission else
                     "unsafe transcript_path" if not transcript_safe else
                     "machine/operator envelope is not direct source authority"
@@ -731,6 +960,12 @@ class SourceEventStore:
                 "recorded_unix_ms": _now_ms(clock),
                 "previous_event_hash": previous,
             }
+            if origin:
+                # Only present when declared, so an ordinary prompt's stored
+                # shape and event hash are exactly what they were before this
+                # field existed. Being inside the hashed body makes a recorded
+                # origin tamper-evident.
+                event["machine_origin"] = origin
             event["event_hash"] = hashlib.sha256(_canonical(event)).hexdigest()
             payload = json.dumps(event, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8") + b"\n"
             if len(payload) > MAX_EVENT_BYTES:
@@ -867,6 +1102,7 @@ def capture_hook_event(
     *,
     state_dir: Path | str,
     clock: Callable[[], float] = time.time,
+    environ: Mapping[str, str] = os.environ,
 ) -> dict[str, Any]:
     if not isinstance(payload, Mapping):
         raise SourceAuthorityError("source hook payload is not an object")
@@ -883,6 +1119,7 @@ def capture_hook_event(
         raw_prompt=payload.get("prompt"),
         transcript_path=payload.get("transcript_path") or payload.get("transcriptPath"),
         clock=clock,
+        environ=environ,
     )
 
 
@@ -1175,6 +1412,17 @@ def _user_texts(record: Mapping[str, Any]) -> list[str]:
     return texts
 
 
+def _codex_preamble_only(texts: Sequence[str]) -> bool:
+    """True when every text here is Codex's own session preamble.
+
+    A record mixing preamble with anything else is not preamble: it still has
+    to match, so the disqualifying rule keeps its reach.
+    """
+    return bool(texts) and all(
+        text.lstrip().startswith(CODEX_PREAMBLE_PREFIXES) for text in texts
+    )
+
+
 def _verify_codex_transcript(
     event: Mapping[str, Any], head: bytes, tail: bytes
 ) -> str:
@@ -1228,11 +1476,19 @@ def _verify_codex_transcript(
         texts = _user_texts(record)
         record_turn = turn or active_turn
         if texts and record_turn == target_turn:
-            saw_user_for_turn = True
             if claims and claims != {target_session}:
                 raise SourceAuthorityError("Codex transcript source session mismatch")
             if any(prompt_sha256(text) == event["prompt_sha256"] for text in texts):
                 return "verified"
+            if _codex_preamble_only(texts):
+                # Codex's own opening record, not a competing prompt. Skipping
+                # it without marking the turn as seen keeps an unwritten prompt
+                # a lag, not a mismatch. Every later record at this turn is
+                # still disqualifying: one non-matching human-role text after
+                # the preamble refuses, which is what stops an appended record
+                # from being accepted behind a real one.
+                continue
+            saw_user_for_turn = True
             raise SourceAuthorityError("Codex transcript prompt digest mismatch")
     if records and not saw_target_turn and not partial:
         raise SourceAuthorityError("Codex transcript source turn mismatch")
@@ -1314,8 +1570,14 @@ def verify_source_event(
     event_id: object,
     *,
     clock: Callable[[], float] = time.time,
+    record: bool = True,
 ) -> dict[str, Any]:
-    """Verify one event, preferring the provider transcript when available."""
+    """Verify one event, preferring the provider transcript when available.
+
+    `record=False` answers the same question without writing the verification
+    marker, so a read-only instrument can report the live tier distribution
+    without leaving receipts behind for verifications nobody asked for.
+    """
     store = SourceEventStore(state_dir)
     try:
         event = store.read(event_id)
@@ -1334,8 +1596,17 @@ def verify_source_event(
             raise SourceAuthorityError(
                 "machine/operator envelope is not direct source authority"
             )
+        recorded_origin = str(event.get("machine_origin") or "")
+        if recorded_origin:
+            raise SourceAuthorityError(
+                f"machine-origin launch ({recorded_origin}) is not direct source authority"
+            )
         transcript = str(event.get("transcript_path") or "")
         basis = "hook-ledger"
+        # No provider file was consulted: the kit's own hook and its
+        # hash-chained ledger are the whole of the evidence.
+        tier = TIER_HOOK_LEDGER
+        evidence_root = ""
         if transcript:
             path = Path(transcript)
             try:
@@ -1346,10 +1617,26 @@ def verify_source_event(
                 result = _verify_transcript(event, path)
                 if result == "verified":
                     basis = "transcript"
-        with store.locked():
-            store.mark_verification(str(event["event_id"]), basis=basis, clock=clock)
+                    tier = TIER_TRANSCRIPT
+                    evidence_root = _evidence_root(
+                        str(event["provider"]), Path(state_dir), path
+                    )
+                else:
+                    # The provider's file exists and did not contradict the
+                    # event; it simply has not caught up yet. That is weaker
+                    # than a file that never existed, because the corroboration
+                    # this event claims is the one thing still missing.
+                    tier = TIER_LEDGER_ONLY_LAG
+        if record:
+            with store.locked():
+                store.mark_verification(
+                    str(event["event_id"]), basis=basis, clock=clock
+                )
         return {
             "verified": True,
+            "tier": tier,
+            "tier_name": TIER_NAMES[tier],
+            "evidence_root": evidence_root,
             "event_id": event["event_id"],
             "provider": event["provider"],
             "source_thread_key": f"{event['provider']}:{event['session_id']}",
@@ -1367,7 +1654,311 @@ def verify_source_event(
             "verified": False,
             "event_id": event_id if isinstance(event_id, str) else "",
             "basis": "none",
+            "tier": TIER_UNVERIFIED,
+            "tier_name": TIER_NAMES[TIER_UNVERIFIED],
+            "evidence_root": "",
             "transcript_verified": False,
             "non_cryptographic": False,
             "reason": str(exc),
         }
+
+
+def _read_release_file(path: Path, *, maximum: int) -> bytes:
+    """One shipped configuration file, read under the no-foreign-write rule.
+
+    Kit *state* is owner-private and stays that way. A file shipped inside a
+    release is not state: it is installed under the operator's umask and is
+    ordinarily world-readable, so the strict mask would reject the kit's own
+    config on any normal machine. What matters for a policy nobody may weaken
+    is that no other account can write it — owned by this uid, no group or
+    other write bit, a regular file, never a symlink.
+    """
+    info = path.lstat()
+    if (
+        stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or stat.S_IMODE(info.st_mode) & PROVIDER_TRANSCRIPT_MODE_MASK
+        or info.st_size > maximum
+    ):
+        raise SourceAuthorityError(f"{path} is not a trustworthy release file")
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        return os.read(descriptor, maximum)
+    finally:
+        os.close(descriptor)
+
+
+def locate_transcript(
+    provider: object, session_id: object, state_dir: Path | str
+) -> str:
+    """The provider file this session's evidence resolves to today, or "".
+
+    The public form of the two discovery walks, so a report can say whether a
+    session's corroboration exists on this machine at all — which is a
+    different question from whether the event recorded a path to it.
+    """
+    if not isinstance(provider, str) or not isinstance(session_id, str):
+        return ""
+    if provider == "claude":
+        return _claude_transcript_path(session_id, Path(state_dir))
+    if provider == "codex":
+        return _codex_rollout_path(session_id)
+    return ""
+
+
+def _policy_path(environ: Mapping[str, str] | None = None) -> Path:
+    """Where the action/tier table lives. The override is a test seam only."""
+    values = os.environ if environ is None else environ
+    override = values.get(AUTHORITY_POLICY_ENV)
+    if override and values.get(TESTING_ENV) == "1":
+        return Path(override)
+    return Path(__file__).resolve().parents[2] / "config" / "authority_policy.json"
+
+
+def authority_policy(environ: Mapping[str, str] | None = None) -> dict[str, Any]:
+    """The action/tier table, or the strictest possible table.
+
+    Fail-closed all the way down: an absent file, a file this uid does not own,
+    unreadable bytes, malformed JSON, a missing action, or a tier outside the
+    ladder all resolve to `default_required_tier`, which itself defaults to the
+    top of the ladder. A policy nobody can read must never be a policy nobody
+    has to meet.
+    """
+    strict: dict[str, Any] = {
+        "source": "",
+        "default_required_tier": TIER_TRANSCRIPT,
+        "actions": {},
+    }
+    path = _policy_path(environ)
+    try:
+        raw = _read_release_file(path, maximum=MAX_EVENT_BYTES)
+        value = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeError, ValueError, SourceAuthorityError):
+        return strict
+    if not isinstance(value, Mapping):
+        return strict
+    fallback = value.get("default_required_tier")
+    default_tier = (
+        fallback
+        if isinstance(fallback, int) and fallback in TIER_NAMES
+        else TIER_TRANSCRIPT
+    )
+    actions: dict[str, dict[str, Any]] = {}
+    rows = value.get("actions")
+    if isinstance(rows, Mapping):
+        for name, row in rows.items():
+            if not isinstance(name, str) or not isinstance(row, Mapping):
+                continue
+            tier = row.get("required_tier")
+            if not isinstance(tier, int) or tier not in TIER_NAMES:
+                continue
+            actions[name] = {
+                "required_tier": tier,
+                "authority_request": row.get("authority_request") is True,
+            }
+    return {
+        "source": os.fspath(path),
+        "default_required_tier": default_tier,
+        "actions": actions,
+    }
+
+
+def required_tier(action: object, environ: Mapping[str, str] | None = None) -> int:
+    """The tier one action needs. An action nobody wrote down needs the most."""
+    policy = authority_policy(environ)
+    row = policy["actions"].get(action) if isinstance(action, str) else None
+    if not isinstance(row, Mapping):
+        return int(policy["default_required_tier"])
+    return int(row["required_tier"])
+
+
+def _requirement_events(entry: Mapping[str, Any]) -> list[tuple[int, str]]:
+    """The intake's ordered requirement chain: the primary, then amendments.
+
+    Generation 0 is the prompt that opened the intake; generation N is the Nth
+    amendment, which is the numbering `intake.preflight` already records. A row
+    with no source event id is a manual intake and contributes nothing to the
+    chain rather than a blank link in it.
+    """
+    chain: list[tuple[int, str]] = []
+    primary = entry.get("source_event_id")
+    if isinstance(primary, str) and primary:
+        chain.append((0, primary))
+    amendments = entry.get("amendments")
+    if isinstance(amendments, Sequence) and not isinstance(amendments, (str, bytes)):
+        for index, row in enumerate(amendments, 1):
+            if not isinstance(row, Mapping):
+                continue
+            value = row.get("source_event_id")
+            if isinstance(value, str) and value:
+                chain.append((index, value))
+    return chain
+
+
+def authority_for_intake(
+    state_dir: Path | str,
+    entry: Mapping[str, Any],
+    *,
+    action: str,
+    clock: Callable[[], float] = time.time,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """What evidence this intake carries, and whether it meets one action's bar.
+
+    The single call a delegation gate makes. It reads; it decides nothing on
+    its own and it changes nothing on disk — no verification receipts are
+    written, so asking the question is not itself an event.
+
+    The chain is the intake's *requirements*: the prompt that opened it and the
+    amendments that extended it, in order. Anything else that happened to land
+    in the same thread is not a requirement and is not consulted. Refusals are
+    reported by cause, most specific first, so the message can name the one
+    thing a person would have to do about it.
+    """
+    store = SourceEventStore(state_dir)
+    wanted = required_tier(action, environ)
+    amendments = entry.get("amendments")
+    current_generation = (
+        len(amendments)
+        if isinstance(amendments, Sequence) and not isinstance(amendments, (str, bytes))
+        else 0
+    )
+    thread = str(entry.get("source_thread_key") or "this thread")
+    chain: list[dict[str, Any]] = []
+    faults: list[dict[str, Any]] = []
+    for generation, event_id in _requirement_events(entry):
+        envelope = False
+        fault = ""
+        transcript = ""
+        try:
+            stored = store.read(event_id)
+            envelope = machine_envelope_prompt(stored.get("raw_prompt"))
+            transcript = str(stored.get("transcript_path") or "")
+        except (OSError, LedgerError, SourceAuthorityError) as exc:
+            fault = str(exc)
+        result = verify_source_event(state_dir, event_id, clock=clock, record=False)
+        receipt = (store.verifications / f"{event_id}.json").is_file()
+        row = {
+            "event_id": event_id,
+            "tier": int(result.get("tier", TIER_UNVERIFIED)),
+            "basis": str(result.get("basis", "none")),
+            "prompt_sha256": str(result.get("prompt_sha256", "")),
+            "generation": generation,
+            "recorded_receipt": receipt,
+        }
+        chain.append(row)
+        faults.append(
+            {"envelope": envelope, "fault": fault, "transcript": transcript}
+        )
+    minimum = min((row["tier"] for row in chain), default=TIER_UNVERIFIED)
+    current = chain[-1] if chain else None
+    refusal: dict[str, str] | None = None
+    if not chain:
+        refusal = {
+            "code": "chain-broken",
+            "event_id": "",
+            "message": (
+                "this intake records no source event, so no requirement of it "
+                "can be traced to a person's own prompt"
+            ),
+            "remedy": f"state the instruction again in {thread}",
+        }
+    else:
+        broken = next(
+            (row for row, extra in zip(chain, faults) if extra["fault"]), None
+        )
+        enveloped = next(
+            (row for row, extra in zip(chain, faults) if extra["envelope"]), None
+        )
+        if broken is not None:
+            refusal = {
+                "code": "ledger-fault",
+                "event_id": str(broken["event_id"]),
+                "message": (
+                    "source event "
+                    + str(broken["event_id"])
+                    + " for "
+                    + thread
+                    + " could not be read from its own ledger"
+                ),
+                "remedy": (
+                    "run the source-event recovery before trusting any "
+                    "requirement of this intake"
+                ),
+            }
+        elif enveloped is not None:
+            refusal = {
+                "code": "envelope-in-chain",
+                "event_id": str(enveloped["event_id"]),
+                "message": (
+                    "requirement "
+                    + str(enveloped["generation"])
+                    + " of this intake is a harness envelope, not a person's "
+                    "own words, so the chain cannot certify what it asks for"
+                ),
+                "remedy": f"state that requirement yourself in {thread}",
+            }
+        elif current is not None and current["tier"] == TIER_UNVERIFIED:
+            refusal = {
+                "code": "generation-unverified",
+                "event_id": str(current["event_id"]),
+                "message": (
+                    "the current requirement of this intake ("
+                    + thread
+                    + ", generation "
+                    + str(current["generation"])
+                    + ") does not verify at all"
+                ),
+                "remedy": f"state the current instruction again in {thread}",
+            }
+        elif minimum == TIER_UNVERIFIED:
+            unverified = next(row for row in chain if row["tier"] == TIER_UNVERIFIED)
+            refusal = {
+                "code": "chain-broken",
+                "event_id": str(unverified["event_id"]),
+                "message": (
+                    "requirement "
+                    + str(unverified["generation"])
+                    + " of this intake does not verify, so the ordered "
+                    "requirements are no longer whole"
+                ),
+                "remedy": f"state that requirement again in {thread}",
+            }
+        elif minimum < wanted:
+            weakest = min(chain, key=lambda row: int(row["tier"]))
+            index = chain.index(weakest)
+            named = faults[index]["transcript"] or "no transcript on this machine"
+            refusal = {
+                "code": "tier-too-low",
+                "event_id": str(weakest["event_id"]),
+                "message": (
+                    str(action)
+                    + " needs tier "
+                    + str(wanted)
+                    + " ("
+                    + TIER_NAMES[wanted]
+                    + "); requirement "
+                    + str(weakest["generation"])
+                    + " of "
+                    + thread
+                    + " reaches tier "
+                    + str(weakest["tier"])
+                    + " ("
+                    + TIER_NAMES[int(weakest["tier"])]
+                    + ") — evidence: "
+                    + named
+                ),
+                "remedy": f"state the instruction again in {thread}",
+            }
+    result_value: dict[str, Any] = {
+        "allowed": refusal is None,
+        "action": str(action),
+        "required_tier": wanted,
+        "current_generation": current_generation,
+        "chain": chain,
+        "min_tier_in_chain": minimum,
+    }
+    if refusal is not None:
+        result_value["refusal"] = refusal
+    return result_value

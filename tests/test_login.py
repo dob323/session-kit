@@ -363,14 +363,19 @@ def run_pty(
 
     pid, descriptor = pty.fork()
     if pid == 0:
-        os.chdir(fixture.base)
-        if os.environ.get("SESSION_KIT_TEST_EXEC_ROOT"):
-            os.execve(
-                "/usr/bin/bash",
-                ["/usr/bin/bash", os.fspath(LOGIN)],
-                environment,
-            )
-        os.execve(LOGIN, [os.fspath(LOGIN)], environment)
+        # A child that cannot exec must never return: it is a forked copy of
+        # the test runner, and returning resumes the whole suite from here.
+        try:
+            os.chdir(fixture.base)
+            if os.environ.get("SESSION_KIT_TEST_EXEC_ROOT"):
+                os.execve(
+                    "/usr/bin/bash",
+                    ["/usr/bin/bash", os.fspath(LOGIN)],
+                    environment,
+                )
+            os.execve(LOGIN, [os.fspath(LOGIN)], environment)
+        finally:
+            os._exit(127)
 
     output = bytearray()
     deadline = time.monotonic() + 10
@@ -2146,6 +2151,11 @@ class LoginPickerTests(unittest.TestCase):
                 env_updates={
                     "SESSION_KIT_PICKER_REFRESH_SECONDS": "2",
                     "SESSION_KIT_NO_COLOR": None,
+                    # This is the repaint guarantee, not the filter preview:
+                    # with type-ahead filtering on, "/alp" would hide the
+                    # arriving row on purpose and there would be no repaint to
+                    # survive. tests/test_picker_ux.py covers the preview.
+                    "SESSION_KIT_PICKER_FILTER_LIVE": "0",
                 },
                 deferred=("Codex bravo", b"ha\nq\n"),
             )

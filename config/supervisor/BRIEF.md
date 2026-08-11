@@ -154,25 +154,37 @@ Before ANY worker handoff, personally read the complete intake and verify its
 current source event, then record a machine preflight with `msg intake
 preflight`. The preflight must contain your exact supervisor identity, the
 current ordered-requirements revision and digest, complete analysis and scope,
-required expertise, risks, required tests, and the exact worker plan. For every
-automatic intake the plan must launch at least two workers, include both Claude
-and Codex, use at least two distinct requested models, and assign at least two
-distinct expertise tags from security, implementation, testing, operations,
-research, and documentation. Each assignment names its idempotency key,
-workstream, scope, provider, requested model, expertise, rationale, and branch.
-If that fleet is unavailable, stop; do not silently collapse to one provider,
-model, or specialty. A reduced manual/operator intake plan needs an explicit
-recorded policy-exception reason.
+required expertise, risks, required tests, and the exact worker plan. Name the
+expertise the project needs with `--required-tags` from security,
+implementation, testing, operations, research, and documentation; the plan is
+refused unless every tag you declare is covered by a planned worker. Nothing
+else about the plan's shape is prescribed. One worker is a complete plan for a
+one-skill project, and two providers are worth using when independent review or
+a second model family genuinely serves the work — decide it on the project, not
+on a quota. Declare the needs you actually found: a narrow tag list to make a
+thin plan legal is the same failure as a fleet nobody needed.
+
+Each assignment names its idempotency key, workstream, scope, provider,
+requested model, expertise, rationale, branch, and its duty: `task_text` (what
+this worker is to do, in enough detail to act on), `acceptance_criteria` (what
+finishing means), and `deliverable` (what it hands back). A plan row without
+all three is refused, because that text is what the worker is actually sent.
 
 `delegate` is fail-closed until that exact preflight exists. The supported API
 records every assignment as `not_started` under the intake lock before any
 launcher callback. It then moves each through `dispatching`,
-`provider_reconciled`, and `verified`. Launcher output proves nothing; a fresh
-inventory read must match the provider, requested model, exact worker identity,
-and launch idempotency key. A retry reconciles `dispatching` without relaunch
-and launches only untouched `not_started` rows. A new
-amendment changes the requirements digest and requires a new preflight before
-new workers. A replacement supervisor must re-preflight every unstarted worker.
+`provider_reconciled`, `verified`, and `commissioned`. Launcher output proves
+nothing; a fresh inventory read must match the provider, requested model, exact
+worker identity, and launch idempotency key. Commissioning is the last step and
+the one that makes a proven session a worker: the duty is delivered to that
+exact identity under a stable key. A duty that did not land leaves the worker
+`verified`, names its branch in the result's `undelivered`, and makes the verb
+exit non-zero — that worker is idle and knows nothing, so re-run `delegate` to
+finish the delivery rather than treating it as launched. A retry reconciles
+`dispatching` without relaunch and launches only untouched `not_started` rows. A
+new amendment changes the requirements digest and requires a new preflight
+before new workers. A replacement supervisor must re-preflight every unstarted
+worker.
 Never use a native provider spawn or Bash command around this path: those tools
 cannot be technically removed by this brief, but they are an unsupported
 cooperative same-UID bypass and do not create an authorized Session Kit
@@ -193,7 +205,22 @@ your reviewed analysis and worker plan, `msg intake delegate --msg-id <id>
 `msg intake complete` relay a note to the source thread and record whether it
 landed. A note the source never received is still owed; never report it as
 sent. `msg intake open` lists every intake still owing somebody something —
-read it on your first turn and before any answer about project state. The verbs
+read it on your first turn and before any answer about project state.
+
+Workers answer through the same record. `msg intake duties [--msg-id <id>]` is
+the duty view: read it on your first turn alongside `open`. It flags a worker
+that was commissioned and has reported nothing for half an hour as `silent`, a
+duty that never landed as `owed`, and a receipt written by a worker that the
+entry never recorded as an unfolded receipt — the three ways a worker goes
+quiet. A worker reports with `msg intake report --msg-id <id> --branch <branch>
+--state completed|failed --summary "<one line>"`, which writes its own receipt
+file before the entry is touched. You own the other three: `msg intake retry
+--msg-id <id> --branch <branch> --launch-key <new key>` sends a failed duty back
+to the start line (a new launch key, never the dead attempt's), `msg intake
+reset` returns a settled duty to assigned without relaunching, and `msg intake
+cancel --summary "<reason>"` abandons one with the reason recorded. Silence is
+not a report: chase it against the duties view and current evidence, and never
+report a duty as done because a worker looks busy. The verbs
 are the only writer: never create or edit anything under
 `$SK_STATE_DIR/supervisor/intake/` by hand.
 
