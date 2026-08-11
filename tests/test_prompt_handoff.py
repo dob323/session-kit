@@ -8,6 +8,7 @@ from pathlib import Path
 import stat
 import sys
 import tempfile
+import time
 import unittest
 
 from tests.support import REPO, run
@@ -104,7 +105,18 @@ class PromptHandoffTests(unittest.TestCase):
         self.stub.chmod(0o755)
 
     def tearDown(self) -> None:
-        self.temporary.cleanup()
+        # The delivery stub runs detached and can still be writing its
+        # observation file when the test ends; retry briefly rather than
+        # racing a one-shot writer that finishes in milliseconds.
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                self.temporary.cleanup()
+                return
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.05)
 
     def env(
         self, *, rc: int = 0, accept: bool = True, intake: bool = True,

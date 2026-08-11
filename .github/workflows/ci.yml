@@ -111,7 +111,7 @@ jobs:
             tests.test_lifecycle_shell.ProviderExitShellTests \
             tests.test_lifecycle_shell.TimeoutPipelineTests \
             tests.test_provider_title_push.ClaudeAiTitleTests \
-            tests.test_inventory.ProviderLifecycleStateTests.test_claude_reopen_passes_hydrated_name_to_native_cli \
+            tests.test_inventory.WorkerLaunchGateTests.test_claude_reopen_passes_hydrated_name_to_native_cli \
             tests.test_projects \
             tests.test_projects_context \
             tests.test_projects_identity \
