@@ -71,7 +71,9 @@ def write_executable(path: Path, content: str) -> None:
     path.chmod(0o755)
 
 
-class ProviderExitShellTests(unittest.TestCase):
+class ProviderExitShellHarness(unittest.TestCase):
+    """Fixture only: launches the bashrc against provider stubs. No tests."""
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(
             prefix=".lifecycle-shell-", dir=REPO
@@ -110,9 +112,17 @@ class ProviderExitShellTests(unittest.TestCase):
         self.boot = self.base / "boot-id"
         self.boot.write_text(BOOT_ID + "\n", encoding="utf-8")
         self.provider_log = self.base / "provider.log"
+        self.account_environment_log = self.base / "account-environment.log"
+        self.account_profile = self.base / "codex-profile"
+        self.account_profile.mkdir(mode=0o700)
+        self.core = CORE
+        self.environment_overrides: dict[str, str] = {}
         write_executable(
             self.bin / "codex",
-            '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$PROVIDER_LOG"\n',
+            '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$PROVIDER_LOG"\n'
+            'if [[ -n ${ACCOUNT_ENV_LOG:-} ]]; then '
+            'printf "%s\\t%s\\t%s\\n" "$CODEX_HOME" "$SESSION_KIT_ACCOUNT_ALIAS" '
+            '"$SESSION_KIT_ACCOUNT_CAPABLE" >> "$ACCOUNT_ENV_LOG"; fi\n',
         )
 
     def tearDown(self) -> None:
@@ -128,21 +138,29 @@ class ProviderExitShellTests(unittest.TestCase):
                 "SHPOOL_JOURNAL": "disabled",
                 "SESSION_KIT_BOOT_ID_FILE": str(self.boot),
                 "SESSION_KIT_CONFIG": str(self.config),
-                "SESSION_KIT_INVENTORY_CORE": str(CORE),
+                "SESSION_KIT_INVENTORY_CORE": str(self.core),
                 "SESSION_KIT_START_DIR": str(self.start),
                 "SESSION_KIT_STATE_DIR": str(self.state),
                 "PROVIDER_LOG": str(self.provider_log),
+                "ACCOUNT_ENV_LOG": str(self.account_environment_log),
                 "PYTHONDONTWRITEBYTECODE": "1",
             }
         )
+        environment.update(self.environment_overrides)
         return environment
 
-    def launch(self, choices: str) -> subprocess.CompletedProcess[str]:
+    def launch(
+        self, choices: str, *, account_alias: str | None = None
+    ) -> subprocess.CompletedProcess[str]:
         record = self.start / "main2"
         record.write_text(
             f"codex\t{self.project}\t{UUID}\tresume\n",
             encoding="utf-8",
         )
+        if account_alias is not None:
+            account = self.start / "main2.account"
+            account.write_text(f"codex\t{account_alias}\n", encoding="utf-8")
+            account.chmod(0o600)
         # The generation of a process is read from /proc on Linux and from the
         # native adapter on Darwin, exactly as the bashrc itself does, so this
         # harness exercises the real launch path on both platforms.
@@ -178,7 +196,7 @@ bash --noprofile --norc -ic '
                 str(self.start),
                 BOOT_ID,
                 UUID,
-                str(CORE),
+                str(self.core),
             ],
             cwd=REPO,
             env=self.environment(),
@@ -201,12 +219,21 @@ bash --noprofile --norc -ic '
         self.assertEqual(0o600, stat.S_IMODE(candidates[0].stat().st_mode))
         return json.loads(candidates[0].read_text(encoding="utf-8"))
 
-    def keep_exit_menu(self) -> None:
-        """Opt this terminal back into the recovery menu on a clean exit."""
-        (self.home / ".sk_keep_exit_menu").write_text("", encoding="utf-8")
+    def autoclose_on_clean_exit(self) -> None:
+        """Opt this terminal out of the recovery menu on a clean exit."""
+        (self.home / ".sk_autoclose_on_clean_exit").write_text(
+            "", encoding="utf-8"
+        )
 
-    def test_clean_provider_exit_closes_without_a_menu_or_a_keypress(self) -> None:
-        # Typing /exit should land straight back on the picker.
+
+class ProviderExitShellTests(ProviderExitShellHarness):
+    def test_clean_exit_with_the_autoclose_marker_closes_without_a_menu(
+        self,
+    ) -> None:
+        # The opt-in marker restores the old behavior: /exit lands straight
+        # back on the picker. Without the marker the menu is the default,
+        # which tests/test_exit_stayalive.py covers.
+        self.autoclose_on_clean_exit()
         completed = self.launch("")
         self.assertEqual(0, completed.returncode, completed.stderr)
         self.assertNotIn("Provider exited:", completed.stdout)
@@ -215,6 +242,42 @@ bash --noprofile --norc -ic '
         self.assertNotIn("SOURCE_RETURNED", completed.stdout)
         state = self.lifecycle_document()
         self.assertTrue(state["user_input_after_exit"])
+
+    def test_account_record_exports_exact_codex_profile_before_resume(self) -> None:
+        wrapper = self.base / "inventory-wrapper.py"
+        wrapper.write_text(
+            """#!/usr/bin/env python3
+import json, os, sys
+if sys.argv[1:4] == ["account", "resume-profile", "codex"]:
+    print(json.dumps({
+        "provider": "codex",
+        "alias": sys.argv[4],
+        "email": "account@example.com",
+        "profile_dir": os.environ["ACCOUNT_PROFILE"],
+        "plan": "plus",
+    }))
+    raise SystemExit(0)
+os.execv(sys.executable, [sys.executable, os.environ["REAL_CORE"], *sys.argv[1:]])
+""",
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o700)
+        self.core = wrapper
+        self.environment_overrides = {
+            "ACCOUNT_PROFILE": str(self.account_profile),
+            "REAL_CORE": str(CORE),
+        }
+        completed = self.launch("", account_alias="work")
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertTrue(
+            self.account_environment_log.exists(),
+            completed.stdout + completed.stderr,
+        )
+        self.assertEqual(
+            f"{self.account_profile}\twork\t1\n",
+            self.account_environment_log.read_text(encoding="utf-8"),
+        )
+        self.assertFalse((self.start / "main2.account").exists())
 
     def test_crashed_provider_still_stops_at_the_recovery_menu(self) -> None:
         write_executable(
@@ -229,7 +292,6 @@ bash --noprofile --norc -ic '
     def test_provider_exit_stays_in_controlled_menu_until_input_is_recorded(
         self,
     ) -> None:
-        self.keep_exit_menu()
         completed = self.launch("s\nexit\n")
         self.assertEqual(0, completed.returncode, completed.stderr)
         self.assertIn("Codex exited with status 0", completed.stdout)
@@ -251,7 +313,6 @@ bash --noprofile --norc -ic '
         self.assertFalse((self.start / "main2.expected").exists())
 
     def test_unknown_choice_is_permanent_input_before_close(self) -> None:
-        self.keep_exit_menu()
         completed = self.launch("not-a-choice\nc\n")
         self.assertEqual(0, completed.returncode, completed.stderr)
         self.assertIn("Unknown choice", completed.stdout)

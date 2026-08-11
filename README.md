@@ -29,13 +29,15 @@ provider exits and refuses actions when live identity cannot be proved.
   Codex, with no filesystem-wide scan.
 - `needs your reply`, working, idle, quiet, provider-exited, and subagent state.
 - Exact open, move, close, reopen, fork, repair, and recovery checks.
+- Separate Claude Code and Codex subscription profiles, selected when a session
+  starts or changed later with an explicit confirmation.
 - Manual names plus guarded 2–5 word agent self-names.
 - Per-provider colors, so two live sessions do not share one until the palette
   runs out, and a Claude session and a Codex session never share one at all.
 - A visible `title pending` state when a Codex bar still needs a safe refresh.
 - Immutable local releases with atomic update and rollback.
 - Optional terminal journals, off by default.
-- No account, hosted service, analytics, update beacon, or telemetry.
+- No Session Kit hosted account, analytics, update beacon, or telemetry.
 
 Normal rows hide shpool IDs and provider UUIDs. Use `sp detail`, JSON output, or
 an explicit search when diagnosis requires exact identity.
@@ -43,7 +45,7 @@ an explicit search when diagnosis requires exact identity.
 ## Install the beta release
 
 Download the archive, checksum, and provenance files attached to the
-[`v0.2.0` release](https://github.com/dob323/session-kit/releases/tag/v0.2.0).
+[`v0.2.1` release](https://github.com/dob323/session-kit/releases/tag/v0.2.1).
 Beta releases are published as GitHub prereleases, so `releases/latest` does not
 resolve to them; browse [all releases](https://github.com/dob323/session-kit/releases)
 or name the tag explicitly, as below. Release assets are named by commit, not by
@@ -52,7 +54,7 @@ version. With the GitHub CLI:
 ```bash
 mkdir session-kit-download
 cd session-kit-download
-gh release download v0.2.0 --repo dob323/session-kit
+gh release download v0.2.1 --repo dob323/session-kit
 if command -v sha256sum >/dev/null; then
   sha256sum --check session-kit-*.sha256
 else
@@ -85,7 +87,10 @@ SSH opens a normal shell. Type `kit` when you want the session picker.
 ```text
 kit
 sp list
-sp new [claude|codex|shell] [project-alias]
+sp account list
+sp account enroll <claude|codex> <alias> <email>
+sp account verify <claude|codex> <alias>
+sp new [claude|codex|shell] [project-alias] [--account <alias>]
 session-kit projects discover
 session-kit projects import
 session-kit projects candidates
@@ -111,6 +116,13 @@ The picker accepts one visible number to open a session. `k` accepts visible
 numbers, comma-separated lists, and small ranges. Every action uses a frozen
 private proof and rechecks live identity immediately before changing anything.
 A cached or stale dashboard is read-only.
+
+Claude Code profiles keep their provider state in separate
+`CLAUDE_CONFIG_DIR` directories. Codex profiles use separate `CODEX_HOME`
+directories. Session Kit stores the alias and verified account description, not
+provider tokens. It never copies credentials between profiles, and it never
+changes a live thread's account automatically. See [Use Session Kit](docs/usage.md#accounts)
+for enrollment, guided creation, and guarded account changes.
 
 If a new Codex process started before its thread acquired a name, the row shows
 `title pending`. A detached, proven-idle provider can refresh automatically on
@@ -158,6 +170,8 @@ watchdog log. See [Watchdog alerts](docs/configuration.md#watchdog-alerts).
 - [Install](docs/install.md)
 - [Configure](docs/configuration.md)
 - [Use Session Kit](docs/usage.md)
+- [Message your sessions](docs/messaging.md)
+- [The Fleet Supervisor](docs/supervisor.md)
 - [Claude Code and Codex integration](docs/provider-integration.md)
 - [Security and local data](docs/security-and-data.md)
 - [Troubleshoot](docs/troubleshooting.md)

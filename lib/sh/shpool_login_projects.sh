@@ -60,7 +60,7 @@ PY
       echo "  a  Add a directory · d  Drop number · Enter  Back"
     fi
     echo
-    picker_read answer "  projects ❯ " || return 0
+    picker_modal_read answer "  projects ❯ " || return 0
     case "$answer" in
       "") return 0 ;;
       a|A) projects_add ;;
@@ -76,7 +76,7 @@ projects_add() {
   local directory alias provider suggestion
   echo
   echo "  Add a project"
-  picker_read directory "  Directory (Enter for $PWD) ❯ " || return 0
+  picker_modal_read directory "  Directory (Enter for $PWD) ❯ " || return 0
   [[ -n $directory ]] || directory=$PWD
   if [[ $directory != /* ]]; then
     echo "  Use an absolute path. Nothing added."
@@ -90,13 +90,13 @@ projects_add() {
     python3 -c 'import json,sys; print(json.load(sys.stdin)["alias"])' 2>/dev/null) ||
     suggestion=""
   if [[ -n $suggestion ]]; then
-    picker_read alias "  Short name [$suggestion] ❯ " || return 0
+    picker_modal_read alias "  Short name [$suggestion] ❯ " || return 0
     [[ -n $alias ]] || alias=$suggestion
   else
-    picker_read alias "  Short name ❯ " || return 0
+    picker_modal_read alias "  Short name ❯ " || return 0
     [[ -n $alias ]] || { echo "  A short name is required. Nothing added."; return 0; }
   fi
-  picker_read provider "  Opens as [claude] ❯ " || return 0
+  picker_modal_read provider "  Opens as [claude] ❯ " || return 0
   [[ -n $provider ]] || provider=claude
   case "$provider" in
     claude|codex|shell) ;;
@@ -123,7 +123,7 @@ PY
   echo
   echo "  numbers/ranges: add those · a: add all · x: never list them · Enter: Back"
   echo
-  picker_read answer "  review ❯ " || return 0
+  picker_modal_read answer "  review ❯ " || return 0
   [[ -n $answer ]] || return 0
   if [[ ${answer,,} != x ]]; then
     projects_tool import --select "$answer" || true

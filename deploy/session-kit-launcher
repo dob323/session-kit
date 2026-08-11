@@ -18,7 +18,7 @@ set -euo pipefail
 # two releases.
 helper=${0##*/}
 case "$helper" in
-  kit|sp|shpool_login|shpool_status|shpool_reaper|codex_resume_here) ;;
+  session-kit|kit|sp|shpool_login|shpool_status|shpool_reaper|codex_resume_here) ;;
   *) echo "session-kit launcher: unsupported helper: $helper" >&2; exit 64 ;;
 esac
 
@@ -33,12 +33,107 @@ release_dir=$(cd -P -- "$current" 2>/dev/null && pwd) || {
   echo "session-kit launcher: invalid release link: $current" >&2
   exit 69
 }
+
+# Runtime helpers follow `current`; lifecycle management follows the newest
+# verified manager. Rollback can select an old session payload without also
+# reviving an updater that predates today's transaction and hook contracts.
+# A launcher with this contract fails closed when that anchor is absent or
+# unsafe. Legacy launchers keep their own pre-anchor recovery behavior until a
+# reviewed source install replaces them and creates the manager link.
+if [[ $helper == session-kit ]]; then
+  manager=$root/manager
+  if [[ -L $manager ]]; then
+    manager_dir=$(cd -P -- "$manager" 2>/dev/null && pwd) || {
+      echo "session-kit launcher: invalid manager link: $manager" >&2
+      exit 69
+    }
+    manager_name=${manager_dir##*/}
+    manager_parent=$(cd -P -- "$root/releases" 2>/dev/null && pwd) || {
+      echo "session-kit launcher: release root is unavailable" >&2
+      exit 69
+    }
+    [[ $manager_dir == "$manager_parent/$manager_name" &&
+       $manager_name =~ ^[0-9a-f]{40}$ ]] || {
+      echo "session-kit launcher: manager escapes $root/releases" >&2
+      exit 78
+    }
+    [[ -x $manager_dir/bin/session-kit ]] || {
+      echo "session-kit launcher: manager command is unavailable" >&2
+      exit 69
+    }
+    release_dir=$manager_dir
+    unset manager_dir manager_name manager_parent
+  else
+    echo "session-kit launcher: unsafe manager link: $manager" >&2
+    exit 78
+  fi
+  unset manager
+fi
+
+# The management entry remains a release-independent launcher. During an
+# interrupted lifecycle transaction it executes the exact pre-flip manager
+# recorded in the durable journal, even when `current` already points at an
+# older release that cannot understand the newer journal schema.
+if [[ $helper == session-kit && ! -L $root/manager ]]; then
+  transaction=${SESSION_KIT_STATE_DIR:-"${XDG_STATE_HOME:-$HOME/.local/state}/session-kit"}/lifecycle-transaction.json
+  if [[ -f $transaction && ! -L $transaction ]]; then
+    recovery_release=$(python3 - "$transaction" "$root" <<'PY'
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+
+journal, root = map(Path, sys.argv[1:])
+info = journal.lstat()
+if (
+    not stat.S_ISREG(info.st_mode)
+    or info.st_uid != os.geteuid()
+    or stat.S_IMODE(info.st_mode) != 0o600
+):
+    raise SystemExit(78)
+payload = json.loads(journal.read_text(encoding="utf-8"))
+entries = payload.get("entries")
+if (
+    payload.get("schema_version") != 1
+    or payload.get("state") != "pending"
+    or not isinstance(entries, list)
+    or not entries
+    or entries[0].get("path") != os.fspath(root / "current")
+    or entries[0].get("kind") != "symlink"
+):
+    raise SystemExit(78)
+target = Path(entries[0].get("target", ""))
+releases = root / "releases"
+try:
+    relative = target.relative_to(releases)
+except ValueError:
+    raise SystemExit(78)
+if len(relative.parts) != 1 or re.fullmatch(r"[0-9a-f]{40}", relative.name) is None:
+    raise SystemExit(78)
+resolved = target.resolve(strict=True)
+if resolved.parent != releases.resolve(strict=True):
+    raise SystemExit(78)
+print(resolved)
+PY
+    ) || {
+      echo "session-kit launcher: pending recovery release is unsafe" >&2
+      exit 78
+    }
+    [[ -z $recovery_release ]] || release_dir=$recovery_release
+    unset recovery_release
+  fi
+  unset transaction
+fi
 case "$release_dir" in
   "$root"/releases/*) ;;
   *) echo "session-kit launcher: release escapes $root/releases" >&2; exit 78 ;;
 esac
 
-if [[ $helper == kit ]]; then
+if [[ $helper == session-kit ]]; then
+  target=$release_dir/bin/session-kit
+elif [[ $helper == kit ]]; then
   target=$release_dir/bin/shpool_login
 else
   target=$release_dir/bin/$helper

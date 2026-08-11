@@ -11,6 +11,12 @@
 # Globals the entry script owns are assigned there, not here.
 # shellcheck disable=SC2154
 
+# A stable launcher from a pre-hook release can source this module after an
+# interrupted pointer flip. Supply the two newer globals here so that recovery
+# remains usable even though that older entry script never assigned them.
+claude_settings=${claude_settings:-${SESSION_KIT_CLAUDE_SETTINGS:-${SESSION_KIT_CLAUDE_HOME:-"$HOME/.claude"}/settings.json}}
+codex_hooks=${codex_hooks:-${SESSION_KIT_CODEX_HOOKS:-${SESSION_KIT_CODEX_HOME:-${CODEX_HOME:-"$HOME/.codex"}}/hooks.json}}
+
 atomic_symlink() {
   local target=$1 destination=$2
   python3 - "$target" "$destination" <<'PY'
@@ -146,6 +152,13 @@ import uuid
 operation, journal_raw, *values = sys.argv[1:]
 journal = pathlib.Path(journal_raw)
 
+def fsync_parent(path):
+    descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
 def atomic_json(path, payload):
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -157,6 +170,7 @@ def atomic_json(path, payload):
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
+        fsync_parent(path)
     finally:
         try:
             os.unlink(temporary)
@@ -242,9 +256,44 @@ elif operation == "recover":
     if not isinstance(entries, list):
         raise SystemExit("session-kit: invalid lifecycle transaction entries")
     paths = [entry.get("path") for entry in entries if isinstance(entry, dict)]
-    if len(paths) != len(entries) or paths[:len(values)] != values:
+    base_count = len(values) - 2
+    if len(paths) != len(entries) or paths[:base_count] != values[:base_count]:
         raise SystemExit("session-kit: lifecycle transaction targets do not match this installation")
-    theme_entries = entries[len(values):]
+
+    def validate_recorded_config(path_raw, expected_name):
+        path = pathlib.Path(path_raw)
+        if not path.is_absolute() or path.name != expected_name:
+            raise SystemExit("session-kit: invalid recorded provider hook target")
+        current = pathlib.Path(path.anchor)
+        for part in path.parent.relative_to(current).parts:
+            current = current / part
+            try:
+                ancestor = current.lstat()
+            except FileNotFoundError:
+                break
+            if (
+                not stat.S_ISDIR(ancestor.st_mode)
+                or stat.S_ISLNK(ancestor.st_mode)
+                or ancestor.st_uid not in {0, os.geteuid()}
+                or stat.S_IMODE(ancestor.st_mode) & 0o022
+            ):
+                raise SystemExit(
+                    f"session-kit: unsafe recorded provider hook ancestor: {current}"
+                )
+
+    core_count = base_count
+    if len(paths) >= base_count + 2:
+        possible_settings, possible_hooks = paths[base_count : base_count + 2]
+        if (
+            isinstance(possible_settings, str)
+            and isinstance(possible_hooks, str)
+            and pathlib.Path(possible_settings).name == "settings.json"
+            and pathlib.Path(possible_hooks).name == "hooks.json"
+        ):
+            validate_recorded_config(possible_settings, "settings.json")
+            validate_recorded_config(possible_hooks, "hooks.json")
+            core_count += 2
+    theme_entries = entries[core_count:]
     expected_themes = [
         f"sk-{color}.tmTheme"
         for color in (
@@ -299,6 +348,7 @@ elif operation == "recover":
             raise SystemExit("session-kit: invalid lifecycle transaction entry")
         restore(entry)
     journal.unlink()
+    fsync_parent(journal)
     print(f"Recovered interrupted Session Kit {payload.get('action', 'lifecycle')} transaction.")
 elif operation == "commit":
     if not journal.is_file() or journal.is_symlink():
@@ -316,6 +366,7 @@ elif operation == "commit":
     )
     atomic_json(backup, payload)
     journal.unlink()
+    fsync_parent(journal)
 else:
     raise SystemExit("session-kit: invalid lifecycle transaction operation")
 PY
@@ -351,6 +402,9 @@ transaction_core_targets() {
   else
     for unit in "${systemd_units[@]}"; do printf '%s\n' "$service_root/$unit"; done
   fi
+  # New transaction targets are appended so a release predating provider-hook
+  # activation still writes a recoverable prefix if it flips to this release.
+  printf '%s\n' "$claude_settings" "$codex_hooks"
 }
 
 transaction_targets() {
@@ -368,15 +422,33 @@ begin_transaction() {
   local -a targets=()
   mapfile -t targets < <(transaction_targets)
   lifecycle_transaction begin "$transaction_path" "$action" "${targets[@]}" "$@"
+  if [[ $action == uninstall ]]; then
+    configure_provider_hooks "" disable
+  fi
 }
 
 commit_transaction() {
   lifecycle_transaction commit "$transaction_path"
 }
 
+# True only when the isolated test harness armed exactly this failpoint.
+#
+# A failpoint aborts an install or update at a chosen instruction so a test can
+# prove the transaction recovers. Production must never honour one: without the
+# SESSION_KIT_TESTING gate, any process able to set an environment variable
+# could abort every install mid-transaction just by naming a failpoint. Both
+# conditions are checked in this one place so no caller can arm a failpoint by
+# checking only the name.
+lifecycle_failpoint_armed() {
+  [[ ${SESSION_KIT_TESTING:-0} == 1 && ${SESSION_KIT_TEST_FAILPOINT:-} == "$1" ]]
+}
+
 lifecycle_failpoint() {
-  [[ ${SESSION_KIT_TEST_FAILPOINT:-} != "$1" ]] ||
-    die "isolated test failpoint after $1"
+  lifecycle_failpoint_armed "$1" || return 0
+  if [[ ${SESSION_KIT_TEST_FAILPOINT_MODE:-} == kill ]]; then
+    kill -KILL "$$"
+  fi
+  die "isolated test failpoint after $1"
 }
 
 write_receipt() {

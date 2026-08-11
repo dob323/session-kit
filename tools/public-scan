@@ -31,6 +31,8 @@ SECRETS = {
 }
 # Repository-specific words are stored only as one-way digests. The scanner
 # remains safe to publish while still rejecting those words in release trees.
+# Personal names of the maintainer or operators belong here too: shipped files
+# name roles ("the operator", "the maintainer"), never people.
 PRIVATE_TOKEN_DIGESTS = frozenset(
     {
         "bcee5f794de98e5f990f21d817f6340df82a99bdcf3f7574f1adbf81be1741d2",
@@ -38,6 +40,13 @@ PRIVATE_TOKEN_DIGESTS = frozenset(
         "9856a5635d21fe7ec66370d38d9326517935b01abae243723ec0d3b1ce610c63",
         "9fcc02aea1ee9a3091972d30ea9054e0d593501ccb26d21c6c0332121dfa888c",
         "72615b744fff4e9baeddb92066417fd08f60c8ebbdab199442069dfcd3c571ee",
+        # Private account aliases and handles. NOTE: the public GitHub
+        # org slug is deliberately NOT listed - it is meant to ship.
+        "e407d44798fe8871fc0e252120f886ccc8eed386ff61ac662a7fafe65bf625ff",
+        "dc0215a3b20331be68e97be4071b9f8612958aaeb9ad61a9111b7cd2a8810e1d",
+        # Personal-name tokens (see the maintainer rule in CONTRIBUTING.md).
+        "ec4f2dbb3b140095550c9afbbb69b5d6fd9e814b9da82fad0b34e9fcbe56f1cb",
+        "0b135e8de8f42b4baddb5e580400b8c2dc56f9204758314c2be7019aa9d8d98a",
         # Neutral test-only marker.
         "9244bfa2efb5ae19b6f84f62dc79582ad52a25a14f7e904e9c39e739360a7cff",
     }
@@ -66,8 +75,16 @@ def scan_text(
     ]
     if private_markers:
         for token in re.findall(r"[A-Za-z0-9_]+", text.casefold()):
-            digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
-            if digest in PRIVATE_TOKEN_DIGESTS:
+            # A snake_case identifier must not smuggle a private word past the
+            # check, so every underscore-separated part is tested as well as
+            # the whole token.
+            parts = {token, *token.split("_")}
+            if any(
+                hashlib.sha256(part.encode("utf-8")).hexdigest()
+                in PRIVATE_TOKEN_DIGESTS
+                for part in parts
+                if part
+            ):
                 failures.append(f"{label}: private marker")
                 break
     return failures

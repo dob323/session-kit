@@ -216,12 +216,31 @@ class ProjectDiscoveryTests(unittest.TestCase):
         pick = lambda answer: [  # noqa: E731
             row["cwd"] for row in projects.select_rows(rows, answer)
         ]
-        self.assertEqual(pick("a"), ["/w/1", "/w/2", "/w/3", "/w/4", "/w/5"])
+        every = ["/w/1", "/w/2", "/w/3", "/w/4", "/w/5"]
+        self.assertEqual(pick("a"), every)
+        # The picker takes the whole word; so does everything else now.
+        self.assertEqual(pick("all"), every)
+        self.assertEqual(pick("ALL"), every)
         self.assertEqual(pick("2"), ["/w/2"])
         self.assertEqual(pick(" 4 , 2-3 "), ["/w/2", "/w/3", "/w/4"])
+        self.assertEqual(pick("4 2"), ["/w/2", "/w/4"])
         self.assertEqual(pick("3,3"), ["/w/3"])
+        self.assertEqual(pick("2-2"), ["/w/2"])
         self.assertEqual(pick(""), [])
-        for bad in ("0", "6", "2-1", "1-", "x", "1,,2", "one", "-3"):
+        for bad in (
+            "0",
+            "6",
+            "2-1",
+            "1-",
+            "x",
+            "1,,2",
+            "one",
+            "-3",
+            "2,",
+            "1-99999",  # a range no picker could show, refused before it is built
+            "\u0663",  # an Arabic-Indic digit is not a number a picker printed
+            "\u00b2",  # a superscript passes str.isdigit() and breaks int()
+        ):
             with self.assertRaises(projects.ProjectError, msg=bad):
                 projects.select_rows(rows, bad)
 

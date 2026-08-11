@@ -26,6 +26,112 @@ systemd_user_manager_transport() {
   return 1
 }
 
+# Report the installed shpool against the release the kit targets.
+#
+# Every place the kit names a shpool version names 0.11.0: install.sh, the
+# macOS install path (which refuses anything else), docs/install.md,
+# macos/README.md, extras/build-static-binary.md, and the shpool-patch series,
+# which applies to upstream v0.11.0 only. No other release is tested against
+# the kit's `shpool list --json` use or the config keys it installs, so an
+# older binary is a failure and a newer one an untested warning rather than a
+# silent pass.
+#
+# Prints one "<status>\t<detail>" line; status is ok, warn, or fail.
+shpool_version_report() {
+  python3 - 0.11.0 <<'PY'
+import re
+import shutil
+import subprocess
+import sys
+
+minimum = sys.argv[1]
+floor = tuple(int(part) for part in minimum.split("."))
+fix = f"cargo install shpool --version {minimum} --locked"
+
+
+def emit(status: str, detail: str) -> None:
+    print(status, " ".join(detail.split()), sep="\t")
+
+
+executable = shutil.which("shpool")
+if executable is None:
+    emit("fail", f"shpool is not on PATH; install it with: {fix}")
+    raise SystemExit(0)
+text = ""
+for argv in ([executable, "version"], [executable, "--version"]):
+    try:
+        done = subprocess.run(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        continue
+    candidate = done.stdout.decode("utf-8", "replace")[:200]
+    if re.search(r"\d+\.\d+\.\d+", candidate):
+        text = candidate
+        break
+match = re.search(r"(\d+)\.(\d+)\.(\d+)", text)
+if match is None:
+    emit(
+        "warn",
+        f"the installed shpool did not report a version; the kit targets {minimum}: {fix}",
+    )
+    raise SystemExit(0)
+found = tuple(int(part) for part in match.groups())
+version = ".".join(str(part) for part in found)
+if found < floor:
+    emit("fail", f"shpool {version} is older than the required {minimum}; upgrade with: {fix}")
+elif found > floor:
+    emit(
+        "warn",
+        f"shpool {version} is newer than the tested {minimum}; pin the tested release with: {fix}",
+    )
+else:
+    emit("ok", f"shpool {version} matches the tested release")
+PY
+}
+
+# Report systemd-logind lingering for the current user. Without it logind
+# stops the user manager at the last logout, which takes the shpool daemon and
+# every managed session with it, so an install that looks complete still loses
+# every session the first time the operator disconnects.
+#
+# Prints one "<status>\t<detail>" line; status is ok, warn, or fail.
+logind_linger_report() {
+  local user=${USER:-} state=
+  [[ -n $user ]] || user=$(id -un 2>/dev/null) || user=
+  if [[ -z $user ]]; then
+    printf 'warn\t%s\n' \
+      "the current user name could not be read, so lingering was not checked"
+    return 0
+  fi
+  if ! command -v loginctl >/dev/null 2>&1; then
+    printf 'warn\t%s\n' \
+      "loginctl is unavailable, so lingering could not be checked; without it every managed session ends at logout"
+    return 0
+  fi
+  state=$(loginctl show-user "$user" --property=Linger --value 2>/dev/null) ||
+    state=
+  state=${state#Linger=}
+  case $state in
+    yes)
+      printf 'ok\t%s\n' \
+        "logind lingering is enabled for $user, so managed sessions survive logout"
+      ;;
+    no)
+      printf 'fail\t%s\n' \
+        "logind lingering is disabled for $user, so every managed session ends at logout; enable it with: loginctl enable-linger $user"
+      ;;
+    *)
+      printf 'warn\t%s\n' \
+        "logind reported no lingering state for $user; check it with: loginctl show-user $user --property=Linger"
+      ;;
+  esac
+}
+
 validate_roots() {
   python3 - "$HOME" "$install_root" "$bin_dir" "$config_root" "$state_root" \
     "$service_root" "$bashrc_path" "$bash_profile_path" "$zshrc_path" \
@@ -171,10 +277,16 @@ check_source() {
     printf 'FAIL  Python 3.%s or newer is required on %s\n' "$python_floor" "$current_platform"
     failed=1
   fi
-  if ! command -v shpool >/dev/null 2>&1; then
-    printf 'FAIL  shpool missing: install v0.11.0 with cargo install shpool --version 0.11.0 --locked\n'
-    failed=1
-  fi
+  local shpool_status= shpool_detail=
+  IFS=$'\t' read -r shpool_status shpool_detail < <(shpool_version_report)
+  case $shpool_status in
+    ok) printf 'OK    shpool: %s\n' "$shpool_detail" ;;
+    warn) printf 'WARN  shpool: %s\n' "$shpool_detail" ;;
+    *)
+      printf 'FAIL  shpool: %s\n' "$shpool_detail"
+      failed=1
+      ;;
+  esac
   if [[ $current_platform == linux ]]; then
     if [[ ! -d /proc && ${SESSION_KIT_TESTING:-0} != 1 ]]; then
       printf 'FAIL  Linux /proc is required for process identity checks\n'
@@ -195,6 +307,15 @@ check_source() {
       printf 'FAIL  systemd user manager is unavailable\n'
       failed=1
     fi
+    # Lingering is a documented install step the installer cannot perform for
+    # the operator, so preflight reports it without blocking the install. The
+    # post-install doctor is the gate that fails on it.
+    local linger_status= linger_detail=
+    IFS=$'\t' read -r linger_status linger_detail < <(logind_linger_report)
+    case $linger_status in
+      ok) printf 'OK    logind lingering: %s\n' "$linger_detail" ;;
+      *) printf 'WARN  logind lingering: %s\n' "$linger_detail" ;;
+    esac
   elif [[ $current_platform == macos ]]; then
     if [[ ${SESSION_KIT_TESTING:-0} != 1 ]]; then
       local mac_major mac_arch
@@ -229,7 +350,8 @@ check_source() {
     bin/codex_resume_here bin/session_kit_common bin/session-kit \
     "${inventory_files[@]}" "${shell_modules[@]}" bashrc/shpool.bashrc \
     deploy/session-kit-launcher config/projects.example.tsv \
-    config/session-inventory.example.json config/shpool.example.toml; do
+    config/session-inventory.example.json config/shpool.example.toml \
+    config/codex/hooks.json lib/sessionkit_supervisor/provider_hooks.py; do
     if [[ ! -f $source/$required ]]; then
       printf 'FAIL  source file missing: %s\n' "$required"
       failed=1
@@ -319,26 +441,52 @@ PY
 }
 
 validate_uninstall_launchers() {
-  local release_id helper target expected
+  local release_id previous_release= helper target expected matched
   release_id=$(current_release_id)
   [[ $release_id =~ ^[0-9a-f]{40}$ ]] ||
     die "uninstall requires a valid active Session Kit release"
   verify_release "$install_root/releases/$release_id" "$release_id"
+  if [[ -r $receipt_path ]]; then
+    previous_release=$(python3 - "$receipt_path" <<'PY'
+import json
+import re
+import sys
+try:
+    value = json.load(open(sys.argv[1], encoding="utf-8")).get("previous_release", "")
+except (OSError, ValueError):
+    value = ""
+print(value if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}", value) else "")
+PY
+    )
+  fi
+  if [[ -n $previous_release ]]; then
+    verify_release "$install_root/releases/$previous_release" "$previous_release"
+  fi
   for helper in "${helpers[@]}"; do
     target=$bin_dir/$helper
-    expected=$install_root/releases/$release_id/deploy/session-kit-launcher
     [[ ! -e $target && ! -L $target ]] && continue
     [[ -f $target && ! -L $target ]] ||
       die "refusing to remove unsafe launcher: $target"
-    cmp -s -- "$target" "$expected" ||
+    matched=0
+    for expected in \
+      "$install_root/releases/$release_id/deploy/session-kit-launcher" \
+      ${previous_release:+"$install_root/releases/$previous_release/deploy/session-kit-launcher"}; do
+      [[ -f $expected && ! -L $expected ]] && cmp -s -- "$target" "$expected" && matched=1
+    done
+    (( matched )) ||
       die "refusing to remove launcher with unowned content: $target"
   done
   target=$bin_dir/session-kit
-  expected=$install_root/releases/$release_id/bin/session-kit
   if [[ -e $target || -L $target ]]; then
     [[ -f $target && ! -L $target ]] ||
       die "refusing to remove unsafe command: $target"
-    cmp -s -- "$target" "$expected" ||
+    matched=0
+    for expected in \
+      "$install_root/releases/$release_id/deploy/session-kit-launcher" \
+      ${previous_release:+"$install_root/releases/$previous_release/deploy/session-kit-launcher"}; do
+      [[ -f $expected && ! -L $expected ]] && cmp -s -- "$target" "$expected" && matched=1
+    done
+    (( matched )) ||
       die "refusing to remove command with unowned content: $target"
   fi
 }

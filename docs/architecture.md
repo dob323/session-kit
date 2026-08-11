@@ -141,6 +141,29 @@ The main dashboard favors names and state. Internal shpool IDs and provider
 UUIDs are available through detail, JSON, and explicit search views, not normal
 rows.
 
+That holds for everything a person reads, and there is no exception and no
+flag that lifts it: rows, `sp detail`, action confirmations, exact-target
+errors, prune candidate lists, repair and attention banners, recovery items,
+`sp msg` previews, receipts and reports, and the message centre all name a
+session by its terminal number and its title. Identifiers live in 0600 state
+files, the JSON output modes, proofs, and command arguments — a command may
+accept an ID; none prints one. Where a risky exact-target action needs a
+confirmation, it shows the number, the title, and a short random token minted
+for that confirmation alone.
+
+`tests/test_human_output_ids.py` is the enforcement: it renders every
+registered human surface against a fixture whose identifiers are distinctive
+hex and fails on any eight-character prefix of one. A new surface either joins
+the registry or fails the scan.
+
+Numbers a person types read the same way everywhere: a single number, a comma
+or space list, inclusive ranges written `2-4`, or `all` (`a` for short). One
+implementation in `sessionkit_inventory.common.parse_number_selection` backs
+the recovery screen, the project screens, the picker's `k`, and `sp msg`, so no
+surface can disagree about what a range means. A range covers at most 200
+numbers, and a number nothing is showing refuses the whole request rather than
+acting on part of it.
+
 Semantic color categories are provider, availability, attention, danger, and
 secondary text. Text labels always carry the meaning, so color is optional.
 

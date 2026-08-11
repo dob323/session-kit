@@ -4,7 +4,112 @@ Session Kit follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-08-11
+
+
 ### Fixed
+
+- `sp msg intake delegate` now launches a worker. The CLI read the intake
+  entry's `cwd`, but the spool has stored the project directory as
+  `source_cwd` since the schema's first commit, so the launcher was always
+  handed nowhere to run and every delegation died with `dispatch is
+  uncertain; reconcile before retry`. The verb had therefore never worked, in
+  any configuration, since it was written. The read now names the stored key,
+  and `also_delivered_as` aliases are resolved before the entry is read
+  because `delegate` itself accepts an alias id. A new end-to-end test drives
+  the real record → preflight → delegate chain through the installed CLI with
+  nothing stubbed between the stored entry and the launcher; it fails three
+  times out of three against the old code.
+
+- A managed terminal survives a clean provider exit. A clean `/exit` returned
+  zero and the shell closed the shpool terminal immediately, which destroyed
+  the only context that still knew the exact conversation identity a reopen
+  needs; a crash, meanwhile, stopped at the recovery menu and kept everything.
+  The default is now the recovery menu with the terminal alive, matching what
+  the troubleshooting guide already documented. Closing is one more keypress
+  and closing is not undoable, so the terminal is worth more than the
+  keypress. `~/.sk_autoclose_on_clean_exit` restores the old behaviour for
+  anyone who wants it, a non-zero exit stops at the menu whether or not that
+  marker exists, and the previous `sk_keep_exit_menu` marker is gone
+  repository-wide.
+
+- A public install no longer registers hooks whose files it never received.
+  The export manifest matched 187 of 220 tracked files, and the 33 it missed
+  included every file under `extras/`: both intake hooks are registered by
+  absolute path into the installed release, so a release built from that
+  manifest installed cleanly, registered both, and then failed on every
+  prompt. The manifest now ships `extras/**`, the supervisor-family tests, and
+  the checker and end-to-end tests added this release — 224 exported files —
+  and its header records the deliberate exclusions. The built tree was
+  verified before shipping: the strict scan passes, 51 documentation links
+  resolve, and 50 test modules collecting 1,115 tests load with no errors.
+
+- The Linux watchdog no longer installs dead. `session-kit services enable`
+  enabled `shpool.socket` and `shpool-reaper.timer` and never
+  `session-kit-watchdog.service`, so every Linux install carried a watchdog
+  unit that was present, disabled, and inert. `enable`, `disable`, and
+  `status` now cover it.
+
+- Reproducible release archives are reproducible across Python versions.
+  `build-release-artifact` ordered archive entries by sorting `Path` objects,
+  which defers to the interpreter's own path comparison; two runners on
+  different Python versions could therefore produce byte-different archives
+  that each verified as reproducible against themselves, and CI would bless
+  either. Ordering is now pinned to `PurePosixPath` parts, and the digest is
+  proven unchanged for the current tree. The builder also refuses a commit
+  that is not reachable, and re-opens and verifies the archive it has just
+  written rather than trusting the write.
+
+- An unchanged login picker no longer flashes every refresh cycle. Fleet
+  Supervisor is now normalized into its rendered pinned position before the
+  visible-state fingerprint is calculated, so the pre-render and rendered row
+  orders cannot manufacture a false change. Compact response ages also omit
+  the repeated `replied` label while `waiting` and `opened` fallbacks remain
+  explicit.
+
+- A message that landed is no longer reported as a retryable failure. When the
+  headless sender delivered an envelope to a target and that target's own
+  transcript has not shown it inside the check window, the receipt now says
+  `landed-unconfirmed` rather than `failed` — a newborn or busy Claude session
+  takes a queued message at its next turn boundary, minutes after the receipt
+  is written. Delivery still counts only from the target's own transcript.
+
+- Repeating a send no longer repeats the message. `SESSION_KIT_MSG_KEY` (or
+  `msg send --key` on the core) names a purpose: a repeat resumes that
+  purpose's message id, skips every target the ledger already shows as landed,
+  and re-reads a Claude target's transcript before dispatching to it again.
+
+- `bin/supervisor ensure` no longer re-injects the standing brief while the
+  new supervisor is reading it. It waited for the word `delivered` in a
+  receipt whose own headline always contains `not delivered`, so the test
+  could never pass: every start sent the same brief up to twelve times and
+  then declared it undelivered. Success is now the supervisor's own proof —
+  a turn finished after the brief was sent, or the brief in its transcript —
+  every attempt carries one idempotency key, and only a brief that never
+  landed is sent again. Once the brief has landed the remaining attempts are
+  spent waiting rather than sending, so a newborn that needs two minutes to
+  reach its first turn boundary is a normal start, not a warning. A brief
+  that landed with no turn behind it after the whole budget exits 3 and says
+  so instead of being delivered a second time.
+
+- `supervisor ensure` no longer reports success for a supervisor that was
+  never briefed. The identity marker is published before the brief exists —
+  terminal numbering needs it — so a start that failed to prove the brief
+  left a marker that made every later `ensure` exit 0 without sending or
+  proving anything. Being briefed is now its own durable record, and an
+  identity without it re-enters the injection and proof loop against the same
+  session. A finished turn also no longer counts as proof on its own: turns
+  are caused by anything, so one counts only behind a receipt showing the
+  brief reached that session, and the cutoff for "after the brief" is when
+  the brief was actually sent, even if that was a previous run.
+
+- Live Codex renames now reach the newest App Server sockets. The sweep
+  visited directories oldest-first under a cap of eight, so enough abandoned
+  socket directories starved every live one; it now walks newest-first, skips
+  dead sockets on a fast refused connect, and counts only accepted
+  connections against the cap. The reaper also removes socket directories
+  whose session is gone, whose socket refuses, and which nothing has touched
+  for an hour.
 
 - Process scans no longer read `/proc/<pid>/environ` or `/proc/<pid>/cwd` for
   processes another user owns. Both are readable only by the process owner, so
@@ -21,6 +126,217 @@ Session Kit follows [Semantic Versioning](https://semver.org/).
   set where the entry points converge. Nothing that was cached stops being
   cached, because nothing ever was, and a `.pyc` precompiled by a future install
   step is still read.
+
+### Security
+
+- Source-authority verification refuses harness machine text and can finally
+  verify Codex sessions. A prompt that begins as a harness envelope
+  (`<task-notification`, `<cross-session-message`, `<system-reminder`, and ten
+  more corpus-evidenced tags) is machine text that reached the same hook, and
+  is now refused both at capture and again at verify time, so envelope events
+  already recorded as capable can no longer certify — on one live install, 32
+  of 82 "capable" events were such envelopes. Codex events, which had never
+  once verified, now can: an empty `transcript_path` resolves to the session's
+  unique rollout under `CODEX_HOME` (anchored filename match, symlinks refused,
+  a second candidate refuses rather than chooses), and provider-owned
+  transcripts are verified under a no-foreign-write mode rule (owner uid, no
+  group/other write bit) instead of the kit-state owner-private rule Codex's
+  0644 rollouts could never meet. Kit-owned state and Claude transcripts keep
+  the strict rule unchanged.
+
+- Every test-only environment hook is gated behind `SESSION_KIT_TESTING`. Five
+  hook families reached fourteen production sites and eleven of them were
+  honoured unconditionally, so a process able to set one environment variable
+  could reach them. The largest was `SESSION_KIT_PROC_ROOT`, ungated in seven
+  places: `/proc` is where every identity proof in the kit gets its answer —
+  which processes exist, when each started, what each is running, who its
+  parent is — so the variable let any caller hand-author that evidence,
+  including the evidence the reaper uses to decide a session is dead. The
+  lifecycle failpoint's fatal branch also fired ungated, which made an
+  installer denial of service one variable wide, and two JSON-file hooks could
+  substitute the whole session roster. All eleven are gated at the lowest
+  shared point of each dependency island, and a gate that refuses a hook falls
+  back to real evidence instead of dying. A new test proves every gate both
+  closed and open, and a regression test walks the tracked production files
+  and fails if a hook name is ever read again without a gate beside it.
+
+- Personal identifiers no longer ship. The maintainer's name was present as
+  prose and, less visibly, as public API surface: a supervisor ledger key, an
+  MCP `send_message` schema property, receipt strings, and the `From:` line of
+  the envelope injected into every messaged agent. Those are now
+  `operator_confirmed` and role wording throughout. Test fixtures carried real
+  email addresses and account aliases; addresses are now `@invalid.example`
+  and the aliases are neutral. `tools/public-scan` digests the name and alias
+  tokens and also hashes the parts of underscore-separated identifiers, so an
+  identifier compound can no longer hide a private word inside it — seeded
+  files that passed the old scanner are refused by this one. `CONTRIBUTING.md`
+  states the rule the export gate enforces: roles rather than people, neutral
+  fixture aliases, and `@invalid.example` addresses.
+
+### Added
+
+- `tools/publish-release`, which makes a release one verified transaction from
+  source commit to artifact. The 0.2.0 tag and the 0.2.0 artifact were built
+  from different commits and nothing compared them; the artifact's recorded
+  source commit is now an unreferenced object that has been collected, so that
+  release cannot be reproduced or audited at all. The failure was not inside
+  any one tool but in the manual sequence between them, which is why the fix
+  is a single command rather than a longer checklist. One invocation exports
+  one source commit, syncs that exact tree into the public repository as one
+  commit, annotates a tag on it, builds the artifact from the same source
+  commit, and then proves rather than assumes that the tag and the artifact
+  are the same bytes: the blob set of the tagged commit must equal the export,
+  the files inside the archive must equal the export, and the `SOURCE.json`
+  recorded inside both must name the release commit. Ten named gates each fail
+  closed, and a printed `session-kit-<version>.chain.json` binds version,
+  source commit, public commit, previous public head, tree digest, and archive
+  digest. `--dry-run` rehearses the whole sequence in throwaway clones and
+  only reads the real public repository. `--push` requires an interactive
+  terminal and a typed confirmation, and refuses outright if any override was
+  used, so a published release can never carry one.
+
+- `tools/check-embedded-scripts`, which checks the code that lives inside
+  other code. It extracts all 116 heredoc bodies from the 34 shell files, runs
+  each through the right compiler for its language, and maps any error back to
+  its real line number in the containing file. CI runs it on Linux and macOS.
+
+- Health checks for the conditions under which the previous doctor reported
+  healthy while sessions could not survive a logout. Doctor now verifies that
+  the watchdog unit is enabled and active rather than merely installed, that
+  logind lingering is on, that the installed `shpool` meets the pinned 0.11.0,
+  the enabled and active state of each socket and timer unit, and that every
+  registered hook file exists and is executable at the exact path the
+  registration runs. Every failure row carries a one-line fix command.
+
+- The third-party notices the repository owed. Vendored Maniple files named
+  their upstream source and commit but shipped no copyright notice and no MIT
+  permission text, which is the part MIT actually requires to be included.
+  Upstream publishes no `LICENSE` file at the pinned commit, so the notice
+  reproduces the standard MIT text with the holder taken from upstream's own
+  declared authors and says so explicitly, and it records the upstream URL,
+  the pinned commit, the file-by-file mapping, and the substantive
+  modifications. Every `shpool-patch` file — not only `0001` — now opens with
+  the project, the Apache-2.0 copyright, the base revision `fe2d115`
+  (shpool 0.11.0), and what it changes; all four were re-proven to apply
+  cleanly to a fresh upstream clone with byte-identical statistics.
+
+- Local Claude Code and Codex account profiles. Each profile isolates native
+  provider state through its own `CLAUDE_CONFIG_DIR` or `CODEX_HOME`; Session
+  Kit records account descriptions but never copies or logs provider tokens.
+  `sp account list`, `enroll`, and `verify` manage profiles, while `sp new
+  ... --account <alias>` selects one explicitly. Guided New may preselect a
+  current provider-qualified Matrix recommendation, but currently leaves Codex
+  unselected because that advice is not yet provider-qualified. Existing
+  sessions can change account only after confirmation and fresh exact-identity,
+  idle, and no-child-work checks. The exact conversation, history, title,
+  project, and terminal number are retained; a session created before this
+  feature needs one explicit recreation of its managed shell. Failed changes
+  attempt a checkpointed return to the original profile. The owner-only
+  `account-switching-off` state sentinel can disable the feature without
+  stopping providers, and no live-thread account rotation is automatic.
+
+- Compact picker rows now use a fixed three-letter provider column (`CLD`,
+  `CDX`, `SHL`, or `UNK`), with yellow Claude and cyan Codex labels. Provider,
+  state, and time columns share fixed starts so mixed `idle`, `working`, and
+  `needs your reply` rows remain vertically aligned.
+
+- The login picker now shows when each AI session last replied in both
+  `Ready to open` and `Open elsewhere`. A session waiting on the operator shows
+  how long it has waited instead; shells and sessions without response history
+  show their opened age with that fallback named explicitly. Relative times use
+  readable minutes, hours, and days before switching to a date, narrow terminals
+  retain the title and primary state first, and `sp detail <number>` carries the
+  exact local response and opened timestamps.
+
+- `sp msg`: the message centre. One screen writes to every live session,
+  every idle one, or a single one, shows deterministic per-target delivery
+  receipts, streams replies in as they arrive, and answers any target in
+  place. The picker opens it with `s` and shows `✉ N new replies` while any
+  reply waits. Direct sends (`sp msg all "text"`) exist for scripted or
+  one-line use. Docs: `docs/messaging.md`.
+- A project reaches the fleet supervisor without anybody messaging it. When a
+  root session takes its first substantive prompt, the provider hook records
+  that prompt as an intake and starts `supervisor ensure` detached: no agent
+  cooperates, no instruction is added to any agent, and the human's prompt
+  waits for none of it — the entry is durable before the supervisor is asked
+  for, and a supervisor that cannot start costs nothing. One root thread
+  yields exactly one OPEN intake however often the hook fires (the claim is the
+  thread itself); subagents and sidechains yield none; slash commands,
+  greetings, agreement, resume boilerplate, and the kit's own operator
+  envelopes are not projects. Simultaneous root starts share one `ensure`
+  through a non-blocking lock and a one-minute stamp. Both providers are picked
+  up by the same `UserPromptSubmit` hook in front of the first turn —
+  `extras/hooks/sk_session_events.py` for Claude,
+  `extras/hooks/sk_codex_intake.py` for Codex, the latter as a user-level
+  `~/.codex/hooks.json` command hook, which loads even in an untrusted project
+  and is trusted by the exact hash of the file. Both adapters' logic is tested
+  against fixture payloads; no live Codex process has been observed discovering
+  and trusting the hook, and that proof is deferred to the end-to-end drill.
+
+- A project that grows reaches the supervisor as it grows. The first
+  substantive prompt in a root thread opens the intake; every later one, while
+  that intake is open, is appended to it as a durable amendment — keyed by turn
+  and prompt digest, so a hook firing twice records one — and delivered to the
+  supervisor exactly once through the messaging core's idempotency key, in a
+  detached run that never delays the prompt that caused it. An amendment
+  extends the open project: it never opens a second intake, and never asks for
+  a second delegation. A prompt arriving after the project was reported opens a
+  fresh intake linked to the one it follows.
+
+- `sp msg intake`: the fleet supervisor's intake spool. A project handed to the
+  supervisor as a message is written to
+  `~/.local/state/session-kit/supervisor/intake/` before anything is delegated,
+  so a resident that dies or is refreshed mid-project loses its conversation
+  and nothing else. One entry per intake carries the lifecycle (received →
+  acknowledged → delegated → reported), the worker branches, and every note
+  relayed to the source thread. A second arrival of the same intake — the same
+  message id, or the same intake key under a new one — joins that entry instead
+  of starting a second project, and `msg intake open` gives a replacement
+  resident the unfinished ones on its first read. Progress and completion go
+  out through the existing `sp msg` delivery path under the note's own
+  idempotency key; a note that never landed stays owed rather than reported.
+  Docs: `docs/supervisor.md`.
+
+- `codex_app_server_all` in `~/.config/session-kit/coordination.json` arms the
+  Codex App Server socket — the thing that makes a Codex session messageable —
+  for kit launches in every project, not only the coordination repository. The
+  repository-scoped broker behavior is unchanged, and the private state-root
+  check now says on stderr when it disables the App Server instead of falling
+  back silently.
+
+### Changed
+
+- Static checks now cover the code they previously skipped. `ruff` and
+  `py_compile` reach the 2,186-line release engine that no check had ever
+  read, along with the new checker and the dashboard renderer, and the `mypy`
+  target grows from 24 files to 58 by adding the supervisor, messages, and
+  events packages and the provider hooks.
+
+- `docs/maintainers/release-process.md` describes the tool rather than the
+  manual steps. The six-step publish sequence it used to document is the exact
+  procedure that let a tag and an artifact diverge; it now documents the single
+  `publish-release` invocation, what each gate refuses, and how to undo a
+  prepared release that has not been pushed.
+
+- The supervisor ledger and the MCP `send_message` schema name the operator
+  confirmation with a role rather than a person. This is a wire and storage
+  rename, not only wording: a ledger row written before this release records
+  the old key, so it now reads as unconfirmed and counts toward the autonomous
+  turn budget. That fails in the restrictive direction rather than the
+  permissive one, the ledger is append-only, and a one-shot local migration
+  follows the release install for anyone who wants the earlier rows to keep
+  counting as confirmed.
+
+- The CI quality job is green at the release commit: shellcheck, `ruff
+  check`, `ruff format`, and mypy (58 files, no per-module overrides) all
+  pass. The sweep proved one flagged import was load-bearing for
+  `sp msg queue --mark-seen` and kept it as an explicit re-export, bound the
+  supervisor's confirmed-act scope check so the narrowing survives, and added
+  a regression test that fails if that validation is ever removed. A new
+  manifest-coverage test fails the build when a tracked file is neither
+  exported nor on the documented private list, and the delegation end-to-end
+  test now terminates the sandboxed shpool daemon it spawns instead of
+  leaking it into the host process table.
 
 ## [0.2.0] - 2026-08-06
 

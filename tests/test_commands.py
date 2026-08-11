@@ -845,7 +845,8 @@ class CommandTests(unittest.TestCase):
 
         env["STUB_DYNAMIC_PROVIDER"] = "claude"
         verified = run([SP, "verify-start", shpool_id], env=env)
-        self.assertIn(f"cleared retained launch record for {shpool_id}", verified.stdout)
+        self.assertIn("cleared the retained launch record for", verified.stdout)
+        self.assertNotIn(shpool_id, verified.stdout)
         self.assertFalse(record.exists())
         self.assertFalse(expected.exists())
         self.assertFalse(any(
@@ -954,6 +955,7 @@ class CommandTests(unittest.TestCase):
                 "SESSION_KIT_PROVIDER_PROOF_ATTEMPTS": "2",
                 "STUB_DYNAMIC_PROVIDER": "unknown",
                 "STUB_DYNAMIC_CWD": str(self.fixture.project),
+                "SESSION_KIT_TESTING": "1",
                 "SESSION_KIT_PROVIDER_PRESENCE_OVERRIDE": "present",
             }
         )
@@ -1003,6 +1005,7 @@ class CommandTests(unittest.TestCase):
                 "SESSION_KIT_PROVIDER_PROOF_ATTEMPTS": "2",
                 "STUB_DYNAMIC_PROVIDER": "unknown",
                 "STUB_DYNAMIC_CWD": str(self.fixture.project),
+                "SESSION_KIT_TESTING": "1",
                 "SESSION_KIT_PROVIDER_PRESENCE_OVERRIDE": "absent",
             }
         )
@@ -1025,6 +1028,7 @@ class CommandTests(unittest.TestCase):
                 "SESSION_KIT_PROVIDER_PROOF_ATTEMPTS": "2",
                 "STUB_DYNAMIC_PROVIDER": "unknown",
                 "STUB_DYNAMIC_CWD": str(self.fixture.project),
+                "SESSION_KIT_TESTING": "1",
                 "SESSION_KIT_PROVIDER_PRESENCE_OVERRIDE": "present",
             }
         )
@@ -1579,7 +1583,8 @@ exec /bin/mv "$@"
         retained.write_text("retained-start\n", encoding="utf-8")
         retained_expected.write_text("retained-expected\n", encoding="utf-8")
         closed = run([SP, "close", "target"], env=env)
-        self.assertIn("Closed exact session target", closed.stdout)
+        self.assertIn("Closed Codex fixture", closed.stdout)
+        self.assertNotIn("target", closed.stdout.splitlines()[-1])
         self.assertEqual("kill target\n", self.fixture.shpool_log.read_text())
         self.assertFalse(retained.exists())
         self.assertFalse(retained_expected.exists())
@@ -1609,7 +1614,8 @@ exec /bin/mv "$@"
         env = self.fixture.env()
         env["SESSION_KIT_CONFIRM_ID"] = "target"
         closed = run([SP, "close", "target"], env=env)
-        self.assertIn("Closed exact session target", closed.stdout)
+        self.assertIn("Closed Codex fixture", closed.stdout)
+        self.assertNotIn("target", closed.stdout.splitlines()[-1])
         self.assertEqual("kill target\n", self.fixture.shpool_log.read_text())
 
     def test_guard_failure_refuses_target_without_kill(self) -> None:
@@ -1731,6 +1737,7 @@ exec /bin/mv "$@"
         env = self.fixture.env()
         env.update(
             {
+                "SESSION_KIT_TESTING": "1",
                 "SESSION_KIT_PROC_ROOT": str(proc_root),
                 "SESSION_KIT_DAEMON_PID": "10",
                 "SESSION_KIT_REAPER_SENTINEL": str(self.fixture.base / "not-disabled"),
@@ -1779,6 +1786,7 @@ exec /bin/mv "$@"
         env = self.fixture.env()
         env.update(
             {
+                "SESSION_KIT_TESTING": "1",
                 "SESSION_KIT_PROC_ROOT": str(proc_root),
                 "SESSION_KIT_DAEMON_PID": "10",
                 "SESSION_KIT_REAPER_SENTINEL": str(self.fixture.base / "enabled"),
@@ -1908,6 +1916,7 @@ exec /bin/mv "$@"
         env = self.fixture.env()
         env.update(
             {
+                "SESSION_KIT_TESTING": "1",
                 "SESSION_KIT_PROC_ROOT": str(proc_root),
                 "SESSION_KIT_DAEMON_PID": "10",
                 "SESSION_KIT_REAPER_SENTINEL": str(self.fixture.base / "enabled"),
@@ -2045,6 +2054,33 @@ class PickerProofTests(unittest.TestCase):
         self.assertEqual("", opened.stdout)
         self.assertEqual("attach main2\n", self.fixture.shpool_log.read_text())
 
+    def test_account_switch_refuses_working_subagents_and_kill_switch(self) -> None:
+        cases = (
+            ("working", [], False, "working"),
+            ("idle", [{"status": "working"}], False, "child agent"),
+            ("idle", [], True, "disabled"),
+        )
+        for status, subagents, disabled, message in cases:
+            with self.subTest(status=status, subagents=bool(subagents), disabled=disabled):
+                row = session_row("main2", status="Attached")
+                row["agent_status"] = status
+                row["subagents"] = subagents
+                row["active_subagent_count"] = len(subagents)
+                proof = self._prime(row)
+                sentinel = self.fixture.state / "account-switching-off"
+                if disabled:
+                    sentinel.touch(mode=0o600)
+                else:
+                    sentinel.unlink(missing_ok=True)
+                refused = run(
+                    [SP, "picker-account-switch", proof, "work"],
+                    env=self.fixture.env(),
+                    check=False,
+                )
+                self.assertNotEqual(0, refused.returncode)
+                self.assertIn(message, refused.stderr)
+                self.assertFalse((self.fixture.state / "account-switches").exists())
+
     def test_picker_takeover_confirms_exact_id_and_uses_force_attach(self) -> None:
         proof = self._prime(session_row("main2", status="Attached"))
         env = self.fixture.env()
@@ -2058,7 +2094,11 @@ class PickerProofTests(unittest.TestCase):
         self.assertIn("Move session to this window", moved.stdout)
         # The confirmation names the session instead of demanding that its ID
         # be retyped.
-        self.assertIn("main2", moved.stdout)
+        # The confirmation names the session, never its ID: the exact ID
+        # still travels as the argument in SESSION_KIT_CONFIRM_ID.
+        self.assertIn("Codex fixture", moved.stdout)
+        self.assertNotIn("main2", moved.stdout)
+        self.assertRegex(moved.stdout, r"\[confirm [0-9a-f]{6}\]")
         self.assertNotIn("Type the exact ID", moved.stdout)
         self.assertEqual("attach main2\n", self.fixture.shpool_log.read_text())
 
@@ -2461,7 +2501,7 @@ class PickerProofTests(unittest.TestCase):
 
         self.fixture.shpool_log.unlink()
         closed = run([SP, "picker-close", proof], env=env)
-        self.assertIn("Closed exact session main9", closed.stdout)
+        self.assertIn("Closed Unknown exact shell", closed.stdout)
         self.assertEqual("kill main9\n", self.fixture.shpool_log.read_text())
 
     def test_unknown_provider_resolution_between_proofs_refuses_close(self) -> None:
@@ -2503,7 +2543,7 @@ class PickerProofTests(unittest.TestCase):
             }
         )
         closed = run([SP, "picker-close", proof], env=env)
-        self.assertIn("Closed exact session main2", closed.stdout)
+        self.assertIn("Closed Codex fixture", closed.stdout)
         self.assertEqual("kill main2\n", self.fixture.shpool_log.read_text())
 
     def test_picker_close_without_exact_confirmation_never_kills(self) -> None:
@@ -2654,7 +2694,9 @@ class PickerProofTests(unittest.TestCase):
             [SP, "picker-name", proof, "  New\u001b title  "],
             env=env,
         )
-        self.assertIn("Named exact codex session main2", named.stdout)
+        self.assertIn("Named the exact codex session", named.stdout)
+        # A provider title can carry control bytes; none may reach the screen.
+        self.assertNotIn("\x1b", named.stdout)
         self.assertNotIn('"aliases"', named.stdout)
         stored = json.loads(self.fixture.config.read_text())
         self.assertEqual(1, stored["schema_version"])
@@ -2678,7 +2720,7 @@ class PickerProofTests(unittest.TestCase):
         )
 
         reset = run([SP, "picker-name-reset", proof], env=env)
-        self.assertIn("Reset local name for exact codex session main2", reset.stdout)
+        self.assertIn("Reset the local name for the exact codex session", reset.stdout)
         self.assertNotIn('"aliases"', reset.stdout)
         stored = json.loads(self.fixture.config.read_text())
         self.assertNotIn(f"codex:{row['identity']['uuid']}", stored["aliases"])
@@ -2728,14 +2770,14 @@ class PickerProofTests(unittest.TestCase):
         self._prime(row)
         env = self.fixture.env()
         named = run([SP, "name", "main2", "Lyrics audit"], env=env)
-        self.assertIn("Named exact claude session main2", named.stdout)
+        self.assertIn("Named the exact claude session", named.stdout)
         stored = json.loads(self.fixture.config.read_text())
         self.assertEqual(
             "Lyrics audit", stored["aliases"][f"claude:{row['identity']['uuid']}"]
         )
 
         reset = run([SP, "name", "reset", "main2"], env=env)
-        self.assertIn("Reset local name for exact claude session main2", reset.stdout)
+        self.assertIn("Reset the local name for the exact claude session", reset.stdout)
         self.assertNotIn(
             f"claude:{row['identity']['uuid']}",
             json.loads(self.fixture.config.read_text())["aliases"],
@@ -2779,7 +2821,7 @@ class PickerProofTests(unittest.TestCase):
         self._prime(row)
         env = self.fixture.env()
         named = run([SP, "name", "main2", "Exited Claude"], env=env)
-        self.assertIn("Named exact claude session main2", named.stdout)
+        self.assertIn("Named the exact claude session", named.stdout)
         stored = json.loads(self.fixture.config.read_text())
         self.assertEqual(
             "Exited Claude", stored["aliases"][f"claude:{historical_uuid}"]
@@ -2812,7 +2854,7 @@ class PickerProofTests(unittest.TestCase):
         self._prime(row)
         env = self.fixture.env()
         named = run([SP, "name", "27", "Stable selector"], env=env)
-        self.assertIn("Named exact claude session main2", named.stdout)
+        self.assertIn("Named the exact claude session", named.stdout)
         stored = json.loads(self.fixture.config.read_text())
         self.assertEqual(
             "Stable selector",
@@ -2845,7 +2887,11 @@ class PickerProofTests(unittest.TestCase):
             }
         )
         forked = run([SP, "picker-fork", proof], env=env)
-        self.assertIn(f"as {fork_uuid}", forked.stdout)
+        # A person is told what was forked, never which conversations were
+        # involved; the exact proof lives in the 0600 launch record.
+        self.assertIn("into a separate", forked.stdout)
+        self.assertNotIn(fork_uuid, forked.stdout)
+        self.assertNotIn(source_uuid, forked.stdout)
         state = json.loads(self.fixture.shpool_state.read_text())
         self.assertEqual(2, len(state["sessions"]))
         self.assertTrue(any(item["name"] == "main2" for item in state["sessions"]))
@@ -2924,7 +2970,11 @@ class PickerProofTests(unittest.TestCase):
             }
         )
         forked = run([SP, "picker-fork", proof], env=env)
-        self.assertIn(f"as {fork_uuid}", forked.stdout)
+        # A person is told what was forked, never which conversations were
+        # involved; the exact proof lives in the 0600 launch record.
+        self.assertIn("into a separate", forked.stdout)
+        self.assertNotIn(fork_uuid, forked.stdout)
+        self.assertNotIn(source_uuid, forked.stdout)
         state = json.loads(self.fixture.shpool_state.read_text())
         self.assertEqual(2, len(state["sessions"]))
 
@@ -2960,7 +3010,7 @@ class PickerProofTests(unittest.TestCase):
         )
         refused = run([SP, "picker-fork", proof], env=env, check=False)
         self.assertNotEqual(0, refused.returncode)
-        self.assertIn("distinct exact claude fork was not proven", refused.stderr)
+        self.assertIn("distinct exact claude conversation was not proven", refused.stderr)
         state = json.loads(self.fixture.shpool_state.read_text())
         self.assertEqual(2, len(state["sessions"]))
         generated = [
@@ -3019,7 +3069,7 @@ class PickerProofTests(unittest.TestCase):
         )
         refused = run([SP, "picker-fork", proof], env=env, check=False)
         self.assertNotEqual(0, refused.returncode)
-        self.assertIn("distinct exact codex fork was not proven", refused.stderr)
+        self.assertIn("distinct exact codex conversation was not proven", refused.stderr)
         state = json.loads(self.fixture.shpool_state.read_text())
         self.assertEqual(2, len(state["sessions"]))
         generated = [item["name"] for item in state["sessions"] if item["name"] != "main2"]
@@ -3167,7 +3217,8 @@ class JournalHistoryTests(unittest.TestCase):
 
 class ConfirmExactDrainTests(unittest.TestCase):
     def test_confirm_is_promptless_and_consumes_no_input(self) -> None:
-        """Interactive confirms are gone (Dan 2026-08-02): the action header
+        """Interactive confirms are gone (maintainer decision, 2026-08-02):
+        the action header
         is the safety display, and nothing typed afterwards may be eaten —
         the very next read must see the human's own input untouched.
         """

@@ -18,6 +18,7 @@ import json
 import os
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -55,11 +56,43 @@ def session(
     }
 
 
-FLAG_LINE = (
-    'handle_conn{cid=1}:handle_attach:bidi_stream{s="wedged"}'
-    ':disconnect_lock(shell_to_client_ctl): failed to tell shell->client to '
-    'disconnect: "SendTimeoutError(..)"'
-)
+def journal_event(message: str, *, age_seconds: int = 300, pid: int | None = None) -> str:
+    """Return one journalctl -o json fixture line."""
+    return json.dumps(
+        {
+            "_PID": str(os.getpid() if pid is None else pid),
+            "__MONOTONIC_TIMESTAMP": str(
+                int((time.monotonic() - age_seconds) * 1_000_000)
+            ),
+            "__REALTIME_TIMESTAMP": str(
+                int((time.time() - age_seconds) * 1_000_000)
+            ),
+            "MESSAGE": message,
+        }
+    )
+
+
+def failure_event(
+    session_id: str = "wedged", *, age_seconds: int = 300, pid: int | None = None
+) -> str:
+    return journal_event(
+        f'handle_attach:bidi_stream{{s="{session_id}"}}:'
+        "disconnect_lock(shell_to_client_ctl): failed to tell shell->client "
+        'to disconnect: "SendTimeoutError(..)"',
+        age_seconds=age_seconds,
+        pid=pid,
+    )
+
+
+def success_event(session_id: str = "wedged", *, age_seconds: int = 60) -> str:
+    return journal_event(
+        f'handle_attach:bidi_stream{{s="{session_id}"}}:'
+        "initial_attach_lock(shell_to_client_ctl): client connection status=New",
+        age_seconds=age_seconds,
+    )
+
+
+FLAG_LINE = failure_event()
 
 
 class WatchdogFixture:
@@ -402,14 +435,84 @@ class WatchdogRepairTests(unittest.TestCase):
         finally:
             fixture.close()
 
-    def test_missing_serving_thread_repairs_the_session(self) -> None:
+    def test_missing_serving_thread_warns_once_and_repairs_nothing(self) -> None:
         fixture = WatchdogFixture(
             sessions=[session(recent_output_age_seconds=300)],
             serving_threads=0,
         )
         try:
             fixture.run()
-            self.assertEqual(["wedged"], fixture.repairs_requested())
+            fixture.run()
+            self.assertEqual([], fixture.repairs_requested())
+            announced = fixture.notify_log.read_text(encoding="utf-8")
+            self.assertEqual(1, announced.count("thread count is inconsistent"))
+        finally:
+            fixture.close()
+
+    def test_null_output_age_with_marker_reports_but_never_repairs(self) -> None:
+        fixture = WatchdogFixture(
+            sessions=[session(recent_output_age_seconds=None)],
+            journal_lines=FLAG_LINE,
+        )
+        try:
+            fixture.run()
+            self.assertEqual([], fixture.repairs_requested())
+            self.assertEqual("reported", fixture.recorded()[0]["outcome"])
+        finally:
+            fixture.close()
+
+    def test_fresh_marker_is_not_reported_or_repaired(self) -> None:
+        fixture = WatchdogFixture(
+            sessions=[session(recent_output_age_seconds=300)],
+            journal_lines=failure_event(age_seconds=30),
+        )
+        try:
+            fixture.run()
+            self.assertEqual([], fixture.repairs_requested())
+            self.assertEqual([], fixture.recorded())
+        finally:
+            fixture.close()
+
+    def test_later_success_invalidates_failure(self) -> None:
+        fixture = WatchdogFixture(
+            sessions=[session(recent_output_age_seconds=300)],
+            journal_lines="\n".join(
+                [failure_event(age_seconds=300), success_event(age_seconds=60)]
+            ),
+        )
+        try:
+            fixture.run()
+            self.assertEqual([], fixture.repairs_requested())
+            self.assertEqual([], fixture.recorded())
+        finally:
+            fixture.close()
+
+    def test_marker_from_old_daemon_generation_is_ignored(self) -> None:
+        fixture = WatchdogFixture(
+            sessions=[session(recent_output_age_seconds=300)],
+            journal_lines=failure_event(pid=os.getpid() + 100_000),
+        )
+        try:
+            fixture.run()
+            self.assertEqual([], fixture.repairs_requested())
+            self.assertEqual([], fixture.recorded())
+        finally:
+            fixture.close()
+
+    def test_global_thread_gap_is_not_attributed_to_every_session(self) -> None:
+        fixture = WatchdogFixture(
+            sessions=[
+                session("one", recent_output_age_seconds=300),
+                session("two", recent_output_age_seconds=300),
+            ],
+            serving_threads=1,
+        )
+        try:
+            fixture.run()
+            self.assertEqual([], fixture.repairs_requested())
+            self.assertEqual([], fixture.recorded())
+            announced = fixture.notify_log.read_text(encoding="utf-8")
+            self.assertEqual(1, announced.count("thread count is inconsistent"))
         finally:
             fixture.close()
 

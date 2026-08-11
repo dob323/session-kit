@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+"""Syntax-check the scripts Session Kit embeds in shell heredocs.
+
+`bash -n`, ShellCheck, and Ruff all stop at the heredoc marker: to every one of
+them a heredoc body is opaque text. Session Kit keeps thousands of lines of
+Python and a handful of shell fragments inside those bodies, including the
+login path in `bashrc/shpool.bashrc`, where a syntax error is not a failed
+check but a broken interactive login.
+
+This extracts each literal heredoc body, checks it with the tool that
+understands it, and maps any error back to its line in the shell file.
+
+Bodies from unquoted heredocs are expanded by the shell before the interpreter
+sees them, so their source is not the text on disk. Those are counted and
+skipped rather than checked against a text the shell never runs.
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+
+DEFAULT_TARGETS = (
+    "install.sh",
+    "bin",
+    "lib/sh",
+    "bashrc/shpool.bashrc",
+    "deploy/session-kit-launcher",
+    "tests/run",
+)
+
+# `<<` starts a heredoc; `<<<` is a here-string and `<<=` is an assignment, so
+# both are excluded. The delimiter may be quoted, which is what makes the body
+# literal instead of expanded.
+HEREDOC = re.compile(
+    r"""<<(?P<dash>-?)\s*(?P<quote>['"]?)(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?P=quote)"""
+)
+PYTHON_NAMES = {"PY", "PYTHON", "PYTHON3", "PYCODE"}
+SHELL_NAMES = {"SH", "BASH", "SHELL", "ZSH"}
+PYTHON_OPENERS = ("import ", "from ", "def ", "class ", "if __name__")
+
+
+@dataclass
+class Body:
+    """One heredoc body and where it starts in the shell file."""
+
+    path: Path
+    name: str
+    line: int
+    expanded: bool
+    text: str
+
+
+def find_bodies(path: Path) -> list[Body]:
+    """Return every heredoc body in one shell file, in file order."""
+    lines = path.read_text(encoding="utf-8").splitlines()
+    bodies: list[Body] = []
+    pending: list[tuple[str, bool, bool]] = []
+    collecting: tuple[str, bool, bool, int, list[str]] | None = None
+    for number, line in enumerate(lines, 1):
+        if collecting is not None:
+            name, strip_tabs, expanded, start, collected = collecting
+            candidate = line.lstrip("\t") if strip_tabs else line
+            if candidate == name:
+                bodies.append(
+                    Body(path, name, start, expanded, "\n".join(collected) + "\n")
+                )
+                collecting = None
+            else:
+                collected.append(candidate)
+            continue
+        if pending:
+            name, strip_tabs, expanded = pending.pop(0)
+            collecting = (name, strip_tabs, expanded, number, [])
+            candidate = line.lstrip("\t") if strip_tabs else line
+            if candidate == name:
+                bodies.append(Body(path, name, number, expanded, ""))
+                collecting = None
+            else:
+                collecting[4].append(candidate)
+            continue
+        if line.lstrip().startswith("#"):
+            continue
+        for match in HEREDOC.finditer(line):
+            before = line[: match.start()]
+            if before.endswith("<") or line[match.end() : match.end() + 1] == "<":
+                continue
+            pending.append((match["name"], match["dash"] == "-", match["quote"] == ""))
+    if collecting is not None:
+        raise ValueError(
+            f"{path}:{collecting[3]}: heredoc {collecting[0]} is never terminated"
+        )
+    return bodies
+
+
+def classify(body: Body) -> str:
+    """Return "python", "shell", or "data" for one body."""
+    if body.name in PYTHON_NAMES:
+        return "python"
+    if body.name in SHELL_NAMES:
+        return "shell"
+    for line in body.text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith(PYTHON_OPENERS):
+            return "python"
+        break
+    return "data"
+
+
+def check_python(body: Body) -> list[str]:
+    try:
+        compile(body.text, str(body.path), "exec")
+    except SyntaxError as error:
+        line = body.line + (error.lineno or 1) - 1
+        return [f"{body.path}:{line}: embedded Python: {error.msg}"]
+    except ValueError as error:
+        return [f"{body.path}:{body.line}: embedded Python: {error}"]
+    return []
+
+
+def check_shell(body: Body, shellcheck: str | None) -> list[str]:
+    problems = []
+    with tempfile.TemporaryDirectory(prefix="session-kit-embedded.") as temporary:
+        script = Path(temporary) / "embedded.sh"
+        script.write_text(body.text, encoding="utf-8")
+        commands = [["bash", "-n", os.fspath(script)]]
+        if shellcheck is not None:
+            commands.append([shellcheck, "--shell=bash", os.fspath(script)])
+        for command in commands:
+            done = subprocess.run(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+            if done.returncode == 0:
+                continue
+            detail = " ".join(done.stdout.split())[:400] or "no output"
+            problems.append(
+                f"{body.path}:{body.line}: embedded shell "
+                f"({Path(command[0]).name}): {detail}"
+            )
+    return problems
+
+
+def shell_files(targets: list[str], root: Path) -> list[Path]:
+    found: list[Path] = []
+    for target in targets:
+        path = root / target
+        if path.is_dir():
+            found.extend(sorted(item for item in path.iterdir() if item.is_file()))
+        elif path.is_file():
+            found.append(path)
+        else:
+            raise SystemExit(f"check-embedded-scripts: missing target: {path}")
+    return found
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Syntax-check scripts embedded in shell heredocs."
+    )
+    parser.add_argument(
+        "targets",
+        nargs="*",
+        help="files or directories to scan (default: the kit's shell sources)",
+    )
+    parser.add_argument(
+        "--root",
+        default=os.fspath(Path(__file__).resolve().parents[1]),
+        help="repository root the default targets resolve against",
+    )
+    parser.add_argument(
+        "--quiet", action="store_true", help="print only failures and the summary"
+    )
+    arguments = parser.parse_args()
+    root = Path(arguments.root).resolve()
+    targets = arguments.targets or list(DEFAULT_TARGETS)
+    shellcheck = shutil.which("shellcheck")
+    problems: list[str] = []
+    checked = {"python": 0, "shell": 0}
+    skipped_expanded = 0
+    data_bodies = 0
+    for path in shell_files(targets, root):
+        try:
+            bodies = find_bodies(path)
+        except (OSError, UnicodeError, ValueError) as error:
+            problems.append(f"{path}: {error}")
+            continue
+        for body in bodies:
+            kind = classify(body)
+            if kind == "data":
+                data_bodies += 1
+                continue
+            if body.expanded:
+                skipped_expanded += 1
+                continue
+            checked[kind] += 1
+            if kind == "python":
+                problems.extend(check_python(body))
+            else:
+                problems.extend(check_shell(body, shellcheck))
+        if not arguments.quiet:
+            print(
+                f"{path.relative_to(root)}: {len(bodies)} heredocs",
+                flush=True,
+            )
+    for problem in problems:
+        print(problem, file=sys.stderr)
+    tool = "shellcheck and bash -n" if shellcheck else "bash -n"
+    print(
+        f"embedded script check: {checked['python']} Python bodies compiled, "
+        f"{checked['shell']} shell bodies checked with {tool}, "
+        f"{skipped_expanded} expanded bodies skipped, "
+        f"{data_bodies} data bodies ignored, {len(problems)} problems"
+    )
+    return 1 if problems else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

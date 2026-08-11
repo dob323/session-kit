@@ -18,7 +18,13 @@ from pathlib import Path
 import re
 from typing import Any, Callable, Mapping
 
-from .common import PROVIDERS, CollectionError, automatic_naming_enabled, valid_uuid
+from .common import (
+    PROVIDERS,
+    CollectionError,
+    automatic_naming_enabled,
+    proc_root as gated_proc_root,
+    valid_uuid,
+)
 from .processes import _process_ancestor_chain
 
 
@@ -44,6 +50,14 @@ _TITLE_TRAILING_STOPWORDS = frozenset(
     "with".split()
 )
 
+_MACHINE_PROMPT_PREFIXES = (
+    "<cross-session-message",
+    "[session-kit operator message ",
+    "Session Kit initialized this managed worker.",
+    "You are a Session Kit delivery runner.",
+    "RUNTIME FOR THIS WAKE: You are a fixed Session Kit delivery bot.",
+)
+
 
 def derive_prompt_title(prompt: Any, *, stopwords: frozenset[str]) -> str | None:
     """Derive a short display title from a first user prompt.
@@ -54,7 +68,11 @@ def derive_prompt_title(prompt: Any, *, stopwords: frozenset[str]) -> str | None
     if not isinstance(prompt, str):
         return None
     text = re.sub(r"\s+", " ", prompt).strip()
-    if not text or text.startswith("/"):
+    if (
+        not text
+        or text.startswith("/")
+        or any(text.startswith(prefix) for prefix in _MACHINE_PROMPT_PREFIXES)
+    ):
         return None
     text = re.split(r"(?<=[.!?])\s", text, maxsplit=1)[0]
     words = text.split(" ")[:7]
@@ -90,6 +108,8 @@ def auto_title_from_hook(
     max_transcript_bytes: int,
     resume_continuation_text: str,
     propagate_title: Callable[..., dict[str, Any]],
+    name_owner: Callable[..., str],
+    claim_name: Callable[..., str],
 ) -> dict[str, Any]:
     """Title a pre-baked Claude conversation from its first real prompt.
 
@@ -98,6 +118,12 @@ def auto_title_from_hook(
     carry the resume-continuation signature, no real conversation beyond the
     triggering prompt, and no title of any kind (ai, /rename, agent-name,
     kit name intent) may already exist.
+
+    The name is claimed once, at the conversation's first prompt: a thread
+    whose name is already owned — by a person, or by the pass that ran at
+    that first prompt — is left exactly as it is. The hook fires twice for a
+    brand-new session (UserPromptSubmit, then Stop), and that claim is what
+    makes the second firing a no-op rather than a second rename.
     """
     out: dict[str, Any] = {"title": None, "pushes": [], "warnings": []}
 
@@ -122,6 +148,11 @@ def auto_title_from_hook(
         return skip("missing or invalid session_id")
 
     env = environ if environ is not None else os.environ
+    owner = name_owner("claude", uuid, environ=env)
+    if owner == "human":
+        return skip("a human name owns this session")
+    if owner == "automatic":
+        return skip("an automatic name already owns this session")
     home = Path(env.get("HOME") or os.fspath(Path.home()))
     transcript_raw = payload.get("transcript_path")
     if not isinstance(transcript_raw, str) or not transcript_raw:
@@ -202,6 +233,11 @@ def auto_title_from_hook(
         out["pushes"].append("claude-transcript-ai-title")
     except OSError as exc:
         return skip(f"transcript not appended: {exc}")
+    # Claim before pushing: the record is what stops a second pass, and a
+    # push that half-succeeds must not leave the thread open to renaming.
+    claimed = claim_name("claude", uuid, environ=env)
+    if claimed:
+        out["warnings"].append(claimed)
     pushed = propagate_title("claude", uuid, title, environ=env)
     out["title"] = title
     out["pushes"].extend(pushed.get("provider_title_pushes", []))
@@ -316,7 +352,7 @@ def self_name_automatic_title(
     caller_environ = environ if environ is not None else os.environ
     if not automatic_naming_enabled(caller_environ):
         raise CollectionError("automatic naming is disabled")
-    proc_root = Path(caller_environ.get("SESSION_KIT_PROC_ROOT", "/proc"))
+    proc_root = gated_proc_root(caller_environ)
     supplied_evidence = inventory is not None or process_table is not None
     live = inventory or snapshot_inventory(write_state=False, config=dict(config))
     table = process_table or process_table_reader(

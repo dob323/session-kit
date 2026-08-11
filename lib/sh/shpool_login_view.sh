@@ -44,6 +44,7 @@ def matches(row):
         row.get("shpool_id"),
         row.get("provider"),
         row.get("display_provider"),
+        row.get("account_alias"),
         row.get("title"),
         row.get("display_title"),
         row.get("native_title"),
@@ -98,6 +99,7 @@ for row in rows:
         row.get("display_shpool_id") or row.get("shpool_id"), 96
     )
     row["native_title"] = clean(row.get("native_title"), 120)
+    row["account_alias"] = clean(row.get("account_alias"), 20)
 
 outside = []
 for original in data.get("outside_agents", []):
@@ -164,46 +166,29 @@ total = len(rows)
 def page_lines(first, last, paged):
     selected = rows[first:min(last, len(rows))]
 
-    # Summary/search, optional other-provider shortcut/stale notices.
+    # Summary/search and stale notice. Attention and advanced counts stay on
+    # one line below the session list.
     lines = 2 if picker.get("query") else 1
-    if outside:
-        lines += 1
-    if picker.get("unavailable_total"):
-        lines += 1
     if data.get("stale"):
         lines += 1
 
     previous_availability = None
-    previous_attention = None
-    previous_provider = None
     for row in selected:
         availability = row.get("availability")
-        attention = bool(row.get("needs_you"))
-        provider = str(
-            row.get("display_provider") or row.get("provider") or "unknown"
-        )
-        if availability != previous_availability:
+        if row.get("_picker_supervisor_pin"):
+            lines += 1  # pinned heading
+            previous_availability = None
+        elif availability != previous_availability:
             lines += 1  # action heading
             previous_availability = availability
-            previous_attention = None
-            previous_provider = None
-        if attention != previous_attention:
-            previous_attention = attention
-            previous_provider = None
-        if provider != previous_provider:
-            lines += 1
-            previous_provider = provider
         lines += 1
 
     if not selected:
         lines += 1
     if paged:
         lines += 1
-    if has_recovery:
-        lines += 1
-    lines += banner_lines  # watchdog repair notice
-    lines += 3  # spacer and two compact help lines
-    lines += 1  # input prompt
+    lines += banner_lines  # one attention cue and/or live warning
+    lines += 3  # spacer, compact footer, and input prompt
     return lines
 
 if total == 0:
@@ -239,6 +224,27 @@ clamp_page() {
   pages=$(page_count)
   (( PAGE >= 1 )) || PAGE=1
   (( PAGE <= pages )) || PAGE=$pages
+}
+
+# Every number the current page is showing, in display order. `all` means
+# exactly what a person can see — never a session on another page.
+page_numbers() {
+  python3 - "$VIEW" "$PAGE" "$PAGE_SIZE" <<'PY'
+import json
+import sys
+
+path, page_text, size_text = sys.argv[1:4]
+page, page_size = int(page_text), int(size_text)
+with open(path, encoding="utf-8") as handle:
+    rows = json.load(handle).get("sessions", [])
+pages = max(1, (len(rows) + page_size - 1) // page_size)
+page = min(max(page, 1), pages)
+first = (page - 1) * page_size
+for row in rows[first : first + page_size]:
+    number = row.get("terminal_number")
+    if isinstance(number, int) and not isinstance(number, bool) and number > 0:
+        print(number)
+PY
 }
 
 number_on_page() {

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 import os
 import shutil
 import sys
+import time
 import unicodedata
 from typing import Any, Callable, Mapping
 
@@ -12,6 +14,46 @@ from .common import _positive_int, clean_text
 
 
 DEFAULT_STALL_SECONDS = 2700
+
+
+def _timestamp(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _relative_time(timestamp_ms: int, now_ms: int) -> str:
+    seconds = max(0, (now_ms - timestamp_ms) // 1000)
+    if seconds < 60:
+        return "just now"
+    if seconds < 3600:
+        return f"{seconds // 60} min ago"
+    if seconds < 86400:
+        return f"{seconds // 3600} hr ago"
+    if seconds < 30 * 86400:
+        days = seconds // 86400
+        return f"{days} day{'s' if days != 1 else ''} ago"
+    local = datetime.fromtimestamp(timestamp_ms / 1000).astimezone()
+    current = datetime.fromtimestamp(now_ms / 1000).astimezone()
+    date = f"{local.strftime('%b')} {local.day}"
+    return date if local.year == current.year else f"{date}, {local.year}"
+
+
+def _precise_local_time(timestamp_ms: int) -> str:
+    local = datetime.fromtimestamp(timestamp_ms / 1000).astimezone()
+    hour = local.hour % 12 or 12
+    zone = local.tzname() or "local time"
+    return (
+        f"{local.strftime('%b')} {local.day}, {local.year} at "
+        f"{hour}:{local.minute:02d} {local.strftime('%p')} {zone}"
+    )
+
+
+def _time_detail(timestamp_ms: object, now_ms: int) -> str:
+    exact = _timestamp(timestamp_ms)
+    if exact is None:
+        return ""
+    return f"{_precise_local_time(exact)} ({_relative_time(exact, now_ms)})"
 
 
 def _format_age(seconds: int | None) -> str:
@@ -246,7 +288,6 @@ def render_inventory(
     if outside:
         lines.append(f"  {bold}Outside shpool{reset}")
         for item in outside:
-            uuid = item.get("identity", {}).get("uuid") or ""
             agent_count = int(
                 item.get("active_subagent_count", len(item.get("subagents", ())))
             )
@@ -256,8 +297,6 @@ def render_inventory(
             )
             lines.append(f"{prefix}{tint(item, title)}")
             detail_parts = [clean_text(item.get("agent_status") or "unknown", 64)]
-            if uuid:
-                detail_parts.append(uuid[:8])
             if agent_count:
                 detail_parts.append(
                     f"{agent_count} subagent{'s' if agent_count != 1 else ''}"
@@ -279,6 +318,84 @@ def render_inventory(
             ]
         )
     return "\n".join(lines)
+
+
+def render_detail(
+    inventory: Mapping[str, Any],
+    selector: str,
+    *,
+    home_factory: Callable[[], Any],
+    activity: Mapping[str, Any] | None = None,
+    now_ms: int | None = None,
+) -> str:
+    """One session in full, for a person.
+
+    `lookup` returns the row itself and is a machine mode — it carries the
+    shpool id, the conversation UUID, PIDs and start ticks. This is what `sp
+    detail` prints instead: everything a person can act on, and no identifier
+    they could paste anywhere.
+    """
+    row = lookup(inventory, selector)
+    if row is None:
+        return "No single session matches that selector."
+    identity = row.get("identity")
+    identity = identity if isinstance(identity, Mapping) else {}
+    subagents = row.get("subagents")
+    subagents = subagents if isinstance(subagents, list) else []
+    activity = activity if isinstance(activity, Mapping) else {}
+    projected_now = _timestamp(now_ms)
+    as_of = projected_now if projected_now is not None else int(time.time() * 1000)
+    status = clean_text(row.get("agent_status"), 64)
+    is_waiting = row.get("needs_you") is True or status.casefold() == "needs your reply"
+    number = row.get("terminal_number")
+    fields: list[tuple[str, str]] = [
+        (
+            "Session",
+            str(number)
+            if isinstance(number, int) and not isinstance(number, bool) and number > 0
+            else "not numbered",
+        ),
+        ("Title", clean_text(row.get("display_title") or row.get("title"), 120)),
+        (
+            "Provider",
+            clean_text(row.get("display_provider") or row.get("provider"), 40),
+        ),
+        ("Account alias", clean_text(row.get("account_alias"), 20)),
+        ("Account email", clean_text(row.get("account_email"), 254)),
+        ("Account plan", clean_text(row.get("account_plan"), 80)),
+        ("Status", status),
+        ("Availability", clean_text(row.get("availability"), 40)),
+        (
+            "Last response",
+            _time_detail(activity.get("last_response_at_unix_ms"), as_of),
+        ),
+        (
+            "Waiting since",
+            _time_detail(
+                activity.get("waiting_since_unix_ms") if is_waiting else None,
+                as_of,
+            ),
+        ),
+        ("Opened", _time_detail(row.get("started_at_unix_ms"), as_of)),
+        ("Attachment", clean_text(row.get("shpool_status"), 40)),
+        (
+            "Project",
+            _short_path(clean_text(row.get("cwd"), 4096), home_factory=home_factory),
+        ),
+        ("Color", clean_text(row.get("display_color") or row.get("color"), 40)),
+        (
+            "Conversation",
+            "exact" if identity.get("confidence") == "exact" else "not yet exact",
+        ),
+        ("Subagents", str(len(subagents)) if subagents else "none"),
+        ("Name state", clean_text(row.get("provider_title_state"), 40)),
+    ]
+    lines = ["  Session detail"]
+    width = max(len(label) for label, _ in fields)
+    for label, value in fields:
+        if value:
+            lines.append(f"  {label.ljust(width)}  {value}")
+    return "\n".join(lines) + "\n"
 
 
 def lookup(inventory: Mapping[str, Any], selector: str) -> dict[str, Any] | None:

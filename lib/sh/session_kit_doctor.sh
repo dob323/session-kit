@@ -13,6 +13,111 @@
 # Globals the entry script owns are assigned there, not here.
 # shellcheck disable=SC2154
 
+# Run one read-only systemctl user query over whichever transport the manager
+# actually answers on. The caller resolves the transport once so a report never
+# probes for it per unit.
+doctor_systemctl_user() {
+  local transport=$1
+  shift
+  if [[ $transport == machine ]]; then
+    systemctl --user --machine=@.host "$@"
+  else
+    systemctl --user "$@"
+  fi
+}
+
+# Report what systemd says about the Session Kit units, not what the file
+# system says. `session-kit services enable` installs unit files for every
+# unit, so a file-exists check passes on a machine where the watchdog has
+# never run and dead terminals are never recovered.
+#
+# Called from doctor_command(), which owns add_check() and the checks array.
+# shellcheck disable=SC2154
+doctor_linux_service_truth() {
+  local transport=$1 unit=  probe=1 show= key= value=
+  local file_state= active_state= detail= summary= degraded=0
+  local watchdog=session-kit-watchdog.service
+  local fix="session-kit services enable"
+  # Live state is only read when the user manager answers on its own socket.
+  # A manager reachable only through the local-machine transport is already
+  # degraded, and logind usually has no session record for the user in that
+  # state, so both readings would be guesses. Test installs point $service_root
+  # at a fixture directory the real manager has never read, so probing there
+  # would report this developer machine instead of the fixture.
+  [[ ${SESSION_KIT_TESTING:-0} != 1 && $transport == direct ]] || probe=0
+  read_unit_state() {
+    file_state=
+    active_state=
+    show=$(doctor_systemctl_user "$transport" show \
+      --property=UnitFileState --property=ActiveState -- "$1" 2>/dev/null) ||
+      show=
+    [[ -n $show ]] || return 1
+    while IFS='=' read -r key value; do
+      case $key in
+        UnitFileState) file_state=$value ;;
+        ActiveState) active_state=$value ;;
+      esac
+    done <<<"$show"
+    return 0
+  }
+  if [[ ! -f $service_root/$watchdog || -L $service_root/$watchdog ]]; then
+    add_check fail watchdog \
+      "unit file is missing from $service_root; reinstall the units with: session-kit update"
+  elif (( probe == 0 )); then
+    add_check warn watchdog \
+      "unit file is installed; the live unit state was not probed here"
+  elif ! read_unit_state "$watchdog"; then
+    add_check warn watchdog \
+      "unit file is installed; systemd did not answer a state query, so it could not be confirmed running"
+  elif [[ $file_state != enabled ]]; then
+    add_check fail watchdog \
+      "installed but not enabled (${file_state:-unknown}), so dead terminals are never recovered; enable it with: $fix"
+  elif [[ $active_state != active ]]; then
+    add_check fail watchdog \
+      "enabled but not running ($active_state), so dead terminals are never recovered; start it with: $fix"
+  else
+    add_check ok watchdog "enabled and running"
+  fi
+  # The socket and the timer carry the daemon and the reaper. The two units
+  # they activate are reported for context and never required to be running.
+  for unit in shpool.socket shpool-reaper.timer shpool.service shpool-reaper.service; do
+    if [[ ! -f $service_root/$unit || -L $service_root/$unit ]]; then
+      summary+="${summary:+; }$unit missing from $service_root"
+      degraded=2
+      continue
+    fi
+    if (( probe == 0 )) || ! read_unit_state "$unit"; then
+      summary+="${summary:+; }$unit installed, state unread"
+      (( degraded >= 1 )) || degraded=1
+      continue
+    fi
+    detail="$unit ${file_state:-unknown}/${active_state:-unknown}"
+    case $unit in
+      shpool.service) detail+=" (socket-activated)" ;;
+      shpool-reaper.service) detail+=" (timer-activated)" ;;
+      *)
+        if [[ $file_state != enabled || $active_state != active ]]; then
+          degraded=2
+        fi
+        ;;
+    esac
+    summary+="${summary:+; }$detail"
+  done
+  case $degraded in
+    0) add_check ok units "$summary" ;;
+    1) add_check warn units "$summary" ;;
+    *) add_check fail units "$summary; enable the units with: $fix" ;;
+  esac
+  local linger_status= linger_detail=
+  if (( probe == 0 )); then
+    add_check warn linger \
+      "lingering was not checked here; without it logind stops the user manager at logout and every managed session ends with it"
+  else
+    IFS=$'\t' read -r linger_status linger_detail < <(logind_linger_report)
+    add_check "$linger_status" linger "$linger_detail"
+  fi
+}
+
 doctor_command() {
   local json=0
   [[ ${1:-} != --json ]] || { json=1; shift; }
@@ -41,6 +146,26 @@ doctor_command() {
   else
     add_check fail release "no valid active release"
   fi
+  local manager_id= manager_dir= manager_error=
+  if [[ -L $manager_link ]] &&
+     manager_dir=$(cd -P -- "$manager_link" 2>/dev/null && pwd) &&
+     manager_id=${manager_dir##*/} &&
+     [[ $manager_id =~ ^[0-9a-f]{40}$ ]] &&
+     [[ $manager_dir == "$install_root/releases/$manager_id" ]] &&
+     manager_error=$(verify_release "$manager_dir" "$manager_id" 2>&1); then
+    add_check ok manager "$manager_id"
+    if [[ -f $bin_dir/session-kit && ! -L $bin_dir/session-kit &&
+          -f $manager_dir/deploy/session-kit-launcher &&
+          ! -L $manager_dir/deploy/session-kit-launcher ]] &&
+       cmp -s -- "$bin_dir/session-kit" "$manager_dir/deploy/session-kit-launcher"; then
+      add_check ok manager-launcher "stable launcher matches the management release"
+    else
+      add_check fail manager-launcher "stable launcher does not match the management release"
+    fi
+  else
+    add_check fail manager "management release anchor is missing, unsafe, or invalid${manager_error:+: ${manager_error#session-kit: }}"
+    add_check fail manager-launcher "management release could not be checked"
+  fi
   local -a required_commands=("${common_required_commands[@]}") missing_commands=()
   if [[ $current_platform == linux ]]; then
     required_commands+=(flock journalctl systemctl)
@@ -55,6 +180,9 @@ doctor_command() {
   else
     add_check fail prerequisites "commands unavailable: ${missing_commands[*]}"
   fi
+  local shpool_status= shpool_detail=
+  IFS=$'\t' read -r shpool_status shpool_detail < <(shpool_version_report)
+  add_check "$shpool_status" shpool-version "$shpool_detail"
   if [[ $current_platform == linux ]]; then
     if [[ -d /proc || ${SESSION_KIT_TESTING:-0} == 1 ]]; then
       add_check ok process "Linux /proc is available"
@@ -73,6 +201,7 @@ doctor_command() {
     else
       add_check fail services "systemd user manager is unavailable"
     fi
+    doctor_linux_service_truth "$manager_transport"
   elif [[ $current_platform == macos ]]; then
     if [[ ${SESSION_KIT_TESTING:-0} == 1 ]] ||
         python3 "$install_root/current/lib/session_inventory.py" platform boot-id >/dev/null 2>&1; then
@@ -109,13 +238,14 @@ doctor_command() {
   local audit_output audit_ok=1 audit_name
   local -a audit_names=(
     claude-version codex-version codex-themes naming-instructions naming-hook
+    provider-hooks hook-files
     kill-switches acceptance shpool-binary
   )
   declare -A audit_expected=() audit_seen=()
   for audit_name in "${audit_names[@]}"; do audit_expected[$audit_name]=1; done
   if audit_output=$(python3 - "$HOME" "$config_root" \
     "${SESSION_KIT_CODEX_HOME:-${CODEX_HOME:-$HOME/.codex}}" \
-    "$release_id" "$current_platform" <<'PY'
+    "$release_id" "$current_platform" "$install_root" <<'PY'
 import datetime
 import hashlib
 import json
@@ -133,6 +263,7 @@ import time
 
 home, config_root, codex_home = map(Path, sys.argv[1:4])
 active_release, active_platform = sys.argv[4:6]
+install_root = Path(sys.argv[6])
 
 
 def emit(status: str, name: str, detail: str) -> None:
@@ -528,6 +659,100 @@ if hook_errors:
 else:
     emit("ok", "naming-hook", "Claude title hook covers SessionStart, UserPromptSubmit, and Stop")
 
+
+def owned_intake_hook(document, expected_command: str) -> bool:
+    if not isinstance(document, dict):
+        return False
+    all_hooks = document.get("hooks")
+    event_groups = all_hooks.get("UserPromptSubmit") if isinstance(all_hooks, dict) else None
+    if not isinstance(event_groups, list):
+        return False
+    owned = []
+    for group in event_groups:
+        if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+            return False
+        for hook in group["hooks"]:
+            if not isinstance(hook, dict):
+                return False
+            provenance = hook.get("sessionKitProvenance")
+            if isinstance(provenance, dict) and provenance.get("owner") == "session-kit":
+                owned.append(hook)
+    return len(owned) == 1 and owned[0].get("command") == expected_command
+
+
+codex_hooks_text = bounded_text(codex_home / "hooks.json")
+try:
+    codex_hooks_document = json.loads(codex_hooks_text or "")
+except ValueError:
+    codex_hooks_document = None
+provider_hook_errors = []
+if not owned_intake_hook(
+    settings,
+    '"$HOME/.local/lib/session-kit/current/extras/hooks/sk_session_events.py"',
+):
+    provider_hook_errors.append("Claude")
+if not owned_intake_hook(
+    codex_hooks_document,
+    'python3 "$HOME/.local/lib/session-kit/current/lib/sessionkit_supervisor/provider_hooks.py" codex-hook',
+):
+    provider_hook_errors.append("Codex")
+provider_hooks_required = (
+    install_root / "releases" / active_release / "config" / "codex" / "hooks.json"
+).is_file()
+if provider_hook_errors and provider_hooks_required:
+    emit(
+        "fail",
+        "provider-hooks",
+        "automatic intake hook missing or ambiguous for: "
+        + ", ".join(provider_hook_errors),
+    )
+elif provider_hook_errors:
+    emit("ok", "provider-hooks", "automatic intake hooks are not required by the active release")
+else:
+    emit("ok", "provider-hooks", "Claude and Codex automatic intake hooks are registered once")
+
+# A registered hook command is not a working hook. The release payload is
+# assembled from a file list, and a release built without extras/ installs
+# cleanly, registers both intake hooks, and then fails on every prompt because
+# the command names a file that was never shipped. Check the exact paths the
+# registered commands run, not the registration strings.
+default_install_root = home / ".local/lib/session-kit"
+hook_file_errors = []
+for label, relative, executable_required in (
+    ("Claude events hook", "extras/hooks/sk_session_events.py", True),
+    ("Codex intake hook", "extras/hooks/sk_codex_intake.py", True),
+    ("provider hook tool", "lib/sessionkit_supervisor/provider_hooks.py", False),
+):
+    hook_file = install_root / "current" / relative
+    try:
+        hook_info = hook_file.stat()
+    except OSError:
+        hook_file_errors.append(f"{label} is missing ({relative})")
+        continue
+    if not stat.S_ISREG(hook_info.st_mode):
+        hook_file_errors.append(f"{label} is not a regular file ({relative})")
+    elif executable_required and not hook_info.st_mode & 0o111:
+        hook_file_errors.append(f"{label} is not executable ({relative})")
+if install_root != default_install_root:
+    # Both registered commands hard-code the default root, so a custom install
+    # root leaves them pointing at a tree this install never wrote.
+    hook_file_errors.append(
+        "the registered hook commands name "
+        + os.fspath(default_install_root)
+        + ", which is not this install root"
+    )
+if not provider_hooks_required:
+    emit("ok", "hook-files", "the active release does not require intake hook files")
+elif hook_file_errors:
+    emit(
+        "fail",
+        "hook-files",
+        "; ".join(hook_file_errors)
+        + "; install a release that ships them with: session-kit update",
+    )
+else:
+    emit("ok", "hook-files", "every registered hook command resolves to a runnable file")
+
 active = []
 if os.environ.get("SESSION_KIT_AUTO_NAME", "").strip().casefold() in {"0", "false", "no", "off"}:
     active.append("SESSION_KIT_AUTO_NAME")
@@ -591,7 +816,7 @@ PY
   ); then
     while IFS=$'\t' read -r status name detail; do
       if [[ ${audit_expected[$name]:-0} == 1 && -z ${audit_seen[$name]:-} &&
-            $status =~ ^(ok|warn)$ && -n $detail ]]; then
+            $status =~ ^(ok|warn|fail)$ && -n $detail ]]; then
         add_check "$status" "$name" "$detail"
         audit_seen[$name]=1
       elif [[ -n $status || -n $name || -n $detail ]]; then

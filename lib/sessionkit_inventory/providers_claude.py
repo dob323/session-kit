@@ -71,6 +71,7 @@ def read_claude_transcript_signals(
     environ: Mapping[str, str],
     home_factory: Callable[[], Path],
     palette: Sequence[str],
+    config_dir: Path | None = None,
 ) -> dict[str, str]:
     """Return Claude's persisted per-conversation title and color evidence.
 
@@ -86,7 +87,8 @@ def read_claude_transcript_signals(
     if not exact_uuid:
         return signals
     base = home if home is not None else Path(environ.get("HOME") or home_factory())
-    projects = base / ".claude" / "projects"
+    claude_root = config_dir if config_dir is not None else base / ".claude"
+    projects = claude_root / "projects"
     try:
         transcripts = sorted(projects.glob(f"*/{exact_uuid}.jsonl"))
     except OSError:
@@ -158,6 +160,7 @@ def _enrich_claude_payload(
     if not isinstance(payload, list):
         return payload
     home = Path(environ.get("HOME") or home_factory())
+    default_root = home / ".claude"
     for item in payload:
         if not isinstance(item, dict):
             continue
@@ -165,7 +168,13 @@ def _enrich_claude_payload(
         uuid = valid_uuid(item.get("sessionId"))
         if not isinstance(pid, int) or pid <= 0 or not uuid:
             continue
-        record_path = home / ".claude" / "sessions" / f"{pid}.json"
+        raw_root = item.get("_session_kit_claude_config_dir")
+        claude_root = (
+            Path(raw_root)
+            if isinstance(raw_root, str) and Path(raw_root).is_absolute()
+            else default_root
+        )
+        record_path = claude_root / "sessions" / f"{pid}.json"
         if "nameSource" not in item and record_path.is_file():
             try:
                 record = json.loads(record_path.read_text(encoding="utf-8"))
@@ -177,7 +186,17 @@ def _enrich_claude_payload(
         needs_name = not item.get("agentName")
         needs_color = item.get("agentColor") not in palette
         if needs_title or needs_name or needs_color:
-            signals = transcript_signals(uuid, home)
+            if claude_root == default_root:
+                signals = transcript_signals(uuid, home)
+            else:
+                signals = read_claude_transcript_signals(
+                    uuid,
+                    home,
+                    environ=environ,
+                    home_factory=home_factory,
+                    palette=palette,
+                    config_dir=claude_root,
+                )
             if needs_title:
                 item["aiTitle"] = signals["ai_title"]
             if needs_name:

@@ -1,0 +1,710 @@
+#!/usr/bin/env bash
+# Create, refresh, or attach to the permanent Fleet Supervisor session.
+set -u
+set -o pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+RELEASE_DIR=$(cd -- "$SCRIPT_DIR/.." && pwd -P)
+SP=${SESSION_KIT_SP:-"$SCRIPT_DIR/sp"}
+STATUS=${SESSION_KIT_SHPOOL_STATUS:-"$SCRIPT_DIR/shpool_status"}
+STATE_DIR=${SESSION_KIT_STATE_DIR:-${XDG_STATE_HOME:-"${HOME:-}/.local/state"}/session-kit}
+SUPERVISOR_DIR=$STATE_DIR/supervisor
+IDENTITY=$SUPERVISOR_DIR/identity
+PREVIOUS_IDENTITY=$SUPERVISOR_DIR/previous-identity
+# The identity marker has to exist before the brief does — terminal numbering
+# needs it on the first allocating snapshot. So it cannot double as proof that
+# the session was ever briefed: a start that failed after publishing it would
+# otherwise make every later `ensure` a silent success. This marker is that
+# proof, written only once the session's own record showed it took the brief.
+BRIEF_PROOF=$SUPERVISOR_DIR/brief-proof
+HANDOFF=$SUPERVISOR_DIR/handoff.md
+MCP_CONFIG=$SUPERVISOR_DIR/mcp.json
+BRIEF=${SESSION_KIT_SUPERVISOR_BRIEF:-"$RELEASE_DIR/config/supervisor/BRIEF.md"}
+SUPERVISOR_CWD=${SESSION_KIT_SUPERVISOR_CWD:-${HOME:-}}
+# A woken resident can need close to a minute to finish its current boundary,
+# read the request, and return a structured handoff. The exact idempotency key
+# prevents a repeat from sending twice while this bounded wait stays patient.
+HANDOFF_WAIT_SECONDS=${SESSION_KIT_SUPERVISOR_HANDOFF_WAIT_SECONDS:-120}
+INVENTORY_CORE=$RELEASE_DIR/lib/session_inventory.py
+# How long each attempt waits for the newborn to prove it took the brief, and
+# how many attempts a brief that never lands is given.
+BRIEF_WAIT_SECONDS=${SESSION_KIT_SUPERVISOR_BRIEF_WAIT_SECONDS:-15}
+BRIEF_ATTEMPTS=${SESSION_KIT_SUPERVISOR_BRIEF_ATTEMPTS:-12}
+# The first line of every bootstrap message, and therefore the string that
+# proves the brief itself is in the supervisor's transcript. It carries no
+# quotes, so it survives JSON escaping in that transcript unchanged.
+BRIEF_MARKER='Treat the standing brief below as binding session instructions.'
+
+usage() {
+  printf 'usage: supervisor {ensure|refresh|open}\n' >&2
+}
+
+die() {
+  printf 'supervisor: %s\n' "$*" >&2
+  return 1
+}
+
+prepare_state() {
+  umask 077
+  if [[ -L $SUPERVISOR_DIR ]]; then
+    die "state directory must not be a symlink: $SUPERVISOR_DIR"
+    return 1
+  fi
+  mkdir -p -- "$SUPERVISOR_DIR" || return 1
+  chmod 700 -- "$SUPERVISOR_DIR" || return 1
+}
+
+read_marker() {
+  python3 - "$1" <<'PY'
+import os
+import re
+import stat
+import sys
+
+path = sys.argv[1]
+flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+try:
+    descriptor = os.open(path, flags)
+except OSError:
+    raise SystemExit(1)
+try:
+    info = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or stat.S_IMODE(info.st_mode) != 0o600
+        or info.st_uid != os.geteuid()
+    ):
+        raise SystemExit(1)
+    raw = os.read(descriptor, 129)
+finally:
+    os.close(descriptor)
+if len(raw) > 128:
+    raise SystemExit(1)
+try:
+    value = raw.decode("ascii").strip()
+except UnicodeDecodeError:
+    raise SystemExit(1)
+if not re.fullmatch(
+    r"claude:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+    value,
+):
+    raise SystemExit(1)
+print(value.lower())
+PY
+}
+
+read_brief_proof() {
+  python3 - "$BRIEF_PROOF" <<'PY'
+import os
+import re
+import stat
+import sys
+
+path = sys.argv[1]
+flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+try:
+    descriptor = os.open(path, flags)
+except OSError:
+    raise SystemExit(1)
+try:
+    info = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or stat.S_IMODE(info.st_mode) != 0o600
+        or info.st_uid != os.geteuid()
+    ):
+        raise SystemExit(1)
+    raw = os.read(descriptor, 160)
+finally:
+    os.close(descriptor)
+if len(raw) > 159:
+    raise SystemExit(1)
+try:
+    value = raw.decode("ascii").strip().lower()
+except UnicodeDecodeError:
+    raise SystemExit(1)
+match = re.fullmatch(
+    r"(claude:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}) ([0-9a-f]{8})",
+    value,
+)
+if not match:
+    raise SystemExit(1)
+print(match.group(1), match.group(2))
+PY
+}
+
+inventory_json() {
+  local mode=${1:---json}
+  "$STATUS" "$mode"
+}
+
+id_for_thread() {
+  local thread_key=$1 payload=$2
+  python3 -c '
+import json
+import sys
+
+value = json.loads(sys.stdin.read())
+wanted = sys.argv[1].casefold()
+for row in value.get("sessions", []):
+    identity = row.get("identity") or {}
+    uuid = identity.get("uuid")
+    provider = row.get("provider")
+    if isinstance(uuid, str) and f"{provider}:{uuid}".casefold() == wanted:
+        raw = row.get("shpool_id_raw") or row.get("shpool_id")
+        if isinstance(raw, str) and raw:
+            print(raw)
+            raise SystemExit(0)
+raise SystemExit(1)
+' "$thread_key" <<<"$payload"
+}
+
+thread_for_id() {
+  local shpool_id=$1 payload=$2
+  python3 -c '
+import json
+import sys
+
+value = json.loads(sys.stdin.read())
+wanted = sys.argv[1]
+for row in value.get("sessions", []):
+    raw = row.get("shpool_id_raw") or row.get("shpool_id")
+    identity = row.get("identity") or {}
+    uuid = identity.get("uuid")
+    provider = row.get("provider")
+    if raw == wanted and provider == "claude" and isinstance(uuid, str):
+        print(f"claude:{uuid.lower()}")
+        raise SystemExit(0)
+raise SystemExit(1)
+' "$shpool_id" <<<"$payload"
+}
+
+write_private_line() {
+  local path=$1 value=$2 temporary
+  temporary=$(mktemp "$SUPERVISOR_DIR/.${path##*/}.XXXXXX") || return 1
+  chmod 600 -- "$temporary" || {
+    rm -f -- "$temporary"
+    return 1
+  }
+  if ! printf '%s\n' "$value" > "$temporary"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  mv -f -- "$temporary" "$path"
+}
+
+publish_identity() {
+  local thread_key=$1 previous=${2:-}
+  if [[ -n $previous ]]; then
+    write_private_line "$PREVIOUS_IDENTITY" "$previous" || return 1
+  else
+    rm -f -- "$PREVIOUS_IDENTITY"
+  fi
+  # A new resident has not been briefed yet, whatever the last one proved.
+  rm -f -- "$BRIEF_PROOF"
+  write_private_line "$IDENTITY" "$thread_key"
+}
+
+brief_proven() {
+  local thread_key=$1 recorded message_id
+  read -r recorded message_id < <(read_brief_proof) || return 1
+  [[ $recorded == "$thread_key" && $message_id =~ ^[0-9a-f]{8}$ ]]
+}
+
+write_mcp_config() {
+  local temporary
+  temporary=$(mktemp "$SUPERVISOR_DIR/.mcp.json.XXXXXX") || return 1
+  chmod 600 -- "$temporary" || {
+    rm -f -- "$temporary"
+    return 1
+  }
+  if ! python3 - "$RELEASE_DIR/lib" > "$temporary" <<'PY'
+import json
+import sys
+
+json.dump(
+    {
+        "mcpServers": {
+            "session-kit-supervisor": {
+                "type": "stdio",
+                "command": "python3",
+                "args": ["-m", "sessionkit_supervisor"],
+                "env": {"PYTHONPATH": sys.argv[1]},
+            }
+        }
+    },
+    sys.stdout,
+    indent=2,
+    sort_keys=True,
+)
+sys.stdout.write("\n")
+PY
+  then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  mv -f -- "$temporary" "$MCP_CONFIG"
+}
+
+current_supervisor() {
+  local marker payload shpool_id
+  # Return 1 only for a proven absence. Return 2 for uncertainty so callers
+  # fail closed instead of creating a second resident while inventory is
+  # transiently ambiguous (for example, during a headless message resume).
+  if [[ -e $IDENTITY || -L $IDENTITY ]]; then
+    marker=$(read_marker "$IDENTITY") || return 2
+  else
+    return 1
+  fi
+  if payload=$(inventory_json --guard-json 2>/dev/null) &&
+     shpool_id=$(id_for_thread "$marker" "$payload"); then
+    printf '%s\n' "$shpool_id"
+    return 0
+  fi
+  # Guard inventory may temporarily omit an otherwise exact managed row when
+  # another process has resumed the same provider conversation. The normal
+  # inventory still proves the managed resident's exact shpool association.
+  payload=$(inventory_json --json 2>/dev/null) || return 2
+  if shpool_id=$(id_for_thread "$marker" "$payload"); then
+    printf '%s\n' "$shpool_id"
+    return 0
+  fi
+  return 1
+}
+
+bootstrap_message() {
+  local brief_text handoff_text= inventory_core_abs state_dir_abs
+  if [[ -f $HANDOFF && ! -L $HANDOFF ]]; then
+    handoff_text=$(<"$HANDOFF")
+  fi
+  state_dir_abs=$(cd -- "$STATE_DIR" && pwd -P) || return 1
+  inventory_core_abs=$(cd -- "$RELEASE_DIR/lib" && pwd -P) || return 1
+  inventory_core_abs=$inventory_core_abs/session_inventory.py
+  brief_text=$(<"$BRIEF") || return 1
+  brief_text=${brief_text//\$\{SK_STATE_DIR\}/$state_dir_abs}
+  brief_text=${brief_text//\$SK_STATE_DIR/$state_dir_abs}
+  brief_text=${brief_text//\$\{INVENTORY_CORE\}/$inventory_core_abs}
+  brief_text=${brief_text//\$INVENTORY_CORE/$inventory_core_abs}
+  printf '%s\n\n%s\n\n%s\n\n%s\n%s\n' \
+    "Run sp self-name \"Fleet Supervisor\" before answering. $BRIEF_MARKER" \
+    "The supervisor stdio MCP definition is $MCP_CONFIG. Use the session-kit-supervisor tools when they are available; report their absence rather than inventing tool output." \
+    "$brief_text" \
+    'Replacement handoff (empty on a first start):' \
+    "$handoff_text"
+}
+
+# Proof that the newborn TOOK this exact brief, read from its own transcript.
+# A send receipt and a later turn boundary cannot establish that correlation:
+# either can belong to an unrelated message. The unique message id can.
+wait_for_registration() {
+  local thread_key=$1 seconds=$2 message_id=$3
+  PYTHONPATH=$RELEASE_DIR/lib python3 - \
+    "$thread_key" "$seconds" "$SUPERVISOR_CWD" "$IDENTITY" "$message_id" <<'PY'
+import os
+import sys
+import time
+
+thread_key, seconds, cwd, identity, message_id = sys.argv[1:6]
+timeout = float(seconds)
+if timeout < 0 or timeout > 600:
+    raise SystemExit(2)
+
+from sessionkit_messages import claude_send
+
+uuid = thread_key.split(":", 1)[1]
+home = os.environ.get("HOME", "")
+
+
+def registered():
+    # The published marker first: proof about some other session is not proof
+    # about this one.
+    try:
+        with open(identity, encoding="ascii") as handle:
+            published = handle.read(129).strip().lower()
+    except (OSError, UnicodeDecodeError):
+        return False
+    if published != thread_key:
+        return False
+    return claude_send.transcript_has_message(
+        claude_send.transcript_path(home, cwd, uuid), message_id, uuid
+    )
+
+
+deadline = time.monotonic() + timeout
+while True:
+    if registered():
+        raise SystemExit(0)
+    if time.monotonic() >= deadline:
+        raise SystemExit(1)
+    time.sleep(0.5)
+PY
+}
+
+# What the ledger says became of this purpose's exact target. Only an absent
+# purpose, pre-dispatch row, or explicit unreachable row permits a provider
+# attempt. Missing records and every post-dispatch uncertainty do not.
+brief_state() {
+  local key=$1 thread_key=$2
+  PYTHONPATH=$RELEASE_DIR/lib python3 - "$STATE_DIR" "$key" "$thread_key" <<'PY'
+import sys
+
+from sessionkit_messages.envelope import PRE_DISPATCH, landed
+from sessionkit_messages.ledger import Ledger
+
+state_dir, key, thread_key = sys.argv[1:4]
+ledger = Ledger(state_dir)
+claimed = ledger.claimed_msg_id_for_key(key)
+if not claimed:
+    print("absent -")
+    raise SystemExit(0)
+record = ledger.read_send(claimed)
+if not isinstance(record, dict):
+    print("unknown %s" % claimed)
+    raise SystemExit(0)
+rows = [
+    row for row in record.get("targets", [])
+    if isinstance(row, dict) and row.get("thread_key") == thread_key
+]
+if not rows:
+    print("unknown %s" % claimed)
+elif any(landed(row.get("status")) for row in rows):
+    print("landed %s" % claimed)
+elif all(row.get("status") in {PRE_DISPATCH, "unreachable"} for row in rows):
+    print("not-landed %s" % claimed)
+else:
+    print("unknown %s" % claimed)
+PY
+}
+
+create_supervisor() {
+  local previous=${1:-} creation_output shpool_id payload thread_key message
+  [[ -x $SP ]] || {
+    die "sp is unavailable: $SP"
+    return 1
+  }
+  [[ -x $STATUS ]] || {
+    die "shpool_status is unavailable: $STATUS"
+    return 1
+  }
+  [[ -r $BRIEF && ! -L $BRIEF ]] || {
+    die "standing brief is unavailable: $BRIEF"
+    return 1
+  }
+  [[ -d $SUPERVISOR_CWD ]] || {
+    die "supervisor cwd is unavailable: $SUPERVISOR_CWD"
+    return 1
+  }
+  prepare_state || return 1
+  write_mcp_config || return 1
+  # One-shot MCP arm for the very first launch: the launcher consumes this
+  # cwd-scoped request (2-minute freshness) and appends --mcp-config. Resumes
+  # need no request — they prove themselves against the identity marker.
+  write_private_line "$SUPERVISOR_DIR/launch-request" "$SUPERVISOR_CWD" || return 1
+  creation_output=$(
+    cd -- "$SUPERVISOR_CWD" || exit 1
+    SESSION_KIT_BACKGROUND=1 "$SP" new claude
+  ) || {
+    die "could not create the Claude supervisor session"
+    return 1
+  }
+  shpool_id=$(printf '%s\n' "$creation_output" | awk 'NF { value=$0 } END { print value }')
+  if [[ ! $shpool_id =~ ^[a-zA-Z0-9._-]+$ ]]; then
+    die "sp returned an invalid new-session identifier"
+    return 1
+  fi
+  # This proof is deliberately non-writing: the marker must exist before the
+  # first allocating snapshot if terminal 1 is to be reserved on a fresh boot.
+  payload=$(inventory_json --guard-json) || {
+    die "new supervisor exists, but its exact identity is not readable"
+    return 1
+  }
+  thread_key=$(thread_for_id "$shpool_id" "$payload") || {
+    die "new supervisor exists, but its exact Claude identity is not proven"
+    return 1
+  }
+  publish_identity "$thread_key" "$previous" || return 1
+  # Allocate/transfer its terminal number now, while the previous-identity
+  # proof is present. Failure leaves both private markers for safe retry.
+  inventory_json --json >/dev/null || {
+    die "supervisor identity is published, but terminal numbering failed"
+    return 1
+  }
+  rm -f -- "$PREVIOUS_IDENTITY"
+  if ! "$SP" name "$shpool_id" "Fleet Supervisor" >/dev/null 2>&1; then
+    die "the supervisor was created, but its title could not be set"
+    return 1
+  fi
+  inject_brief "$shpool_id" "$thread_key"
+}
+
+# Brief one existing supervisor session and prove it took it. Separate from
+# creation because it is re-enterable: a start that published an identity and
+# then failed to prove the brief must be finishable against the SAME session,
+# not answered with a false success and not answered with a second session.
+inject_brief() {
+  local shpool_id=$1 thread_key=$2 message
+  [[ -r $BRIEF && ! -L $BRIEF ]] || {
+    die "standing brief is unavailable: $BRIEF"
+    return 1
+  }
+  message=$(bootstrap_message) || return 1
+  if [[ ! $BRIEF_ATTEMPTS =~ ^[1-9][0-9]?$ ]]; then
+    die "SESSION_KIT_SUPERVISOR_BRIEF_ATTEMPTS must be 1-99"
+    return 1
+  fi
+  # sp msg exits 0 once the receipt is written, even when that receipt says
+  # the target never registered (a trust prompt, a dead launch, or simply a
+  # session seconds old whose socket is not up yet). A supervisor without its
+  # standing brief is worse than none, so an attempt that never reached the
+  # session is made again — but nothing here re-sends blindly:
+  #
+  # * every attempt carries the same idempotency key, so a repeat resumes one
+  #   message id and never reaches a session that already has it;
+  # * success is the supervisor's own record of taking the brief, never the
+  #   receipt's prose. A newborn takes a queued message at its next turn
+  #   boundary, minutes after the receipt is written, so the receipt cannot
+  #   prove arrival and must not be read as disproving it;
+  # * only an affirmative "it never landed" earns another send. Five identical
+  #   briefs in seven minutes were the cost of the opposite rule.
+  #
+  # The whole budget — every attempt's wait — belongs to a brief that landed.
+  # A newborn can need over two minutes to reach its first turn boundary, so
+  # one 15-second window is not patience, it is a stopwatch. Once the brief is
+  # in the session's queue the loop stops SENDING and keeps WAITING, and only
+  # the full calibrated patience running out is worth reporting.
+  local brief_key=supervisor-brief:$shpool_id
+  local receipt="" attempt=0 checks=0 sends=0 outcome="" proven=0 landed=0
+  local message_id=-
+  # What a previous pass already did. Re-entering must not re-send a brief the
+  # ledger has recorded as landed, so this is read before the first send, not
+  # after it. Its exact message id is also the only transcript proof accepted.
+  read -r outcome message_id < <(brief_state "$brief_key" "$thread_key")
+  [[ $outcome != landed ]] || landed=1
+  for (( attempt = 1; attempt <= BRIEF_ATTEMPTS; attempt++ )); do
+    checks=$attempt
+    if (( ! landed )) && [[ $outcome == absent || $outcome == not-landed ]]; then
+      if ! receipt=$(
+        SESSION_KIT_MSG_KEY=$brief_key "$SP" msg "$shpool_id" "$message" --fyi --yes 2>&1
+      ); then
+        printf '%s\n' "$receipt" >&2
+        die "the supervisor exists, but brief injection failed"
+        return 1
+      fi
+      sends=$(( sends + 1 ))
+      read -r outcome message_id < <(brief_state "$brief_key" "$thread_key")
+      # Once a provider command has run, an absent receipt is an unknown
+      # outcome. It cannot authorize a second provider call.
+      [[ $outcome != absent ]] || outcome=unknown
+      [[ $outcome != landed ]] || landed=1
+    fi
+    if [[ $message_id =~ ^[0-9a-f]{8}$ ]] &&
+       wait_for_registration "$thread_key" "$BRIEF_WAIT_SECONDS" "$message_id"; then
+      proven=1
+      break
+    fi
+    [[ $outcome != unknown || $message_id =~ ^[0-9a-f]{8}$ ]] || break
+  done
+  [[ -z $receipt ]] || printf '%s\n' "$receipt" >&2
+  if (( ! proven )); then
+    if (( landed )); then
+      # Exit 3, not 1: the message is in the session's queue and re-sending it
+      # would duplicate it. Whoever runs this needs to look at the session,
+      # not send the brief again.
+      die "the supervisor exists and its standing brief LANDED, but the session proved no turn in $checks registration check(s); the brief was sent $sends time(s) and was NOT re-sent after it landed — open it and check before sending anything else"
+      return 3
+    fi
+    if [[ $outcome == unknown ]]; then
+      # Unknown is never evidence of a miss and never earns another send.
+      die "the supervisor exists, but its standing brief has an unknown delivery outcome after $sends attempt(s); it was not re-sent without explicit pre-dispatch or unreachable evidence"
+      return 1
+    fi
+    die "the supervisor exists, but the standing brief NEVER landed in $sends attempt(s) — see the last receipt above"
+    return 1
+  fi
+  write_private_line "$BRIEF_PROOF" "$thread_key $message_id" || return 1
+  printf '%s\n' "$shpool_id"
+}
+
+ensure_supervisor() {
+  local shpool_id thread_key lookup_status
+  shpool_id=$(current_supervisor)
+  lookup_status=$?
+  if (( lookup_status == 0 )); then
+    thread_key=$(read_marker "$IDENTITY") || {
+      die "live supervisor has no exact identity marker"
+      return 1
+    }
+    # A live session is not an ensured supervisor. The identity marker is
+    # published before the brief is even composed, so on its own it says only
+    # that a session was started — a start that then failed to prove the brief
+    # would make every later ensure a silent success. Finish that start
+    # against the same session instead: the idempotency key makes re-entry
+    # safe, so a brief that landed is never sent twice.
+    if brief_proven "$thread_key"; then
+      printf '%s\n' "$shpool_id"
+      return 0
+    fi
+    inject_brief "$shpool_id" "$thread_key"
+    return
+  fi
+  if (( lookup_status != 1 )); then
+    die "the existing supervisor identity could not be verified; no replacement was created"
+    return 1
+  fi
+  create_supervisor
+}
+
+capture_handoff_reply() {
+  local key=$1 thread_key=$2
+  PYTHONPATH=$RELEASE_DIR/lib python3 - \
+    "$STATE_DIR" "$key" "$thread_key" "$HANDOFF" "$HANDOFF_WAIT_SECONDS" <<'PY'
+import json
+import os
+from pathlib import Path
+import tempfile
+import time
+import sys
+
+from sessionkit_messages.ledger import Ledger
+
+state_dir, key, thread_key, destination_text, timeout_text = sys.argv[1:6]
+timeout = float(timeout_text)
+if timeout <= 0 or timeout > 300:
+    raise SystemExit(2)
+destination = Path(destination_text)
+prefix = "SESSION_KIT_HANDOFF_V1 "
+required = {
+    "active_decisions": list,
+    "unresolved_needs_you": list,
+    "budget_state": str,
+    "unbriefed_lane_2": list,
+    "evidence_paths": list,
+}
+ledger = Ledger(state_dir)
+deadline = time.monotonic() + timeout
+payload = None
+while time.monotonic() < deadline:
+    msg_id = ledger.claimed_msg_id_for_key(key)
+    if msg_id:
+        replies = [
+            row
+            for row in ledger.read_thread(thread_key)
+            if isinstance(row, dict)
+            and row.get("dir") == "in"
+            and row.get("msg_id") == msg_id
+        ]
+        if replies:
+            text = str(replies[-1].get("text") or "").strip()
+            if not text.startswith(prefix):
+                raise SystemExit(3)
+            try:
+                candidate = json.loads(text[len(prefix):])
+            except ValueError:
+                raise SystemExit(3) from None
+            if not isinstance(candidate, dict) or set(candidate) != set(required):
+                raise SystemExit(3)
+            for field, expected in required.items():
+                value = candidate[field]
+                if not isinstance(value, expected):
+                    raise SystemExit(3)
+                if expected is list and not all(isinstance(item, str) for item in value):
+                    raise SystemExit(3)
+            payload = candidate
+            break
+    time.sleep(0.2)
+if payload is None:
+    raise SystemExit(1)
+
+body = "# Fleet Supervisor handoff\n\n" + json.dumps(
+    payload, ensure_ascii=False, indent=2, sort_keys=True
+) + "\n"
+if len(body.encode("utf-8")) > 32768:
+    raise SystemExit(3)
+destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+descriptor, temporary = tempfile.mkstemp(
+    prefix=".handoff.", dir=destination.parent
+)
+try:
+    os.fchmod(descriptor, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        descriptor = -1
+        handle.write(body)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, destination)
+    directory = os.open(destination.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+finally:
+    if descriptor >= 0:
+        os.close(descriptor)
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+PY
+}
+
+refresh_supervisor() {
+  local shpool_id old_thread request lookup_status handoff_key
+  if [[ -e $IDENTITY || -L $IDENTITY ]]; then
+    old_thread=$(read_marker "$IDENTITY") || {
+      die "supervisor identity marker is not a private exact Claude identity"
+      return 1
+    }
+  fi
+  shpool_id=$(current_supervisor)
+  lookup_status=$?
+  if (( lookup_status == 1 )); then
+    create_supervisor
+    return
+  fi
+  if (( lookup_status != 0 )); then
+    die "the existing supervisor identity could not be verified; no replacement was created"
+    return 1
+  fi
+  if [[ -z ${old_thread:-} ]]; then
+    die "live supervisor has no exact identity marker"
+    return 1
+  fi
+  handoff_key="supervisor-handoff:$shpool_id"
+  request='Return the refresh handoff as one reply; do not create or edit any file. Reply with exactly SESSION_KIT_HANDOFF_V1 followed by one space and a one-line JSON object with exactly these fields: active_decisions (string array), unresolved_needs_you (string array), budget_state (string), unbriefed_lane_2 (string array), evidence_paths (string array).'
+  SESSION_KIT_MSG_KEY=$handoff_key "$SP" msg "$shpool_id" "$request" --yes >&2 || {
+    die "handoff request was not delivered; the live supervisor was kept"
+    return 1
+  }
+  if ! capture_handoff_reply "$handoff_key" "$old_thread"; then
+    die "a valid handoff reply was not captured within ${HANDOFF_WAIT_SECONDS}s; the live supervisor was kept"
+    return 1
+  fi
+  SESSION_KIT_CONFIRM_ID=$shpool_id "$SP" close "$shpool_id" >&2 || {
+    die "handoff is ready, but the old supervisor could not be closed"
+    return 1
+  }
+  create_supervisor "$old_thread"
+}
+
+open_supervisor() {
+  local shpool_id
+  shpool_id=$(ensure_supervisor) || return 1
+  exec "$SP" go "$shpool_id"
+}
+
+if (( $# != 1 )); then
+  usage
+  exit 2
+fi
+case "$1" in
+  ensure)
+    ensure_supervisor >/dev/null || exit $?
+    printf '%s\n' "Fleet Supervisor is ready."
+    ;;
+  refresh)
+    refresh_supervisor >/dev/null || exit $?
+    printf '%s\n' "Fleet Supervisor refreshed."
+    ;;
+  open) open_supervisor ;;
+  *) usage; exit 2 ;;
+esac

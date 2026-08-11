@@ -449,16 +449,34 @@ def index_codex_processes(
     rollout_by_uuid: Callable[[Path, str], list[dict[str, Any]]],
     open_rollouts: Callable[[int, Path, Path, Mapping[str, Any]], list[dict[str, Any]]],
 ) -> dict[int, list[dict[str, Any]]]:
+    def process_home(process: Mapping[str, Any]) -> Path | None:
+        raw = process.get("codex_home")
+        if not isinstance(raw, str) or not raw:
+            return codex_home
+        candidate = Path(raw)
+        if not candidate.is_absolute() or ".." in candidate.parts:
+            return None
+        return candidate
+
     if runtime_platform() == darwin_platform:
         result: dict[int, list[dict[str, Any]]] = {}
         for pid, process in process_table.items():
             if not is_native_codex(process):
                 continue
+            profile_home = process_home(process)
             uuid = valid_uuid(process.get("codex_thread_id"))
-            result[pid] = rollout_by_uuid(codex_home, uuid) if uuid else []
+            result[pid] = (
+                rollout_by_uuid(profile_home, uuid)
+                if profile_home is not None and uuid
+                else []
+            )
         return result
     return {
-        pid: open_rollouts(pid, proc_root, codex_home, process)
+        pid: (
+            open_rollouts(pid, proc_root, profile_home, process)
+            if (profile_home := process_home(process)) is not None
+            else []
+        )
         for pid, process in process_table.items()
         if is_native_codex(process)
     }

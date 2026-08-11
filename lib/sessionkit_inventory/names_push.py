@@ -321,6 +321,9 @@ def codex_pending_auto_titles(
     load_config: Callable[[], dict[str, Any]],
     max_session_index_bytes: int,
     push_live_rename: Callable[[Path, str, str], tuple[list[str], list[str]]],
+    name_owner: Callable[..., str],
+    claim_name: Callable[..., str],
+    adopt_native: Callable[..., str],
 ) -> list[dict[str, str]]:
     """Kit-side auto-titler for Codex threads nobody has named.
 
@@ -333,6 +336,12 @@ def codex_pending_auto_titles(
     stores. Self-terminating: the push writes the index entry that excludes
     the thread from every later pass, and a later agent self-name simply
     overwrites it (last-writer-wins).
+
+    Ownership is claimed at the thread's first turn, which is the earliest
+    moment a Codex thread has an identity at all: before that turn there is
+    no thread id and no first_user_message, so nothing here can see it. From
+    the claim onward the thread is named, and no later pass renames it — and
+    a thread a person has renamed is never a candidate in the first place.
     """
     import sqlite3
 
@@ -420,6 +429,22 @@ def codex_pending_auto_titles(
         exact = valid_uuid(uuid)
         if not exact:
             continue
+        # The index name is the deliberate one when it exists — /rename
+        # writes it — and threads.title is the fallback evidence.
+        adopted = adopt_native(
+            "codex",
+            exact,
+            indexed.get(exact) or str(raw_title or ""),
+            environ=env,
+        )
+        if adopted:
+            results.append({"uuid": exact, "title": adopted})
+            continue
+        owner = name_owner("codex", exact, environ=env)
+        if owner == "human":
+            # A person renamed this thread. Neither the titler nor the healer
+            # touches it again, in this pass or any pass after any restart.
+            continue
         if exact in indexed:
             # Heal the database half of the dual write: the status bar reads
             # threads.title, and a curated index name next to a prompt-echo
@@ -443,6 +468,9 @@ def codex_pending_auto_titles(
             continue
         if exact == "00000000-0000-0000-0000-000000000000":
             continue
+        if owner:
+            # The first-turn pass already claimed this thread's name.
+            continue
         if (
             not isinstance(updated_at, (int, float))
             or isinstance(updated_at, bool)
@@ -464,6 +492,7 @@ def codex_pending_auto_titles(
             _append_codex_index_entry(index, exact, derived[:100])
         except OSError:
             continue
+        claim_name("codex", exact, environ=env)
         _push_codex_thread_title(codex_root, exact, derived)
         if live_state_dir is not None:
             push_live_rename(live_state_dir, exact, derived)
@@ -650,11 +679,29 @@ def _push_codex_live_rename(
 
     app_root = kit_state_dir / "app-server"
     try:
-        candidates = sorted(app_root.iterdir())[:max_sockets]
+        entries = list(app_root.iterdir())
     except OSError:
         return [], []
+    # Newest directory first. A socket directory outlives the session that
+    # made it, so the oldest entries are the least likely to answer, and a
+    # name-ordered walk (the directory names begin with their creation date)
+    # reached exactly the wrong end of the list: nine dead 2026-08-04 dirs
+    # consumed the cap while three live windows behind them were never
+    # offered the rename. The cap below counts sockets that ACCEPTED a
+    # connection, never directories considered, so any number of dead ones
+    # may precede the live ones.
+    ordered: list[tuple[float, Path]] = []
+    for entry in entries:
+        try:
+            ordered.append((entry.stat().st_mtime, entry))
+        except OSError:
+            continue
+    ordered.sort(key=lambda item: item[0], reverse=True)
     delivered = False
-    for directory in candidates:
+    connected = 0
+    for _, directory in ordered:
+        if connected >= max_sockets:
+            break
         socket_path = directory / "app.sock"
         try:
             if socket_path.is_symlink() or not statmod.S_ISSOCK(
@@ -666,7 +713,13 @@ def _push_codex_live_rename(
         connection = socketmod.socket(socketmod.AF_UNIX, socketmod.SOCK_STREAM)
         connection.settimeout(2.0)
         try:
-            connection.connect(os.fspath(socket_path))
+            try:
+                connection.connect(os.fspath(socket_path))
+            except OSError:
+                # An abandoned socket file refuses the connection at once;
+                # skipping it costs nothing and never spends the cap.
+                continue
+            connected += 1
             key = base64.b64encode(os.urandom(16)).decode()
             connection.sendall(
                 (

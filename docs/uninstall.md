@@ -71,6 +71,10 @@ cannot prove it wrote.
 
 The default uninstall removes:
 
+- Session Kit's provenance-marked `UserPromptSubmit` handler from Claude and
+  Codex configuration; unrelated handlers in the same matcher group are
+  retained, and a file, empty `hooks` object, or empty event list that existed
+  before installation is restored byte-for-byte;
 - the guarded login block from `.bashrc`, and on macOS from `.bash_profile` and
   `.zshrc` as well;
 - the private integration marker;

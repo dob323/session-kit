@@ -13,6 +13,7 @@ import time
 from typing import Any, Mapping
 
 from .common import CollectionError, PROVIDERS, valid_uuid
+from .model import recovery_spec
 from .state_io import (
     atomic_write_private_json,
     create_private_json,
@@ -20,7 +21,7 @@ from .state_io import (
 )
 
 
-LIFECYCLE_SCHEMA_VERSION = 2
+LIFECYCLE_SCHEMA_VERSION = 3
 MAX_LIFECYCLE_BYTES = 16 * 1024
 _SESSION_ID_RE = re.compile(
     r"(?:main(?:[1-9][0-9]*)?|"
@@ -104,6 +105,12 @@ def _positive_number(value: Any, label: str) -> int:
 
 
 def _validated_state(value: Any, expected_key: str | None = None) -> dict[str, Any]:
+    if (
+        isinstance(value, Mapping)
+        and value.get("schema_version") == 2
+        and "conversation_uuid" not in value
+    ):
+        value = {**value, "schema_version": 3, "conversation_uuid": None}
     if not isinstance(value, Mapping) or set(value) != {
         "schema_version",
         "session_key",
@@ -111,6 +118,7 @@ def _validated_state(value: Any, expected_key: str | None = None) -> dict[str, A
         "shell_pid",
         "shell_start_ticks",
         "provider",
+        "conversation_uuid",
         "provider_exited_at_monotonic_ns",
         "exit_code",
         "input_tracking",
@@ -121,6 +129,7 @@ def _validated_state(value: Any, expected_key: str | None = None) -> dict[str, A
     key = value.get("session_key")
     boot_id = value.get("boot_id")
     provider = value.get("provider")
+    conversation_uuid = value.get("conversation_uuid")
     exit_code = value.get("exit_code")
     if (
         value.get("schema_version") != LIFECYCLE_SCHEMA_VERSION
@@ -130,6 +139,10 @@ def _validated_state(value: Any, expected_key: str | None = None) -> dict[str, A
         or not isinstance(boot_id, str)
         or not _BOOT_ID_RE.fullmatch(boot_id)
         or provider not in PROVIDERS
+        or (
+            conversation_uuid is not None
+            and valid_uuid(conversation_uuid) != conversation_uuid
+        )
         or isinstance(exit_code, bool)
         or not isinstance(exit_code, int)
         or exit_code < 0
@@ -170,11 +183,17 @@ def record_provider_exit(
     shell_pid: int,
     shell_start_ticks: int,
     provider: str,
+    conversation_uuid: str | None = None,
     exit_code: int,
     input_tracking: bool,
     now_monotonic_ns: int | None = None,
 ) -> dict[str, Any]:
     """Record one exact provider exit while preserving prior safety blockers."""
+    if (
+        conversation_uuid is not None
+        and valid_uuid(conversation_uuid) != conversation_uuid
+    ):
+        raise CollectionError("provider-exit conversation UUID is invalid")
     key = session_key(state_dir, session_id, create=True)
     assert key is not None
     previous = load_state(state_dir, session_id)
@@ -184,6 +203,22 @@ def record_provider_exit(
         and previous["shell_pid"] == shell_pid
         and previous["shell_start_ticks"] == shell_start_ticks
     )
+    if same_generation and previous is not None:
+        prior_conversation = previous.get("conversation_uuid")
+        if previous.get("provider") != provider:
+            raise CollectionError(
+                "provider-exit provider changed within one shell generation"
+            )
+        if (
+            prior_conversation is not None
+            and conversation_uuid is not None
+            and prior_conversation != conversation_uuid
+        ):
+            raise CollectionError(
+                "provider-exit conversation changed within one shell generation"
+            )
+        if conversation_uuid is None:
+            conversation_uuid = prior_conversation
     value = {
         "schema_version": LIFECYCLE_SCHEMA_VERSION,
         "session_key": key,
@@ -191,6 +226,7 @@ def record_provider_exit(
         "shell_pid": shell_pid,
         "shell_start_ticks": shell_start_ticks,
         "provider": provider,
+        "conversation_uuid": valid_uuid(conversation_uuid) or None,
         "provider_exited_at_monotonic_ns": (
             time.monotonic_ns() if now_monotonic_ns is None else now_monotonic_ns
         ),
@@ -569,6 +605,17 @@ def apply_provider_exit_states(
                 for key in ("title", "display_title", "title_source"):
                     if isinstance(retained.get(key), str) and retained[key]:
                         item[key] = retained[key]
+        committed_uuid = valid_uuid(lifecycle.get("conversation_uuid"))
+        if committed_uuid:
+            identity_hint = identity_hint or {
+                "provider": provider,
+                "uuid": committed_uuid,
+            }
+            recovery = recovery or recovery_spec(
+                provider,
+                committed_uuid,
+                item.get("cwd") if isinstance(item.get("cwd"), str) else None,
+            )
         item["display_provider"] = provider
         item["agent_status"] = "provider exited"
         item["needs_you"] = False
@@ -584,7 +631,11 @@ def apply_provider_exit_states(
             item["_terminal_identity_hint"] = identity_hint
             item["exited_identity"] = {
                 "uuid": identity_hint["uuid"],
-                "provenance": "last exact live inventory for this shell generation",
+                "provenance": (
+                    "committed provider-exit conversation for this shell generation"
+                    if identity_hint["uuid"] == committed_uuid
+                    else "last exact live inventory for this shell generation"
+                ),
                 "confidence": "historical-exact",
             }
         if recovery is not None:

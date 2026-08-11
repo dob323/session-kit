@@ -4,9 +4,10 @@
 #         line 2: 5h PCT% (left) · 7d PCT% (left) · account email (~/.claude.json oauthAccount)
 # Quota segment reads ~/.claude/cache/quota_headers (refreshed in background
 # by statusline-quota-refresh.sh, TTL 180s); time-left counts down to window reset.
-# Session name leads line 1 (Dan 2026-08-04): the tab title and top-right
-# chip only update at session start or the next prompt, so this is the one
-# surface that shows a mid-turn name change while the human just watches.
+# Session name leads line 1 (maintainer decision, 2026-08-04): the tab title
+# and top-right chip only update at session start or the next prompt, so
+# this is the one surface that shows a mid-turn name change while the human
+# just watches.
 # Source: ~/.claude/sessions/<session_id>.nameintent (kit name push).
 
 input=$(cat)

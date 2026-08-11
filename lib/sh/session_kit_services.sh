@@ -68,13 +68,19 @@ services_command() {
     case "$action" in
       enable)
         systemctl --user daemon-reload
-        systemctl --user enable --now shpool.socket shpool-reaper.timer
+        # The watchdog is the unit that recovers a session whose terminal
+        # died. Every Linux install writes its unit file, so leaving it out of
+        # enable installed it dead while every file-level check still passed.
+        systemctl --user enable --now shpool.socket shpool-reaper.timer \
+          session-kit-watchdog.service
         ;;
       disable)
-        systemctl --user disable --now shpool-reaper.timer shpool.socket
+        systemctl --user disable --now session-kit-watchdog.service \
+          shpool-reaper.timer shpool.socket
         ;;
       status)
-        systemctl --user --no-pager status shpool.socket shpool-reaper.timer
+        systemctl --user --no-pager status shpool.socket shpool-reaper.timer \
+          session-kit-watchdog.service
         ;;
     esac
     return

@@ -1,3 +1,19 @@
+# Upstream project: shpool -- https://github.com/shell-pool/shpool
+# Upstream license: Apache License, Version 2.0
+#   (Copyright 2023 Google LLC; see ../LICENSES/Apache-2.0.txt)
+# Base revision:    v0.11.0 == fe2d11595ff255810523b0868159dec051e303f1
+#
+# This file is a patch against Apache-2.0 licensed shpool source. The modified
+# source stays subject to the Apache License, Version 2.0 and to upstream's
+# own notices. Session Kit does not vendor, redistribute, or replace the
+# shpool source tree or any shpool binary; only this diff is distributed.
+# Apply with: git apply <this file>   (see README.md in this directory)
+#
+# Change: libshpool/src/daemon/shell.rs. Treats ESRCH from the SIGHUP kill as
+#   success, because a child that is already gone is the state kill exists to
+#   reach. Without it a session whose shell exited on its own can never be
+#   removed from the daemon table and haunts the list until a daemon restart.
+#
 diff --git a/libshpool/src/daemon/shell.rs b/libshpool/src/daemon/shell.rs
 index af76798..4e85e6a 100644
 --- a/libshpool/src/daemon/shell.rs

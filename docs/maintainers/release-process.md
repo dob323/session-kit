@@ -162,14 +162,24 @@ Codex, Python, and Bash versions that passed that gate.
 
 ## Publish
 
-After every gate passes:
+After every gate passes, publishing is ONE tool invocation — the manual
+six-step sequence this section used to describe is how the v0.2.0 tag and its
+artifact ended up built from different commits, and it must not come back:
 
-1. add the release date to `CHANGELOG.md`;
-2. confirm `main` points to the accepted commit;
-3. create one annotated tag;
-4. push the branch and tag;
-5. publish matching notes, archive, checksum, and provenance file;
-6. verify links and downloads from a logged-out view.
+1. add the release date to `CHANGELOG.md` and commit;
+2. rehearse: `tools/publish-release --version vX.Y.Z --commit <C> --dry-run …`
+   (throwaway clones only; exercises every gate);
+3. run the same command without `--dry-run`: it exports commit C, creates the
+   public commit, tags it, builds the artifact from the same C, and proves
+   tag == archive == export byte-for-byte before printing the push and
+   `gh release create` commands (or run once with `--push`, which asks for a
+   typed yes — never both);
+4. verify the printed chain record (`session-kit-vX.Y.Z.chain.json`), then
+   links and downloads from a logged-out view.
+
+The tool refuses dirty trees, unreachable commits, existing tags, version
+drift, scan failures, and every override under `--push`. If it refuses,
+fix the cause — do not fall back to manual tagging.
 
 Repository visibility and GitHub security settings are separate administrative
 changes. Perform them only after the final repository and history audit.

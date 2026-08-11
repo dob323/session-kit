@@ -48,6 +48,7 @@ def recovery_manifest(
             "provider": recovery["provider"],
             "uuid": recovery["uuid"],
             "title": item.get("title", ""),
+            "started_at_unix_ms": item.get("started_at_unix_ms"),
             "cwd": recovery.get("cwd"),
             "argv": recovery.get("argv", []),
             "command": recovery.get("command"),
@@ -65,6 +66,7 @@ def recovery_manifest(
             "provider": provider,
             "uuid": uuid,
             "title": item.get("title", ""),
+            "started_at_unix_ms": item.get("started_at_unix_ms"),
             "cwd": recovery.get("cwd"),
             "argv": recovery.get("argv", []),
             "command": recovery.get("command"),
@@ -366,6 +368,7 @@ def flatten_pending(
                     continue
                 uuid = valid_uuid(raw_session.get("uuid"))
                 provider = raw_session.get("provider")
+                started_at = raw_session.get("started_at_unix_ms")
                 entries.append(
                     {
                         "source_generation_key": key,
@@ -379,6 +382,13 @@ def flatten_pending(
                         "provider": provider if provider in PROVIDERS else None,
                         "uuid": uuid,
                         "title": clean_text(raw_session.get("title"), 120),
+                        "started_at_unix_ms": (
+                            started_at
+                            if isinstance(started_at, int)
+                            and not isinstance(started_at, bool)
+                            and started_at > 0
+                            else None
+                        ),
                         "cwd": clean_text(raw_session.get("cwd"), 4096) or None,
                         "argv": list(raw_session.get("argv", ()))
                         if isinstance(raw_session.get("argv"), list)

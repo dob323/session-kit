@@ -29,6 +29,8 @@ from .common import (
     _valid_aliases,
     _valid_automatic_title_failures,
     _valid_automatic_titles,
+    _valid_name_ownership,
+    _valid_pushed_titles,
     automatic_naming_enabled,
     clean_text,
     normalize_automatic_title,
@@ -60,6 +62,8 @@ def _alias_document_from_bytes(
             "automatic_title_failures" in raw
             and not isinstance(raw["automatic_title_failures"], Mapping)
         )
+        or ("name_ownership" in raw and not isinstance(raw["name_ownership"], Mapping))
+        or ("pushed_titles" in raw and not isinstance(raw["pushed_titles"], Mapping))
     ):
         raise CollectionError(f"{label} has an invalid schema")
     aliases = raw.get("aliases", {})
@@ -80,7 +84,85 @@ def _alias_document_from_bytes(
                 f"{label} contains an invalid automatic title failure"
             )
         raw["automatic_title_failures"] = dict(sorted(failures.items()))
+    if "name_ownership" in raw:
+        owners = _valid_name_ownership(raw["name_ownership"])
+        if len(owners) != len(raw["name_ownership"]):
+            raise CollectionError(f"{label} contains an invalid name ownership record")
+        raw["name_ownership"] = dict(sorted(owners.items()))
+    if "pushed_titles" in raw:
+        pushed = _valid_pushed_titles(raw["pushed_titles"])
+        if len(pushed) != len(raw["pushed_titles"]):
+            raise CollectionError(f"{label} contains an invalid pushed title")
+        raw["pushed_titles"] = dict(sorted(pushed.items()))
     return raw
+
+
+def last_kit_title(document: Mapping[str, Any], key: str) -> str:
+    """The last title the kit itself put into the provider's own store.
+
+    The recorded push is the exact answer. Documents written before that
+    record existed fall back to the retained automatic title, which is the
+    value the kit would have pushed — that fallback is what lets a session
+    renamed natively before this release still be recognised.
+    """
+    pushed = _valid_pushed_titles(document.get("pushed_titles")).get(key)
+    if pushed:
+        return pushed
+    return _valid_automatic_titles(document.get("automatic_titles")).get(key, "")
+
+
+def native_rename(document: Mapping[str, Any], key: str, native_title: str) -> str:
+    """The natively typed name for this thread, or "" if the kit wrote it.
+
+    A native title equal to what the kit last pushed is the kit's own echo. A
+    native title that differs is a person at a /rename prompt, and that is the
+    most recent statement of intent anyone has made about this name.
+    """
+    title = clean_text(native_title, 120)
+    kit_title = last_kit_title(document, key)
+    # No kit value means the kit never named this thread, so a native title is
+    # not a correction of anything the kit did — it is just the name the
+    # thread has always had, and the ordinary precedence rules cover it.
+    if not kit_title or not title:
+        return ""
+    # Byte-exact, end to end. A title is an opaque string: changing only its
+    # capitals is still a person deciding what their work is called, and the
+    # kit is in no position to rule that it did not count.
+    if title == kit_title:
+        return ""
+    return title
+
+
+def _name_owner(document: Mapping[str, Any], key: str) -> str:
+    """Say who owns one session's name: human, automatic, or nobody ("").
+
+    Documents written before the ownership record exists still carry the
+    evidence: an alias is a human rename unless the automatic tier holds the
+    identical text, which only a self-name ever writes.
+    """
+    recorded = _valid_name_ownership(document.get("name_ownership")).get(key)
+    if recorded:
+        return recorded["owner"]
+    aliases = _valid_aliases(document.get("aliases"))
+    if key not in aliases:
+        return ""
+    titles = _valid_automatic_titles(document.get("automatic_titles"))
+    return "automatic" if titles.get(key) == aliases[key] else "human"
+
+
+def _record_name_ownership(document: dict[str, Any], key: str, owner: str) -> None:
+    """Stamp who owns a name, without ever re-stamping a human override.
+
+    A human rename takes ownership from an automatic pass; nothing takes it
+    back. An automatic claim is one-shot: the first pass to name a thread
+    keeps the record, so a later pass finds the thread already owned.
+    """
+    owners = _valid_name_ownership(document.get("name_ownership"))
+    existing = owners.get(key)
+    if existing and (owner == "automatic" or existing["owner"] == "human"):
+        return
+    owners[key] = {"owner": owner, "at": _utc_now()}
+    document["name_ownership"] = dict(sorted(owners.items()))
 
 
 def _private_alias_document(
@@ -158,6 +240,12 @@ def mutate_canonical_alias(
                 if not clean_title:
                     raise CollectionError("alias title must contain visible text")
                 aliases[key] = clean_title
+                # This is the human rename surface — `sp name` and the picker
+                # reach the alias tier and nothing else does. Marking it here
+                # makes the override durable: `sp name reset` drops the alias
+                # but keeps the marker, so no automatic pass can resurrect a
+                # name over a session a person already named.
+                _record_name_ownership(document, key, "human")
             document["aliases"] = dict(sorted(aliases.items()))
             atomic_write_json(path, document)
             return dict(document["aliases"])
@@ -171,6 +259,21 @@ def canonical_automatic_titles(
 ) -> dict[str, str]:
     document = private_alias_document(config_path(), allow_missing=True)
     return _valid_automatic_titles(document.get("automatic_titles"))
+
+
+def canonical_name_ownership(
+    config: Mapping[str, Any],
+    *,
+    config_path: Callable[[], Path],
+    private_alias_document: Callable[..., dict[str, Any]],
+) -> dict[str, dict[str, str]]:
+    """Read every recorded name owner, including inferred legacy renames."""
+    document = private_alias_document(config_path(), allow_missing=True)
+    owners = _valid_name_ownership(document.get("name_ownership"))
+    for key in _valid_aliases(document.get("aliases")):
+        if key not in owners:
+            owners[key] = {"owner": _name_owner(document, key), "at": ""}
+    return dict(sorted(owners.items()))
 
 
 def mutate_canonical_automatic_title(
@@ -208,6 +311,8 @@ def mutate_canonical_automatic_title(
             aliases = dict(document["aliases"])
             if clean_title is not None and key in aliases:
                 raise CollectionError("explicit local alias already owns this title")
+            if clean_title is not None and _name_owner(document, key) == "human":
+                raise CollectionError("a human name owns this session")
             titles = _valid_automatic_titles(document.get("automatic_titles"))
             failures = _valid_automatic_title_failures(
                 document.get("automatic_title_failures")
@@ -220,6 +325,8 @@ def mutate_canonical_automatic_title(
             else:
                 titles[key] = clean_title
             failures.pop(key, None)
+            if clean_title is not None:
+                _record_name_ownership(document, key, "automatic")
             document["automatic_titles"] = dict(sorted(titles.items()))
             if failures:
                 document["automatic_title_failures"] = dict(sorted(failures.items()))
@@ -242,6 +349,146 @@ def mutate_canonical_automatic_title(
                 "title": clean_title,
                 "automatic_titles": verified_titles,
             }
+
+
+def record_pushed_title(
+    config: Mapping[str, Any],
+    provider: str,
+    uuid: str,
+    title: str,
+    *,
+    atomic_write_json: Callable[[Path, Any], None],
+    config_path: Callable[[], Path],
+    private_alias_document: Callable[..., dict[str, Any]],
+    private_alias_parent: Callable[[Path], None],
+) -> None:
+    """Remember exactly what the kit last wrote into a provider's own store."""
+    exact_uuid = valid_uuid(uuid)
+    clean = clean_text(title, 120)
+    if provider not in PROVIDERS or not exact_uuid or not clean:
+        return
+    path = config_path()
+    paths = _state_paths(config)
+    key = f"{provider}:{exact_uuid}"
+    with StateLock(paths["root"], paths["config_lock"]):
+        with StateLock(paths["root"], paths["lock"]):
+            private_alias_parent(path)
+            document = private_alias_document(path, allow_missing=True)
+            pushed = _valid_pushed_titles(document.get("pushed_titles"))
+            if pushed.get(key) == clean:
+                return
+            pushed[key] = clean
+            document["pushed_titles"] = dict(sorted(pushed.items()))
+            atomic_write_json(path, document)
+
+
+def adopt_native_rename(
+    config: Mapping[str, Any],
+    provider: str,
+    uuid: str,
+    native_title: str,
+    *,
+    atomic_write_json: Callable[[Path, Any], None],
+    config_path: Callable[[], Path],
+    private_alias_document: Callable[..., dict[str, Any]],
+    private_alias_parent: Callable[[Path], None],
+) -> str:
+    """Promote a provider-native rename to the permanent, human-owned name.
+
+    Renaming a room with /rename is a person naming their work, and it is the
+    newest thing they have said about it. So it wins outright: it becomes the
+    alias, it takes human ownership, and the automatic title it replaced is
+    dropped rather than left behind to be restored by a later pass.
+
+    This is also the migration. A session renamed natively before any of this
+    existed carries the same evidence — a native title that is not the
+    retained automatic one — so the first reconciliation after the release
+    settles it without anyone re-typing anything.
+
+    Returns the adopted title, or "" when there was no native rename to adopt.
+    """
+    exact_uuid = valid_uuid(uuid)
+    if provider not in PROVIDERS or not exact_uuid:
+        return ""
+    path = config_path()
+    paths = _state_paths(config)
+    key = f"{provider}:{exact_uuid}"
+    with StateLock(paths["root"], paths["config_lock"]):
+        with StateLock(paths["root"], paths["lock"]):
+            private_alias_parent(path)
+            document = private_alias_document(path, allow_missing=True)
+            adopted = native_rename(document, key, native_title)
+            if not adopted:
+                return ""
+            aliases = dict(document["aliases"])
+            if (
+                aliases.get(key) == adopted
+                and _name_owner(document, key) == "human"
+                and _valid_pushed_titles(document.get("pushed_titles")).get(key)
+                == adopted
+            ):
+                return ""
+            aliases[key] = adopted
+            document["aliases"] = dict(sorted(aliases.items()))
+            _record_name_ownership(document, key, "human")
+            titles = _valid_automatic_titles(document.get("automatic_titles"))
+            titles.pop(key, None)
+            document["automatic_titles"] = dict(sorted(titles.items()))
+            failures = _valid_automatic_title_failures(
+                document.get("automatic_title_failures")
+            )
+            failures.pop(key, None)
+            if failures:
+                document["automatic_title_failures"] = dict(sorted(failures.items()))
+            else:
+                document.pop("automatic_title_failures", None)
+            # The adopted name is now what both stores hold, so the next pass
+            # sees agreement rather than detecting the same rename forever.
+            pushed = _valid_pushed_titles(document.get("pushed_titles"))
+            pushed[key] = adopted
+            document["pushed_titles"] = dict(sorted(pushed.items()))
+            atomic_write_json(path, document)
+            return adopted
+
+
+def claim_automatic_name(
+    config: Mapping[str, Any],
+    provider: str,
+    uuid: str,
+    *,
+    atomic_write_json: Callable[[Path, Any], None],
+    config_path: Callable[[], Path],
+    private_alias_document: Callable[..., dict[str, Any]],
+    private_alias_parent: Callable[[Path], None],
+) -> str:
+    """Take the one-shot automatic claim on one session's name.
+
+    Returns "" when the claim landed and the reason it did not otherwise. The
+    claim is what makes first-prompt ownership hold across restarts: the
+    record outlives the process that wrote it, so the pass that runs after a
+    reboot finds the thread already named instead of naming it again.
+    """
+    exact_uuid = valid_uuid(uuid)
+    if provider not in PROVIDERS or not exact_uuid:
+        raise CollectionError(
+            "automatic name claim requires provider claude|codex and an exact UUID"
+        )
+    path = config_path()
+    paths = _state_paths(config)
+    key = f"{provider}:{exact_uuid}"
+    with StateLock(paths["root"], paths["config_lock"]):
+        with StateLock(paths["root"], paths["lock"]):
+            private_alias_parent(path)
+            document = private_alias_document(path, allow_missing=True)
+            owner = _name_owner(document, key)
+            if owner:
+                return f"a {owner} name already owns this session"
+            _record_name_ownership(document, key, "automatic")
+            atomic_write_json(path, document)
+            verified = private_alias_document(path, allow_missing=False)
+            if _name_owner(verified, key) != "automatic":
+                raise CollectionError("automatic name claim verification failed")
+    return ""
 
 
 def mutate_canonical_self_name(
@@ -275,6 +522,8 @@ def mutate_canonical_self_name(
                 revalidate()
             private_alias_parent(path)
             document = private_alias_document(path, allow_missing=True)
+            if _name_owner(document, key) == "human":
+                raise CollectionError("a human name owns this session")
             aliases = dict(document["aliases"])
             titles = _valid_automatic_titles(document.get("automatic_titles"))
             failures = _valid_automatic_title_failures(
@@ -283,6 +532,7 @@ def mutate_canonical_self_name(
             aliases[key] = clean_title
             titles[key] = clean_title
             failures.pop(key, None)
+            _record_name_ownership(document, key, "automatic")
             document["aliases"] = dict(sorted(aliases.items()))
             document["automatic_titles"] = dict(sorted(titles.items()))
             if failures:
@@ -452,8 +702,18 @@ def prune_automatic_titles(
             failures = _valid_automatic_title_failures(
                 document.get("automatic_title_failures")
             )
+            owners = _valid_name_ownership(document.get("name_ownership"))
             for key in orphans:
                 failures.pop(key, None)
+                # A spent automatic claim goes with the title it claimed. A
+                # human override never does: it has to outlive the pruning of
+                # a conversation that is merely not running right now.
+                if owners.get(key, {}).get("owner") == "automatic":
+                    owners.pop(key, None)
+            if owners:
+                document["name_ownership"] = dict(sorted(owners.items()))
+            else:
+                document.pop("name_ownership", None)
             if failures:
                 document["automatic_title_failures"] = dict(sorted(failures.items()))
             else:
@@ -518,6 +778,7 @@ def propagate_provider_title(
     push_claude_title: Callable[..., tuple[list[str], list[str]]],
     push_codex_title: Callable[..., tuple[list[str], list[str]]],
     session_kit_state_dir: Callable[[Mapping[str, str], Path], Path],
+    record_pushed: Callable[..., None],
 ) -> dict[str, Any]:
     """One-shot push of an assigned name into the provider's own surfaces.
 
@@ -565,6 +826,12 @@ def propagate_provider_title(
         )
     for warning in warnings:
         print(f"session inventory: {warning}", file=sys.stderr)
+    if pushed and not warnings:
+        # Only a push that landed becomes the kit's last-pushed value. A push
+        # that failed leaves the old title in the provider store, and calling
+        # that the kit's own value would read the kit's own stale name back as
+        # somebody's rename.
+        record_pushed(provider, exact_uuid, clean_title, environ=environ)
     return {
         "provider_title_pushes": pushed,
         "provider_title_warnings": warnings,
@@ -691,12 +958,17 @@ def _reconcile_pending_provider_titles(
     atomic_write_json: Callable[[Path, Any], None],
     retry_disposition: Callable[..., Any],
     propagate_title: Callable[..., dict[str, Any]],
+    human_named: Callable[[Mapping[str, str]], frozenset[str]],
 ) -> list[dict[str, Any]]:
     """Retry a bounded number of exact failed self-name provider pushes."""
     paths = _state_paths(config)
     with StateLock(paths["root"], paths["lock"]):
         raw = read_state_json(paths["provider_title_retries"])
     entries = dict(raw.get("entries", {})) if isinstance(raw, Mapping) else {}
+    # A queued retry outlives the process that queued it. If a person renamed
+    # the session in the meantime, replaying the old automatic title would
+    # resurrect it over their name — after a restart, without them asking.
+    owned = human_named(environ)
     candidates = [
         (key, item)
         for key, item in sorted(entries.items())
@@ -706,6 +978,7 @@ def _reconcile_pending_provider_titles(
         and clean_text(item.get("title"), 100)
         and isinstance(item.get("attempts"), int)
         and item.get("attempts", 0) < 3
+        and f"{provider}:{valid_uuid(item.get('uuid'))}" not in owned
     ][:limit]
     results: list[dict[str, Any]] = []
     for key, item in candidates:
@@ -796,6 +1069,8 @@ def claude_pending_native_hydrations(
     propagate_color: Callable[..., dict[str, Any]],
     propagate_title: Callable[..., dict[str, Any]],
     reconcile_pending_titles: Callable[..., Any],
+    human_named: Callable[[Mapping[str, str]], frozenset[str]],
+    adopt_native: Callable[..., str],
 ) -> list[dict[str, Any]]:
     """Fill absent visible records for exact managed Claude sessions.
 
@@ -819,6 +1094,7 @@ def claude_pending_native_hydrations(
         return hydrated
     home = Path(home_raw)
     colors = canonical_colors(settings)
+    owned = human_named(env)
     for item in live.get("sessions", ()):
         if not isinstance(item, Mapping) or item.get("provider") != "claude":
             continue
@@ -828,9 +1104,19 @@ def claude_pending_native_hydrations(
         signals = transcript_signals(uuid, home)
         pushes: list[str] = []
         warnings: list[str] = []
+        # A /rename lands in agent-name, the same record the kit pushes to.
+        # Whatever is there now that the kit did not put there is a person's
+        # name for this conversation, and it wins for good.
+        adopted = adopt_native("claude", uuid, signals["agent_name"], environ=env)
+        if adopted:
+            hydrated.append({"uuid": uuid, "adopted_native_rename": adopted})
+            continue
         title = signals["ai_title"]
+        # A session someone renamed keeps that name on its prompt bar. The
+        # provider's own ai-title is the automatic tier and never outranks it.
         if (
             naming_enabled
+            and f"claude:{uuid}" not in owned
             and title
             and not signals["agent_name"]
             and item.get("native_title") == title

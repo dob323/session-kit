@@ -107,7 +107,7 @@ def guard_live_inventory(
     rows: set[int] = set()
     terminal_numbers: set[int] = set()
     raw_ids: set[str] = set()
-    exact_provider_uuids: set[tuple[str, str]] = set()
+    managed_provider_uuids: set[tuple[str, str]] = set()
     for item in sessions:
         if not isinstance(item, Mapping):
             return False
@@ -183,12 +183,13 @@ def guard_live_inventory(
             if not uuid:
                 return False
             key = (provider, uuid)
-            if key in exact_provider_uuids:
+            if key in managed_provider_uuids:
                 return False
-            exact_provider_uuids.add(key)
+            managed_provider_uuids.add(key)
         elif identity.get("uuid") is not None:
             return False
 
+    outside_provider_uuids: set[tuple[str, str]] = set()
     for item in outside_agents:
         if not isinstance(item, Mapping):
             return False
@@ -208,9 +209,14 @@ def guard_live_inventory(
         if not uuid:
             return False
         key = (provider, uuid)
-        if key in exact_provider_uuids:
+        # A provider may be resumed outside shpool while its managed copy is
+        # still alive.  That is unsafe for conversation-level recovery, but it
+        # does not make an unrelated, proof-bound shpool session ambiguous.
+        # Keep rejecting duplicate outside rows while allowing the guard used
+        # by exact session actions and new-session generation capture to work.
+        if key in outside_provider_uuids:
             return False
-        exact_provider_uuids.add(key)
+        outside_provider_uuids.add(key)
 
     return rows == set(range(1, len(sessions) + 1))
 

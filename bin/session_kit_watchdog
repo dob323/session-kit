@@ -11,9 +11,10 @@
 #      terminal fills, the program blocks, and the session list still says
 #      "running".
 #
-# Both look identical from outside: a session that claims to be running and
-# has produced nothing for hours. This watchdog finds them, proves they are
-# dead rather than merely busy, and moves the conversation to a fresh session.
+# Both can look identical from outside: a session that claims to be running and
+# has produced nothing for hours. This watchdog reports the evidence by default.
+# Its explicit Linux-only repair mode can move a directly proven conversation
+# to a fresh session.
 #
 # It is read-only until every proof holds, and it never touches a session that
 # is simply quiet for a while.
@@ -146,38 +147,73 @@ notify() {
     log "notify not delivered for $ALERT_TYPE (hub down or non-critical drop)"
 }
 
-# Sessions the daemon has reported a terminal-handoff failure for. Only these
-# lines carry the session name; the accompanying ERROR line does not, so it is
-# deliberately not used as a trigger.
-flagged_sessions() {
+# Timestamped attach outcomes from the current journal window. The daemon's
+# failure line carries the session name, and a later successful attach for that
+# same name cancels it. Keep PID and monotonic timestamps so old daemon
+# generations can never be blamed on the current process.
+flagged_events() {
   local since=$1
   [[ $(sk_platform) != Darwin ]] || return 0
-  journalctl --user -u "$JOURNAL_UNIT" --since "$since" -o cat --no-pager 2>/dev/null |
-    grep -F 'failed to tell shell->client to disconnect' |
-    grep -oE 's="[^"]+"' |
-    sed 's/^s="//; s/"$//' |
-    sort -u
+  journalctl --user -u "$JOURNAL_UNIT" --since "$since" -o json --no-pager 2>/dev/null |
+    python3 -c '
+import json
+import re
+import sys
+
+events = []
+for raw in sys.stdin:
+    try:
+        row = json.loads(raw)
+        message = str(row.get("MESSAGE", ""))
+        pid = int(row.get("_PID", 0))
+        monotonic_us = int(row.get("__MONOTONIC_TIMESTAMP", 0))
+        realtime_us = int(row.get("__REALTIME_TIMESTAMP", 0))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        continue
+    match = re.search(r"s=\"([^\"]+)\"", message)
+    if not match or pid <= 0 or monotonic_us <= 0 or realtime_us <= 0:
+        continue
+    if "failed to tell shell->client to disconnect" in message:
+        kind = "failure"
+    elif (
+        "initial_attach_lock(shell_to_client_ctl): client connection status="
+        in message
+    ):
+        kind = "success"
+    else:
+        continue
+    events.append(
+        {
+            "kind": kind,
+            "monotonic_us": monotonic_us,
+            "pid": pid,
+            "realtime_us": realtime_us,
+            "session": match.group(1),
+        }
+    )
+print(json.dumps(events, separators=(",", ":")))
+'
 }
 
-# Prints one JSON verdict per candidate session that is proven dead.
-# Proofs: still present; claims to be running; silent past its threshold; and
-# either the daemon has fewer terminal-serving threads than sessions, or the
-# session was flagged, or the silence is past the long no-marker threshold.
+# Prints one JSON verdict per candidate session plus any manager-level warning.
+# A current-generation, sufficiently aged failure marker is direct evidence;
+# silence alone is only a report, and a global thread-count mismatch is never
+# attributed to one session.
 dead_sessions() {
-  local flagged=$1 snapshot status=0
+  local events=$1 snapshot status=0
   snapshot=$(mktemp "$SK_STATE_DIR/watchdog-snapshot.json.XXXXXX") || return 3
   if ! "$STATUS_CMD" --json > "$snapshot" 2>/dev/null; then
     command rm -f -- "$snapshot"
     return 3
   fi
-  python3 - "$snapshot" "$flagged" \
+  python3 - "$snapshot" "$events" \
     "$FLAGGED_QUIET_SECONDS" "$DEAD_QUIET_SECONDS" <<'PY'
 import json
 import os
 import sys
+import time
 
-snapshot_path, flagged_raw, flagged_quiet_raw, dead_quiet_raw = sys.argv[1:5]
-flagged = {name for name in flagged_raw.split() if name}
+snapshot_path, events_raw, flagged_quiet_raw, dead_quiet_raw = sys.argv[1:5]
 flagged_quiet = int(flagged_quiet_raw)
 dead_quiet = int(dead_quiet_raw)
 
@@ -191,8 +227,48 @@ if inventory.get("source") != "live" or inventory.get("stale") is not False:
 
 daemon = inventory.get("daemon_generation") or {}
 daemon_pid = daemon.get("pid")
-if not isinstance(daemon_pid, int) or daemon_pid <= 0:
+daemon_start_ticks = daemon.get("process_start_ticks")
+if (
+    not isinstance(daemon_pid, int)
+    or daemon_pid <= 0
+    or not isinstance(daemon_start_ticks, int)
+    or daemon_start_ticks <= 0
+):
     sys.exit(3)
+
+try:
+    events = json.loads(events_raw or "[]")
+except (TypeError, ValueError):
+    events = []
+if not isinstance(events, list):
+    events = []
+
+# Linux process start ticks and journal monotonic timestamps share the same
+# boot-relative clock. This excludes matching text from an earlier daemon even
+# if the kernel later reuses its PID.
+clock_ticks = os.sysconf("SC_CLK_TCK")
+daemon_start_us = daemon_start_ticks * 1_000_000 // clock_ticks
+latest_event = {}
+now_us = int(time.time() * 1_000_000)
+for event in events:
+    if not isinstance(event, dict) or event.get("pid") != daemon_pid:
+        continue
+    monotonic_us = event.get("monotonic_us")
+    realtime_us = event.get("realtime_us")
+    name = event.get("session")
+    kind = event.get("kind")
+    if (
+        not isinstance(monotonic_us, int)
+        or monotonic_us < daemon_start_us
+        or not isinstance(realtime_us, int)
+        or realtime_us <= 0
+        or not isinstance(name, str)
+        or kind not in {"failure", "success"}
+    ):
+        continue
+    previous = latest_event.get(name)
+    if previous is None or monotonic_us > previous["monotonic_us"]:
+        latest_event[name] = event
 
 sessions = list(inventory.get("sessions", ()))
 
@@ -220,6 +296,21 @@ else:
 
 missing_thread = serving < len(sessions)
 
+# A process-wide count cannot identify which session lost its serving thread.
+# Emit one manager-level warning and never attribute or repair a specific
+# session from this count alone.
+if missing_thread:
+    print(
+        json.dumps(
+            {
+                "evidence": "manager-missing-thread",
+                "serving_threads": serving,
+                "sessions": len(sessions),
+            },
+            sort_keys=True,
+        )
+    )
+
 for row in sessions:
     shpool_id = row.get("shpool_id")
     provider = row.get("provider")
@@ -229,25 +320,27 @@ for row in sessions:
         continue
     if row.get("mutation_allowed") is not True:
         continue
-    if isinstance(age, bool) or not isinstance(age, int):
-        continue
     # Only a detached session can be probed safely. A session that shows as
     # attached may have a live human on it, and forcing it off to run a test
     # would be exactly the damage this watchdog exists to prevent.
     if row.get("availability") != "ready":
         continue
-    was_flagged = shpool_id in flagged
-    # Only the first two are evidence that the terminal is actually dead. The
-    # third is silence, which proves nothing on its own and is reported only.
-    if was_flagged and age >= flagged_quiet:
+    event = latest_event.get(shpool_id)
+    marker_age = None
+    if event is not None and event["kind"] == "failure":
+        marker_age = max(0, (now_us - event["realtime_us"]) // 1_000_000)
+    was_flagged = marker_age is not None and marker_age >= flagged_quiet
+    age_known = isinstance(age, int) and not isinstance(age, bool)
+    # A sufficiently aged failure from this exact daemon generation is direct
+    # evidence. Unknown output age is safe to report but not safe to repair.
+    if was_flagged:
         evidence = "daemon-marker"
         reason = "the daemon logged a terminal handoff failure for this session"
-    elif missing_thread and age >= flagged_quiet:
-        evidence = "missing-thread"
-        reason = "the daemon has no thread left to serve this terminal"
-    elif age >= dead_quiet:
+        repair_allowed = age_known and age >= flagged_quiet
+    elif age_known and age >= dead_quiet:
         evidence = "silence-only"
         reason = "no output for far longer than any normal pause"
+        repair_allowed = False
     else:
         continue
     print(
@@ -260,8 +353,10 @@ for row in sessions:
                 "serving_threads": serving,
                 "sessions": len(sessions),
                 "flagged": was_flagged,
+                "marker_age_seconds": marker_age,
                 "evidence": evidence,
                 "reason": reason,
+                "repair_allowed": repair_allowed,
             },
             sort_keys=True,
         )
@@ -286,11 +381,14 @@ json_field() {
 # the login picker went blind, and the only way out was restarting the daemon,
 # which ends every managed session. A watchdog must never be able to do that.
 #
-# So confirmation is read-only. Two passive signals are precise enough, and
-# both were present in every wedge observed:
+# So confirmation is read-only. A current-daemon handoff failure that has not
+# been followed by a successful attach is direct per-session evidence:
 #
-#   * the daemon logged a terminal handoff failure naming the session, or
-#   * the daemon has fewer terminal-serving threads than it has sessions.
+#   * the daemon logged a terminal handoff failure naming the session.
+#
+# A daemon-wide serving-thread count mismatch identifies manager trouble but
+# cannot identify which individual session is affected. It is reported once
+# and never used for an automatic repair.
 #
 # Silence alone is never sufficient, because it carries no information: Codex
 # reports "running" for its entire life whether it is working or waiting at its
@@ -382,16 +480,23 @@ PY
 }
 
 sweep() {
-  local since=$1 flagged verdict id
+  local since=$1 events verdict id evidence
   if [[ -e $SENTINEL ]]; then
     return 0
   fi
-  flagged=$(flagged_sessions "$since" | tr '\n' ' ')
+  events=$(flagged_events "$since")
   while IFS= read -r verdict; do
     [[ -n $verdict ]] || continue
+    evidence=$(json_field "$verdict" evidence)
+    if [[ $evidence == manager-missing-thread ]]; then
+      report_once serving-thread-mismatch \
+        "Session manager thread count is inconsistent" \
+        "The manager has fewer terminal-serving threads than listed sessions. The count cannot identify which session is affected, so no session was changed. Inspect the manager journal and session history."
+      continue
+    fi
     id=$(json_field "$verdict" shpool_id)
     [[ -n $id ]] || continue
-    if [[ $(json_field "$verdict" evidence) == silence-only ]]; then
+    if [[ $evidence == silence-only ]]; then
       # Nothing but silence. Report it and let a human decide; closing a
       # session on this alone would eventually close an idle one.
       if ! already_reported_quiet "$id"; then
@@ -404,7 +509,7 @@ sweep() {
       continue
     fi
     log "candidate $id has direct evidence its terminal cannot be served"
-    if [[ $WATCHDOG_MODE == repair ]]; then
+    if [[ $WATCHDOG_MODE == repair && $(json_field "$verdict" repair_allowed) == True ]]; then
       repair_session "$verdict"
     elif ! already_reported_quiet "$id"; then
       record_repair "$id" "" "$(json_field "$verdict" title)" \
@@ -412,7 +517,7 @@ sweep() {
         "$(json_field "$verdict" reason)" || true
       remember_quiet_report "$id" || true
     fi
-  done < <(dead_sessions "$flagged")
+  done < <(dead_sessions "$events")
   return 0
 }
 

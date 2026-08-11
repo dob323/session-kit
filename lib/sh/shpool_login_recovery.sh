@@ -91,7 +91,42 @@ review_recovery() {
   echo
   echo "  Conversations available for exact recovery"
   python3 - "$RECOVERY" <<'PY'
-import json,sys,unicodedata
+import datetime
+import json
+import re
+import sys
+import time
+import unicodedata
+
+def started_at(row):
+    value = row.get("started_at_unix_ms")
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value / 1000
+    # Older records predate the timestamp field. Generated internal IDs contain
+    # the local login time, so use one only as legacy input and never print it.
+    match = re.fullmatch(
+        r"s(\d{8})-(\d{6})-\d+", str(row.get("old_shpool_id") or "")
+    )
+    if not match:
+        return None
+    try:
+        value = datetime.datetime.strptime("".join(match.groups()), "%Y%m%d%H%M%S")
+    except ValueError:
+        return None
+    return time.mktime(value.timetuple())
+
+def login_age(row):
+    started = started_at(row)
+    if started is None:
+        return "login time unknown"
+    hours = max(0, int((time.time() - started) // 3600))
+    if hours < 1:
+        return "logged in less than 1h ago"
+    days, remaining = divmod(hours, 24)
+    if days:
+        return f"logged in {days}d {remaining}h ago"
+    return f"logged in {hours}h ago"
+
 for number,row in enumerate(json.load(open(sys.argv[1])).get("entries",[]),1):
     provider=str(row.get("provider") or "unknown").title()
     clean=lambda value: " ".join(
@@ -101,44 +136,27 @@ for number,row in enumerate(json.load(open(sys.argv[1])).get("entries",[]),1):
         ).split()
     )
     title=clean(row.get("title"))
-    old_id=clean(row.get("display_old_shpool_id"))
     conflicts=", ".join(clean(value) for value in row.get("conflict_fields",[]))
     suffix=f" [review required: conflicting {conflicts}]" if conflicts else ""
-    print(f"  {number:2}  [{provider}] {title} [{old_id}]{suffix}")
+    print(f"  {number:2}  [{provider}] {title} [{login_age(row)}]{suffix}")
 PY
   echo
-  echo "  numbers/ranges: restore selected | a: restore all"
+  echo "  1,3,5 or 2-4: restore selected | all (or a): restore every conversation"
   echo "  Enter: Back"
   echo
   local answer selected
-  picker_read answer "  recovery ❯ " || return 0
+  picker_modal_read answer "  recovery ❯ " || return 0
   [[ -n $answer ]] || return 0
-  selected=$(python3 - "$RECOVERY" "$answer" <<'PY'
+  selected=$(python3 - "$RECOVERY" "$answer" "$SCRIPT_DIR/../lib" <<'PY'
 import json,sys
+sys.path.insert(0, sys.argv[3])
+from sessionkit_inventory.common import CollectionError, parse_number_selection
 entries=json.load(open(sys.argv[1])).get("entries",[])
-answer=sys.argv[2].strip().lower()
-if answer == "a":
-    chosen=list(range(1,len(entries)+1))
-else:
-    values=set()
-    for part in answer.split(","):
-        part=part.strip()
-        if not part:
-            raise SystemExit(2)
-        if "-" in part:
-            first,last=part.split("-",1)
-            if not first.isdigit() or not last.isdigit():
-                raise SystemExit(2)
-            a,b=int(first),int(last)
-            if a > b:
-                raise SystemExit(2)
-            values.update(range(a,b+1))
-        elif part.isdigit():
-            values.add(int(part))
-        else:
-            raise SystemExit(2)
-    chosen=sorted(values)
-if any(number < 1 or number > len(entries) for number in chosen):
+try:
+    chosen=parse_number_selection(sys.argv[2], len(entries))
+except CollectionError:
+    raise SystemExit(2)
+if not chosen:
     raise SystemExit(2)
 print("\n".join(map(str,chosen)))
 PY
@@ -199,8 +217,8 @@ PY
           printf '  Exact active session %s was found, but its recovery record could not be cleared; the record was retained.\n' \
             "$active_number" >&2
         fi
-        printf '  %s is already active as session %s; opening the existing session instead.\n' \
-          "$old_id" "$active_number"
+        printf '  Recovery item %s is already active as session %s; opening the existing session instead.\n' \
+          "$number" "$active_number"
         printf '  Use fork %s from the picker to start a separate writable fork.\n' \
           "$active_number"
         QUERY=$uuid
@@ -213,18 +231,18 @@ PY
         continue
         ;;
       outside)
-        printf '  %s is already active outside the session manager; no duplicate was started.\n' \
-          "$old_id"
+        printf '  Recovery item %s is already active outside the session manager; no duplicate was started.\n' \
+          "$number"
         continue
         ;;
       ambiguous)
-        printf '  Active identity for %s is ambiguous; no duplicate was started.\n' \
-          "$old_id"
+        printf '  Active identity for recovery item %s is ambiguous; no duplicate was started.\n' \
+          "$number"
         continue
         ;;
     esac
     if launched=$("$SP_CMD" restore-exact "$provider" "$uuid" "$cwd"); then
-      printf '  Started %s as %s\n' "$old_id" "$launched"
+      printf '  Started recovery item %s.\n' "$number"
       acknowledged=0
       for attempt in {1..20}; do
         if "$STATUS_CMD" --recovery-pending-ack \
@@ -235,10 +253,10 @@ PY
         sleep 0.25
       done
       if (( acknowledged == 0 )); then
-        printf '  Exact live proof is pending for %s; its recovery record was retained.\n' "$old_id" >&2
+        printf '  Exact live proof is pending for recovery item %s; its recovery record was retained.\n' "$number" >&2
       fi
     else
-      printf '  Could not restore %s; its recovery record was retained.\n' "$old_id" >&2
+      printf '  Could not restore recovery item %s; its recovery record was retained.\n' "$number" >&2
     fi
   done 3<<<"$selected"
   refresh_after_action

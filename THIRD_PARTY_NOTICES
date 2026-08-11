@@ -4,19 +4,50 @@ Third-party notices
 shpool
 ------
 
-Session Kit works with shpool and includes an optional source patch against
+Session Kit works with shpool and includes optional source patches against
 shpool 0.11.0:
 
   shpool-patch/0001-heartbeat-ack-timeout-is-not-fatal.patch
+  shpool-patch/0002-restore-input-modes-on-reattach.patch
+  shpool-patch/0003-kill-tolerates-an-already-dead-shell.patch
+  shpool-patch/0004-detach-must-not-hold-the-shells-lock.patch
 
 Upstream: https://github.com/shell-pool/shpool
+Base revision: v0.11.0 == fe2d11595ff255810523b0868159dec051e303f1
+Copyright 2023 Google LLC, per the upstream source headers.
 
-shpool is licensed under the Apache License, Version 2.0. The patch modifies
-the corresponding upstream source and remains subject to that license and
-upstream notices.
+shpool is licensed under the Apache License, Version 2.0. The patches modify
+the corresponding upstream source and remain subject to that license and
+upstream notices. Each patch file carries a comment header naming the upstream
+project, its license, the base revision, and what that patch changes.
 
 Session Kit does not include the shpool source tree or a shpool binary.
 
 The Apache License text is included at:
 
   LICENSES/Apache-2.0.txt
+
+Maniple (maniple-mcp)
+---------------------
+
+The supervisor's oversight primitives are adapted from Maniple:
+
+  lib/sessionkit_supervisor/vendor/**
+  lib/sessionkit_supervisor/server.py
+
+Upstream: https://github.com/Martian-Engineering/maniple
+Vendored commit: 0987ccf59552989600f6134e6602abe72a3214d0
+Upstream version: maniple-mcp 0.13.0
+
+Maniple is MIT licensed. The upstream repository declares MIT in its
+pyproject.toml and README and publishes no LICENSE file of its own, so the MIT
+text reproduced here names the copyright holder from the project's declared
+authors and maintainers. The upstream file mapping and the Session Kit
+modifications are recorded at:
+
+  lib/sessionkit_supervisor/vendor/NOTICE
+
+The MIT license text is included at:
+
+  lib/sessionkit_supervisor/vendor/LICENSE
+  LICENSES/MIT-maniple.txt

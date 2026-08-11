@@ -138,7 +138,7 @@ else:
 print()
 PY
   local ignored
-  picker_read ignored "  Enter: Back ❯ " || return 0
+  picker_modal_read ignored "  Enter: Back ❯ " || return 0
 }
 
 number_metadata() {
@@ -176,6 +176,179 @@ PY
 
 decode64() {
   printf '%s' "$1" | base64 -d
+}
+
+prompt_quarantine_selection() {
+  local wanted=$1 token key state
+  [[ $wanted =~ ^[0-9]+$ ]] || return 1
+  while IFS=$'\t' read -r token key state; do
+    if [[ $token == "q$wanted" && $key =~ ^[0-9a-f]{12}$ &&
+          ( $state == intake_pending || $state == outcome_unknown ) ]]; then
+      printf '%s\n%s\n' "$key" "$state"
+      return 0
+    fi
+  done <<<"$PROMPT_QUARANTINE_INDEX"
+  return 1
+}
+
+run_prompt_quarantine_action() {
+  local action=$1
+  shift
+  local output status=0
+  new_temp prompt-quarantine-action || {
+    echo "  The prompt action could not be prepared. Nothing changed."
+    return 1
+  }
+  output=$NEW_TEMP
+  "$SP_CMD" prompt-quarantine "$action" "$@" >"$output" 2>&1 || status=$?
+  if (( status != 0 )); then
+    echo "  The prompt action was refused; its durable record was left unchanged."
+    return "$status"
+  fi
+  case "$action" in
+    ingest) echo "  The prompt was ingested without sending it to Codex again." ;;
+    resume) echo "  The exact Codex conversation was resumed in a managed session." ;;
+    discard) echo "  The prompt left Needs You and remains recoverable for 30 days." ;;
+    prune) echo "  Expired prompt recovery records were pruned." ;;
+  esac
+}
+
+prompt_quarantine_prune() {
+  run_prompt_quarantine_action prune || true
+}
+
+dismiss_repair_failure() {
+  local wanted=$1 token index="" answer
+  [[ $wanted =~ ^[0-9]+$ ]] || return 1
+  while IFS=$'\t' read -r token index; do
+    [[ $token == "d$wanted" && $index =~ ^[0-9]+$ ]] && break
+    index=""
+  done <<<"$REPAIR_INDEX"
+  if [[ -z $index ]]; then
+    echo "  Choose a d-number shown here. Nothing changed."
+    return 0
+  fi
+  picker_modal_read answer "  Type dismiss to confirm this unresolved repair is understood ❯ " || return 0
+  if [[ ${answer,,} != dismiss ]]; then
+    echo "  Repair failure kept. Nothing changed."
+    return 0
+  fi
+  if python3 - "$REPAIR_FILE" "$index" <<'PY'
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+import tempfile
+
+path = Path(sys.argv[1])
+index = int(sys.argv[2])
+flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+descriptor = os.open(path, flags)
+with os.fdopen(descriptor, encoding="utf-8") as handle:
+    metadata = os.fstat(handle.fileno())
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid():
+        raise SystemExit(2)
+    data = json.load(handle)
+entries = data.get("repairs") if isinstance(data, dict) else None
+if not isinstance(entries, list) or not 0 <= index < len(entries):
+    raise SystemExit(2)
+item = entries[index]
+if not isinstance(item, dict) or item.get("acknowledged") or item.get("outcome") == "repaired":
+    raise SystemExit(2)
+item["acknowledged"] = True
+out, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+try:
+    os.fchmod(out, 0o600)
+    with os.fdopen(out, "w", encoding="utf-8") as handle:
+        out = -1
+        json.dump(data, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+finally:
+    if out >= 0:
+        os.close(out)
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+PY
+  then
+    echo "  Repair failure dismissed; its history remains in the repair log."
+    CONFIRM_FORGIVE=1
+  else
+    echo "  The repair record changed or was unsafe to update. Nothing changed."
+  fi
+}
+
+choose_prompt_quarantine() {
+  local number=$1 metadata key state
+  metadata=$(prompt_quarantine_selection "$number") || {
+    echo "  Choose a q-number shown here. Nothing changed."
+    return
+  }
+  key=${metadata%%$'\n'*}
+  state=${metadata#*$'\n'}
+  while true; do
+    echo
+    if [[ $state == intake_pending ]]; then
+      echo "  Codex prompt intake pending"
+    else
+      echo "  Codex prompt outcome unknown"
+    fi
+    echo "  1  Ingest the accepted prompt without sending it to Codex again"
+    echo "  2  Resume the exact Codex conversation in a managed session"
+    echo "  3  Discard from Needs You (recoverable for 30 days)"
+    echo "  4  Prune all prompt records older than 30 days"
+    echo "  Enter  Back"
+    echo
+    local action answer resume_dir
+    picker_modal_read action "  action ❯ " || return 0
+    case "$action" in
+      "") return ;;
+      1)
+        run_prompt_quarantine_action ingest "$key" || true
+        return
+        ;;
+      2)
+        picker_modal_read resume_dir "  Absolute project directory (Enter: current directory) ❯ " || return 0
+        if [[ -z $resume_dir ]]; then
+          resume_dir=$(pwd -P)
+        fi
+        if [[ $resume_dir != /* ]]; then
+          echo "  Use an absolute project directory. Nothing changed."
+          continue
+        fi
+        run_prompt_quarantine_action resume "$key" "$resume_dir" || true
+        return
+        ;;
+      3)
+        picker_modal_read answer "  Type discard to confirm ❯ " || return 0
+        if [[ ${answer,,} != discard ]]; then
+          echo "  Prompt kept. Nothing changed."
+          continue
+        fi
+        run_prompt_quarantine_action discard "$key" || true
+        CONFIRM_FORGIVE=1
+        return
+        ;;
+      4)
+        prompt_quarantine_prune
+        return
+        ;;
+      *) echo "  Unknown choice. Nothing changed." ;;
+    esac
+  done
+}
+
+picker_mark_seen() {
+  local provider=$1 uuid=$2 confidence=$3
+  [[ ( $provider == claude || $provider == codex ) &&
+     $confidence == exact && -n $uuid ]] || return 0
+  python3 "$SK_INVENTORY_CORE" msg queue \
+    --mark-seen "$provider:$uuid" >/dev/null 2>&1 || true
 }
 
 create_proof() {
@@ -280,6 +453,56 @@ refresh_after_action() {
   fi
 }
 
+change_account_number() {
+  local number=$1 provider=$2 choices answer alias
+  new_temp account-switch-choices || return
+  choices=$NEW_TEMP
+  if ! "$SP_CMD" account choices "$provider" >"$choices" 2>/dev/null; then
+    echo "  Account choices are unavailable. Nothing changed."
+    return
+  fi
+  echo
+  python3 - "$choices" <<'PY'
+import json,sys
+data=json.load(open(sys.argv[1], encoding="utf-8"))
+print("  Change to account")
+for number,row in enumerate(data.get("choices",[]),1):
+    state="ready" if row.get("eligible") else str(row.get("health") or "unverified")
+    plan=f" | {row.get('plan')}" if row.get("plan") else ""
+    print(f"  {number:2}  {row.get('alias')}: {row.get('email')}{plan} | {state}")
+print("  Enter  Back")
+PY
+  echo
+  picker_modal_read answer "  target account ❯ " || return
+  [[ -n $answer ]] || return
+  alias=$(python3 - "$choices" "$answer" <<'PY'
+import json,sys
+rows=json.load(open(sys.argv[1], encoding="utf-8")).get("choices",[])
+choice=sys.argv[2].strip()
+if not choice.isdigit() or not 1 <= int(choice) <= len(rows):
+    raise SystemExit(2)
+selected=rows[int(choice)-1]
+if selected.get("eligible") is not True:
+    raise SystemExit(2)
+print(selected.get("alias", ""))
+PY
+  ) || {
+    echo "  Choose a healthy account number shown above. Nothing changed."
+    return
+  }
+  echo
+  printf '  Change terminal %s to account %s?\n' "$number" "$alias"
+  local confirm
+  picker_modal_read confirm "  Type switch to confirm ❯ " || return
+  if [[ ${confirm,,} != switch ]]; then
+    echo "  Account change cancelled."
+    return
+  fi
+  run_proof_action picker-account-switch "$number" "$alias" || true
+  CONFIRM_FORGIVE=1
+  refresh_after_action
+}
+
 choose_number() {
   local number=$1 metadata
   require_live_actions || return
@@ -297,12 +520,14 @@ choose_number() {
     echo "  The displayed row changed format. Nothing changed."
     return
   fi
-  local availability mutation display_id provider title title_state
+  local availability mutation display_id provider title title_state uuid confidence
   availability=$(decode64 "${fields[0]}")
   mutation=$(decode64 "${fields[1]}")
   display_id=$(decode64 "${fields[2]}")
   provider=$(decode64 "${fields[3]}")
   title=$(decode64 "${fields[4]}")
+  uuid=$(decode64 "${fields[6]}")
+  confidence=$(decode64 "${fields[7]}")
   title_state=$(python3 - "$VIEW" "$number" <<'PY'
 import json, sys
 with open(sys.argv[1], encoding="utf-8") as handle:
@@ -312,7 +537,7 @@ print(str(matches[0].get("provider_title_state") or "") if len(matches) == 1 els
 PY
 ) || title_state=""
   if [[ $mutation != true ]]; then
-    printf '  %s is display-only. Nothing changed.\n' "$display_id"
+    printf '  Session %s (%s) is display-only. Nothing changed.\n' "$number" "$title"
     return
   fi
   if [[ $availability == ready ]]; then
@@ -323,6 +548,7 @@ PY
       printf '\033]0;%s\007' "$title"
     fi
     local open_status=0
+    picker_mark_seen "$provider" "$uuid" "$confidence"
     PROOF_ACTION_QUIET=1 run_proof_action picker-open "$number" || open_status=$?
     # The attachment (or its failed attempt) owned the screen; start the
     # menu from a clean frame.
@@ -349,22 +575,26 @@ PY
 
   while true; do
     echo
-    printf '  %s [%s]\n' "$title" "$display_id"
+    printf '  %s [session %s]\n' "$title" "$number"
     echo "  Already open in another SSH window."
     echo
     echo "  1  Move it here (the other window disconnects)"
     echo "  2  View full terminal history"
     echo "  3  Close it (the shell and everything inside will end)"
+    if [[ $provider == claude || $provider == codex ]]; then
+      echo "  4  Change subscription account (keeps this exact thread)"
+    fi
     if [[ $provider == codex && $title_state == pending ]]; then
-      echo "  4  Apply the pending title (restarts only a proven-idle Codex provider)"
+      echo "  5  Apply the pending title (restarts only a proven-idle Codex provider)"
     fi
     echo "  Enter  Back"
     echo
     local action
-    picker_read action "  action ❯ " || return 0
+    picker_modal_read action "  action ❯ " || return 0
     case "$action" in
       "") return ;;
       1)
+        picker_mark_seen "$provider" "$uuid" "$confidence"
         run_proof_action picker-takeover "$number" || true
         CONFIRM_FORGIVE=1
         refresh_after_action
@@ -382,6 +612,13 @@ PY
         return
         ;;
       4)
+        if [[ $provider == claude || $provider == codex ]]; then
+          change_account_number "$number" "$provider"
+          return
+        fi
+        echo "  Only Claude and Codex threads can change account. Nothing changed."
+        ;;
+      5)
         if [[ $provider == codex && $title_state == pending ]]; then
           run_proof_action picker-title-refresh "$number" || true
           refresh_after_action
@@ -394,12 +631,21 @@ PY
   done
 }
 
-# Accepts one number, a comma/space list, or ranges: k 5 · k 5, 6, 8 · k 4-7.
-# Every number is validated against the CURRENT page before anything closes;
-# one bad token refuses the whole request so a typo never kills a neighbor.
+# The one selection grammar: k 5 · k 5, 6, 8 · k 4-7 · k all. Every number is
+# validated against the CURRENT page before anything closes; one bad token
+# refuses the whole request so a typo never kills a neighbor.
 direct_close() {
   local raw=$1 token
   local -a numbers=()
+  if [[ ${raw,,} == a || ${raw,,} == all ]]; then
+    local -a shown=()
+    mapfile -t shown < <(page_numbers)
+    (( ${#shown[@]} > 0 )) || {
+      echo "  Use k with visible numbers (k 5, 6, 8). Nothing changed."
+      return
+    }
+    numbers=("${shown[@]}")
+  else
   raw=${raw//,/ }
   for token in $raw; do
     if [[ $token =~ ^[0-9]+$ ]]; then
@@ -419,6 +665,7 @@ direct_close() {
       return
     fi
   done
+  fi
   (( ${#numbers[@]} > 0 )) || {
     echo "  Use k with visible numbers (k 5, 6, 8). Nothing changed."
     return
@@ -458,7 +705,7 @@ rename_number() {
     return
   fi
   local title
-  picker_read title "  New name (Enter: cancel) ❯ " || return 0
+  picker_modal_read title "  New name (Enter: cancel) ❯ " || return 0
   [[ -n ${title//[[:space:]]/} ]] || {
     echo "  Rename cancelled."
     return
@@ -519,6 +766,88 @@ fork_number() {
   refresh_after_action
 }
 
+# Open the report a chosen reply belongs to. The row's position is the only
+# thing a person typed; the message id comes from the index the same redraw
+# built, so a reply that arrived since cannot shift what r2 means mid-keypress.
+open_reply_row() {
+  local wanted=$1 line key msg_id=""
+  [[ $wanted =~ ^[0-9]+$ ]] || {
+    echo "  Choose a reply shown here, such as r1. Nothing changed."
+    return
+  }
+  while IFS=$'\t' read -r key line; do
+    [[ $key == "r$wanted" ]] || continue
+    msg_id=$line
+    break
+  done <<<"$MSG_REPLY_INDEX"
+  if [[ -z $msg_id ]]; then
+    echo "  r$wanted is not a reply shown here. Nothing changed."
+    return
+  fi
+  require_live_actions || return
+  "$SP_CMD" msg report "$msg_id" || true
+  picker_clear_screen
+  CONFIRM_FORGIVE=1
+}
+
+# Hand the window to the message centre. Writing a message, watching the
+# answers, and going back to an older one all live there, in one surface that
+# the command line reaches the same way -- this menu entry only opens it, so
+# there is nothing here to drift out of step with it.
+compose_message() {
+  require_live_actions || return
+  "$SP_CMD" msg || true
+  # The centre owned the screen while it ran, and its own last act clears it;
+  # start the menu from a clean frame either way. A stray Enter left by a
+  # confirm inside it must not read as "give me a plain terminal".
+  picker_clear_screen
+  CONFIRM_FORGIVE=1
+}
+
+# The supervisor helper is supplied by the steward lane. During a partial
+# rollout this key remains fail-open and returns to a usable picker.
+open_supervisor() {
+  local supervisor="$SCRIPT_DIR/supervisor" candidate owner
+  if [[ -n ${SESSION_KIT_SUPERVISOR_CMD:-} ]]; then
+    candidate=$SESSION_KIT_SUPERVISOR_CMD
+    owner=$(stat -c '%u' -- "$candidate" 2>/dev/null) || owner=""
+    if [[ $candidate == /* && ! -L $candidate && -f $candidate &&
+          -x $candidate && $owner == "$(id -u)" ]]; then
+      supervisor=$candidate
+    fi
+  fi
+  if [[ -L $supervisor || ! -f $supervisor || ! -x $supervisor ]]; then
+    echo "  The fleet supervisor is not installed yet. Nothing changed."
+    return 0
+  fi
+  # Creation is bounded — a wedged ensure must hand the picker back. The
+  # attach is interactive and runs unbounded in the foreground, exactly like
+  # every other picker attach; a timeout here would kill the live session.
+  # `supervisor ensure` reports to its caller in identifiers — the session it
+  # created, the receipt of the brief it sent. That is a machine's report, and
+  # the picker is a person's screen: keep it off the screen and say what
+  # happened instead.
+  local ensure_log
+  ensure_log=$(mktemp "${TMPDIR:-/tmp}/session-kit-supervisor-ensure.XXXXXX") || {
+    echo "  The fleet supervisor could not be started. Nothing else changed."
+    return 0
+  }
+  chmod 600 "$ensure_log" 2>/dev/null || true
+  if ! sk_timeout "${SESSION_KIT_SUPERVISOR_ENSURE_TIMEOUT:-20}" "$supervisor" ensure \
+       >"$ensure_log" 2>&1; then
+    command rm -f -- "$ensure_log"
+    echo "  The fleet supervisor could not be started. Nothing else changed."
+    return 0
+  fi
+  command rm -f -- "$ensure_log"
+  if ! "$supervisor" open; then
+    echo "  The fleet supervisor could not be opened. Nothing else changed."
+    return 0
+  fi
+  picker_clear_screen
+  refresh_after_action
+}
+
 project_file() {
   local destination=$1
   python3 - "$SK_PROJECTS_FILE" "$destination" <<'PY'
@@ -571,6 +900,71 @@ os.chmod(destination, 0o600)
 PY
 }
 
+guided_account() {
+  local provider=$1 choices answer selected
+  GUIDED_ACCOUNT=
+  new_temp login-accounts || return 1
+  choices=$NEW_TEMP
+  if ! "$SP_CMD" account choices "$provider" >"$choices" 2>/dev/null; then
+    echo "  Account choices are unavailable. Nothing started."
+    return 1
+  fi
+  echo
+  python3 - "$choices" <<'PY'
+import json
+import sys
+
+data=json.load(open(sys.argv[1], encoding="utf-8"))
+rows=data.get("choices", [])
+print("  Account")
+for number,row in enumerate(rows,1):
+    state="ready" if row.get("eligible") else str(row.get("health") or "unverified")
+    mark=" | recommended" if row.get("recommended") else ""
+    plan=f" | {row.get('plan')}" if row.get("plan") else ""
+    print(f"  {number:2}  {row.get('alias')}: {row.get('email')}{plan} | {state}{mark}")
+recommendation=data.get("recommendation")
+if recommendation:
+    print(f"  Enter  Use {recommendation} | b  Back")
+else:
+    print("  Choose a number | b  Back")
+PY
+  local count
+  count=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1])).get("choices",[])))' "$choices") || return 1
+  if [[ $count == 0 ]]; then
+    printf '  No %s account is enrolled. Use sp account adopt-default or sp account enroll first.\n' "$provider"
+    return 1
+  fi
+  echo
+  picker_modal_read answer "  account ❯ " || return 1
+  [[ $answer != b && $answer != B ]] || return 1
+  selected=$(python3 - "$choices" "$answer" <<'PY'
+import json
+import sys
+
+data=json.load(open(sys.argv[1], encoding="utf-8"))
+choice=sys.argv[2].strip()
+rows=data.get("choices", [])
+if not choice:
+    recommendation=data.get("recommendation")
+    if not recommendation:
+        raise SystemExit(2)
+    print(recommendation)
+    raise SystemExit(0)
+if not choice.isdigit() or not 1 <= int(choice) <= len(rows):
+    raise SystemExit(2)
+selected=rows[int(choice)-1]
+if selected.get("eligible") is not True:
+    raise SystemExit(2)
+print(selected.get("alias", ""))
+PY
+  ) || {
+    echo "  Choose a healthy account number shown above. Nothing started."
+    return 1
+  }
+  [[ $selected =~ ^[a-z][a-z0-9_-]{0,11}$ ]] || return 1
+  GUIDED_ACCOUNT=$selected
+}
+
 guided_new() {
   require_live_actions || return
   echo
@@ -581,7 +975,7 @@ guided_new() {
   echo "  Enter  Back"
   echo
   local answer provider
-  picker_read answer "  provider ❯ " || return 0
+  picker_modal_read answer "  provider ❯ " || return 0
   case "$answer" in
     "") return ;;
     1) provider=claude ;;
@@ -589,6 +983,12 @@ guided_new() {
     3) provider=shell ;;
     *) echo "  Unknown choice. Nothing changed."; return ;;
   esac
+
+  local account_alias=
+  if [[ $provider == claude || $provider == codex ]]; then
+    guided_account "$provider" || return
+    account_alias=$GUIDED_ACCOUNT
+  fi
 
   local projects
   new_temp login-projects || return
@@ -613,7 +1013,7 @@ else:
 PY
   echo
   local project_choice project_alias
-  picker_read project_choice "  project ❯ " || return 0
+  picker_modal_read project_choice "  project ❯ " || return 0
   [[ $project_choice != b && $project_choice != B ]] || return
   project_alias=$(python3 - "$projects" "$project_choice" <<'PY'
 import json,sys
@@ -641,9 +1041,17 @@ PY
     echo "  After exact startup proof, use name <number> to assign an optional conversation name."
   fi
   if [[ -n $project_alias ]]; then
-    "$SP_CMD" new "$provider" "$project_alias" || true
+    if [[ -n $account_alias ]]; then
+      "$SP_CMD" new "$provider" "$project_alias" --account "$account_alias" || true
+    else
+      "$SP_CMD" new "$provider" "$project_alias" || true
+    fi
   else
-    "$SP_CMD" new "$provider" || true
+    if [[ -n $account_alias ]]; then
+      "$SP_CMD" new "$provider" --account "$account_alias" || true
+    else
+      "$SP_CMD" new "$provider" || true
+    fi
   fi
   refresh_after_action
 }

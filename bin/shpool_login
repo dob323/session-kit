@@ -26,25 +26,34 @@ VIEW=""
 RECOVERY=""
 QUERY=""
 PAGE=1
+# The map from an r-key on the screen to the message its reply belongs to.
+# Rebuilt on every redraw, so a row that moved cannot open the wrong report.
+MSG_REPLY_INDEX=""
+# The q-number to durable quarantine-key map is rebuilt on every redraw. The
+# machine key is never rendered or accepted directly from a person.
+PROMPT_QUARANTINE_INDEX=""
+# The d-number to watchdog repair array index, built only inside Needs you.
+REPAIR_INDEX=""
 PAGE_SIZE=1
 PICKER_REFUSED_STATUS=74
 PICKER_ATTACH_FAILED_STATUS=75
 TEMP_FILES=()
 NEW_TEMP=""
 PICKER_STYLE=0
+PICKER_SCREEN=0
 PICKER_BOLD=""
 PICKER_GREEN=""
 PICKER_RESET=""
+PICKER_TTY_STATE=""
 
-if [[ -t 1 &&
-      -n ${TERM:-} &&
-      ${TERM,,} != dumb &&
-      ! -v NO_COLOR &&
-      ! -v SESSION_KIT_NO_COLOR ]]; then
-  PICKER_STYLE=1
-  PICKER_BOLD=$'\033[1m'
-  PICKER_GREEN=$'\033[32m'
-  PICKER_RESET=$'\033[0m'
+if [[ -t 1 && -n ${TERM:-} && ${TERM,,} != dumb ]]; then
+  PICKER_SCREEN=1
+  if [[ ! -v NO_COLOR && ! -v SESSION_KIT_NO_COLOR ]]; then
+    PICKER_STYLE=1
+    PICKER_BOLD=$'\033[1m'
+    PICKER_GREEN=$'\033[32m'
+    PICKER_RESET=$'\033[0m'
+  fi
 fi
 
 # The picker's function groups live beside this program under ../lib/sh, in a
@@ -90,25 +99,22 @@ LIVE_PID=
 LIVE_FILE=
 LIVE_DONE=
 LIVE_FINGERPRINT=
+LIVE_WARNING=
 
 # The main prompt, kept live. Identical to picker_read from the keyboard's
 # point of view: a read that times out consumes nothing, and a line that is
 # still being typed stays queued in the terminal untouched.
 # Returns 3 when the estate changed and the caller should repaint.
 PICKER_LIVE_STATUS=0
-# Sessions the watchdog repaired while nobody was here. Shown once, then
-# marked as seen, so the human always learns what changed even when every
-# notification path was down.
+# Repair failures are read into the explicit Needs-you view. Merely drawing a
+# menu never acknowledges or changes them.
 REPAIR_FILE=${SESSION_KIT_WATCHDOG_REPAIRS:-"$SK_STATE_DIR/watchdog-repairs.json"}
-REPAIR_BANNER=""
-REPAIR_BANNER_LINES=0
 
 # Recovery pending count is refreshed with the snapshot, not on every
 # keystroke: recovery state only changes through actions or refreshes, and
 # recomputing it per redraw ran a full status build each keypress — most of
 # the visible menu lag on a loaded box.
 PENDING_CACHE=0
-load_repair_banner
 
 # Start from a clean frame: after a daemon restart the previous attachment's
 # dead screen is still in the terminal, and menus painted over it read as
@@ -139,13 +145,6 @@ while true; do
   choice=""
   picker_read_live choice "  $(picker_green '❯') "
   live_status=$?
-  if (( live_status == 3 )); then
-    # The estate changed while the prompt sat idle. This REPLACES the menu:
-    # without the clear, every repaint would stack another copy down the
-    # screen.
-    picker_clear_screen
-    continue
-  fi
   (( live_status == 0 )) || continue
   FORGIVE_EMPTY=$CONFIRM_FORGIVE
   CONFIRM_FORGIVE=0
@@ -167,6 +166,12 @@ while true; do
     m|M)
       show_more_menu
       ;;
+    a|A)
+      show_attention_menu
+      ;;
+    v|V)
+      open_supervisor
+      ;;
     \?)
       show_help
       ;;
@@ -178,6 +183,9 @@ while true; do
       ;;
     n|N)
       guided_new
+      ;;
+    s|S)
+      compose_message
       ;;
     next|\>)
       pages=$(page_count)
@@ -193,6 +201,15 @@ while true; do
       else
         echo "  Already on the first page."
       fi
+      ;;
+    r[0-9]*|R[0-9]*)
+      open_reply_row "${choice#[rR]}"
+      ;;
+    q[0-9]*|Q[0-9]*)
+      choose_prompt_quarantine "${choice#[qQ]}"
+      ;;
+    qp|QP|q\ prune|Q\ PRUNE)
+      prompt_quarantine_prune
       ;;
     /*)
       QUERY=${choice#/}

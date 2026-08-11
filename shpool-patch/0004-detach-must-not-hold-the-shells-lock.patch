@@ -1,3 +1,19 @@
+# Upstream project: shpool -- https://github.com/shell-pool/shpool
+# Upstream license: Apache License, Version 2.0
+#   (Copyright 2023 Google LLC; see ../LICENSES/Apache-2.0.txt)
+# Base revision:    v0.11.0 == fe2d11595ff255810523b0868159dec051e303f1
+#
+# This file is a patch against Apache-2.0 licensed shpool source. The modified
+# source stays subject to the Apache License, Version 2.0 and to upstream's
+# own notices. Session Kit does not vendor, redistribute, or replace the
+# shpool source tree or any shpool binary; only this diff is distributed.
+# Apply with: git apply <this file>   (see README.md in this directory)
+#
+# Change: libshpool/src/daemon/server.rs. Restructures handle_detach so the
+#   control handshake runs after the global shells lock is dropped. Holding
+#   that lock across a rendezvous channel exchange lets one unresponsive
+#   client deadlock every list, attach, detach and kill in the daemon.
+#
 diff --git a/libshpool/src/daemon/server.rs b/libshpool/src/daemon/server.rs
 index 7e59d9a..91f0bc5 100644
 --- a/libshpool/src/daemon/server.rs

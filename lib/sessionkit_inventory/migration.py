@@ -27,6 +27,7 @@ from .common import (
     _utc_now,
     _valid_aliases,
     natural_name_key,
+    proc_root as gated_proc_root,
     valid_uuid,
 )
 from .processes import _proc_stat
@@ -507,7 +508,7 @@ def _migration_context(
     generation = detected["daemon_generation"]
     if evidence.get("daemon_pid") != generation.get("pid"):
         raise CollectionError("current daemon PID does not match continuity evidence")
-    root = proc_root or Path(os.environ.get("SESSION_KIT_PROC_ROOT", "/proc"))
+    root = proc_root or gated_proc_root()
     daemon_started = _daemon_start_epoch(root, generation)
     if daemon_started > evidence_captured.timestamp():
         raise CollectionError("current daemon did not predate continuity evidence")

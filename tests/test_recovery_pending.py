@@ -20,6 +20,7 @@ def pending_session(provider: str, uuid: str, title: str) -> dict:
         "provider": provider,
         "uuid": uuid,
         "title": title,
+        "started_at_unix_ms": 1_700_000_000_000,
         "cwd": "/srv/project",
         "argv": argv,
         "command": " ".join(argv),
@@ -97,10 +98,20 @@ class PendingRecoveryTests(unittest.TestCase):
             {"primary", "queued"}, {entry["queue"] for entry in entries}
         )
         self.assertTrue(all(entry["actionable"] for entry in entries))
+        self.assertTrue(
+            all(entry["started_at_unix_ms"] == 1_700_000_000_000 for entry in entries)
+        )
         self.assertEqual(
             {"old-claude", "old-codex", "older-codex"},
             {entry["old_shpool_id"] for entry in entries},
         )
+
+    def test_manifest_preserves_login_timestamp_for_future_recovery(self) -> None:
+        live = inventory_core.build_inventory(*inventory_fixture(1), now=1_800_000_000)
+        source = live["sessions"][0]
+        manifest = inventory_core.recovery_manifest(live)
+        stored = manifest["sessions"][source["shpool_id_raw"]]
+        self.assertEqual(source["started_at_unix_ms"], stored["started_at_unix_ms"])
 
     def test_duplicate_exact_identity_prefers_primary_and_acknowledges_all_evidence(self) -> None:
         document = pending_document()

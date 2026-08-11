@@ -7,9 +7,10 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import sys
 import time
-from typing import Any, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from .common import CollectionError, PROVIDERS, valid_uuid
 from .state_io import atomic_write_private_json, read_private_json
@@ -19,6 +20,9 @@ AUTO_CLOSE_SCHEMA_VERSION = 1
 DEFAULT_AUTO_CLOSE_HOURS = 72
 MAX_AUTO_CLOSE_HOURS = 24 * 365
 GENERATED_SESSION_RE = re.compile(r"s[0-9]{8}-[0-9]{6}-[1-9][0-9]*(?:-[1-9][0-9]*)?")
+APP_SERVER_STALE_SECONDS = 3600
+MAX_APP_SERVER_REMOVALS = 64
+APP_SERVER_DIR_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 
 def _positive_int(value: Any) -> bool:
@@ -377,6 +381,132 @@ def plan_auto_close(
     return observation_doc, candidate_doc
 
 
+def app_server_socket_answers(socket_path: Path) -> bool:
+    """Whether an App Server socket still has a listener behind it.
+
+    Only an outright refusal proves nobody is there. An unreadable path, an
+    unexpected file type, a timeout, or any other error answers "yes" so the
+    caller leaves the directory alone.
+    """
+    import socket as socketmod
+
+    try:
+        metadata = os.lstat(socket_path)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    if not stat.S_ISSOCK(metadata.st_mode):
+        return True
+    connection = socketmod.socket(socketmod.AF_UNIX, socketmod.SOCK_STREAM)
+    try:
+        connection.settimeout(1.0)
+        connection.connect(os.fspath(socket_path))
+    except (ConnectionRefusedError, FileNotFoundError):
+        return False
+    except OSError:
+        return True
+    finally:
+        connection.close()
+    return True
+
+
+def sweep_stale_app_server_dirs(
+    state_dir: Path,
+    live_session_ids: Iterable[str],
+    *,
+    now_unix: float,
+    stale_after_seconds: int = APP_SERVER_STALE_SECONDS,
+    max_removals: int = MAX_APP_SERVER_REMOVALS,
+    socket_answers: Callable[[Path], bool] = app_server_socket_answers,
+) -> list[str]:
+    """Remove App Server directories no session can still be using.
+
+    A `codex app-server` socket dies with its process, but the directory
+    holding it survives every reboot, so the tree grows one entry per Codex
+    window forever. A directory is removed only when all three proofs hold:
+    the daemon no longer lists its session, its socket refuses a connection,
+    and nothing has touched the directory or its files for the stale window.
+    Anything unexpected — a foreign owner, a symlink, an unreadable entry, a
+    socket that answers — leaves the directory in place. Returns the removed
+    session IDs.
+    """
+    live = set(live_session_ids)
+    app_root = state_dir / "app-server"
+    try:
+        names = sorted(os.listdir(app_root))
+    except OSError:
+        return []
+    cutoff = now_unix - stale_after_seconds
+    owner = os.geteuid()
+    removed: list[str] = []
+    for name in names:
+        if len(removed) >= max_removals:
+            break
+        if name in live or not APP_SERVER_DIR_RE.fullmatch(name):
+            continue
+        directory = app_root / name
+        try:
+            metadata = os.lstat(directory)
+        except OSError:
+            continue
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != owner
+            or metadata.st_mtime > cutoff
+        ):
+            continue
+        children: list[str] = []
+        newest = metadata.st_mtime
+        try:
+            for child in os.listdir(directory):
+                child_metadata = os.lstat(directory / child)
+                if (
+                    not (
+                        stat.S_ISREG(child_metadata.st_mode)
+                        or stat.S_ISSOCK(child_metadata.st_mode)
+                    )
+                    or child_metadata.st_uid != owner
+                ):
+                    raise OSError("unexpected App Server directory entry")
+                newest = max(newest, child_metadata.st_mtime)
+                children.append(child)
+        except OSError:
+            continue
+        if newest > cutoff or socket_answers(directory / "app.sock"):
+            continue
+        try:
+            for child in children:
+                os.unlink(directory / child)
+            os.rmdir(directory)
+        except OSError:
+            continue
+        removed.append(name)
+    return removed
+
+
+def sweep_app_servers_from_environment() -> list[str]:
+    """Sweep using the reaper's exact daemon list; any doubt removes nothing."""
+    try:
+        payload = json.loads(os.environ["SK_REAPER_SHPOOL_JSON"])
+        state_dir = Path(os.environ["SK_REAPER_STATE_DIR"])
+    except (KeyError, ValueError, json.JSONDecodeError):
+        return []
+    try:
+        rows = _rows(payload)
+    except CollectionError:
+        return []
+    live: list[str] = []
+    for row in rows:
+        name = row.get("name")
+        if not isinstance(name, str) or not name:
+            # An unreadable row means the live set is unknown, and an unknown
+            # live set may never authorize a removal.
+            return []
+        live.append(name)
+    return sweep_stale_app_server_dirs(state_dir, live, now_unix=time.time())
+
+
 def plan_from_environment(
     *,
     write_state: bool,
@@ -439,8 +569,18 @@ def main(argv: list[str] | None = None) -> int:
     plan_parser.add_argument("--no-write", action="store_true")
     verify = subparsers.add_parser("verify")
     verify.add_argument("candidate")
+    subparsers.add_parser("sweep-app-servers")
     args = parser.parse_args(argv)
     try:
+        if args.command == "sweep-app-servers":
+            swept = sweep_app_servers_from_environment()
+            for session_id in swept:
+                print(
+                    f"App Server GC removed {session_id}",
+                    file=sys.stderr,
+                )
+            print(len(swept))
+            return 0
         if args.command == "plan":
             _, candidates = plan_from_environment(write_state=not args.no_write)
             print(f"auto_candidates={len(candidates['candidates'])} actions=0")

@@ -484,7 +484,7 @@ class ClaudeAiTitleTests(unittest.TestCase):
                     {
                         "provider": "claude",
                         "identity": {"uuid": exact},
-                        "native_title": "Dan's explicit name",
+                        "native_title": "The operator's explicit name",
                         "provider_title_state": "ready",
                     }
                 ],
@@ -557,6 +557,16 @@ class DerivePromptTitleTests(unittest.TestCase):
         self.assertIsNone(inventory_core.derive_prompt_title("hi"))
         self.assertIsNone(inventory_core.derive_prompt_title(""))
         self.assertIsNone(inventory_core.derive_prompt_title(None))
+
+    def test_rejects_session_kit_machine_transport_prompts(self) -> None:
+        for prompt in (
+            '<cross-session-message from="uds:/run/user/1000/example.sock">work</cross-session-message>',
+            "[session-kit operator message abc123] work",
+            "Session Kit initialized this managed worker. Wait for assignment.",
+            "You are a Session Kit delivery runner. Deliver one message.",
+            "RUNTIME FOR THIS WAKE: You are a fixed Session Kit delivery bot.",
+        ):
+            self.assertIsNone(inventory_core.derive_prompt_title(prompt))
 
     def test_caps_length_at_64(self) -> None:
         title = inventory_core.derive_prompt_title(
@@ -1255,12 +1265,12 @@ class AutoTitleFromHookTests(unittest.TestCase):
             )
             index = codex / "session_index.jsonl"
             index.write_text(
-                json.dumps({"id": uuid, "thread_name": "Renamed By Dan"})
+                json.dumps({"id": uuid, "thread_name": "Renamed By The Operator"})
                 + "\n",
                 encoding="utf-8",
             )
             self.assertEqual(
-                "Renamed By Dan",
+                "Renamed By The Operator",
                 inventory_core.codex_bounce_prepare(uuid, codex),
             )
             self.assertEqual(
@@ -1685,6 +1695,712 @@ class CodexPendingAutoTitleTests(unittest.TestCase):
                             environ={"HOME": str(base), **kill}
                         ),
                     )
+
+
+class NameOwnershipTests(unittest.TestCase):
+    """Who owns a name, and what an automatic pass may do about it."""
+
+    UUID = "00000000-0000-4000-8000-000000000201"
+
+    def _sandbox(self, base: Path) -> tuple[Path, dict[str, str]]:
+        home = base / "home"
+        home.mkdir(mode=0o700)
+        return home, {"HOME": str(home)}
+
+    def _document(self, home: Path) -> dict:
+        path = home / ".config" / "session-kit" / "inventory.json"
+        if not path.is_file():
+            return {}
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def _human_rename(
+        self, home: Path, provider: str, uuid: str, title: str | None
+    ) -> None:
+        """Rename the way `sp name` and the picker do: through the alias tier."""
+        state = home / "state"
+        state.mkdir(mode=0o700, exist_ok=True)
+        path = home / ".config" / "session-kit" / "inventory.json"
+        inventory_core._private_alias_parent(path)
+        with mock.patch.dict(
+            os.environ, {"SESSION_KIT_CONFIG": str(path)}, clear=False
+        ):
+            inventory_core.mutate_canonical_alias(
+                {"state_dir": state}, provider, uuid, title
+            )
+
+    def test_an_automatic_claim_is_taken_once_and_then_reported_as_owned(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            home, env = self._sandbox(Path(raw))
+            self.assertEqual("", inventory_core.name_owner("codex", self.UUID, environ=env))
+            self.assertEqual(
+                "", inventory_core.claim_automatic_name("codex", self.UUID, environ=env)
+            )
+            self.assertEqual(
+                "automatic",
+                inventory_core.name_owner("codex", self.UUID, environ=env),
+            )
+            self.assertIn(
+                "already owns",
+                inventory_core.claim_automatic_name("codex", self.UUID, environ=env),
+            )
+            record = self._document(home)["name_ownership"][f"codex:{self.UUID}"]
+            self.assertEqual("automatic", record["owner"])
+            self.assertTrue(record["at"])
+
+    def test_a_human_rename_takes_ownership_and_never_gives_it_back(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            home, env = self._sandbox(Path(raw))
+            self.assertEqual(
+                "", inventory_core.claim_automatic_name("claude", self.UUID, environ=env)
+            )
+            self._human_rename(home, "claude", self.UUID, "the operator named this")
+            self.assertEqual(
+                "human", inventory_core.name_owner("claude", self.UUID, environ=env)
+            )
+            self.assertEqual(
+                frozenset({f"claude:{self.UUID}"}),
+                inventory_core.human_named_keys(env),
+            )
+            stamped = self._document(home)["name_ownership"][f"claude:{self.UUID}"]
+            self.assertIn(
+                "already owns",
+                inventory_core.claim_automatic_name("claude", self.UUID, environ=env),
+            )
+            # `sp name reset` drops the alias. The override outlives it, so no
+            # later automatic pass can resurrect a name over the reset.
+            self._human_rename(home, "claude", self.UUID, None)
+            self.assertEqual(
+                {}, self._document(home)["aliases"]
+            )
+            self.assertEqual(
+                "human", inventory_core.name_owner("claude", self.UUID, environ=env)
+            )
+            self.assertIn(
+                "already owns",
+                inventory_core.claim_automatic_name("claude", self.UUID, environ=env),
+            )
+            # A second rename does not re-stamp the moment the override began.
+            self._human_rename(home, "claude", self.UUID, "the operator named it again")
+            self.assertEqual(
+                stamped,
+                self._document(home)["name_ownership"][f"claude:{self.UUID}"],
+            )
+
+
+    def test_a_legacy_document_is_read_from_the_evidence_it_kept(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            home, env = self._sandbox(Path(raw))
+            path = home / ".config" / "session-kit" / "inventory.json"
+            inventory_core._private_alias_parent(path)
+            renamed = uuid_for(202)
+            self_named = uuid_for(203)
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "aliases": {
+                            f"claude:{renamed}": "A person wrote this",
+                            f"codex:{self_named}": "Session Kit Updates",
+                        },
+                        "automatic_titles": {
+                            f"codex:{self_named}": "Session Kit Updates"
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            path.chmod(0o600)
+            # No ownership record exists yet: an alias is a human rename unless
+            # the automatic tier holds the same text, which only a self-name
+            # ever writes.
+            self.assertEqual(
+                "human", inventory_core.name_owner("claude", renamed, environ=env)
+            )
+            self.assertEqual(
+                "automatic", inventory_core.name_owner("codex", self_named, environ=env)
+            )
+            self.assertEqual(
+                frozenset({f"claude:{renamed}"}),
+                inventory_core.human_named_keys(env),
+            )
+
+    def test_an_unreadable_document_owns_nothing(self) -> None:
+        self.assertEqual("", inventory_core.name_owner("codex", self.UUID, environ={}))
+        self.assertEqual(frozenset(), inventory_core.human_named_keys({}))
+        self.assertIn(
+            "no home",
+            inventory_core.claim_automatic_name("codex", self.UUID, environ={}),
+        )
+        self.assertEqual(
+            "", inventory_core.name_owner("codex", "not-a-uuid", environ={"HOME": "/"})
+        )
+
+
+class ClaudeFirstPromptOwnershipTests(unittest.TestCase):
+    """The Claude hook claims a thread's name at its first prompt, once."""
+
+    UUID = "00000000-0000-4000-8000-000000000211"
+
+    def _prebaked_home(self, base: Path) -> tuple[Path, Path]:
+        home = base / "home"
+        (home / ".claude" / "sessions").mkdir(parents=True, mode=0o700)
+        project = home / ".claude" / "projects" / "-srv-project"
+        project.mkdir(parents=True, mode=0o700)
+        transcript = project / f"{self.UUID}.jsonl"
+        records = [
+            {
+                "type": "user",
+                "isMeta": True,
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Continue from where you left off."}
+                    ],
+                },
+            }
+        ]
+        transcript.write_text(
+            "".join(json.dumps(record) + "\n" for record in records),
+            encoding="utf-8",
+        )
+        return home, transcript
+
+    def _payload(self, transcript: Path, prompt: str, event: str) -> str:
+        return json.dumps(
+            {
+                "hook_event_name": event,
+                "session_id": self.UUID,
+                "transcript_path": str(transcript),
+                "prompt": prompt,
+            }
+        )
+
+    def test_the_first_prompt_claims_the_name_and_the_stop_firing_does_not(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            home, transcript = self._prebaked_home(Path(raw))
+            env = {"HOME": str(home)}
+            first = inventory_core.auto_title_from_hook(
+                self._payload(
+                    transcript,
+                    "trace the cdn purge failure across both edges",
+                    "UserPromptSubmit",
+                ),
+                environ=env,
+            )
+            self.assertEqual(
+                "Trace the cdn purge failure across both", first["title"]
+            )
+            self.assertEqual(
+                "automatic",
+                inventory_core.name_owner("claude", self.UUID, environ=env),
+            )
+            # session_start fires twice for a brand-new session and the hook
+            # fires again at Stop. The claim is what keeps this a no-op.
+            before = transcript.read_bytes()
+            again = inventory_core.auto_title_from_hook(
+                self._payload(transcript, "a different second prompt here", "Stop"),
+                environ=env,
+            )
+            self.assertIsNone(again["title"])
+            self.assertEqual(
+                "an automatic name already owns this session", again["reason"]
+            )
+            self.assertEqual(before, transcript.read_bytes())
+
+    def test_a_human_rename_stops_the_hook_before_it_writes_anything(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            home, transcript = self._prebaked_home(Path(raw))
+            env = {"HOME": str(home)}
+            state = home / "state"
+            state.mkdir(mode=0o700)
+            path = home / ".config" / "session-kit" / "inventory.json"
+            inventory_core._private_alias_parent(path)
+            with mock.patch.dict(
+                os.environ, {"SESSION_KIT_CONFIG": str(path)}, clear=False
+            ):
+                inventory_core.mutate_canonical_alias(
+                    {"state_dir": state}, "claude", self.UUID, "the operator named this"
+                )
+            before = transcript.read_bytes()
+            result = inventory_core.auto_title_from_hook(
+                self._payload(
+                    transcript, "trace the cdn purge failure now", "UserPromptSubmit"
+                ),
+                environ=env,
+            )
+            self.assertIsNone(result["title"])
+            self.assertEqual("a human name owns this session", result["reason"])
+            self.assertEqual([], result["pushes"])
+            self.assertEqual(before, transcript.read_bytes())
+
+
+class CodexFirstTurnOwnershipTests(unittest.TestCase):
+    """A Codex thread is claimed at its first turn — the first moment it exists."""
+
+    def _codex_root(self, base: Path, rows: list[tuple]) -> Path:
+        import sqlite3
+
+        codex = base / ".codex"
+        codex.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(codex / "state_5.sqlite")
+        connection.execute(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT,"
+            " first_user_message TEXT, updated_at INTEGER)"
+        )
+        connection.executemany("INSERT INTO threads VALUES (?, ?, ?, ?)", rows)
+        connection.commit()
+        connection.close()
+        return codex
+
+    def _run(self, base: Path, codex: Path) -> list[dict[str, str]]:
+        with mock.patch.dict(
+            os.environ, {"SESSION_KIT_CODEX_HOME": str(codex)}, clear=False
+        ):
+            os.environ.pop("SESSION_KIT_CODEX_DB", None)
+            return inventory_core.codex_pending_auto_titles(
+                environ={"HOME": str(base)}
+            )
+
+    def _thread_title(self, codex: Path, uuid: str) -> str:
+        import sqlite3
+
+        connection = sqlite3.connect(codex / "state_5.sqlite")
+        try:
+            return connection.execute(
+                "SELECT title FROM threads WHERE id = ?", (uuid,)
+            ).fetchone()[0]
+        finally:
+            connection.close()
+
+    def test_the_first_turn_claims_the_thread_and_a_later_pass_leaves_it_alone(
+        self,
+    ) -> None:
+        import time
+
+        uuid = uuid_for(221)
+        now = int(time.time())
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            base.chmod(0o700)
+            codex = self._codex_root(
+                base,
+                [(uuid, "trace the cdn purge failure", "trace the cdn purge failure", now - 60)],
+            )
+            titled = self._run(base, codex)
+            self.assertEqual(1, len(titled))
+            env = {"HOME": str(base)}
+            self.assertEqual(
+                "automatic", inventory_core.name_owner("codex", uuid, environ=env)
+            )
+            named = self._thread_title(codex, uuid)
+            # Codex re-stamps the raw prompt over the title and the index entry
+            # is gone; only the claim keeps the second pass from renaming.
+            import sqlite3
+
+            connection = sqlite3.connect(codex / "state_5.sqlite")
+            connection.execute(
+                "UPDATE threads SET title = ? WHERE id = ?",
+                ("trace the cdn purge failure", uuid),
+            )
+            connection.commit()
+            connection.close()
+            (codex / "session_index.jsonl").unlink()
+            self.assertEqual([], self._run(base, codex))
+            self.assertTrue(named)
+            self.assertFalse((codex / "session_index.jsonl").is_file())
+
+    def test_a_human_rename_is_never_titled_or_healed(self) -> None:
+        import time
+
+        uuid = uuid_for(222)
+        now = int(time.time())
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            base.chmod(0o700)
+            codex = self._codex_root(
+                base,
+                [(uuid, "trace the cdn purge failure", "trace the cdn purge failure", now - 60)],
+            )
+            state = base / "state"
+            state.mkdir(mode=0o700)
+            config = base / ".config" / "session-kit" / "inventory.json"
+            inventory_core._private_alias_parent(config)
+            with mock.patch.dict(
+                os.environ, {"SESSION_KIT_CONFIG": str(config)}, clear=False
+            ):
+                inventory_core.mutate_canonical_alias(
+                    {"state_dir": state}, "codex", uuid, "the operator named this"
+                )
+            # A curated index entry plus a prompt-echo title is exactly the
+            # shape the healer re-asserts. It must not touch a human's name.
+            (codex / "session_index.jsonl").write_text(
+                json.dumps({"id": uuid, "thread_name": "An older automatic name"})
+                + "\n",
+                encoding="utf-8",
+            )
+            self.assertEqual([], self._run(base, codex))
+            self.assertEqual(
+                "trace the cdn purge failure", self._thread_title(codex, uuid)
+            )
+
+    def test_a_queued_retry_never_replays_over_a_human_rename_after_a_restart(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            base.chmod(0o700)
+            uuid = uuid_for(223)
+            state = base / ".local" / "state" / "session-kit"
+            state.mkdir(mode=0o700, parents=True)
+            # The retry queue is on disk from before the reboot.
+            (state / "provider-title-retries.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "entries": {
+                            f"codex:{uuid}": {
+                                "provider": "codex",
+                                "uuid": uuid,
+                                "title": "An Older Automatic Name",
+                                "attempts": 0,
+                                "updated_at": "2026-08-09T00:00:00Z",
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (state / "provider-title-retries.json").chmod(0o600)
+            config = base / ".config" / "session-kit" / "inventory.json"
+            inventory_core._private_alias_parent(config)
+            with mock.patch.dict(
+                os.environ, {"SESSION_KIT_CONFIG": str(config)}, clear=False
+            ):
+                inventory_core.mutate_canonical_alias(
+                    {"state_dir": base / "scratch"}, "codex", uuid, "the operator named this"
+                )
+            with mock.patch.object(
+                inventory_core, "propagate_provider_title"
+            ) as push:
+                replayed = inventory_core._reconcile_pending_provider_titles(
+                    {"state_dir": state}, "codex", {"HOME": str(base)}
+                )
+            self.assertEqual([], replayed)
+            push.assert_not_called()
+
+
+class NativeRenameOwnershipTests(unittest.TestCase):
+    """A /rename typed into a provider is a person naming their own work."""
+
+    def _sandbox(self, base: Path) -> tuple[Path, Path, dict[str, str]]:
+        home = base / "home"
+        home.mkdir(mode=0o700)
+        config = home / ".config" / "session-kit" / "inventory.json"
+        inventory_core._private_alias_parent(config)
+        return home, config, {"HOME": str(home)}
+
+    def _seed(self, config: Path, document: dict) -> None:
+        config.write_text(json.dumps(document), encoding="utf-8")
+        config.chmod(0o600)
+
+    def _document(self, config: Path) -> dict:
+        return json.loads(config.read_text(encoding="utf-8"))
+
+    def _title(self, document: dict, provider: str, uuid: str, native: str) -> tuple:
+        """What a row would show, with the document's own evidence."""
+        return inventory_core._provider_title_info(
+            provider,
+            uuid,
+            native,
+            document.get("aliases", {}),
+            "/srv/project",
+            1_700_000_000_000,
+            document.get("automatic_titles", {}),
+            provider_title_is_explicit=True,
+            pushed_titles=document.get("pushed_titles", {}),
+            name_ownership=document.get("name_ownership", {}),
+        )
+
+    def test_the_live_stale_room_self_corrects_and_never_reverts(self) -> None:
+        """Seeded exactly as observed: alias and automatic both stale.
+
+        The room was self-named "Session Kit Audit"; the automatic title was
+        written as an alias too, so the alias masked the native store. The
+        operator typed /rename in Codex. Both Codex stores read "kit test"; the picker
+        still read "Session Kit Audit".
+        """
+        uuid = uuid_for(301)
+        key = f"codex:{uuid}"
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            base.chmod(0o700)
+            home, config, env = self._sandbox(base)
+            self._seed(
+                config,
+                {
+                    "schema_version": 1,
+                    "aliases": {key: "Session Kit Audit"},
+                    "automatic_titles": {key: "Session Kit Audit"},
+                },
+            )
+            # The row is honest immediately: the alias is kit-authored (it
+            # equals the automatic title), so the rename outranks it before
+            # anything has been written.
+            self.assertEqual(
+                ("kit test", "native"),
+                self._title(self._document(config), "codex", uuid, "kit test"),
+            )
+            adopted = inventory_core.adopt_native_rename(
+                "codex", uuid, "kit test", environ=env
+            )
+            # Byte for byte, including the lower case actually typed. A
+            # human title is an opaque string: no Title Case, no folding.
+            self.assertEqual("kit test", adopted)
+            document = self._document(config)
+            # After: one name, owned by a person, on every tier at once.
+            self.assertEqual("kit test", document["aliases"][key])
+            self.assertEqual("kit test", document["pushed_titles"][key])
+            self.assertEqual("human", document["name_ownership"][key]["owner"])
+            self.assertNotIn(key, document.get("automatic_titles", {}))
+            self.assertEqual(
+                ("kit test", "alias"),
+                self._title(document, "codex", uuid, "kit test"),
+            )
+            # Every surface, byte-exact: the row, the detail view, the alias
+            # list. Nothing along the way re-cases a name a person chose.
+            rendered = inventory_core.render_inventory(
+                {
+                    "schema_version": 1,
+                    "generated_at": "2026-08-09T00:00:00Z",
+                    "source": "live",
+                    "stale": False,
+                    "warnings": [],
+                    "sessions": [
+                        {
+                            "row": 1,
+                            "terminal_number": 4,
+                            "shpool_id": "s-1",
+                            "provider": "codex",
+                            "display_provider": "codex",
+                            "identity": {"uuid": uuid, "confidence": "exact"},
+                            "title": document["aliases"][key],
+                            "display_title": document["aliases"][key],
+                            "agent_status": "idle",
+                            "availability": "ready",
+                            "shpool_status": "Disconnected",
+                            "cwd": "/srv/project",
+                            "subagents": [],
+                        }
+                    ],
+                    "outside_agents": [],
+                }
+            )
+            self.assertIn("kit test", rendered)
+            self.assertNotIn("Kit Test", rendered)
+            self.assertNotIn("Session Kit Audit", rendered)
+            self.assertEqual(
+                "human", inventory_core.name_owner("codex", uuid, environ=env)
+            )
+            # A reconciliation pass is idempotent — nothing left to adopt.
+            self.assertEqual(
+                "", inventory_core.adopt_native_rename("codex", uuid, "kit test", environ=env)
+            )
+            # And no automatic path may put the old name back, ever.
+            self.assertIn(
+                "already owns",
+                inventory_core.claim_automatic_name("codex", uuid, environ=env),
+            )
+            with self.assertRaisesRegex(
+                inventory_core.CollectionError, "already owns"
+            ):
+                self._refuse_automatic(config, base, uuid)
+            self.assertEqual(
+                "kit test", self._document(config)["aliases"][key]
+            )
+
+    def _refuse_automatic(self, config: Path, base: Path, uuid: str) -> None:
+        state = base / "state"
+        state.mkdir(mode=0o700, exist_ok=True)
+        with mock.patch.dict(
+            os.environ, {"SESSION_KIT_CONFIG": str(config)}, clear=False
+        ):
+            inventory_core.mutate_canonical_automatic_title(
+                {"state_dir": state}, "codex", uuid, "Session Kit Audit", overwrite=True
+            )
+
+    def test_a_rename_after_the_kit_pushed_its_own_title_is_adopted(self) -> None:
+        for provider in ("claude", "codex"):
+            with self.subTest(provider=provider):
+                uuid = uuid_for(310 if provider == "claude" else 311)
+                key = f"{provider}:{uuid}"
+                with tempfile.TemporaryDirectory() as raw:
+                    base = Path(raw)
+                    base.chmod(0o700)
+                    home, config, env = self._sandbox(base)
+                    self._seed(
+                        config,
+                        {
+                            "schema_version": 1,
+                            "aliases": {},
+                            "automatic_titles": {key: "Session Kit Audit"},
+                            "pushed_titles": {key: "Session Kit Audit"},
+                        },
+                    )
+                    # The kit's own echo is not a rename.
+                    self.assertEqual(
+                        "",
+                        inventory_core.adopt_native_rename(
+                            provider, uuid, "Session Kit Audit", environ=env
+                        ),
+                    )
+                    self.assertEqual(
+                        "Kit Test",
+                        inventory_core.adopt_native_rename(
+                            provider, uuid, "Kit Test", environ=env
+                        ),
+                    )
+                    document = self._document(config)
+                    self.assertEqual("Kit Test", document["aliases"][key])
+                    self.assertEqual(
+                        "human", document["name_ownership"][key]["owner"]
+                    )
+                    self.assertEqual(
+                        ("Kit Test", "alias"),
+                        self._title(document, provider, uuid, "Kit Test"),
+                    )
+
+    def test_a_native_rename_after_sp_name_replaces_it_for_good(self) -> None:
+        """`sp name` is not a shield. The newest human act is the name.
+
+        No timestamp is needed: `pushed_titles` holds the last value the kit
+        wrote into the provider's store, and `sp name` writes through that
+        same push. A native store that disagrees with it can only have been
+        typed afterwards, so the divergence itself dates the rename.
+        """
+        for provider, number in (("claude", 315), ("codex", 316)):
+            with self.subTest(provider=provider):
+                uuid = uuid_for(number)
+                key = f"{provider}:{uuid}"
+                with tempfile.TemporaryDirectory() as raw:
+                    base = Path(raw)
+                    base.chmod(0o700)
+                    home, config, env = self._sandbox(base)
+                    # Exactly what `sp name Old Name` leaves behind: the alias,
+                    # human ownership, and the value it pushed to the provider.
+                    self._seed(
+                        config,
+                        {
+                            "schema_version": 1,
+                            "aliases": {key: "Old Name"},
+                            "pushed_titles": {key: "Old Name"},
+                            "name_ownership": {
+                                key: {"owner": "human", "at": "2026-08-09T00:00:00Z"}
+                            },
+                        },
+                    )
+                    # The row shows it before anything is written.
+                    self.assertEqual(
+                        ("New Name", "native"),
+                        self._title(self._document(config), provider, uuid, "New Name"),
+                    )
+                    self.assertEqual(
+                        "New Name",
+                        inventory_core.adopt_native_rename(
+                            provider, uuid, "New Name", environ=env
+                        ),
+                    )
+                    document = self._document(config)
+                    self.assertEqual("New Name", document["aliases"][key])
+                    self.assertEqual("New Name", document["pushed_titles"][key])
+                    self.assertEqual(
+                        "human", document["name_ownership"][key]["owner"]
+                    )
+                    self.assertEqual(
+                        ("New Name", "alias"),
+                        self._title(document, provider, uuid, "New Name"),
+                    )
+                    # Ownership stays human; the stale value cannot come back.
+                    self.assertEqual(
+                        "human",
+                        inventory_core.name_owner(provider, uuid, environ=env),
+                    )
+                    self.assertIn(
+                        "already owns",
+                        inventory_core.claim_automatic_name(
+                            provider, uuid, environ=env
+                        ),
+                    )
+                    self.assertEqual(
+                        "",
+                        inventory_core.adopt_native_rename(
+                            provider, uuid, "New Name", environ=env
+                        ),
+                    )
+                    self.assertNotIn(
+                        "Old Name", json.dumps(self._document(config))
+                    )
+
+    def test_a_capitalisation_only_rename_sticks_byte_exact(self) -> None:
+        """Changing only the capitals is still a person renaming their work.
+
+        The kit has no standing to rule that it did not count, and no reason
+        to believe a store that disagrees about case is the store echoing
+        itself. Exact comparison, exact storage, exact display.
+        """
+        uuid = uuid_for(314)
+        key = f"codex:{uuid}"
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            base.chmod(0o700)
+            home, config, env = self._sandbox(base)
+            self._seed(
+                config,
+                {
+                    "schema_version": 1,
+                    "aliases": {},
+                    "automatic_titles": {key: "Session Kit Audit"},
+                    "pushed_titles": {key: "Session Kit Audit"},
+                },
+            )
+            adopted = inventory_core.adopt_native_rename(
+                "codex", uuid, "session kit audit", environ=env
+            )
+            self.assertEqual("session kit audit", adopted)
+            document = self._document(config)
+            self.assertEqual("session kit audit", document["aliases"][key])
+            self.assertEqual("session kit audit", document["pushed_titles"][key])
+            self.assertEqual("human", document["name_ownership"][key]["owner"])
+            self.assertNotIn(key, document.get("automatic_titles", {}))
+            self.assertEqual(
+                ("session kit audit", "alias"),
+                self._title(document, "codex", uuid, "session kit audit"),
+            )
+            self.assertEqual(
+                "human", inventory_core.name_owner("codex", uuid, environ=env)
+            )
+            # And the automatic tier can never put the capitals back.
+            self.assertIn(
+                "already owns",
+                inventory_core.claim_automatic_name("codex", uuid, environ=env),
+            )
+
+    def test_a_thread_the_kit_never_named_keeps_its_ordinary_precedence(self) -> None:
+        """No kit value means no rename to detect: a seeded prompt is not one."""
+        uuid = uuid_for(313)
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            base.chmod(0o700)
+            home, config, env = self._sandbox(base)
+            self._seed(config, {"schema_version": 1, "aliases": {}})
+            self.assertEqual(
+                "",
+                inventory_core.adopt_native_rename(
+                    "codex", uuid, "trace the cdn purge failure", environ=env
+                ),
+            )
+            self.assertEqual({}, self._document(config).get("name_ownership", {}))
 
 
 if __name__ == "__main__":

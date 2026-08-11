@@ -16,7 +16,15 @@ else
   REAPER_PLATFORM=$(uname -s 2>/dev/null)
 fi
 STATE_DIR=${SESSION_KIT_STATE_DIR:-${XDG_STATE_HOME:-"$HOME/.local/state"}/session-kit}
-PROC_ROOT=${SESSION_KIT_PROC_ROOT:-/proc}
+# The reaper closes terminals, and /proc is the evidence it closes them on. A
+# fixture root is honoured only inside the isolated test harness; production
+# reads the real process table so no environment variable can dress up a live
+# session as a seven-day corpse.
+if [[ ${SESSION_KIT_TESTING:-0} == 1 && -n ${SESSION_KIT_PROC_ROOT:-} ]]; then
+  PROC_ROOT=$SESSION_KIT_PROC_ROOT
+else
+  PROC_ROOT=/proc
+fi
 SENTINEL=${SESSION_KIT_REAPER_SENTINEL:-"$HOME/.no_shpool_reaper"}
 MAX_AGE_DAYS=${SESSION_KIT_PRUNE_DAYS:-7}
 SHPOOL=${SESSION_KIT_SHPOOL_CMD:-}
@@ -400,6 +408,25 @@ elif [[ -z $daemon_pid && $PROC_ROOT == /proc ]]; then
   daemon_pid=$(pgrep -f '^.*/shpool daemon$' | head -1)
 fi
 [[ $daemon_pid =~ ^[0-9]+$ ]] || fail "daemon PID unavailable"
+
+# A Codex App Server socket dies with its window, but the private directory
+# holding it survives every reboot, so the tree grows one entry per Codex
+# session forever — and a live-rename sweep that walks it pays for every
+# corpse. Remove only directories whose session the daemon no longer lists,
+# whose socket refuses a connection, and that nothing has touched for an hour.
+# Entirely fail-open: no proof, no removal.
+expire_stale_app_server_dirs() {
+  [[ $MODE != verify && $DRY_RUN != 1 ]] || return 0
+  [[ -f $RELEASE_DIR/lib/sessionkit_inventory/reaper.py ]] || return 0
+  local swept
+  swept=$(SK_REAPER_SHPOOL_JSON=$json \
+    SK_REAPER_STATE_DIR=$STATE_DIR \
+    PYTHONPATH="$RELEASE_DIR/lib" \
+    python3 -m sessionkit_inventory.reaper sweep-app-servers) || return 0
+  [[ $swept =~ ^[0-9]+$ && $swept -gt 0 ]] || return 0
+  printf '%s expired_app_server_dirs=%s\n' "$(timestamp)" "$swept" >&2
+}
+expire_stale_app_server_dirs
 
 if [[ $MODE == auto ]]; then
   [[ -x $STATUS ]] || fail "guard-live status command unavailable"

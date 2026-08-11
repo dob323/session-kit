@@ -12,6 +12,8 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -31,6 +33,8 @@ inventory_core = importlib.util.module_from_spec(CORE_SPEC)
 sys.modules[CORE_SPEC.name] = inventory_core
 CORE_SPEC.loader.exec_module(inventory_core)
 from sessionkit_inventory import lifecycle as lifecycle_state  # noqa: E402
+from sessionkit_inventory import processes as process_inventory  # noqa: E402
+from sessionkit_inventory import providers_claude as claude_inventory  # noqa: E402
 
 
 def uuid_for(number: int) -> str:
@@ -305,6 +309,303 @@ class InventoryScaleTests(unittest.TestCase):
 
 
 class InventoryIdentityTests(unittest.TestCase):
+    def test_linux_process_scan_retains_exact_provider_account_environment(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix=".proc-account-", dir=REPO) as raw:
+            proc_root = Path(raw)
+            entry = proc_root / "123"
+            entry.mkdir()
+            (entry / "stat").write_text("fixture\n", encoding="utf-8")
+            (entry / "cmdline").write_bytes(b"codex\0")
+            (entry / "comm").write_text("codex\n", encoding="utf-8")
+            (entry / "environ").write_bytes(
+                b"CLAUDE_CONFIG_DIR=/profiles/claude-a\0"
+                b"CODEX_HOME=/profiles/codex-a\0"
+                b"SESSION_KIT_ACCOUNT_ALIAS=paid-a\0"
+                b"SESSION_KIT_ACCOUNT_CAPABLE=1\0"
+            )
+            os.symlink(REPO, entry / "cwd")
+            with mock.patch.object(
+                process_inventory, "_proc_stat", return_value=(123, 10, 1000)
+            ):
+                scanned = process_inventory.scan_process_table(
+                    proc_root,
+                    64,
+                    proc_stat=process_inventory._proc_stat,
+                    proc_environ=process_inventory._proc_environ,
+                )
+        self.assertEqual("/profiles/claude-a", scanned[123]["claude_config_dir"])
+        self.assertEqual("/profiles/codex-a", scanned[123]["codex_home"])
+        self.assertEqual("paid-a", scanned[123]["account_alias"])
+        self.assertEqual("1", scanned[123]["account_capable"])
+
+    def test_darwin_process_scan_retains_exact_provider_account_environment(
+        self,
+    ) -> None:
+        info = inventory_core._DarwinBsdInfo()
+        info.pbi_pid = 123
+        info.pbi_ppid = 10
+        info.pbi_start_tvsec = 1_752_000_000
+        info.pbi_start_tvusec = 123_456
+        info.pbi_name = b"codex"
+        values = [
+            b"/opt/homebrew/bin/codex",
+            b"",
+            b"/opt/homebrew/bin/codex",
+            b"CLAUDE_CONFIG_DIR=/profiles/claude-a",
+            b"CODEX_HOME=/profiles/codex-a",
+            b"SESSION_KIT_ACCOUNT_ALIAS=paid-a",
+            b"SESSION_KIT_ACCOUNT_CAPABLE=1",
+        ]
+        payload = struct.pack("=i", 1) + b"\0".join(values) + b"\0"
+        scanned = inventory_core.scan_darwin_process_table(
+            4,
+            pids=[123],
+            bsd_reader=lambda _pid: info,
+            args_reader=lambda _pid: payload,
+        )
+        self.assertEqual("/profiles/claude-a", scanned[123]["claude_config_dir"])
+        self.assertEqual("/profiles/codex-a", scanned[123]["codex_home"])
+        self.assertEqual("paid-a", scanned[123]["account_alias"])
+        self.assertEqual("1", scanned[123]["account_capable"])
+
+    def test_account_evidence_requires_an_exact_provider_process(self) -> None:
+        fixture = list(inventory_fixture(2))
+        provider_pids = {
+            row["comm"]: pid
+            for pid, row in fixture[2].items()
+            if row["comm"] in {"claude", "codex"}
+        }
+        fixture[2][provider_pids["claude"]].update(
+            {"account_alias": "  claude_a  ", "account_capable": "1"}
+        )
+        fixture[2][provider_pids["codex"]].update(
+            {"account_alias": "codex-paid", "account_capable": "yes"}
+        )
+        exact = inventory_core.build_inventory(*fixture, now=1_800_000_000)
+        rows = {row["provider"]: row for row in exact["sessions"]}
+        self.assertEqual("claude_a", rows["claude"]["account_alias"])
+        self.assertTrue(rows["claude"]["account_switch_capable"])
+        self.assertEqual("codex-paid", rows["codex"]["account_alias"])
+        self.assertFalse(rows["codex"]["account_switch_capable"])
+
+        unresolved_fixture = list(inventory_fixture(1, providers=("claude",)))
+        unresolved_fixture[2][2001].update(
+            {"account_alias": "no-leak", "account_capable": "1"}
+        )
+        unresolved_fixture[1] = []
+        unresolved = inventory_core.build_inventory(
+            *unresolved_fixture, now=1_800_000_000
+        )["sessions"][0]
+        self.assertEqual("unknown", unresolved["provider"])
+        self.assertNotIn("account_alias", unresolved)
+        self.assertFalse(unresolved["account_switch_capable"])
+
+    def test_codex_process_index_uses_each_exact_live_profile(self) -> None:
+        default_home = REPO / ".codex-default-fixture"
+        custom_home = REPO / ".codex-custom-fixture"
+        proc_root = REPO / ".proc-fixture"
+        table = {
+            20: {
+                **process(20, 10, "codex"),
+                "codex_thread_id": uuid_for(20),
+            },
+            21: {
+                **process(21, 10, "codex"),
+                "codex_home": os.fspath(custom_home),
+                "codex_thread_id": uuid_for(21),
+            },
+        }
+        with (
+            mock.patch.object(
+                inventory_core, "_runtime_platform", return_value="linux"
+            ),
+            mock.patch.object(
+                inventory_core, "codex_open_rollouts", return_value=[]
+            ) as open_rollouts,
+        ):
+            inventory_core.index_codex_processes(table, proc_root, default_home)
+        open_rollouts.assert_has_calls(
+            [
+                mock.call(20, proc_root, default_home, table[20]),
+                mock.call(21, proc_root, custom_home, table[21]),
+            ]
+        )
+        with (
+            mock.patch.object(
+                inventory_core, "_runtime_platform", return_value="darwin"
+            ),
+            mock.patch.object(
+                inventory_core, "codex_rollout_by_uuid", return_value=[]
+            ) as rollout_by_uuid,
+        ):
+            inventory_core.index_codex_processes(table, proc_root, default_home)
+        rollout_by_uuid.assert_has_calls(
+            [
+                mock.call(default_home, uuid_for(20)),
+                mock.call(custom_home, uuid_for(21)),
+            ]
+        )
+
+    def test_claude_enrichment_reads_the_exact_custom_profile(self) -> None:
+        with tempfile.TemporaryDirectory(prefix=".claude-profile-", dir=REPO) as raw:
+            custom_root = Path(raw)
+            exact_uuid = uuid_for(25)
+            transcript = custom_root / "projects" / "fixture" / f"{exact_uuid}.jsonl"
+            transcript.parent.mkdir(parents=True)
+            transcript.write_text(
+                json.dumps(
+                    {
+                        "type": "ai-title",
+                        "sessionId": exact_uuid,
+                        "aiTitle": "Custom profile title",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            payload = [
+                {
+                    "pid": 225,
+                    "sessionId": exact_uuid,
+                    "_session_kit_claude_config_dir": os.fspath(custom_root),
+                }
+            ]
+            enriched = claude_inventory._enrich_claude_payload(
+                payload,
+                environ=os.environ,
+                home_factory=Path.home,
+                palette=inventory_core.CLAUDE_SESSION_COLORS,
+                transcript_signals=inventory_core.read_claude_transcript_signals,
+            )
+        self.assertEqual("Custom profile title", enriched[0]["aiTitle"])
+
+    def test_live_collection_keeps_claude_and_codex_profiles_isolated(self) -> None:
+        with tempfile.TemporaryDirectory(prefix=".profiles-", dir=REPO) as raw:
+            base = Path(raw)
+            account_home = base / "home"
+            custom_claude = base / "claude-custom"
+            default_codex = base / "codex-default"
+            custom_codex = base / "codex-custom"
+            account_home.mkdir()
+            custom_claude.mkdir()
+            default_codex.mkdir()
+            custom_codex.mkdir()
+            fixture = list(
+                inventory_fixture(
+                    4, providers=("claude", "claude", "codex", "codex")
+                )
+            )
+            claude_pids = sorted(
+                pid for pid, row in fixture[2].items() if row["comm"] == "claude"
+            )
+            codex_pids = sorted(
+                pid for pid, row in fixture[2].items() if row["comm"] == "codex"
+            )
+            fixture[2][claude_pids[0]].update(
+                {"account_alias": "cld-main", "account_capable": "1"}
+            )
+            fixture[2][claude_pids[1]].update(
+                {
+                    "claude_config_dir": os.fspath(custom_claude),
+                    "account_alias": "cld-alt",
+                    "account_capable": "0",
+                }
+            )
+            fixture[2][codex_pids[0]].update(
+                {"account_alias": "cdx-main", "account_capable": "1"}
+            )
+            fixture[2][codex_pids[1]].update(
+                {
+                    "codex_home": os.fspath(custom_codex),
+                    "account_alias": "cdx-alt",
+                    "account_capable": "",
+                }
+            )
+            for home, exact_uuid, title in (
+                (default_codex, uuid_for(3), "Default Codex title"),
+                (custom_codex, uuid_for(4), "Custom Codex title"),
+            ):
+                connection = sqlite3.connect(home / "state_5.sqlite")
+                connection.execute(
+                    "CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, cwd TEXT)"
+                )
+                connection.execute(
+                    "INSERT INTO threads VALUES (?, ?, ?)",
+                    (
+                        exact_uuid,
+                        title,
+                        f"/srv/project-{3 if home == default_codex else 4}",
+                    ),
+                )
+                connection.commit()
+                connection.close()
+
+            commands: list[tuple[str, ...]] = []
+
+            def command_json(**kwargs: object) -> object:
+                command = tuple(kwargs["default_command"])
+                commands.append(command)
+                if "shpool" in Path(command[0]).name:
+                    return fixture[0]
+                if command == ("claude", "agents", "--json"):
+                    return fixture[1]
+                if command[:1] == ("env",):
+                    return fixture[1]
+                self.fail(f"unexpected command: {command!r}")
+
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"HOME": os.fspath(account_home), "CLAUDE_CONFIG_DIR": ""},
+                    clear=False,
+                ),
+                mock.patch.object(
+                    inventory_core, "_command_json", side_effect=command_json
+                ),
+                mock.patch.object(
+                    inventory_core, "scan_process_table", return_value=fixture[2]
+                ),
+                mock.patch.object(
+                    inventory_core,
+                    "_codex_paths",
+                    return_value=(default_codex, default_codex / "state_5.sqlite"),
+                ),
+                mock.patch.object(
+                    inventory_core, "index_codex_processes", return_value=fixture[3]
+                ),
+                mock.patch.object(
+                    inventory_core, "recent_output_times", return_value={}
+                ),
+            ):
+                collected = inventory_core.collect_live(fixture[5])
+
+        rows = {row["shpool_id"]: row for row in collected["sessions"]}
+        self.assertEqual("Claude task 1", rows["main"]["native_title"])
+        self.assertEqual("Claude task 2", rows["main2"]["native_title"])
+        self.assertEqual("Default Codex title", rows["main3"]["native_title"])
+        self.assertEqual("Custom Codex title", rows["main4"]["native_title"])
+        self.assertEqual("cld-main", rows["main"]["account_alias"])
+        self.assertEqual("cld-alt", rows["main2"]["account_alias"])
+        self.assertEqual("cdx-main", rows["main3"]["account_alias"])
+        self.assertEqual("cdx-alt", rows["main4"]["account_alias"])
+        self.assertTrue(rows["main"]["account_switch_capable"])
+        self.assertFalse(rows["main2"]["account_switch_capable"])
+        self.assertTrue(rows["main3"]["account_switch_capable"])
+        self.assertFalse(rows["main4"]["account_switch_capable"])
+        self.assertIn(
+            (
+                "env",
+                f"CLAUDE_CONFIG_DIR={custom_claude}",
+                "claude",
+                "agents",
+                "--json",
+            ),
+            commands,
+        )
+        self.assertTrue(collected["_complete"])
+
     def test_default_proc_bound_covers_peak_and_remains_bounded(self) -> None:
         with tempfile.TemporaryDirectory(prefix=".config-bound-", dir=REPO) as raw:
             missing = Path(raw) / "missing.json"
@@ -1416,15 +1717,15 @@ class TerminalNumberRegistryTests(unittest.TestCase):
             boot_id="boot-a",
             allocate=True,
         )
-        self.assertEqual(1, exact["terminal_number"])
+        self.assertEqual(2, exact["terminal_number"])
         self.assertIsNone(orphan["terminal_number"])
         self.assertIs(orphan["mutation_allowed"], False)
         self.assertEqual(
             "missing-shell-generation",
             orphan["mutation_rejection_reason"],
         )
-        self.assertEqual(2, registry["next_number"])
-        self.assertEqual({1}, set(registry["bindings"].values()))
+        self.assertEqual(3, registry["next_number"])
+        self.assertEqual({2}, set(registry["bindings"].values()))
         self.assertTrue(inventory_core.guard_live_inventory(inventory))
         self.assertFalse(inventory_core.strict_live_inventory(inventory))
         unchanged = inventory_core.apply_terminal_numbers(
@@ -1437,8 +1738,8 @@ class TerminalNumberRegistryTests(unittest.TestCase):
         self.assertIsNone(orphan["terminal_number"])
         self.assertIs(orphan["mutation_allowed"], False)
 
-        self.assertIs(inventory_core.lookup(inventory, "1"), exact)
-        self.assertIsNone(inventory_core.lookup(inventory, "2"))
+        self.assertIsNone(inventory_core.lookup(inventory, "1"))
+        self.assertIs(inventory_core.lookup(inventory, "2"), exact)
         self.assertIs(
             inventory_core.lookup(inventory, orphan["shpool_id_raw"]),
             orphan,
@@ -1450,13 +1751,13 @@ class TerminalNumberRegistryTests(unittest.TestCase):
             path = Path(raw) / "inventory.json"
             path.write_text(json.dumps(inventory), encoding="utf-8")
             loaded = getattr(inventory_core, "load_inventory_input")(path)
-        self.assertEqual(1, loaded["sessions"][0]["terminal_number"])
+        self.assertEqual(2, loaded["sessions"][0]["terminal_number"])
         self.assertIsNone(loaded["sessions"][1]["terminal_number"])
 
     def test_recycled_numbers_respect_the_quarantine_and_continuity(self) -> None:
         quarantine = inventory_core.TERMINAL_NUMBER_QUARANTINE_SECONDS
         now = 1_800_000_000.0
-        # Pass 1: two live sessions take 1 and 2.
+        # Pass 1: terminal 1 is supervisor-only; ordinary sessions take 2 and 3.
         inventory = inventory_core.build_inventory(
             *inventory_fixture(2), now=1_800_000_000
         )
@@ -1470,11 +1771,11 @@ class TerminalNumberRegistryTests(unittest.TestCase):
             current_time=now,
         )
         self.assertEqual(
-            [1, 2], [item["terminal_number"] for item in inventory["sessions"]]
+            [2, 3], [item["terminal_number"] for item in inventory["sessions"]]
         )
         self.assertEqual({}, retired)
 
-        # Pass 2: session 1 died — its number enters quarantine.
+        # Pass 2: session 1 died — ordinary number 2 enters quarantine.
         survivor = inventory_core.build_inventory(
             *inventory_fixture(2), now=1_800_000_100
         )
@@ -1487,10 +1788,10 @@ class TerminalNumberRegistryTests(unittest.TestCase):
             retired=retired,
             current_time=now + 100,
         )
-        self.assertEqual(2, survivor["sessions"][0]["terminal_number"])
-        self.assertEqual({1: now + 100}, retired)
+        self.assertEqual(3, survivor["sessions"][0]["terminal_number"])
+        self.assertEqual({2: now + 100}, retired)
 
-        # Pass 3, inside the quarantine: a NEW session must not take 1.
+        # Pass 3, inside the quarantine: a NEW session must not take 2.
         fresh = inventory_core.build_inventory(
             *inventory_fixture(3), now=1_800_000_200
         )
@@ -1507,9 +1808,9 @@ class TerminalNumberRegistryTests(unittest.TestCase):
             item["shpool_id_raw"]: item["terminal_number"]
             for item in fresh["sessions"]
         }
-        self.assertEqual(2, numbers["main2"])
-        self.assertEqual(3, numbers["main3"])
-        self.assertIn(1, retired)
+        self.assertEqual(3, numbers["main2"])
+        self.assertEqual(4, numbers["main3"])
+        self.assertIn(2, retired)
 
         # Pass 4: the dead conversation RECOVERS inside the window — its AI
         # binding hands its old number back and the retirement clears.
@@ -1528,8 +1829,8 @@ class TerminalNumberRegistryTests(unittest.TestCase):
             item["shpool_id_raw"]: item["terminal_number"]
             for item in revived["sessions"]
         }
-        self.assertEqual(1, revived_numbers["main"])
-        self.assertNotIn(1, retired)
+        self.assertEqual(2, revived_numbers["main"])
+        self.assertNotIn(2, retired)
 
         # Pass 5: dead again, and the quarantine EXPIRES — the number frees,
         # its bindings prune, and the next new session takes the lowest gap.
@@ -1545,7 +1846,7 @@ class TerminalNumberRegistryTests(unittest.TestCase):
             retired=retired,
             current_time=now + 400,
         )
-        self.assertEqual({1: now + 400}, {n: retired[n] for n in retired if n == 1})
+        self.assertEqual({2: now + 400}, {n: retired[n] for n in retired if n == 2})
         expired_pass = inventory_core.build_inventory(
             *inventory_fixture(4), now=1_800_000_500
         )
@@ -1562,9 +1863,9 @@ class TerminalNumberRegistryTests(unittest.TestCase):
             item["shpool_id_raw"]: item["terminal_number"]
             for item in expired_pass["sessions"]
         }
-        # main4 is new; 1 finished quarantine and is the lowest free number.
-        self.assertEqual(1, expired_numbers["main4"])
-        self.assertNotIn(1, retired)
+        # main4 is new; 2 finished quarantine and is the lowest ordinary number.
+        self.assertEqual(2, expired_numbers["main4"])
+        self.assertNotIn(2, retired)
         self.assertNotIn(
             f"ai:claude:{uuid_for(1)}", registry["bindings"]
         )
@@ -1734,7 +2035,7 @@ class TerminalNumberRegistryTests(unittest.TestCase):
             self.assertEqual("live", result["source"])
             self.assertIs(result["stale"], False)
             self.assertEqual([], result["warnings"])
-            self.assertEqual(1, result["sessions"][0]["terminal_number"])
+            self.assertEqual(2, result["sessions"][0]["terminal_number"])
             self.assertIsNone(result["sessions"][1]["terminal_number"])
             stored = json.loads(
                 (state / "inventory.json").read_text(encoding="utf-8")
@@ -1752,7 +2053,7 @@ class TerminalNumberRegistryTests(unittest.TestCase):
         registry = inventory_core.apply_terminal_numbers(
             inventory, registry, boot_id="boot-a", allocate=True
         )
-        self.assertEqual(1, item["terminal_number"])
+        self.assertEqual(2, item["terminal_number"])
 
         inventory["daemon_generation"]["process_start_ticks"] += 99
         unchanged = inventory_core.apply_terminal_numbers(
@@ -1761,7 +2062,7 @@ class TerminalNumberRegistryTests(unittest.TestCase):
             boot_id="boot-a",
             allocate=False,
         )
-        self.assertEqual(1, item["terminal_number"])
+        self.assertEqual(2, item["terminal_number"])
         self.assertEqual(registry, unchanged)
 
         item["provider"] = "claude"
@@ -1769,9 +2070,9 @@ class TerminalNumberRegistryTests(unittest.TestCase):
         promoted = inventory_core.apply_terminal_numbers(
             inventory, registry, boot_id="boot-a", allocate=True
         )
-        self.assertEqual(1, item["terminal_number"])
+        self.assertEqual(2, item["terminal_number"])
         self.assertEqual(
-            1, promoted["bindings"][f"ai:claude:{exact_identity['uuid']}"]
+            2, promoted["bindings"][f"ai:claude:{exact_identity['uuid']}"]
         )
 
         item["shpool_id"] = item["shpool_id_raw"] = "main20"
@@ -1781,8 +2082,8 @@ class TerminalNumberRegistryTests(unittest.TestCase):
         recovered = inventory_core.apply_terminal_numbers(
             inventory, promoted, boot_id="boot-a", allocate=True
         )
-        self.assertEqual(1, item["terminal_number"])
-        self.assertEqual(2, recovered["next_number"])
+        self.assertEqual(2, item["terminal_number"])
+        self.assertEqual(3, recovered["next_number"])
 
     def test_exact_recovery_overrides_a_new_generation_provisional_number(
         self,
@@ -1798,7 +2099,7 @@ class TerminalNumberRegistryTests(unittest.TestCase):
             boot_id="boot-a",
             allocate=True,
         )
-        self.assertEqual(1, item["terminal_number"])
+        self.assertEqual(2, item["terminal_number"])
 
         item["shpool_id"] = item["shpool_id_raw"] = "main20"
         item["started_at_unix_ms"] += 100
@@ -1808,25 +2109,25 @@ class TerminalNumberRegistryTests(unittest.TestCase):
         registry = inventory_core.apply_terminal_numbers(
             inventory, registry, boot_id="boot-a", allocate=True
         )
-        self.assertEqual(2, item["terminal_number"])
+        self.assertEqual(3, item["terminal_number"])
 
         item["provider"] = "claude"
         item["identity"] = exact_identity
         recovered = inventory_core.apply_terminal_numbers(
             inventory, registry, boot_id="boot-a", allocate=True
         )
-        self.assertEqual(1, item["terminal_number"])
-        self.assertEqual(3, recovered["next_number"])
+        self.assertEqual(2, item["terminal_number"])
+        self.assertEqual(4, recovered["next_number"])
         generation = inventory_core._terminal_generation_key(
             inventory, item, "boot-a"
         )
-        self.assertEqual(1, recovered["bindings"][generation])
+        self.assertEqual(2, recovered["bindings"][generation])
         self.assertEqual(
             [generation],
             [
                 key
                 for key, value in recovered["bindings"].items()
-                if key.startswith("generation:") and value == 1
+                if key.startswith("generation:") and value == 2
             ],
         )
 
@@ -1842,7 +2143,7 @@ class TerminalNumberRegistryTests(unittest.TestCase):
             boot_id="boot-a",
             allocate=True,
         )
-        self.assertEqual(1, item["terminal_number"])
+        self.assertEqual(2, item["terminal_number"])
 
         item["shpool_id"] = item["shpool_id_raw"] = "main20"
         item["started_at_unix_ms"] += 100
@@ -1853,7 +2154,7 @@ class TerminalNumberRegistryTests(unittest.TestCase):
             inventory, registry, boot_id="boot-a", allocate=True
         )
         self.assertEqual(first_uuid, item["identity"]["uuid"])
-        self.assertEqual(2, item["terminal_number"])
+        self.assertEqual(3, item["terminal_number"])
 
         item["shpool_id"] = item["shpool_id_raw"] = "main21"
         item["started_at_unix_ms"] += 100
@@ -1864,7 +2165,7 @@ class TerminalNumberRegistryTests(unittest.TestCase):
         inventory_core.apply_terminal_numbers(
             inventory, registry, boot_id="boot-a", allocate=True
         )
-        self.assertEqual(3, item["terminal_number"])
+        self.assertEqual(4, item["terminal_number"])
 
     def test_unrelated_uuid_replaces_same_generation_with_a_new_number(
         self,
@@ -1886,8 +2187,8 @@ class TerminalNumberRegistryTests(unittest.TestCase):
         generation = inventory_core._terminal_generation_key(
             inventory, item, "boot-a"
         )
-        self.assertEqual(2, item["terminal_number"])
-        self.assertEqual(2, updated["bindings"][generation])
+        self.assertEqual(3, item["terminal_number"])
+        self.assertEqual(3, updated["bindings"][generation])
 
     def test_registry_rejects_duplicate_generations_and_active_exact_duplicates(
         self,
@@ -2144,12 +2445,28 @@ class AutomaticTitleTests(unittest.TestCase):
         )
         exact = uuid_for(81)
         automatic = {f"codex:{exact}": "Session Kit Updates"}
+        # A native rename outranks the alias tier, `sp name` included. The
+        # kit last pushed "Session Kit Updates", so a native store reading
+        # "Provider Rename" can only have been typed after that push: it is
+        # the newest thing a person said about this name, and it wins.
+        self.assertEqual(
+            ("Provider Rename", "native"),
+            inventory_core._provider_title_info(
+                "codex",
+                exact,
+                "Provider Rename",
+                {f"codex:{exact}": "Manual Override"},
+                automatic_titles=automatic,
+            ),
+        )
+        # The alias keeps its place against a native title the kit itself
+        # pushed — that one is the kit's own echo, not somebody's rename.
         self.assertEqual(
             ("Manual Override", "alias"),
             inventory_core._provider_title_info(
                 "codex",
                 exact,
-                "Provider Rename",
+                "Session Kit Updates",
                 {f"codex:{exact}": "Manual Override"},
                 automatic_titles=automatic,
             ),
@@ -2586,6 +2903,138 @@ class AutomaticTitleTests(unittest.TestCase):
                     {f"codex:{active}": "Active Task Name"},
                     inventory_core.canonical_automatic_titles(config),
                 )
+
+    def test_a_human_rename_refuses_every_later_automatic_rename(self) -> None:
+        with tempfile.TemporaryDirectory(prefix=".name-owner-", dir=REPO) as raw:
+            base = Path(raw)
+            config_path, config = self._private_config(base)
+            exact = uuid_for(91)
+            inventory, table, environment, current_pid = self._caller_fixture(
+                config, exact
+            )
+            with mock.patch.dict(
+                os.environ, {"SESSION_KIT_CONFIG": str(config_path)}, clear=False
+            ):
+                inventory_core.mutate_canonical_alias(
+                    config, "codex", exact, "the operator named this"
+                )
+                document = json.loads(config_path.read_text(encoding="utf-8"))
+                self.assertEqual(
+                    "human",
+                    document["name_ownership"][f"codex:{exact}"]["owner"],
+                )
+                self.assertEqual(
+                    {"owner": "human", "at": document["name_ownership"][
+                        f"codex:{exact}"
+                    ]["at"]},
+                    inventory_core.canonical_name_ownership(config)[
+                        f"codex:{exact}"
+                    ],
+                )
+                for message, call in (
+                    (
+                        "explicit local alias",
+                        lambda: inventory_core.mutate_canonical_automatic_title(
+                            config, "codex", exact, "Some Automatic Name"
+                        ),
+                    ),
+                    (
+                        "a human name owns this session",
+                        lambda: inventory_core.self_name_automatic_title(
+                            config,
+                            "Some Automatic Name",
+                            inventory=inventory,
+                            process_table=table,
+                            environ=environment,
+                            current_pid=current_pid,
+                        ),
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        inventory_core.CollectionError, message
+                    ):
+                        call()
+                # The reset drops the alias. The override is not a display
+                # tier — it outlives the name it was recorded for.
+                inventory_core.mutate_canonical_alias(config, "codex", exact, None)
+                document = json.loads(config_path.read_text(encoding="utf-8"))
+                self.assertEqual({}, document["aliases"])
+                self.assertEqual(
+                    "human",
+                    document["name_ownership"][f"codex:{exact}"]["owner"],
+                )
+                for call in (
+                    lambda: inventory_core.mutate_canonical_automatic_title(
+                        config, "codex", exact, "Some Automatic Name", overwrite=True
+                    ),
+                    lambda: inventory_core.self_name_automatic_title(
+                        config,
+                        "Some Automatic Name",
+                        inventory=inventory,
+                        process_table=table,
+                        environ=environment,
+                        current_pid=current_pid,
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        inventory_core.CollectionError,
+                        "a human name owns this session",
+                    ):
+                        call()
+                self.assertEqual(
+                    {},
+                    json.loads(config_path.read_text(encoding="utf-8")).get(
+                        "automatic_titles", {}
+                    ),
+                )
+
+    def test_a_self_name_keeps_naming_itself_and_prunes_its_own_claim(self) -> None:
+        with tempfile.TemporaryDirectory(prefix=".name-claim-", dir=REPO) as raw:
+            base = Path(raw)
+            config_path, config = self._private_config(base)
+            exact = uuid_for(92)
+            inventory, table, environment, current_pid = self._caller_fixture(
+                config, exact
+            )
+            with mock.patch.dict(
+                os.environ, {"SESSION_KIT_CONFIG": str(config_path)}, clear=False
+            ):
+                for title in ("Session Kit Updates", "Session Kit Release"):
+                    inventory_core.self_name_automatic_title(
+                        config,
+                        title,
+                        inventory=inventory,
+                        process_table=table,
+                        environ=environment,
+                        current_pid=current_pid,
+                    )
+                document = json.loads(config_path.read_text(encoding="utf-8"))
+                self.assertEqual(
+                    "automatic",
+                    document["name_ownership"][f"codex:{exact}"]["owner"],
+                )
+                # A dead conversation's spent claim is pruned with its title;
+                # a human override in the same sweep is not.
+                human = uuid_for(93)
+                inventory_core.mutate_canonical_alias(
+                    config, "codex", human, "the operator named this"
+                )
+                empty = inventory_core.build_inventory(
+                    *inventory_fixture(0), now=1_800_000_000
+                )
+                audit = inventory_core.audit_automatic_titles(config, empty)
+                inventory_core.prune_automatic_titles(
+                    config, empty, audit["prune_token"]
+                )
+                document = json.loads(config_path.read_text(encoding="utf-8"))
+                self.assertNotIn(
+                    f"codex:{exact}", document.get("name_ownership", {})
+                )
+                self.assertEqual(
+                    "human",
+                    document["name_ownership"][f"codex:{human}"]["owner"],
+                )
+
 
 
 class CanonicalAliasTests(unittest.TestCase):
@@ -3279,7 +3728,7 @@ class InventoryInputAndRecoveryTests(unittest.TestCase):
         self.assertEqual("claude", known["provider"])
         self.assertEqual("exact", known["identity"]["confidence"])
 
-    def test_guard_rejects_invalid_outside_identity_and_managed_duplicate(
+    def test_guard_allows_managed_outside_duplicate_but_strict_rejects_it(
         self,
     ) -> None:
         fixture = inventory_core.build_inventory(
@@ -3305,8 +3754,14 @@ class InventoryInputAndRecoveryTests(unittest.TestCase):
         duplicate["outside_agents"][0]["identity"] = copy.deepcopy(
             managed["identity"]
         )
-        self.assertFalse(inventory_core.guard_live_inventory(duplicate))
+        self.assertTrue(inventory_core.guard_live_inventory(duplicate))
         self.assertFalse(inventory_core.strict_live_inventory(duplicate))
+
+        duplicate_outside = copy.deepcopy(duplicate)
+        duplicate_outside["outside_agents"].append(
+            copy.deepcopy(duplicate_outside["outside_agents"][0])
+        )
+        self.assertFalse(inventory_core.guard_live_inventory(duplicate_outside))
 
         mutations = (
             lambda item: item.update(provider="shell"),
@@ -3660,6 +4115,223 @@ class InventoryRenderingTests(unittest.TestCase):
 
 
 class ProviderLifecycleStateTests(unittest.TestCase):
+    def test_provider_exit_requires_exact_committed_intake_generation(self) -> None:
+        with tempfile.TemporaryDirectory(prefix=".lifecycle-commit-", dir=REPO) as raw:
+            root = Path(raw)
+            root.chmod(0o700)
+            marker = root / "prompt.intake_committed"
+            conversation = uuid_for(91)
+            generation = "aaaaaaaa-bbbb:123:456:789"
+            payload = {
+                "schema_version": 2,
+                "status": "intake_committed",
+                "provider": "codex",
+                "session_id": conversation,
+                "submission_key": "turn-1",
+                "prompt_sha256": "a" * 64,
+                "bytes": 12,
+                "source_event_id": "b" * 64,
+                "intake_msg_id": "c" * 8,
+                "requirements_revision": 0,
+                "requirements_digest": "d" * 64,
+                "managed_generation": generation,
+                "committed_unix_ms": 1_800_000_000_000,
+            }
+            marker.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+            marker.chmod(0o600)
+            environment = {
+                "SESSION_KIT_LIFECYCLE_CONVERSATION_UUID": conversation,
+                "SESSION_KIT_LIFECYCLE_INTAKE_COMMIT": os.fspath(marker),
+                "SESSION_KIT_MANAGED_GENERATION": generation,
+            }
+            with mock.patch.dict(os.environ, environment, clear=False):
+                exact = inventory_core._lifecycle_committed_conversation(
+                    provider="codex", boot_id="aaaaaaaa-bbbb", shell_pid=123, shell_start=456
+                )
+            self.assertEqual(conversation, exact)
+
+            for field, changed in (
+                ("provider", "claude"),
+                ("session_id", uuid_for(92)),
+                ("managed_generation", "aaaaaaaa-bbbb:123:999:789"),
+                ("prompt_sha256", "not-a-digest"),
+            ):
+                broken = dict(payload)
+                broken[field] = changed
+                marker.write_text(json.dumps(broken) + "\n", encoding="utf-8")
+                marker.chmod(0o600)
+                with mock.patch.dict(os.environ, environment, clear=False), self.assertRaises(
+                    inventory_core.CollectionError
+                ):
+                    inventory_core._lifecycle_committed_conversation(
+                        provider="codex", boot_id="aaaaaaaa-bbbb", shell_pid=123, shell_start=456
+                    )
+
+            marker.unlink()
+            with mock.patch.dict(os.environ, environment, clear=False), self.assertRaisesRegex(
+                inventory_core.CollectionError, "unavailable"
+            ):
+                inventory_core._lifecycle_committed_conversation(
+                    provider="codex", boot_id="aaaaaaaa-bbbb", shell_pid=123, shell_start=456
+                )
+
+    def test_conversation_uuid_is_persisted_in_provider_exit_state(self) -> None:
+        with tempfile.TemporaryDirectory(prefix=".lifecycle-conversation-", dir=REPO) as raw:
+            value = lifecycle_state.record_provider_exit(
+                Path(raw), session_id="main", boot_id="aaaaaaaa-bbbb",
+                shell_pid=123, shell_start_ticks=456, provider="codex",
+                conversation_uuid=uuid_for(93), exit_code=0,
+                input_tracking=True, now_monotonic_ns=999,
+            )
+            self.assertEqual(uuid_for(93), value["conversation_uuid"])
+            self.assertEqual(3, value["schema_version"])
+            with self.assertRaisesRegex(
+                inventory_core.CollectionError, "conversation changed"
+            ):
+                lifecycle_state.record_provider_exit(
+                    Path(raw), session_id="main", boot_id="aaaaaaaa-bbbb",
+                    shell_pid=123, shell_start_ticks=456, provider="codex",
+                    conversation_uuid=uuid_for(94), exit_code=0,
+                    input_tracking=True, now_monotonic_ns=1000,
+                )
+
+
+class WorkerLaunchGateTests(unittest.TestCase):
+    def assignment(self) -> dict[str, str]:
+        return {
+            "branch": "w5c/picker-audit",
+            "provider": "codex",
+            "requested_model": "gpt-codex-test",
+            "idempotency_key": "worker:implementation:1",
+        }
+
+    def test_installed_launcher_passes_exact_model_and_key_and_ignores_stdout(self) -> None:
+        calls: list[tuple[list[str], dict[str, object]]] = []
+        prompts: list[tuple[str, int]] = []
+
+        def runner(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            calls.append((argv, kwargs))
+            prompt_path = Path(argv[argv.index("--prompt-file") + 1])
+            prompts.append(
+                (prompt_path.read_text(encoding="utf-8"), stat.S_IMODE(prompt_path.stat().st_mode))
+            )
+            return subprocess.CompletedProcess(argv, 0, "self-asserted fake identity", "")
+
+        with tempfile.TemporaryDirectory(prefix=".worker-launch-", dir=REPO) as raw:
+            executable = Path(raw) / "sp"
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            executable.chmod(0o700)
+            result = inventory_core._launch_intake_worker(
+                self.assignment(), cwd=Path(raw),
+                environ={"SESSION_KIT_SP_CMD": os.fspath(executable)}, runner=runner,
+            )
+        self.assertTrue(result["dispatched"])
+        self.assertEqual(
+            [os.fspath(executable), "new", "codex", "--model", "gpt-codex-test", "--launch-key", "worker:implementation:1", "--prompt-file"],
+            calls[0][0][:-1],
+        )
+        self.assertFalse(Path(calls[0][0][-1]).exists())
+        self.assertIn("Wait for the Fleet Supervisor", prompts[0][0])
+        self.assertEqual(0o600, prompts[0][1])
+        self.assertNotIn("worker_identity", result)
+        self.assertEqual("1", calls[0][1]["env"]["SESSION_KIT_BACKGROUND"])
+
+    def test_claude_worker_launch_needs_no_bootstrap_prompt(self) -> None:
+        calls: list[list[str]] = []
+
+        def runner(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        assignment = {
+            "provider": "claude",
+            "requested_model": "claude-opus-test",
+            "idempotency_key": "worker:research:1",
+        }
+        with tempfile.TemporaryDirectory(prefix=".worker-launch-", dir=REPO) as raw:
+            executable = Path(raw) / "sp"
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            executable.chmod(0o700)
+            inventory_core._launch_intake_worker(
+                assignment, cwd=Path(raw),
+                environ={"SESSION_KIT_SP_CMD": os.fspath(executable)}, runner=runner,
+            )
+        self.assertNotIn("--prompt-file", calls[0])
+
+    def test_reconciler_requires_one_fresh_exact_provider_model_identity(self) -> None:
+        row = {
+            "provider": "codex",
+            "actual_model": "gpt-codex-test",
+            "launch_idempotency_key": "worker:implementation:1",
+            "identity": {"uuid": uuid_for(77), "confidence": "exact"},
+        }
+        proof = inventory_core._reconcile_intake_worker(
+            self.assignment(), {"source": "live", "stale": False, "sessions": [row]}
+        )
+        self.assertTrue(proof["inventory_verified"])
+        self.assertEqual(f"codex:{uuid_for(77)}", proof["worker_identity"])
+        for inventory in (
+            {"source": "cache", "stale": True, "sessions": [row]},
+            {"source": "live", "stale": False, "sessions": [row, dict(row)]},
+            {"source": "live", "stale": False, "sessions": [{**row, "actual_model": "gpt-other"}]},
+            {"source": "live", "stale": False, "sessions": [{**row, "provider": "claude"}]},
+        ):
+            with self.assertRaises(inventory_core.CollectionError):
+                inventory_core._reconcile_intake_worker(self.assignment(), inventory)
+
+    def test_reconciler_automatically_names_a_verified_worker_from_its_branch(self) -> None:
+        row = {
+            "provider": "codex",
+            "actual_model": "gpt-codex-test",
+            "launch_idempotency_key": "worker:implementation:1",
+            "identity": {"uuid": uuid_for(77), "confidence": "exact"},
+        }
+        with (
+            mock.patch.object(inventory_core, "mutate_canonical_self_name") as mutate,
+            mock.patch.object(inventory_core, "propagate_provider_title") as propagate,
+        ):
+            proof = inventory_core._reconcile_intake_worker(
+                self.assignment(),
+                {"source": "live", "stale": False, "sessions": [row]},
+                config={},
+            )
+        mutate.assert_called_once_with({}, "codex", uuid_for(77), "W5C Picker Audit")
+        propagate.assert_called_once_with("codex", uuid_for(77), "W5C Picker Audit")
+        self.assertEqual("W5C Picker Audit", proof["worker_title"])
+
+    def test_inventory_row_carries_only_bound_process_model_and_launch_key(self) -> None:
+        fixture = list(inventory_fixture(1))
+        table = fixture[2]
+        provider_pid = next(pid for pid, row in table.items() if row["comm"] == "claude")
+        table[provider_pid]["cmdline"] = ["/usr/bin/claude", "--model", "claude-opus-test"]
+        table[provider_pid]["requested_model"] = "claude-opus-test"
+        table[provider_pid]["launch_idempotency_key"] = "worker:research:1"
+        inventory = inventory_core.build_inventory(*fixture)
+        row = inventory["sessions"][0]
+        self.assertEqual("claude-opus-test", row["actual_model"])
+        self.assertEqual("worker:research:1", row["launch_idempotency_key"])
+
+    def test_inventory_binds_codex_cli_evidence_under_exact_managed_shell(self) -> None:
+        fixture = list(inventory_fixture(1, providers=("codex",)))
+        table = fixture[2]
+        provider_pid = next(pid for pid, row in table.items() if row["comm"] == "codex")
+        shell_pid = table[provider_pid]["ppid"]
+        table[provider_pid]["cmdline"] = ["/usr/bin/codex", "app-server"]
+        cli_pid = max(table) + 1
+        table[cli_pid] = process(cli_pid, shell_pid, "node")
+        table[cli_pid]["cmdline"] = [
+            "/usr/bin/node",
+            "/opt/codex",
+            "--model",
+            "gpt-codex-test",
+        ]
+        table[cli_pid]["requested_model"] = "gpt-codex-test"
+        table[cli_pid]["launch_idempotency_key"] = "worker:implementation:1"
+        inventory = inventory_core.build_inventory(*fixture)
+        row = inventory["sessions"][0]
+        self.assertEqual("gpt-codex-test", row["actual_model"])
+        self.assertEqual("worker:implementation:1", row["launch_idempotency_key"])
+
     def test_lifecycle_caller_must_descend_from_exact_managed_shell(self) -> None:
         current_pid = os.getpid()
         shell_pid = current_pid + 10_000
@@ -3834,6 +4506,34 @@ class ProviderLifecycleStateTests(unittest.TestCase):
             item["_terminal_identity_hint"],
         )
         self.assertFalse(item["needs_you"])
+
+    def test_fast_exit_synthesizes_recovery_from_committed_conversation(self) -> None:
+        fixture = list(inventory_fixture(1, providers=("codex",)))
+        root_pid = 1001
+        del fixture[2][2001]
+        fixture[3] = {}
+        idle = inventory_core.build_inventory(*fixture, now=1_800_000_001)
+        expected_uuid = uuid_for(81)
+        with tempfile.TemporaryDirectory(prefix=".lifecycle-fast-exit-", dir=REPO) as raw:
+            state_dir = Path(raw)
+            lifecycle_state.record_provider_exit(
+                state_dir, session_id="main",
+                boot_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                shell_pid=root_pid,
+                shell_start_ticks=fixture[2][root_pid]["start_ticks"],
+                provider="codex", conversation_uuid=expected_uuid,
+                exit_code=0, input_tracking=True,
+                now_monotonic_ns=1_800_000_000_500,
+            )
+            lifecycle_state.apply_provider_exit_states(
+                idle, None, state_dir=state_dir,
+                boot_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            )
+        item = idle["sessions"][0]
+        self.assertEqual(expected_uuid, item["exited_identity"]["uuid"])
+        self.assertIn("committed provider-exit", item["exited_identity"]["provenance"])
+        self.assertEqual(expected_uuid, item["recovery"]["uuid"])
+        self.assertTrue(item["recovery"]["available"])
 
     def test_reopen_executes_only_generation_bound_exact_recovery(self) -> None:
         with tempfile.TemporaryDirectory(

@@ -1,6 +1,6 @@
 # Install Session Kit
 
-Session Kit `v0.2.0` is a public beta for Linux with systemd and macOS 14 or
+Session Kit `v0.2.1` is a public beta for Linux with systemd and macOS 14 or
 newer. Install the accepted release artifact under a single-user account where
 provider conversations are recoverable.
 
@@ -12,7 +12,7 @@ are named by source commit rather than by version.
 ```bash
 mkdir session-kit-download
 cd session-kit-download
-gh release download v0.2.0 --repo dob323/session-kit
+gh release download v0.2.1 --repo dob323/session-kit
 if command -v sha256sum >/dev/null; then
   sha256sum --check session-kit-*.sha256
 else
@@ -44,7 +44,7 @@ an install or update.
 
 Without the GitHub CLI, download the `.tar.gz`, `.sha256`, and
 `.provenance.json` assets from the
-[`v0.2.0` release](https://github.com/dob323/session-kit/releases/tag/v0.2.0),
+[`v0.2.1` release](https://github.com/dob323/session-kit/releases/tag/v0.2.1),
 and put them in one empty directory. The checksum file covers the archive. Use
 `sha256sum --check` on Linux or
 `shasum -a 256 --check` on macOS. The provenance file records the exact source
@@ -188,6 +188,32 @@ and `.bash_profile` for managed Bash sessions and adds only the Session Kit
 command path to `.zshrc`. A normal zsh SSH login remains a normal shell and the
 picker opens only when you type `kit`.
 
+One provider file is registered rather than only laid down: the automatic
+project intake hook, added to `~/.claude/settings.json` and `~/.codex/hooks.json`
+under `UserPromptSubmit`. Both files are backed up before the edit and re-read
+after it. Session Kit adds one provenance-marked handler inside a compatible
+matcher group; it does not claim that group. Existing handlers, including
+other `UserPromptSubmit` commands in the same group, remain byte-for-byte
+untouched. The registration is idempotent — installing again changes nothing.
+Configuration JSON with duplicate keys, a linked path ancestor, or more than
+one Session Kit-owned handler is refused instead of being normalized.
+
+A managed `sp new codex --prompt-file ...` keeps the source file until its
+private handoff is durable and the audit append succeeds. Provider acceptance
+and supervisor intake are separate proofs. The prompt is consumed only after
+the fsynced intake proof matches the exact conversation, turn, content digest,
+and managed shell generation. Any started process without that proof moves the
+prompt to `sp prompt-quarantine list` as **Needs You** and never replays it.
+Use `ingest` to retry supervisor intake without contacting Codex, `resume` to
+reopen the exact accepted conversation, or `discard` to retain it for 30-day
+recovery.
+
+**Codex asks you to trust that hook once.** Codex trusts a command hook by the
+exact hash of the registered wrapper file, so the first Codex session after
+installation prompts to review it, and until you accept, Codex skips the hook
+and no Codex project is recorded automatically. The same prompt returns
+whenever a release changes that file — see `docs/update-and-rollback.md`.
+
 The installer does not change provider storage, start a service, restart
 shpool, attach to a session, or close a session.
 
@@ -224,7 +250,9 @@ session-kit services status
 does not make the picker open automatically.
 
 Review the generated definitions before enabling them. On Linux,
-`services enable` activates the shpool socket and cleanup timer. On macOS, it
+`services enable` activates the shpool socket, the cleanup timer, and the
+session watchdog; `session-kit doctor` fails while any of the three is
+installed but not enabled. On macOS, it
 loads the shpool, cleanup, and report-only watchdog LaunchAgents. macOS refuses
 activation if another shpool daemon is reachable. Disabling macOS services
 holds the creation lock and requires two empty-session proofs before unloading

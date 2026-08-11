@@ -1,3 +1,10 @@
+# Public export manifest for tools/build-public-tree.
+# fnmatch patterns, one per line; every tracked file that matches is exported.
+# Rule: every tracked file is either matched here or deliberately private.
+# The deliberately-private files are listed, with a reason each, in
+# tests/test_manifest_coverage.py. That test fails when a tracked file appears
+# in neither place, so an omission cannot pass review unseen. Do not move a
+# file between the two without a maintainer decision.
 .github/**
 .gitignore
 .shellcheckrc
@@ -17,6 +24,7 @@ docs/**
 docs/assets/session-kit-dashboard.png
 deploy/session-kit-launcher
 deploy/session-kit-release
+extras/**
 install.sh
 lib/**
 lib/sh/session_kit_checks.sh
@@ -47,27 +55,61 @@ systemd/**
 tests/__init__.py
 tests/run
 tests/support.py
+tests/test_accounts.py
+tests/test_app_server_gate.py
+tests/test_app_server_reaper.py
 tests/test_commands.py
 tests/test_config.py
+tests/test_coordination_broker.py
+tests/test_delegation_e2e.py
 tests/test_doc_links.py
+tests/test_events_hook.py
+tests/test_events_store.py
+tests/test_exit_stayalive.py
 tests/test_facade.py
+tests/test_human_output_ids.py
 tests/test_install.py
+tests/test_intake_preflight.py
+tests/test_intake_producer.py
+tests/test_intake_spool.py
 tests/test_inventory.py
 tests/test_lifecycle_shell.py
 tests/test_login.py
 tests/test_macos_preview.py
+tests/test_manifest_coverage.py
+tests/test_messages_delivery.py
+tests/test_messages_ledger.py
+tests/test_messages_verbs.py
+tests/test_model_launch.py
+tests/test_msg_cli.py
+tests/test_msg_console.py
+tests/test_picker_message.py
+tests/test_prompt_handoff.py
+tests/test_prompt_quarantine.py
+tests/test_provider_hooks.py
 tests/test_provider_title_push.py
 tests/test_projects.py
 tests/test_public_export.py
 tests/test_public_scan.py
+tests/test_queue_events.py
+tests/test_queue_picker.py
+tests/test_ratchet_policy.py
+tests/test_ratchet_terminal.py
 tests/test_reaper_autoclose.py
 tests/test_recovery_pending.py
 tests/test_release.py
 tests/test_release_artifact.py
 tests/test_session_colors.py
+tests/test_source_authority.py
+tests/test_supervisor_adapter.py
+tests/test_supervisor_bin_lifecycle.py
+tests/test_supervisor_mcp.py
+tests/test_supervisor_registry.py
+tests/test_testing_gates.py
 tests/test_watchdog.py
 tools/build-public-tree
 tools/build-release-artifact
 tools/check-doc-links
+tools/check-embedded-scripts
 tools/public-scan
 tools/render-readme-dashboard

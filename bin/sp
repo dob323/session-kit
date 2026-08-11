@@ -28,7 +28,8 @@ usage() {
   cat <<'EOF'
 Usage:
   sp list
-  sp new [claude|codex|shell] [project-alias]
+  sp new [claude|codex|shell] [project-alias] [--account ALIAS] [--model ID] [--launch-key KEY]
+      Codex also accepts [--prompt-file OWNER-PRIVATE-FILE]
   sp name <terminal-number|shpool-id> <title>
   sp name reset <terminal-number|shpool-id>
   sp color <terminal-number|shpool-id> <color>
@@ -43,11 +44,24 @@ Usage:
   sp repair <terminal-number|shpool-id>
   sp prune
   sp detail <terminal-number|shpool-id>
+  sp account list [claude|codex]
+  sp account adopt-default <claude|codex> <alias> <email>
+  sp account enroll <claude|codex> <alias> <email>
+  sp account verify <claude|codex> <alias>
+  sp account configure-feeds <roster-json> <advice-json>
   sp find <text>
+  sp msg <all|idle|3|1,3,5|2-4|shpool-id> "text" [--fyi] [--yes]
+  sp msg report [msg-id]
+  sp msg reply <msg-id> "text"
+  sp msg list
   sp history <terminal-number|shpool-id>
   sp health
   sp recover
   sp verify-start <terminal-number|shpool-id>
+  sp prompt-quarantine list
+  sp prompt-quarantine ingest|discard <key>
+  sp prompt-quarantine resume <key> <absolute-project-directory>
+  sp prompt-quarantine prune
 EOF
 }
 
@@ -69,6 +83,8 @@ source "$MODULE_DIR/sp_provider_bounce.sh"
 source "$MODULE_DIR/sp_sessions.sh"
 # shellcheck source=lib/sh/sp_commands.sh
 source "$MODULE_DIR/sp_commands.sh"
+# shellcheck source=lib/sh/sp_msg.sh
+source "$MODULE_DIR/sp_msg.sh"
 
 trap cleanup_snapshot EXIT
 # Ctrl-C must actually stop sp. A trap that only cleaned up let bash resume
@@ -85,7 +101,7 @@ case "$command" in
     ;;
   new)
     shift
-    start_new "${1:-}" "${2:-}"
+    start_new "$@"
     ;;
   name)
     if [[ ${2:-} == reset ]]; then
@@ -130,7 +146,11 @@ case "$command" in
     ;;
   detail)
     [[ $# -eq 2 ]] || { usage >&2; exit 2; }
-    exec "$SCRIPT_DIR/shpool_status" --lookup "$2"
+    exec "$SCRIPT_DIR/shpool_status" --detail "$2"
+    ;;
+  account)
+    shift
+    exec python3 "$INVENTORY_CORE" account "$@"
     ;;
   history|log)
     [[ $# -eq 2 ]] || { usage >&2; exit 2; }
@@ -141,6 +161,10 @@ case "$command" in
     [[ $# -gt 0 ]] || { usage >&2; exit 2; }
     find_history "$*"
     ;;
+  msg)
+    shift
+    msg_command "$@"
+    ;;
   health|resources)
     show_health
     ;;
@@ -150,6 +174,10 @@ case "$command" in
   verify-start)
     [[ $# -eq 2 ]] || { usage >&2; exit 2; }
     verify_start_target "$2"
+    ;;
+  prompt-quarantine)
+    shift
+    exec python3 "$SCRIPT_DIR/../lib/sessionkit_supervisor/prompt_quarantine.py" "$@"
     ;;
   picker-open)
     [[ $# -eq 2 ]] || { usage >&2; exit 2; }
@@ -191,9 +219,13 @@ case "$command" in
     [[ $# -eq 2 ]] || { usage >&2; exit 2; }
     picker_fork "$2"
     ;;
+  picker-account-switch)
+    [[ $# -eq 3 ]] || { usage >&2; exit 2; }
+    picker_account_switch "$2" "$3"
+    ;;
   restore-exact)
-    [[ $# -eq 4 ]] || { usage >&2; exit 2; }
-    restore_exact "$2" "$3" "$4"
+    [[ $# -eq 4 || $# -eq 5 ]] || { usage >&2; exit 2; }
+    restore_exact "$2" "$3" "$4" "${5:-}"
     ;;
   help|-h|--help)
     usage

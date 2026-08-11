@@ -1,0 +1,37 @@
+{
+  "factual_agent_reply": {
+    "lane": 2,
+    "promoted_at": null,
+    "streak": 0
+  },
+  "fleet_broadcast": {
+    "lane": 3,
+    "promoted_at": null,
+    "streak": 0
+  },
+  "irreversible_action": {
+    "lane": 3,
+    "promoted_at": null,
+    "streak": 0
+  },
+  "silence_chase": {
+    "lane": 1,
+    "promoted_at": null,
+    "streak": 0
+  },
+  "single_target_nudge": {
+    "lane": 2,
+    "promoted_at": null,
+    "streak": 0
+  },
+  "status_compilation": {
+    "lane": 1,
+    "promoted_at": null,
+    "streak": 0
+  },
+  "uncertain_action": {
+    "lane": 3,
+    "promoted_at": null,
+    "streak": 0
+  }
+}

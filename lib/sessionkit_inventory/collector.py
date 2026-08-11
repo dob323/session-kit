@@ -22,9 +22,12 @@ from .common import (
     _valid_aliases,
     _valid_automatic_title_failures,
     _valid_automatic_titles,
+    _valid_name_ownership,
+    _valid_pushed_titles,
     automatic_naming_enabled,
     clean_text,
     natural_name_key,
+    proc_root as gated_proc_root,
     shpool_id_mutation_policy,
     valid_uuid,
 )
@@ -38,11 +41,58 @@ from .model import (
 from .processes import _children_index, _process_age
 from .providers import _parse_shpool_payload
 from .providers_claude import _is_native_claude
-from .providers_codex import _codex_turn_state, _is_native_codex
+from .providers_codex import (
+    _codex_state_databases,
+    _codex_turn_state,
+    _is_native_codex,
+)
 
 
 PROVIDER_ORDER = {"claude": 0, "codex": 1, "shell": 2, "unknown": 3}
 AVAILABILITY_ORDER = {"ready": 0, "attached": 1}
+
+
+def _provider_profile_path(raw: Any, fallback: Path) -> Path | None:
+    """Return one absolute provider profile path without inventing a target."""
+    if not isinstance(raw, str) or not raw:
+        return fallback
+    candidate = Path(raw)
+    if not candidate.is_absolute() or ".." in candidate.parts:
+        return None
+    return candidate
+
+
+def _profile_key(path: Path) -> str:
+    return os.fspath(path.resolve(strict=False))
+
+
+def _exact_account_alias(
+    pid: Any,
+    identity: Mapping[str, Any],
+    process_table: Mapping[int, Mapping[str, Any]],
+) -> str:
+    """Read a display alias only from the exact provider process generation."""
+    if (
+        not isinstance(pid, int)
+        or identity.get("confidence") != "exact"
+        or identity.get("pid") != pid
+    ):
+        return ""
+    alias = clean_text(process_table.get(pid, {}).get("account_alias"), 12)
+    return alias if re.fullmatch(r"[a-z][a-z0-9_-]{0,11}", alias) else ""
+
+
+def _exact_account_capable(
+    pid: Any,
+    identity: Mapping[str, Any],
+    process_table: Mapping[int, Mapping[str, Any]],
+) -> bool:
+    return bool(
+        isinstance(pid, int)
+        and identity.get("confidence") == "exact"
+        and identity.get("pid") == pid
+        and process_table.get(pid, {}).get("account_capable") == "1"
+    )
 
 
 def regular_file_mtime_ms(path: Path) -> int | None:
@@ -309,9 +359,7 @@ def build_inventory(
     claude_payload: Any,
     process_table: Mapping[int, Mapping[str, Any]],
     codex_index: Mapping[int, Sequence[Mapping[str, Any]]],
-    codex_db_rows: tuple[
-        Mapping[str, Mapping[str, Any]], Mapping[str, Sequence[dict[str, Any]]]
-    ],
+    codex_db_rows: Sequence[Any],
     config: Mapping[str, Any],
     now: float | None = None,
     recent_output_by_shpool_id: Mapping[str, int] | None = None,
@@ -348,10 +396,49 @@ def build_inventory(
     claude_by_pid = {item["pid"]: item for item in claude_agents}
     aliases = _valid_aliases(config.get("aliases"))
     automatic_titles = _valid_automatic_titles(config.get("automatic_titles"))
+    pushed_titles = _valid_pushed_titles(config.get("pushed_titles"))
+    name_ownership = _valid_name_ownership(config.get("name_ownership"))
     automatic_failures = _valid_automatic_title_failures(
         config.get("automatic_title_failures")
     )
-    codex_threads, codex_edges = codex_db_rows
+    if len(codex_db_rows) < 2:
+        raise CollectionError("Codex metadata bundle is incomplete")
+    codex_threads, codex_edges = codex_db_rows[:2]
+    codex_profiles: Mapping[str, Any] = (
+        codex_db_rows[2]
+        if len(codex_db_rows) >= 3 and isinstance(codex_db_rows[2], Mapping)
+        else {}
+    )
+    codex_default_home = codex_profiles.get("default_home")
+    codex_profile_rows = codex_profiles.get("profiles")
+    if not isinstance(codex_default_home, str) or not isinstance(
+        codex_profile_rows, Mapping
+    ):
+        codex_default_home = ""
+        codex_profile_rows = {}
+
+    def codex_rows_for_pid(
+        candidate_pid: int,
+    ) -> tuple[Mapping[str, Mapping[str, Any]], Mapping[str, Sequence[dict[str, Any]]]]:
+        if not codex_default_home:
+            return codex_threads, codex_edges
+        default_path = Path(codex_default_home)
+        profile = _provider_profile_path(
+            process_table.get(candidate_pid, {}).get("codex_home"), default_path
+        )
+        if profile is None:
+            return {}, {}
+        selected = codex_profile_rows.get(_profile_key(profile))
+        if (
+            isinstance(selected, Sequence)
+            and not isinstance(selected, (str, bytes))
+            and len(selected) >= 2
+            and isinstance(selected[0], Mapping)
+            and isinstance(selected[1], Mapping)
+        ):
+            return selected[0], selected[1]
+        return {}, {}
+
     roots, root_diagnostics = shpool_roots(
         (item["name"] for item in shpool_sessions), process_table
     )
@@ -474,7 +561,8 @@ def build_inventory(
             and not native_claude_candidates
         ):
             pid, uuid = codex_candidates[0]
-            thread = codex_threads.get(uuid, {})
+            profile_threads, profile_edges = codex_rows_for_pid(pid)
+            thread = profile_threads.get(uuid, {})
             native_title = clean_text(
                 thread.get("session_index_name")
                 or thread.get("name")
@@ -506,7 +594,7 @@ def build_inventory(
                 provenance="native Codex PID open exact rollout",
                 confidence="exact",
             )
-            subagents = list(codex_edges.get(uuid, ()))
+            subagents = list(profile_edges.get(uuid, ()))
             recovery = recovery_spec(provider, uuid, cwd or None)
             mapped_codex.add(pid)
             turn_state = _codex_turn_state(codex_index.get(pid, ()), uuid)
@@ -597,6 +685,8 @@ def build_inventory(
             shpool["started_at_unix_ms"],
             automatic_titles,
             provider_title_is_explicit=provider_title_is_explicit,
+            pushed_titles=pushed_titles,
+            name_ownership=name_ownership,
         )
         recent_output_at = recent_outputs.get(name)
         if (
@@ -637,6 +727,12 @@ def build_inventory(
                     else None
                 ),
             )
+        )
+        account_alias = _exact_account_alias(pid, identity, process_table)
+        if account_alias:
+            sessions[-1]["account_alias"] = account_alias
+        sessions[-1]["account_switch_capable"] = _exact_account_capable(
+            pid, identity, process_table
         )
         if claude_color_evidence:
             sessions[-1]["_claude_agent_color"] = claude_color_evidence
@@ -689,6 +785,8 @@ def build_inventory(
             agent["cwd"],
             agent["started_at_unix_ms"],
             automatic_titles,
+            pushed_titles=pushed_titles,
+            name_ownership=name_ownership,
         )
         outside_agents.append(
             _base_agent(
@@ -721,6 +819,14 @@ def build_inventory(
                 shpool_shell=None,
             )
         )
+        account_alias = _exact_account_alias(
+            agent["pid"], outside_agents[-1]["identity"], process_table
+        )
+        if account_alias:
+            outside_agents[-1]["account_alias"] = account_alias
+        outside_agents[-1]["account_switch_capable"] = _exact_account_capable(
+            agent["pid"], outside_agents[-1]["identity"], process_table
+        )
         if agent.get("agent_color"):
             outside_agents[-1]["_claude_agent_color"] = agent["agent_color"]
     for pid, metadata in codex_index.items():
@@ -730,7 +836,8 @@ def build_inventory(
         if len(identities) != 1:
             continue
         uuid = identities[0]
-        thread = codex_threads.get(uuid, {})
+        profile_threads, profile_edges = codex_rows_for_pid(pid)
+        thread = profile_threads.get(uuid, {})
         native_title = clean_text(
             thread.get("session_index_name")
             or thread.get("name")
@@ -749,6 +856,8 @@ def build_inventory(
             None,
             automatic_titles,
             provider_title_is_explicit=bool(thread.get("session_index_name")),
+            pushed_titles=pushed_titles,
+            name_ownership=name_ownership,
         )
         turn_state = _codex_turn_state(metadata, uuid)
         outside_agents.append(
@@ -774,11 +883,19 @@ def build_inventory(
                 process_age_seconds=_process_age(pid, process_table, current_time),
                 agent_status=turn_state,
                 needs_you=turn_state == "needs your reply",
-                subagents=list(codex_edges.get(uuid, ())),
+                subagents=list(profile_edges.get(uuid, ())),
                 recovery=recovery_spec("codex", uuid, cwd or None),
                 diagnostics=["active provider root is outside shpool"],
                 shpool_shell=None,
             )
+        )
+        account_alias = _exact_account_alias(
+            pid, outside_agents[-1]["identity"], process_table
+        )
+        if account_alias:
+            outside_agents[-1]["account_alias"] = account_alias
+        outside_agents[-1]["account_switch_capable"] = _exact_account_capable(
+            pid, outside_agents[-1]["identity"], process_table
         )
     sessions.sort(
         key=lambda item: (
@@ -869,7 +986,7 @@ def collect_live(
     """Collect a live inventory using one call per external list command."""
     invoke = runner or default_runner
     timeout = float(config.get("command_timeout_seconds", 6.0))
-    root = proc_root or Path(environ.get("SESSION_KIT_PROC_ROOT", "/proc"))
+    root = proc_root or gated_proc_root(environ)
     try:
         shpool_payload = command_json(
             fixture_env="SESSION_KIT_SHPOOL_JSON_FILE",
@@ -878,66 +995,194 @@ def collect_live(
             runner=invoke,
             timeout=timeout,
         )
-    except (OSError, ValueError, subprocess.SubprocessError, CollectionError) as exc:
+    except (
+        OSError,
+        ValueError,
+        subprocess.SubprocessError,
+        CollectionError,
+    ) as exc:
         raise CollectionError(f"cannot collect shpool snapshot: {exc}") from exc
     _parse_shpool_payload(shpool_payload)
     process_table = platform_process_table(
         root, int(config.get("max_proc_nodes", default_max_proc_nodes))
     )
     warnings: list[str] = []
-    claude_failed = False
-    try:
-        claude_payload = command_json(
-            fixture_env="SESSION_KIT_CLAUDE_JSON_FILE",
-            command_env="SESSION_KIT_CLAUDE_CMD",
-            default_command=("claude", "agents", "--json"),
-            runner=invoke,
-            timeout=timeout,
+    account_home = Path(environ.get("HOME") or Path.home())
+    configured_claude_root = environ.get("CLAUDE_CONFIG_DIR", "")
+    default_claude_root = _provider_profile_path(
+        configured_claude_root, account_home / ".claude"
+    )
+    if default_claude_root is None:
+        default_claude_root = account_home / ".claude"
+    default_claude_key = _profile_key(default_claude_root)
+    claude_profiles: dict[str, Path] = {default_claude_key: default_claude_root}
+    claude_process_profiles: dict[int, str | None] = {}
+    for pid, process in process_table.items():
+        if not _is_native_claude(process):
+            continue
+        profile = _provider_profile_path(
+            process.get("claude_config_dir"), default_claude_root
         )
+        if profile is None:
+            claude_process_profiles[pid] = None
+            continue
+        key = _profile_key(profile)
+        claude_process_profiles[pid] = key
+        claude_profiles[key] = profile
+
+    claude_payload: list[Any] = []
+    failed_claude_profiles: set[str | None] = set()
+    ordered_claude_profiles = [
+        default_claude_key,
+        *sorted(key for key in claude_profiles if key != default_claude_key),
+    ]
+    for profile_key in ordered_claude_profiles:
+        profile = claude_profiles[profile_key]
+        command = (
+            ("claude", "agents", "--json")
+            if profile_key == default_claude_key
+            else (
+                "env",
+                f"CLAUDE_CONFIG_DIR={profile}",
+                "claude",
+                "agents",
+                "--json",
+            )
+        )
+        try:
+            profile_payload = command_json(
+                fixture_env="SESSION_KIT_CLAUDE_JSON_FILE",
+                command_env="SESSION_KIT_CLAUDE_CMD",
+                default_command=command,
+                runner=invoke,
+                timeout=timeout,
+            )
+            if not isinstance(profile_payload, list):
+                raise CollectionError("claude agents --json returned a non-array")
+            for item in profile_payload:
+                if not isinstance(item, Mapping):
+                    continue
+                agent_pid = item.get("pid")
+                if not isinstance(agent_pid, int):
+                    continue
+                if claude_process_profiles.get(agent_pid) != profile_key:
+                    continue
+                retained = dict(item)
+                retained["_session_kit_claude_config_dir"] = os.fspath(profile)
+                claude_payload.append(retained)
+        except (
+            OSError,
+            ValueError,
+            subprocess.SubprocessError,
+            CollectionError,
+        ) as exc:
+            failed_claude_profiles.add(profile_key)
+            warnings.append(
+                f"Claude inventory unavailable: {clean_text(str(exc), 240)}"
+            )
+    if any(value is None for value in claude_process_profiles.values()):
+        failed_claude_profiles.add(None)
+        warnings.append("Claude inventory unavailable: invalid live profile path")
+    try:
         claude_payload = enrich_claude_payload(claude_payload)
         parse_claude_payload(claude_payload)
     except (OSError, ValueError, subprocess.SubprocessError, CollectionError) as exc:
         claude_payload = []
-        claude_failed = True
+        failed_claude_profiles.update(ordered_claude_profiles)
         warnings.append(f"Claude inventory unavailable: {clean_text(str(exc), 240)}")
+
     codex_home, db_path = codex_paths()
     codex_index = index_codex_processes(process_table, root, codex_home)
-    codex_visible = bool(codex_index)
-    session_index_names: dict[str, str] = {}
+    default_codex_key = _profile_key(codex_home)
+    codex_profiles: dict[str, Path] = {default_codex_key: codex_home}
+    codex_process_profiles: dict[int, str | None] = {}
+    for pid, process in process_table.items():
+        if not _is_native_codex(process):
+            continue
+        profile = _provider_profile_path(process.get("codex_home"), codex_home)
+        if profile is None:
+            codex_process_profiles[pid] = None
+            continue
+        key = _profile_key(profile)
+        codex_process_profiles[pid] = key
+        codex_profiles[key] = profile
+
     naming_warnings: list[str] = []
-    try:
-        session_index_names = read_codex_session_index(
-            codex_home / "session_index.jsonl", naming_warnings
-        )
-    except CollectionError as exc:
-        naming_warnings.append(
-            f"Codex session names unavailable: {clean_text(str(exc), 240)}"
-        )
-    try:
-        codex_rows = read_codex_db(db_path, session_index_names)
-    except (OSError, sqlite3.Error, CollectionError) as exc:
-        codex_rows = (
-            {
-                uuid: {
-                    "id": uuid,
-                    "title": "",
-                    "cwd": "",
-                    "session_index_name": title,
-                }
-                for uuid, title in session_index_names.items()
-            },
-            {},
-        )
-        codex_failed = True
-        if codex_visible:
-            warnings.append(f"Codex metadata unavailable: {clean_text(str(exc), 240)}")
-    else:
-        codex_failed = not db_path.is_file()
-        if codex_failed and codex_visible:
-            warnings.append(
-                "Codex metadata unavailable: database does not exist: "
-                f"{clean_text(str(db_path), 240)}"
+    codex_profile_rows: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+    failed_codex_profiles: set[str | None] = set()
+    visible_codex_profiles = {
+        profile_key
+        for pid, profile_key in codex_process_profiles.items()
+        if codex_index.get(pid)
+    }
+    ordered_codex_profiles = [
+        default_codex_key,
+        *sorted(key for key in codex_profiles if key != default_codex_key),
+    ]
+    for profile_key in ordered_codex_profiles:
+        profile = codex_profiles[profile_key]
+        profile_db = db_path
+        if profile_key != default_codex_key:
+            databases = _codex_state_databases(profile)
+            profile_db = databases[-1] if databases else profile / "state_5.sqlite"
+        session_index_names: dict[str, str] = {}
+        try:
+            session_index_names = read_codex_session_index(
+                profile / "session_index.jsonl", naming_warnings
             )
+        except CollectionError as exc:
+            naming_warnings.append(
+                f"Codex session names unavailable: {clean_text(str(exc), 240)}"
+            )
+        try:
+            profile_rows = read_codex_db(profile_db, session_index_names)
+        except (OSError, sqlite3.Error, CollectionError) as exc:
+            profile_rows = (
+                {
+                    uuid: {
+                        "id": uuid,
+                        "title": "",
+                        "cwd": "",
+                        "session_index_name": title,
+                    }
+                    for uuid, title in session_index_names.items()
+                },
+                {},
+            )
+            failed_codex_profiles.add(profile_key)
+            if profile_key in visible_codex_profiles:
+                warnings.append(
+                    f"Codex metadata unavailable: {clean_text(str(exc), 240)}"
+                )
+        else:
+            if not profile_db.is_file():
+                failed_codex_profiles.add(profile_key)
+                if profile_key in visible_codex_profiles:
+                    warnings.append(
+                        "Codex metadata unavailable: database does not exist: "
+                        f"{clean_text(str(profile_db), 240)}"
+                    )
+        codex_profile_rows[profile_key] = profile_rows
+    if any(value is None for value in codex_process_profiles.values()):
+        failed_codex_profiles.add(None)
+        warnings.append("Codex metadata unavailable: invalid live profile path")
+
+    merged_codex_threads: dict[str, Any] = {}
+    merged_codex_edges: dict[str, Any] = {}
+    for profile_key in ordered_codex_profiles:
+        profile_threads, profile_edges = codex_profile_rows[profile_key]
+        for uuid, thread in profile_threads.items():
+            merged_codex_threads.setdefault(uuid, thread)
+        for uuid, edges in profile_edges.items():
+            merged_codex_edges.setdefault(uuid, edges)
+    codex_rows = (
+        merged_codex_threads,
+        merged_codex_edges,
+        {
+            "default_home": os.fspath(codex_home),
+            "profiles": codex_profile_rows,
+        },
+    )
     recent_outputs = recent_output_times(
         item["name"] for item in _parse_shpool_payload(shpool_payload)
     )
@@ -956,10 +1201,14 @@ def collect_live(
     inventory["naming_warnings"] = naming_warnings
     # Optional providers may be absent on a general-purpose installation.
     # A query failure is material only when that provider is visibly running.
-    claude_visible = any(
-        _is_native_claude(process) for process in process_table.values()
+    claude_failed = any(
+        profile_key in failed_claude_profiles
+        for profile_key in claude_process_profiles.values()
     )
-    inventory["_complete"] = not (
-        (claude_failed and claude_visible) or (codex_failed and codex_visible)
+    codex_failed = any(
+        profile_key in failed_codex_profiles
+        for pid, profile_key in codex_process_profiles.items()
+        if codex_index.get(pid)
     )
+    inventory["_complete"] = not (claude_failed or codex_failed)
     return inventory

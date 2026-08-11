@@ -31,7 +31,11 @@ _SESSION_KIT_LIB_DIR = os.fspath(Path(__file__).resolve().parent)
 if _SESSION_KIT_LIB_DIR not in sys.path:
     sys.path.insert(0, _SESSION_KIT_LIB_DIR)
 
+from sessionkit_messages import command as _messages  # noqa: E402
+from sessionkit_messages.envelope import MessageError  # noqa: E402
+from sessionkit_events import queue as _events  # noqa: E402
 from sessionkit_inventory import collector as _collector  # noqa: E402
+from sessionkit_inventory import accounts as _accounts  # noqa: E402
 from sessionkit_inventory import colors as _colors  # noqa: E402
 from sessionkit_inventory import common as _common  # noqa: E402
 from sessionkit_inventory import lifecycle as _lifecycle  # noqa: E402
@@ -211,6 +215,183 @@ def default_state_dir() -> Path:
     )
 
 
+def _scoped_config_path(environ: Mapping[str, str] | None) -> Path | None:
+    """Resolve the naming document inside the caller's own environment.
+
+    An explicit environment IS the caller's sandbox — the automatic namers
+    run inside one, and resolving the real home from in there would read (and
+    write) name ownership outside the sandbox that asked for the work.
+    """
+    if environ is None:
+        return config_path()
+    env = dict(environ)
+    if not (
+        env.get("SESSION_KIT_CONFIG") or env.get("XDG_CONFIG_HOME") or env.get("HOME")
+    ):
+        return None
+    return _common.config_path(
+        environ=env,
+        home=lambda: _common._home(environ=env, home_factory=Path.home),
+        xdg_path=lambda name, fallback: _common._xdg_path(
+            name, fallback, environ=env
+        ),
+    )
+
+
+def _scoped_state_config(environ: Mapping[str, str] | None) -> dict[str, Any] | None:
+    """The state root the caller's own environment locks its naming writes in."""
+    if environ is None:
+        return load_config()
+    env = dict(environ)
+    if not (
+        env.get("SESSION_KIT_STATE_DIR")
+        or env.get("XDG_STATE_HOME")
+        or env.get("HOME")
+    ):
+        return None
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "state_dir": _common.default_state_dir(
+            environ=env,
+            home=lambda: _common._home(environ=env, home_factory=Path.home),
+            xdg_path=lambda name, fallback: _common._xdg_path(
+                name, fallback, environ=env
+            ),
+        ),
+    }
+
+
+def record_pushed_title(
+    provider: str, uuid: str, title: str, *, environ: Mapping[str, str] | None = None
+) -> None:
+    """Remember what the kit just wrote into a provider's own store.
+
+    Fail-open: naming is advisory, and a thread with no record simply falls
+    back to its retained automatic title as the last kit-authored value.
+    """
+    path = _scoped_config_path(environ)
+    config = _scoped_state_config(environ)
+    if path is None or config is None:
+        return
+    try:
+        _names.record_pushed_title(
+            config,
+            provider,
+            uuid,
+            title,
+            atomic_write_json=atomic_write_json,
+            config_path=lambda: path,
+            private_alias_document=_private_alias_document,
+            private_alias_parent=_private_alias_parent,
+        )
+    except (CollectionError, OSError):
+        return
+
+
+def adopt_native_rename(
+    provider: str,
+    uuid: str,
+    native_title: str,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> str:
+    """Take a provider-native rename as the permanent human-owned name."""
+    path = _scoped_config_path(environ)
+    config = _scoped_state_config(environ)
+    if path is None or config is None:
+        return ""
+    try:
+        return _names.adopt_native_rename(
+            config,
+            provider,
+            uuid,
+            native_title,
+            atomic_write_json=atomic_write_json,
+            config_path=lambda: path,
+            private_alias_document=_private_alias_document,
+            private_alias_parent=_private_alias_parent,
+        )
+    except (CollectionError, OSError):
+        return ""
+
+
+def name_owner(
+    provider: str, uuid: str, *, environ: Mapping[str, str] | None = None
+) -> str:
+    """Say who owns a session's name: human, automatic, or nobody ("").
+
+    Fails open: a document that cannot be read owns nothing, because a
+    naming pass that cannot prove a name is taken is exactly the pass that
+    should keep looking rather than refuse to work at all.
+    """
+    exact = _common.valid_uuid(uuid)
+    if provider not in PROVIDERS or not exact:
+        return ""
+    path = _scoped_config_path(environ)
+    if path is None:
+        return ""
+    try:
+        document = _private_alias_document(path, allow_missing=True)
+    except (CollectionError, OSError):
+        return ""
+    return _names._name_owner(document, f"{provider}:{exact}")
+
+
+def human_named_keys(environ: Mapping[str, str] | None = None) -> frozenset[str]:
+    """Every session a person renamed, as provider:uuid keys."""
+    path = _scoped_config_path(environ)
+    if path is None:
+        return frozenset()
+    try:
+        document = _private_alias_document(path, allow_missing=True)
+    except (CollectionError, OSError):
+        return frozenset()
+    keys = {
+        key
+        for key, record in _common._valid_name_ownership(
+            document.get("name_ownership")
+        ).items()
+        if record["owner"] == "human"
+    }
+    # Documents written before the ownership record still hold the evidence.
+    keys.update(
+        key
+        for key in _names._valid_aliases(document.get("aliases"))
+        if _names._name_owner(document, key) == "human"
+    )
+    return frozenset(keys)
+
+
+def claim_automatic_name(
+    provider: str, uuid: str, *, environ: Mapping[str, str] | None = None
+) -> str:
+    """Take the one-shot automatic claim on a session's name.
+
+    Returns "" when the claim landed, or the reason it did not. Naming is
+    advisory work that must never break a session, so every failure is
+    reported rather than raised.
+    """
+    exact = _common.valid_uuid(uuid)
+    if provider not in PROVIDERS or not exact:
+        return "invalid automatic name claim request"
+    path = _scoped_config_path(environ)
+    config = _scoped_state_config(environ)
+    if path is None or config is None:
+        return "caller environment has no home; automatic name not claimed"
+    try:
+        return _names.claim_automatic_name(
+            config,
+            provider,
+            exact,
+            atomic_write_json=atomic_write_json,
+            config_path=lambda: path,
+            private_alias_document=_private_alias_document,
+            private_alias_parent=_private_alias_parent,
+        )
+    except (CollectionError, OSError) as exc:
+        return f"automatic name not claimed: {exc}"
+
+
 def default_journal_dir() -> Path:
     return _common.default_journal_dir(
         environ=os.environ,
@@ -260,6 +441,14 @@ def load_config() -> dict[str, Any]:
             raw = {}
     config["colors"] = _valid_colors(
         raw.get("colors") if isinstance(raw, Mapping) else None
+    )
+    # So does the record of what the kit last pushed into each provider's own
+    # store — the collector needs it to tell a native /rename from its own echo.
+    config["pushed_titles"] = _common._valid_pushed_titles(
+        raw.get("pushed_titles") if isinstance(raw, Mapping) else None
+    )
+    config["name_ownership"] = _common._valid_name_ownership(
+        raw.get("name_ownership") if isinstance(raw, Mapping) else None
     )
     return config
 
@@ -327,12 +516,38 @@ def _enrich_claude_payload(payload: Any) -> Any:
 
 def scan_process_table(proc_root: Path, max_nodes: int) -> dict[int, dict[str, Any]]:
     """Read one bounded process-table view from proc_root."""
-    return _processes.scan_process_table(
+    def inventory_environ(path: Path) -> dict[str, str]:
+        values = _proc_environ(path)
+        return {
+            key: values[key]
+            for key in (
+                "SHPOOL_SESSION_NAME",
+                "SESSION_KIT_REQUESTED_MODEL",
+                "SESSION_KIT_LAUNCH_IDEMPOTENCY_KEY",
+                "CLAUDE_CONFIG_DIR",
+                "CODEX_HOME",
+                "SESSION_KIT_ACCOUNT_ALIAS",
+                "SESSION_KIT_ACCOUNT_CAPABLE",
+            )
+            if key in values
+        }
+
+    table = _processes.scan_process_table(
         proc_root,
         max_nodes,
         proc_stat=_proc_stat,
-        proc_environ=_proc_environ,
+        proc_environ=inventory_environ,
     )
+    for pid, row in table.items():
+        try:
+            values = inventory_environ(proc_root / str(pid) / "environ")
+        except OSError:
+            continue
+        row["requested_model"] = values.get("SESSION_KIT_REQUESTED_MODEL", "")
+        row["launch_idempotency_key"] = values.get(
+            "SESSION_KIT_LAUNCH_IDEMPOTENCY_KEY", ""
+        )
+    return table
 
 
 def scan_darwin_process_table(
@@ -588,6 +803,8 @@ def _provider_title(
     automatic_titles: Mapping[str, str] | None = None,
     *,
     provider_title_is_explicit: bool = True,
+    pushed_titles: Mapping[str, str] | None = None,
+    name_ownership: Mapping[str, Mapping[str, str]] | None = None,
 ) -> str:
     return _model._provider_title(
         provider,
@@ -599,6 +816,8 @@ def _provider_title(
         automatic_titles,
         provider_title_is_explicit=provider_title_is_explicit,
         provider_title_info=_provider_title_info,
+        pushed_titles=pushed_titles,
+        name_ownership=name_ownership,
     )
 
 
@@ -612,6 +831,8 @@ def _provider_title_info(
     automatic_titles: Mapping[str, str] | None = None,
     *,
     provider_title_is_explicit: bool = True,
+    pushed_titles: Mapping[str, str] | None = None,
+    name_ownership: Mapping[str, Mapping[str, str]] | None = None,
 ) -> tuple[str, str]:
     return _model._provider_title_info(
         provider,
@@ -623,6 +844,8 @@ def _provider_title_info(
         automatic_titles,
         provider_title_is_explicit=provider_title_is_explicit,
         context_title=_context_title,
+        pushed_titles=pushed_titles,
+        name_ownership=name_ownership,
     )
 
 
@@ -691,7 +914,7 @@ def build_inventory(
     recent_output_by_shpool_id: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
     """Pure inventory composition for fixture tests and the live collector."""
-    return _collector.build_inventory(
+    inventory = _collector.build_inventory(
         shpool_payload,
         claude_payload,
         process_table,
@@ -716,6 +939,52 @@ def build_inventory(
         claude_palette=CLAUDE_SESSION_COLORS,
         default_max_proc_nodes=DEFAULT_MAX_PROC_NODES,
     )
+    from sessionkit_messages.envelope import valid_idempotency_key
+
+    children = _children_index(process_table)
+    for item in inventory.get("sessions", ()):
+        if not isinstance(item, dict):
+            continue
+        shell = item.get("shpool_shell")
+        shell_pid = shell.get("pid") if isinstance(shell, Mapping) else None
+        candidate_pids = (
+            descendants(
+                shell_pid,
+                children,
+                max_nodes=DEFAULT_MAX_PROC_NODES,
+                max_depth=8,
+            )
+            if isinstance(shell_pid, int)
+            else ()
+        )
+        evidence: set[tuple[str, str]] = set()
+        for candidate_pid in candidate_pids:
+            candidate = process_table.get(candidate_pid, {})
+            model = candidate.get("requested_model")
+            launch_key = valid_idempotency_key(
+                candidate.get("launch_idempotency_key")
+            )
+            argv = candidate.get("cmdline")
+            command_model = (
+                _arg_value(argv, "--model") if isinstance(argv, list) else ""
+            )
+            command_names = {
+                Path(str(value)).name
+                for value in (argv[:2] if isinstance(argv, list) else ())
+            }
+            if (
+                item.get("provider") in command_names
+                and isinstance(model, str)
+                and model
+                and command_model == model
+                and launch_key
+            ):
+                evidence.add((model, launch_key))
+        if len(evidence) == 1:
+            model, launch_key = next(iter(evidence))
+            item["actual_model"] = model
+            item["launch_idempotency_key"] = launch_key
+    return inventory
 
 
 def apply_provider_title_states(
@@ -831,7 +1100,7 @@ def collect_live(
     proc_root: Path | None = None,
 ) -> dict[str, Any]:
     """Collect a live inventory using one call per external list command."""
-    return _collector.collect_live(
+    inventory = _collector.collect_live(
         config,
         runner=runner,
         proc_root=proc_root,
@@ -852,6 +1121,7 @@ def collect_live(
         apply_provider_title_states=apply_provider_title_states,
         apply_retained_setup_attributions=apply_retained_setup_attributions,
     )
+    return _apply_account_bindings(inventory, config)
 
 
 def _read_state_json(path: Path) -> Any:
@@ -910,6 +1180,17 @@ def mutate_canonical_alias(
 
 def canonical_automatic_titles(config: Mapping[str, Any]) -> dict[str, str]:
     return _names.canonical_automatic_titles(
+        config,
+        config_path=config_path,
+        private_alias_document=_private_alias_document,
+    )
+
+
+def canonical_name_ownership(
+    config: Mapping[str, Any],
+) -> dict[str, dict[str, str]]:
+    """Read who owns every named session, human renames included."""
+    return _names.canonical_name_ownership(
         config,
         config_path=config_path,
         private_alias_document=_private_alias_document,
@@ -1068,6 +1349,7 @@ def propagate_provider_title(
         push_claude_title=_push_claude_title,
         push_codex_title=_push_codex_title,
         session_kit_state_dir=_session_kit_state_dir,
+        record_pushed=record_pushed_title,
     )
 
 
@@ -1116,6 +1398,7 @@ def _reconcile_pending_provider_titles(
         atomic_write_json=atomic_write_json,
         retry_disposition=_provider_title_retry_disposition,
         propagate_title=propagate_provider_title,
+        human_named=human_named_keys,
     )
 
 
@@ -1136,6 +1419,8 @@ def claude_pending_native_hydrations(
         propagate_color=propagate_provider_color,
         propagate_title=propagate_provider_title,
         reconcile_pending_titles=_reconcile_pending_provider_titles,
+        human_named=human_named_keys,
+        adopt_native=adopt_native_rename,
     )
 
 
@@ -1193,6 +1478,9 @@ def codex_pending_auto_titles(
         load_config=load_config,
         max_session_index_bytes=MAX_CODEX_SESSION_INDEX_BYTES,
         push_live_rename=_push_codex_live_rename,
+        name_owner=name_owner,
+        claim_name=claim_automatic_name,
+        adopt_native=adopt_native_rename,
     )
 
 
@@ -1498,6 +1786,8 @@ def auto_title_from_hook(
         propagate_title=propagate_provider_title,
         max_transcript_bytes=MAX_AUTO_TITLE_TRANSCRIPT_BYTES,
         resume_continuation_text=RESUME_CONTINUATION_TEXT,
+        name_owner=name_owner,
+        claim_name=claim_automatic_name,
     )
 
 
@@ -1853,15 +2143,18 @@ def _validate_terminal_registry(raw: Any, boot_id: str) -> dict[str, Any]:
 def _read_terminal_registry(
     path: Path, boot_id: str, epoch_path: Path | None = None
 ) -> dict[str, Any]:
-    return _state_io._read_terminal_registry(
-        path,
-        boot_id,
-        epoch_path,
-        schema_version=SCHEMA_VERSION,
-        max_bytes=MAX_PRIVATE_JSON_BYTES,
-        read_bounded_owner_file=_read_bounded_owner_file,
-        empty_registry=_empty_terminal_registry,
-        validate_registry=_validate_terminal_registry,
+    return _terminal._with_supervisor_identities(
+        _state_io._read_terminal_registry(
+            path,
+            boot_id,
+            epoch_path,
+            schema_version=SCHEMA_VERSION,
+            max_bytes=MAX_PRIVATE_JSON_BYTES,
+            read_bounded_owner_file=_read_bounded_owner_file,
+            empty_registry=_empty_terminal_registry,
+            validate_registry=_validate_terminal_registry,
+        ),
+        path.parent / "supervisor",
     )
 
 
@@ -1896,6 +2189,8 @@ def apply_terminal_numbers(
     allocate: bool,
     retired: dict[int, float] | None = None,
     current_time: float | None = None,
+    supervisor_key: str | None = None,
+    previous_supervisor_key: str | None = None,
 ) -> dict[str, Any]:
     """Apply boot-stable selectors without changing contiguous internal rows."""
     return _terminal.apply_terminal_numbers(
@@ -1905,6 +2200,16 @@ def apply_terminal_numbers(
         allocate=allocate,
         retired=retired,
         current_time=current_time,
+        supervisor_key=(
+            supervisor_key
+            if supervisor_key is not None
+            else getattr(registry, "supervisor_key", None)
+        ),
+        previous_supervisor_key=(
+            previous_supervisor_key
+            if previous_supervisor_key is not None
+            else getattr(registry, "previous_supervisor_key", None)
+        ),
         validate_registry=_validate_terminal_registry,
         schema_version=SCHEMA_VERSION,
         quarantine_seconds=TERMINAL_NUMBER_QUARANTINE_SECONDS,
@@ -2151,10 +2456,55 @@ def _cold_inventory(error: str) -> dict[str, Any]:
     )
 
 
+def _apply_account_bindings(
+    inventory: dict[str, Any], config: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Project verified profile bindings onto exact rows without guessing."""
+    if "state_dir" not in config:
+        return inventory
+    try:
+        registry = _accounts.load_registry(config)
+    except (CollectionError, OSError, ValueError):
+        registry = _accounts._empty_registry()
+    profiles = registry.get("profiles", {})
+    bindings = registry.get("bindings", {})
+    for item in inventory.get("sessions", ()):
+        if not isinstance(item, dict):
+            continue
+        provider = item.get("provider")
+        identity = item.get("identity")
+        exact = (
+            valid_uuid(identity.get("uuid"))
+            if provider in PROVIDERS and isinstance(identity, Mapping)
+            else None
+        )
+        live_alias = clean_text(item.get("account_alias"), 12)
+        if live_alias and f"{provider}:{live_alias}" not in profiles:
+            item.pop("account_alias", None)
+            live_alias = ""
+        live_profile = profiles.get(f"{provider}:{live_alias}") if live_alias else None
+        if live_alias and not isinstance(live_profile, Mapping):
+            item["account_binding_mismatch"] = True
+            item.pop("account_alias", None)
+            live_alias = ""
+        if isinstance(live_profile, Mapping):
+            item["account_email"] = clean_text(live_profile.get("email"), 254)
+            item["account_plan"] = clean_text(live_profile.get("plan"), 80)
+        binding = bindings.get(f"{provider}:{exact}") if exact else None
+        if live_alias and isinstance(binding, Mapping):
+            bound_profile = profiles.get(binding.get("profile"))
+            if isinstance(bound_profile, Mapping):
+                bound_alias = clean_text(bound_profile.get("alias"), 12)
+                if bound_alias != live_alias:
+                    item["account_binding_mismatch"] = True
+    return inventory
+
+
 def snapshot(*, write_state: bool = True, config: dict[str, Any] | None = None) -> dict[str, Any]:
-    return _snapshot.snapshot(
+    settings = config if config is not None else load_config()
+    inventory = _snapshot.snapshot(
         write_state=write_state,
-        config=config,
+        config=settings,
         schema_version=SCHEMA_VERSION,
         load_config=load_config,
         state_paths=_state_paths,
@@ -2176,6 +2526,7 @@ def snapshot(*, write_state: bool = True, config: dict[str, Any] | None = None) 
         update_recovery_state=update_recovery_state,
         cold_inventory=_cold_inventory,
     )
+    return inventory
 
 
 
@@ -2199,6 +2550,49 @@ def render_inventory(inventory: Mapping[str, Any], rows_only: bool = False) -> s
         inventory,
         rows_only,
         color_enabled=_color_enabled,
+    )
+
+
+def render_detail(
+    inventory: Mapping[str, Any],
+    selector: str,
+    *,
+    state_dir: Path | str | None = None,
+) -> str:
+    """One session in full, for a person to read."""
+    activity: Mapping[str, Any] | None = None
+    now_ms = int(time.time() * 1000)
+    row = lookup(inventory, selector)
+    if row is not None and state_dir is not None:
+        try:
+            queue = _events.build_attention_queue(
+                inventory,
+                Path(state_dir),
+                now_ms=now_ms,
+                mutate=False,
+            )
+            identity = row.get("identity")
+            uuid = identity.get("uuid") if isinstance(identity, Mapping) else None
+            key = f"{row.get('provider')}:{uuid}"
+            activity = next(
+                (
+                    item
+                    for item in queue.get("items", [])
+                    if isinstance(item, Mapping) and item.get("thread_key") == key
+                ),
+                None,
+            )
+            projected = queue.get("as_of_unix_ms")
+            if isinstance(projected, int) and not isinstance(projected, bool):
+                now_ms = projected
+        except (OSError, ValueError):
+            activity = None
+    return _render.render_detail(
+        inventory,
+        selector,
+        home_factory=_home,
+        activity=activity,
+        now_ms=now_ms,
     )
 
 
@@ -2266,12 +2660,12 @@ def _platform_command(args: argparse.Namespace) -> int:
         return 0
     if args.platform_action == "process-table":
         table = platform_process_table(
-            Path(os.environ.get("SESSION_KIT_PROC_ROOT", "/proc")),
+            _common.proc_root(),
             DEFAULT_MAX_PROC_NODES,
         )
         _json_print({"processes": [table[pid] for pid in sorted(table)]})
         return 0
-    root = Path(os.environ.get("SESSION_KIT_PROC_ROOT", "/proc"))
+    root = _common.proc_root()
     if platform == DARWIN_PLATFORM and args.platform_action == "process-info":
         table = scan_darwin_process_table(1, pids=[args.pid])
     else:
@@ -2525,6 +2919,7 @@ def _automatic_title_command(
                 "automatic_title_failures": _valid_automatic_title_failures(
                     document.get("automatic_title_failures")
                 ),
+                "name_ownership": canonical_name_ownership(config),
             }
         )
         return 0
@@ -2559,6 +2954,99 @@ def _automatic_title_command(
     return 0
 
 
+def _account_command(args: argparse.Namespace, config: dict[str, Any]) -> int:
+    """Run one owner-only account profile or switch-transaction verb."""
+    action = args.account_action
+    if action == "list":
+        _json_print(
+            {
+                "schema_version": _accounts.ACCOUNT_SCHEMA_VERSION,
+                "profiles": _accounts.list_profiles(config, args.provider),
+            }
+        )
+    elif action == "choices":
+        _json_print(_accounts.account_choices(config, args.provider))
+    elif action == "configure-feeds":
+        _json_print(
+            _accounts.configure_feeds(config, args.roster_path, args.advice_path)
+        )
+    elif action == "adopt-default":
+        _json_print(
+            _accounts.adopt_default(
+                config, args.provider, args.alias, args.email
+            )
+        )
+    elif action == "enroll":
+        _json_print(
+            _accounts.enroll(config, args.provider, args.alias, args.email)
+        )
+    elif action == "verify":
+        _json_print(_accounts.verify_profile(config, args.provider, args.alias))
+    elif action == "binding":
+        value = _accounts.binding_for(config, args.provider, args.uuid)
+        if value is None:
+            return 1
+        _json_print(value)
+    elif action == "source":
+        _json_print(
+            _accounts.source_profile_for_thread(config, args.provider, args.uuid)
+        )
+    elif action == "bind":
+        _json_print(
+            _accounts.bind(
+                config,
+                args.provider,
+                args.uuid,
+                args.alias,
+                source=args.source,
+            )
+        )
+    elif action == "launch-profile":
+        _json_print(_accounts.launch_profile(config, args.provider, args.alias))
+    elif action == "resume-profile":
+        _json_print(_accounts.resume_profile(config, args.provider, args.alias))
+    elif action == "sync-ui":
+        item = _accounts.resume_profile(config, args.provider, args.alias)
+        profile_dir = item["profile_dir"]
+        if args.provider == "claude":
+            os.environ["CLAUDE_CONFIG_DIR"] = profile_dir
+        else:
+            os.environ["CODEX_HOME"] = profile_dir
+            os.environ["SESSION_KIT_CODEX_HOME"] = profile_dir
+        key = f"{args.provider}:{valid_uuid(args.uuid) or ''}"
+        payload: dict[str, Any] = {"provider": args.provider, "uuid": args.uuid}
+        title = canonical_aliases(config).get(key)
+        if title:
+            payload.update(propagate_provider_title(args.provider, args.uuid, title))
+        color = canonical_colors(config).get(key)
+        if color:
+            payload.update(propagate_provider_color(args.provider, args.uuid, color))
+        _json_print(payload)
+    elif action == "switch-prepare":
+        _json_print(
+            _accounts.prepare_switch(
+                config,
+                args.provider,
+                args.uuid,
+                args.source_alias,
+                args.target_alias,
+                args.cwd,
+                args.shpool_id,
+            )
+        )
+    elif action == "switch-apply":
+        _json_print(_accounts.apply_switch(config, args.txid))
+    elif action == "switch-commit":
+        _json_print(_accounts.commit_switch(config, args.txid))
+    elif action == "switch-rollback":
+        _json_print(_accounts.rollback_switch(config, args.txid))
+    elif action == "switch-status":
+        _json_print(_accounts.transaction(config, args.txid))
+    else:  # pragma: no cover - argparse owns this boundary
+        raise CollectionError("unknown account action")
+    return 0
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -2573,10 +3061,16 @@ def _parser() -> argparse.ArgumentParser:
     lookup_parser = subparsers.add_parser("lookup")
     lookup_parser.add_argument("selector")
     lookup_parser.add_argument("--input")
+    detail_parser = subparsers.add_parser("detail")
+    detail_parser.add_argument("selector")
+    detail_parser.add_argument("--input")
     recovery_parser = subparsers.add_parser("recovery-command")
     recovery_parser.add_argument("provider", choices=PROVIDERS)
     recovery_parser.add_argument("uuid")
     recovery_parser.add_argument("--cwd")
+    worker_model_parser = subparsers.add_parser("validate-worker-model")
+    worker_model_parser.add_argument("provider", choices=PROVIDERS)
+    worker_model_parser.add_argument("model")
     bounce_parser = subparsers.add_parser("codex-bounce-title")
     bounce_parser.add_argument("uuid")
     claude_bounce_parser = subparsers.add_parser("claude-bounce-title")
@@ -2666,6 +3160,59 @@ def _parser() -> argparse.ArgumentParser:
     automatic_subparsers.add_parser("audit")
     automatic_prune = automatic_subparsers.add_parser("prune")
     automatic_prune.add_argument("--apply", dest="prune_token", required=True)
+    account_parser = subparsers.add_parser("account")
+    account_subparsers = account_parser.add_subparsers(
+        dest="account_action", required=True
+    )
+    account_list = account_subparsers.add_parser("list")
+    account_list.add_argument("provider", nargs="?", choices=sorted(_accounts.PROVIDERS))
+    account_choices = account_subparsers.add_parser("choices")
+    account_choices.add_argument("provider", choices=sorted(_accounts.PROVIDERS))
+    account_feeds = account_subparsers.add_parser("configure-feeds")
+    account_feeds.add_argument("roster_path")
+    account_feeds.add_argument("advice_path")
+    for account_action in ("adopt-default", "enroll"):
+        account_mutation = account_subparsers.add_parser(account_action)
+        account_mutation.add_argument("provider", choices=sorted(_accounts.PROVIDERS))
+        account_mutation.add_argument("alias")
+        account_mutation.add_argument("email")
+    account_verify = account_subparsers.add_parser("verify")
+    account_verify.add_argument("provider", choices=sorted(_accounts.PROVIDERS))
+    account_verify.add_argument("alias")
+    account_binding = account_subparsers.add_parser("binding")
+    account_binding.add_argument("provider", choices=sorted(_accounts.PROVIDERS))
+    account_binding.add_argument("uuid")
+    account_source = account_subparsers.add_parser("source")
+    account_source.add_argument("provider", choices=sorted(_accounts.PROVIDERS))
+    account_source.add_argument("uuid")
+    account_bind = account_subparsers.add_parser("bind")
+    account_bind.add_argument("provider", choices=sorted(_accounts.PROVIDERS))
+    account_bind.add_argument("uuid")
+    account_bind.add_argument("alias")
+    account_bind.add_argument("--source", default="verified")
+    for account_action in ("launch-profile", "resume-profile"):
+        account_launch = account_subparsers.add_parser(account_action)
+        account_launch.add_argument("provider", choices=sorted(_accounts.PROVIDERS))
+        account_launch.add_argument("alias")
+    account_sync = account_subparsers.add_parser("sync-ui")
+    account_sync.add_argument("provider", choices=sorted(_accounts.PROVIDERS))
+    account_sync.add_argument("uuid")
+    account_sync.add_argument("alias")
+    account_prepare = account_subparsers.add_parser("switch-prepare")
+    account_prepare.add_argument("provider", choices=sorted(_accounts.PROVIDERS))
+    account_prepare.add_argument("uuid")
+    account_prepare.add_argument("source_alias")
+    account_prepare.add_argument("target_alias")
+    account_prepare.add_argument("cwd")
+    account_prepare.add_argument("shpool_id")
+    for account_action in (
+        "switch-apply",
+        "switch-commit",
+        "switch-rollback",
+        "switch-status",
+    ):
+        account_transaction = account_subparsers.add_parser(account_action)
+        account_transaction.add_argument("txid")
     pending_parser = subparsers.add_parser("recovery-pending")
     pending_subparsers = pending_parser.add_subparsers(
         dest="pending_action", required=True
@@ -2698,7 +3245,410 @@ def _parser() -> argparse.ArgumentParser:
     lifecycle_subparsers.add_parser("reopen")
     lifecycle_keep = lifecycle_subparsers.add_parser("keep")
     lifecycle_keep.add_argument("choice", choices=("on", "off"))
+    message_parser = subparsers.add_parser("msg")
+    message_subparsers = message_parser.add_subparsers(
+        dest="msg_action", required=True
+    )
+    message_resolve = message_subparsers.add_parser("resolve")
+    message_resolve.add_argument("--target", required=True)
+    message_send = message_subparsers.add_parser("send")
+    message_send.add_argument("--target", required=True)
+    message_send.add_argument("--text", required=True)
+    message_send.add_argument("--fyi", action="store_true")
+    # One repeatable purpose, one message. A caller that cannot prove delivery
+    # repeats the send under the same key rather than minting a second copy.
+    message_send.add_argument("--key", dest="idempotency_key")
+    message_report = message_subparsers.add_parser("report")
+    message_report.add_argument("--id", dest="msg_id")
+    message_report.add_argument("--key", dest="idempotency_key")
+    message_mark_read = message_subparsers.add_parser("mark-read")
+    message_mark_read.add_argument("--thread", required=True)
+    message_reply = message_subparsers.add_parser("reply")
+    message_reply.add_argument("msg_id")
+    message_reply.add_argument("--text", required=True)
+    message_subparsers.add_parser("list")
+    message_subparsers.add_parser("unread-count")
+    message_queue = message_subparsers.add_parser("queue")
+    message_queue.add_argument("--mark-seen", dest="queue_mark_seen")
+    # The intake spool: the durable side of a project that arrived as a
+    # message. Every verb is machine JSON — the entries carry thread keys and
+    # message ids, which belong in a record and never in an operator's view.
+    message_intake = message_subparsers.add_parser("intake")
+    intake_subparsers = message_intake.add_subparsers(
+        dest="intake_action", required=True
+    )
+    intake_record = intake_subparsers.add_parser("record")
+    intake_record.add_argument("--msg-id", dest="msg_id", required=True)
+    intake_record.add_argument("--source", required=True)
+    intake_record.add_argument("--key", dest="intake_key")
+    intake_record.add_argument("--summary")
+    intake_record.add_argument("--terminal", type=int)
+    intake_record.add_argument("--title")
+    intake_record.add_argument("--cwd")
+    # The automatic producer's entry point: one provider hook payload on
+    # stdin, at most one intake out. The hooks call the library directly; this
+    # is the same door for anything that cannot.
+    intake_subparsers.add_parser("from-hook")
+    # Detached provider hooks use this exact real facade verb to wake an
+    # already-running supervisor after the durable intake write.
+    intake_subparsers.add_parser("flush")
+    intake_subparsers.add_parser("dismiss-machine")
+    intake_ack = intake_subparsers.add_parser("ack")
+    intake_ack.add_argument("--msg-id", dest="msg_id", required=True)
+    intake_ack.add_argument("--text", required=True)
+    intake_preflight = intake_subparsers.add_parser("preflight")
+    intake_preflight.add_argument("--msg-id", dest="msg_id", required=True)
+    intake_preflight.add_argument("--source-event-id", dest="source_event_id")
+    intake_preflight.add_argument("--analysis", required=True)
+    intake_preflight.add_argument("--scope", required=True)
+    intake_preflight.add_argument("--required-expertise", dest="required_expertise", required=True)
+    intake_preflight.add_argument("--worker-plan-json", dest="worker_plan_json", required=True)
+    intake_preflight.add_argument("--risks", required=True)
+    intake_preflight.add_argument("--tests", required=True)
+    intake_preflight.add_argument("--manual-policy-exception", dest="manual_policy_exception")
+    intake_delegate = intake_subparsers.add_parser("delegate")
+    intake_delegate.add_argument("--msg-id", dest="msg_id", required=True)
+    intake_delegate.add_argument(
+        "--branch", dest="branches", action="append", required=True
+    )
+    for intake_relay in ("progress", "complete"):
+        intake_note = intake_subparsers.add_parser(intake_relay)
+        intake_note.add_argument("--msg-id", dest="msg_id", required=True)
+        intake_note.add_argument("--text", required=True)
+    intake_subparsers.add_parser("open")
     return parser
+
+
+def _messages_run(action: str, config: dict[str, Any], **fields: Any) -> tuple[int, Any]:
+    """One messaging verb, with the process evidence only the facade owns."""
+    return _messages.run(
+        action,
+        config=config,
+        environ=os.environ,
+        home=_home(),
+        snapshot_inventory=snapshot,
+        process_table_reader=platform_process_table,
+        prove_caller=prove_self_name_caller,
+        max_proc_nodes=int(config.get("max_proc_nodes", DEFAULT_MAX_PROC_NODES)),
+        **fields,
+    )
+
+
+def _launch_intake_worker(
+    assignment: Mapping[str, Any],
+    *,
+    cwd: Path,
+    environ: Mapping[str, str],
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> Mapping[str, Any]:
+    """Run the installed exact-model worker launcher; its stdout proves nothing."""
+    from sessionkit_messages.envelope import valid_idempotency_key
+    from sessionkit_supervisor.intake import validate_requested_model
+
+    provider = str(assignment.get("provider") or "")
+    model = validate_requested_model(provider, assignment.get("requested_model"))
+    launch_key = valid_idempotency_key(assignment.get("idempotency_key"))
+    if not launch_key:
+        raise CollectionError("worker launch has no exact idempotency key")
+    if not cwd.is_absolute() or not cwd.is_dir():
+        raise CollectionError("worker launch directory is unavailable")
+    sp_raw = environ.get("SESSION_KIT_SP_CMD") or os.fspath(
+        Path(__file__).resolve().parents[1] / "bin" / "sp"
+    )
+    sp_path = Path(sp_raw)
+    try:
+        sp_info = sp_path.lstat()
+    except OSError as exc:
+        raise CollectionError("installed Session Kit launcher is unavailable") from exc
+    if (
+        not sp_path.is_absolute()
+        or statmod.S_ISLNK(sp_info.st_mode)
+        or not statmod.S_ISREG(sp_info.st_mode)
+        or not os.access(sp_path, os.X_OK)
+    ):
+        raise CollectionError("installed Session Kit launcher is unavailable")
+    launch_env = dict(environ)
+    launch_env["SESSION_KIT_BACKGROUND"] = "1"
+    prompt_path: Path | None = None
+    argv = [
+        os.fspath(sp_path), "new", provider,
+        "--model", model, "--launch-key", launch_key,
+    ]
+    if provider == "codex":
+        # A new Codex process has no conversation identity until its first
+        # submitted prompt creates a rollout.  Reconciliation deliberately
+        # refuses an identity-free process, so bootstrap the managed worker
+        # with a private no-work prompt and let the supervisor send the actual
+        # scoped assignment only after exact model/identity proof succeeds.
+        descriptor, raw_prompt_path = tempfile.mkstemp(
+            prefix="session-kit-worker-", suffix=".prompt"
+        )
+        prompt_path = Path(raw_prompt_path)
+        try:
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(
+                    "Session Kit initialized this managed worker. Do not inspect, "
+                    "change, or execute anything yet. Wait for the Fleet Supervisor "
+                    "to send the scoped assignment.\n"
+                )
+                handle.flush()
+                os.fsync(handle.fileno())
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+            with contextlib.suppress(OSError):
+                prompt_path.unlink()
+            raise
+        argv.extend(("--prompt-file", os.fspath(prompt_path)))
+    try:
+        completed = runner(
+            argv,
+            cwd=os.fspath(cwd),
+            env=launch_env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=180,
+            check=False,
+        )
+    finally:
+        if prompt_path is not None:
+            with contextlib.suppress(OSError):
+                prompt_path.unlink()
+    if completed.returncode != 0:
+        detail = clean_text(completed.stderr or completed.stdout, 300)
+        raise CollectionError(
+            f"installed worker launcher exited {completed.returncode}: {detail}"
+        )
+    return {"dispatched": True, "launch_idempotency_key": launch_key}
+
+
+def _reconcile_intake_worker(
+    assignment: Mapping[str, Any],
+    inventory: Mapping[str, Any],
+    *,
+    config: Mapping[str, Any] | None = None,
+) -> Mapping[str, Any]:
+    """Independently bind one dispatch to one exact fresh inventory row."""
+    from sessionkit_messages.envelope import valid_idempotency_key
+    from sessionkit_supervisor.intake import validate_requested_model
+
+    if inventory.get("source") != "live" or inventory.get("stale") is not False:
+        raise CollectionError("worker reconciliation requires fresh live inventory")
+    launch_key = valid_idempotency_key(assignment.get("idempotency_key"))
+    provider = str(assignment.get("provider") or "")
+    model = validate_requested_model(provider, assignment.get("requested_model"))
+    matches = [
+        row for row in inventory.get("sessions", ())
+        if isinstance(row, Mapping)
+        and row.get("launch_idempotency_key") == launch_key
+    ]
+    if not launch_key or len(matches) != 1:
+        raise CollectionError("inventory has no unique exact worker launch key")
+    row = matches[0]
+    identity = row.get("identity")
+    uuid = valid_uuid(identity.get("uuid")) if isinstance(identity, Mapping) else ""
+    if (
+        row.get("provider") != provider
+        or row.get("actual_model") != model
+        or not isinstance(identity, Mapping)
+        or identity.get("confidence") != "exact"
+        or not uuid
+        or row.get("setup_incomplete") is True
+    ):
+        raise CollectionError("inventory worker provider, model, or identity is unproven")
+    worker_title = ""
+    if config is not None:
+        tokens = [
+            token
+            for token in re.split(
+                r"[^A-Za-z0-9]+", str(assignment.get("branch") or "")
+            )
+            if token
+        ][:5]
+        if len(tokens) == 1:
+            tokens.append("Worker")
+        if tokens:
+            worker_title = " ".join(
+                token.upper() if any(character.isdigit() for character in token)
+                else token.capitalize()
+                for token in tokens
+            )
+            try:
+                mutate_canonical_self_name(config, provider, uuid, worker_title)
+                propagate_provider_title(provider, uuid, worker_title)
+            except CollectionError as exc:
+                if "a human name owns this session" in str(exc):
+                    worker_title = ""
+                else:
+                    raise
+    return {
+        "inventory_verified": True,
+        "provider": provider,
+        "actual_model": model,
+        "worker_identity": f"{provider}:{uuid}",
+        "worker_title": worker_title,
+        "launch_idempotency_key": launch_key,
+    }
+
+
+def _intake_command(args: argparse.Namespace, config: dict[str, Any]) -> int:
+    """Run one intake-spool verb and print its JSON result.
+
+    Both relay paths are the messaging core's own verbs: a note to the source
+    thread is a `send` under the note's idempotency key, an acknowledgement is
+    a `reply` to the intake itself. The spool records what they did and never
+    reaches a session on its own.
+    """
+    # The supervisor package pulls its MCP surface in at import time; one
+    # intake verb must not put that cost on every snapshot.
+    from sessionkit_supervisor import intake as _intake
+
+    def deliver(*, thread_key: str, text: str, key: str) -> Mapping[str, Any]:
+        try:
+            _code, payload = _messages_run(
+                "send",
+                config,
+                target=f"key:{thread_key}",
+                text=text,
+                fyi=True,
+                idempotency_key=key,
+            )
+        except MessageError as exc:
+            # A send the core refused — an exited source session, a kill
+            # switch — is a note still owed, recorded with the reason. Losing
+            # it to an exception would leave the spool claiming nothing was
+            # ever written.
+            return {
+                "msg_id": None,
+                "targets": [
+                    {
+                        "thread_key": thread_key,
+                        "status": "unreachable",
+                        "detail": str(exc),
+                    }
+                ],
+            }
+        return payload if isinstance(payload, Mapping) else {}
+
+    def reply(*, msg_id: str, text: str) -> Mapping[str, Any]:
+        _code, payload = _messages_run("reply", config, msg_id=msg_id, text=text)
+        return payload if isinstance(payload, Mapping) else {}
+
+    hook_payload = None
+    if args.intake_action == "from-hook":
+        hook_payload = json.loads(sys.stdin.read() or "{}")
+        if not isinstance(hook_payload, Mapping):
+            raise MessageError("a hook payload must be a JSON object")
+    worker_plan = ()
+    if args.intake_action == "preflight":
+        worker_plan = json.loads(args.worker_plan_json)
+        if not isinstance(worker_plan, list):
+            raise MessageError("worker plan JSON must be an array")
+    launcher: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None
+    reconciler: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None
+    if args.intake_action == "delegate":
+        spool = _intake.Spool(Path(config["state_dir"]))
+        # Two things the delegate verb itself already knows, and this lookup
+        # has to agree with or the launcher is handed nowhere to run. The
+        # entry stores the project's directory as `source_cwd` — a stored
+        # entry is validated into that fixed key set, so no on-disk entry has
+        # ever carried a plain `cwd`. And `delegate` names its intake through
+        # `resolve`, so any id the project was delivered under has to reach
+        # the same entry here.
+        primary = spool.resolve(getattr(args, "msg_id", ""))
+        entry = spool.read_entry(primary) if primary else None
+        cwd_raw = entry.get("source_cwd") if isinstance(entry, Mapping) else None
+        launch_cwd = Path(cwd_raw) if isinstance(cwd_raw, str) and cwd_raw else Path("")
+
+        def launch(assignment: Mapping[str, Any]) -> Mapping[str, Any]:
+            return _launch_intake_worker(
+                assignment, cwd=launch_cwd, environ=os.environ
+            )
+
+        def reconcile(assignment: Mapping[str, Any]) -> Mapping[str, Any]:
+            return _reconcile_intake_worker(
+                assignment, snapshot(config=config), config=config
+            )
+
+        launcher = launch
+        reconciler = reconcile
+    else:
+        spool = _intake.Spool(Path(config["state_dir"]))
+    code, payload = _intake.run(
+        args.intake_action,
+        spool=spool,
+        deliver=deliver,
+        reply=reply,
+        msg_id=getattr(args, "msg_id", None),
+        source=getattr(args, "source", None),
+        intake_key=getattr(args, "intake_key", None),
+        summary=getattr(args, "summary", None),
+        terminal=getattr(args, "terminal", None),
+        title=getattr(args, "title", None),
+        text=getattr(args, "text", None),
+        cwd=getattr(args, "cwd", None),
+        branches=getattr(args, "branches", None) or (),
+        worker_plan=worker_plan,
+        source_event_id=getattr(args, "source_event_id", None),
+        analysis=getattr(args, "analysis", None),
+        scope=getattr(args, "scope", None),
+        required_expertise=getattr(args, "required_expertise", None),
+        risks=getattr(args, "risks", None),
+        tests=getattr(args, "tests", None),
+        manual_policy_exception=getattr(args, "manual_policy_exception", None),
+        launcher=launcher,
+        reconciler=reconciler,
+        payload=hook_payload,
+        state_dir=Path(config["state_dir"]),
+        environ=os.environ,
+    )
+    _json_print(payload)
+    return code
+
+
+def _msg_command(args: argparse.Namespace, config: dict[str, Any]) -> int:
+    """Run one mass-messaging verb and print its JSON result."""
+    if args.msg_action == "queue":
+        if args.queue_mark_seen:
+            timestamp = _events.mark_seen(
+                Path(config["state_dir"]), args.queue_mark_seen
+            )
+            _json_print(
+                {
+                    "thread_key": _events.valid_thread_key(args.queue_mark_seen),
+                    "seen_unix_ms": timestamp,
+                }
+            )
+            return 0
+        queue_input = os.environ.get("SESSION_KIT_INPUT_SNAPSHOT")
+        queue_inventory = (
+            load_inventory_input(queue_input)
+            if queue_input
+            else snapshot(config=config)
+        )
+        _json_print(
+            _events.build_attention_queue(
+                queue_inventory,
+                Path(config["state_dir"]),
+            )
+        )
+        return 0
+    if args.msg_action == "intake":
+        return _intake_command(args, config)
+    code, payload = _messages_run(
+        args.msg_action,
+        config,
+        target=getattr(args, "target", None),
+        text=getattr(args, "text", None),
+        fyi=getattr(args, "fyi", False),
+        msg_id=getattr(args, "msg_id", None),
+        thread=getattr(args, "thread", None),
+        idempotency_key=getattr(args, "idempotency_key", None),
+    )
+    _json_print(payload)
+    return code
 
 
 def _lifecycle_environment() -> tuple[Path, str, str, int, int]:
@@ -2721,12 +3671,7 @@ def _prove_lifecycle_caller(
     shell_start: int,
 ) -> None:
     platform = _require_supported_platform()
-    proc_root = Path("/proc")
-    if (
-        os.environ.get("SESSION_KIT_TESTING") == "1"
-        and os.environ.get("SESSION_KIT_PROC_ROOT")
-    ):
-        proc_root = Path(os.environ["SESSION_KIT_PROC_ROOT"])
+    proc_root = _common.proc_root()
     process_table = (
         scan_darwin_process_table(DEFAULT_MAX_PROC_NODES)
         if platform == DARWIN_PLATFORM
@@ -2743,6 +3688,87 @@ def _prove_lifecycle_caller(
         raise CollectionError(
             "lifecycle caller is outside the exact managed shell generation"
         )
+
+
+def _lifecycle_committed_conversation(
+    *,
+    provider: str,
+    boot_id: str,
+    shell_pid: int,
+    shell_start: int,
+) -> str | None:
+    conversation = os.environ.get("SESSION_KIT_LIFECYCLE_CONVERSATION_UUID", "")
+    marker_raw = os.environ.get("SESSION_KIT_LIFECYCLE_INTAKE_COMMIT", "")
+    generation = os.environ.get("SESSION_KIT_MANAGED_GENERATION", "")
+    if not conversation and not marker_raw and not generation:
+        return None
+    exact = valid_uuid(conversation)
+    # Resumes and ordinary provider starts bind their exact launch-record UUID
+    # without a first-prompt handoff. A configured handoff path/generation is
+    # stricter: accepted-without-intake must still fail closed.
+    if exact and not marker_raw and not generation:
+        return exact
+    if not exact or not marker_raw or not generation:
+        raise CollectionError("lifecycle intake commit evidence is incomplete")
+    parts = generation.split(":")
+    if (
+        len(parts) != 4
+        or parts[0] != boot_id
+        or parts[1] != str(shell_pid)
+        or parts[2] != str(shell_start)
+        or not parts[3].isdigit()
+        or int(parts[3]) <= 0
+    ):
+        raise CollectionError("lifecycle intake commit generation does not match the shell")
+    marker = Path(marker_raw)
+    if not marker.is_absolute() or not marker.name.endswith(".intake_committed"):
+        raise CollectionError("lifecycle intake commit path is invalid")
+    try:
+        parent_info = marker.parent.lstat()
+        info = marker.lstat()
+        value = _state_io.read_private_json(marker, max_bytes=8192)
+    except (OSError, ValueError) as exc:
+        raise CollectionError("lifecycle intake commit marker is unavailable") from exc
+    if (
+        statmod.S_ISLNK(parent_info.st_mode)
+        or not statmod.S_ISDIR(parent_info.st_mode)
+        or parent_info.st_uid != os.geteuid()
+        or statmod.S_IMODE(parent_info.st_mode) != 0o700
+        or statmod.S_ISLNK(info.st_mode)
+        or not statmod.S_ISREG(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or statmod.S_IMODE(info.st_mode) != 0o600
+        or info.st_size > 8192
+        or not isinstance(value, Mapping)
+    ):
+        raise CollectionError("lifecycle intake commit marker does not match the provider generation")
+    # Read the three numeric fields once. Repeating `value.get(...)` inside the
+    # chain re-reads the mapping after its own type test, which is both slower
+    # and unprovable.
+    marker_bytes = value.get("bytes")
+    revision = value.get("requirements_revision")
+    committed = value.get("committed_unix_ms")
+    if (
+        value.get("schema_version") != 2
+        or value.get("status") != "intake_committed"
+        or value.get("provider") != provider
+        or valid_uuid(value.get("session_id")) != exact
+        or value.get("managed_generation") != generation
+        or not isinstance(value.get("submission_key"), str)
+        or not value.get("submission_key")
+        or not re.fullmatch(r"[0-9a-f]{64}", str(value.get("prompt_sha256") or ""))
+        or not isinstance(marker_bytes, int)
+        or marker_bytes <= 0
+        or not re.fullmatch(r"[0-9a-f]{64}", str(value.get("source_event_id") or ""))
+        or not re.fullmatch(r"[0-9a-f]{8}", str(value.get("intake_msg_id") or ""))
+        or not isinstance(revision, int)
+        or revision < 0
+        or not re.fullmatch(r"[0-9a-f]{64}", str(value.get("requirements_digest") or ""))
+        or not isinstance(committed, int)
+        or committed <= 0
+    ):
+        raise CollectionError("lifecycle intake commit marker does not match the provider generation")
+    return exact
 
 
 def _lifecycle_command(args: argparse.Namespace) -> int:
@@ -2765,6 +3791,12 @@ def _lifecycle_command(args: argparse.Namespace) -> int:
             shell_pid=shell_pid,
             shell_start_ticks=shell_start,
             provider=provider,
+            conversation_uuid=_lifecycle_committed_conversation(
+                provider=provider,
+                boot_id=boot_id,
+                shell_pid=shell_pid,
+                shell_start=shell_start,
+            ),
             exit_code=exit_code,
             input_tracking=True,
         )
@@ -2862,6 +3894,11 @@ def _lifecycle_command(args: argparse.Namespace) -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
+        if args.command == "validate-worker-model":
+            from sessionkit_supervisor.intake import validate_requested_model
+
+            print(validate_requested_model(args.provider, args.model))
+            return 0
         if args.command == "platform":
             return _platform_command(args)
         if args.command == "lifecycle":
@@ -2888,6 +3925,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _color_command(args, config)
         if args.command == "automatic-title":
             return _automatic_title_command(args, config)
+        if args.command == "account":
+            return _account_command(args, config)
+        if args.command == "msg":
+            return _msg_command(args, config)
         if args.command == "recovery-pending":
             if args.pending_action == "list":
                 _json_print(list_pending(config))
@@ -2927,7 +3968,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         input_path = getattr(args, "input", None) or os.environ.get(
             "SESSION_KIT_INPUT_SNAPSHOT"
         )
-        if input_path and args.command in {"render", "lookup"}:
+        if input_path and args.command in {"render", "lookup", "detail"}:
             inventory = load_inventory_input(input_path)
         else:
             inventory = snapshot(
@@ -2961,8 +4002,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"no unique shpool session matches {args.selector!r}", file=sys.stderr)
                 return 2
             _json_print(item)
+        elif args.command == "detail":
+            # `lookup` is the machine mode and carries every identifier.
+            # This is what a person is shown instead.
+            if lookup(inventory, args.selector) is None:
+                print(
+                    "no single session matches that selector", file=sys.stderr
+                )
+                return 2
+            print(
+                render_detail(
+                    inventory,
+                    args.selector,
+                    state_dir=Path(config["state_dir"]),
+                ),
+                end="",
+            )
         return 0
-    except (CollectionError, OSError, ValueError) as exc:
+    except (CollectionError, MessageError, OSError, ValueError) as exc:
         print(f"session inventory: {exc}", file=sys.stderr)
         return 1
 

@@ -43,6 +43,8 @@ jobs:
           bash -n bashrc/shpool.bashrc
           bash -n deploy/session-kit-launcher
           bash -n tests/run
+      - name: Check scripts embedded in heredocs
+        run: tools/check-embedded-scripts
       - name: Check public working tree
         run: tools/public-scan .
       - name: Run tests
@@ -98,6 +100,8 @@ jobs:
           "$SESSION_KIT_TEST_BASH" -n bashrc/shpool.bashrc
           "$SESSION_KIT_TEST_BASH" -n deploy/session-kit-launcher
           "$SESSION_KIT_TEST_BASH" -n tests/run
+      - name: Check scripts embedded in heredocs
+        run: tools/check-embedded-scripts
       - name: Run native and fixture-only macOS tests
         run: |
           python3 -m unittest -v \
@@ -142,7 +146,9 @@ jobs:
           ruff check --output-format github .
           ruff check --output-format github \
             tools/build-public-tree tools/build-release-artifact \
-            tools/check-doc-links tools/public-scan
+            tools/check-doc-links tools/check-embedded-scripts \
+            tools/public-scan tools/render-readme-dashboard \
+            deploy/session-kit-release
           ruff format --check lib/sessionkit_inventory/__init__.py \
             lib/sessionkit_inventory/collector.py \
             lib/sessionkit_inventory/colors.py \
@@ -169,16 +175,28 @@ jobs:
             tests/test_public_export.py tests/test_public_scan.py \
             tests/test_release_artifact.py tests/support.py
           ruff format --check tools/build-public-tree tools/build-release-artifact \
-            tools/check-doc-links tools/public-scan
+            tools/check-doc-links tools/check-embedded-scripts tools/public-scan
           python -m compileall -q lib tests
           python -m py_compile tools/build-public-tree \
-            tools/build-release-artifact tools/check-doc-links tools/public-scan
+            tools/build-release-artifact tools/check-doc-links \
+            tools/check-embedded-scripts tools/public-scan \
+            tools/render-readme-dashboard deploy/session-kit-release
       - name: Check types
         env:
           MYPY_CACHE_DIR: ${{ runner.temp }}/mypy-cache
         run: |
           mypy --ignore-missing-imports \
-            lib/session_inventory.py lib/sessionkit_inventory
+            lib/session_inventory.py lib/sessionkit_inventory \
+            lib/sessionkit_supervisor lib/sessionkit_messages \
+            lib/sessionkit_events extras/hooks
+          # Extensionless scripts have no module name to infer, so they need
+          # --scripts-are-modules. tools/render-readme-dashboard is excluded:
+          # it imports the login test fixture, which pulls the whole test tree
+          # into the type check.
+          mypy --ignore-missing-imports --scripts-are-modules \
+            tools/build-public-tree tools/build-release-artifact \
+            tools/check-doc-links tools/check-embedded-scripts \
+            tools/public-scan deploy/session-kit-release
       - name: Check documentation links
         run: tools/check-doc-links
       - name: Scan working tree and reachable history
@@ -223,12 +241,16 @@ jobs:
           coverage report --skip-empty --fail-under=70
 
   shpool-patch:
-    name: Optional shpool patches apply and build
+    name: Optional shpool patches apply, test, and build
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+      - name: Install shpool test shells
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes zsh
       - name: Check patches against shpool 0.11.0
         run: |
           git clone --branch v0.11.0 --depth 1 \
@@ -239,11 +261,14 @@ jobs:
           for patch in \
             0001-heartbeat-ack-timeout-is-not-fatal.patch \
             0002-restore-input-modes-on-reattach.patch \
-            0003-kill-tolerates-an-already-dead-shell.patch; do
+            0003-kill-tolerates-an-already-dead-shell.patch \
+            0004-detach-must-not-hold-the-shells-lock.patch; do
             git -C "$RUNNER_TEMP/shpool" apply --check \
               "$GITHUB_WORKSPACE/shpool-patch/$patch"
             git -C "$RUNNER_TEMP/shpool" apply \
               "$GITHUB_WORKSPACE/shpool-patch/$patch"
           done
+          cargo test --locked --manifest-path \
+            "$RUNNER_TEMP/shpool/Cargo.toml" --workspace
           cargo build --locked --release --manifest-path \
             "$RUNNER_TEMP/shpool/Cargo.toml" --bin shpool

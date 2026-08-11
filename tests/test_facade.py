@@ -27,8 +27,13 @@ REQUIRED_SYMBOLS = {
     "_empty_terminal_registry",
     "_json_bytes",
     "_lifecycle_command",
+    "_lifecycle_committed_conversation",
+    "_launch_intake_worker",
+    "_reconcile_intake_worker",
     "_parse_darwin_procargs2",
     "_parser",
+    "_private_alias_parent",
+    "_reconcile_pending_provider_titles",
     "_alias_command",
     "auto_title_from_hook",
     "derive_prompt_title",
@@ -55,6 +60,7 @@ REQUIRED_SYMBOLS = {
     "_validate_terminal_registry",
     "TERMINAL_NUMBER_QUARANTINE_SECONDS",
     "acknowledge_pending",
+    "adopt_native_rename",
     "apply_legacy_recovery_manifest",
     "apply_provider_title_states",
     "apply_retained_setup_attributions",
@@ -65,6 +71,8 @@ REQUIRED_SYMBOLS = {
     "build_inventory",
     "canonical_aliases",
     "canonical_automatic_titles",
+    "canonical_name_ownership",
+    "claim_automatic_name",
     "claude_bounce_prepare",
     "codex_bounce_prepare",
     "codex_refresh_target",
@@ -80,9 +88,11 @@ REQUIRED_SYMBOLS = {
     "lookup",
     "main",
     "MAX_CODEX_SESSION_INDEX_BYTES",
+    "human_named_keys",
     "migrate_runtime_aliases",
     "mutate_canonical_alias",
     "mutate_canonical_automatic_title",
+    "name_owner",
     "normalize_automatic_title",
     "os",
     "plan_legacy_recovery_manifest",
@@ -97,6 +107,7 @@ REQUIRED_SYMBOLS = {
     "read_codex_db",
     "read_codex_session_index",
     "recent_output_times",
+    "recovery_manifest",
     "recovery_spec",
     "render_inventory",
     "rollback_legacy_recovery_manifest",
@@ -151,16 +162,20 @@ EXPECTED_TOP_LEVEL_COMMANDS = (
     "render",
     "waiting-count",
     "lookup",
+    "detail",
     "recovery-command",
+    "validate-worker-model",
     "codex-bounce-title",
     "claude-bounce-title",
     "platform",
     "alias",
     "color",
     "automatic-title",
+    "account",
     "recovery-pending",
     "recovery-manifest",
     "lifecycle",
+    "msg",
 )
 
 
@@ -187,9 +202,44 @@ def referenced_facade_symbols() -> set[str]:
     return referenced
 
 
+class TestSuiteReachabilityTests(unittest.TestCase):
+    """A test that cannot run is worse than a test that does not exist.
+
+    It reads as coverage in a review, it passes the file it lives in, and it
+    reports success for a thing nobody checked. One was written in this repo:
+    a method indented at class level but placed after the module's
+    ``__main__`` guard, so discovery never saw it and its author read the
+    surrounding suite's OK as its own.
+    """
+
+    def test_every_test_method_is_reachable_by_discovery(self) -> None:
+        unreachable: list[str] = []
+        for path in sorted((REPO / "tests").glob("test_*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            # Discovery finds a method only through a module-level class.
+            reachable = {
+                item.name
+                for node in tree.body
+                if isinstance(node, ast.ClassDef)
+                for item in node.body
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and item.name.startswith("test")
+            }
+            declared = {
+                node.name
+                for node in ast.walk(tree)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name.startswith("test_")
+            }
+            unreachable.extend(
+                f"{path.name}::{name}" for name in sorted(declared - reachable)
+            )
+        self.assertEqual([], unreachable)
+
+
 class InventoryFacadeTests(unittest.TestCase):
     def test_contract_matches_every_current_test_reference(self) -> None:
-        self.assertEqual(len(REQUIRED_SYMBOLS), 101)
+        self.assertEqual(len(REQUIRED_SYMBOLS), 112)
         self.assertEqual(REQUIRED_SYMBOLS, referenced_facade_symbols())
 
     def test_current_tested_symbols_remain_available(self) -> None:

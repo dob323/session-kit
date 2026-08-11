@@ -2,10 +2,10 @@
 
 ## Local operation
 
-Session Kit has no hosted service, account, analytics, update beacon, or
-telemetry. It reads local shpool state, provider metadata, configuration, and
-its own state. Process evidence comes from Linux `/proc` or from native macOS
-process, start-time, and boot metadata.
+Session Kit has no hosted service, Session Kit cloud account, analytics, update
+beacon, or telemetry. It reads local shpool state, provider metadata,
+configuration, and its own state. Process evidence comes from Linux `/proc` or
+from native macOS process, start-time, and boot metadata.
 
 Optional project discovery reads only project paths already stored in Claude
 Code's local project map and history, and in Codex's local configuration and
@@ -28,6 +28,46 @@ running as the same Unix user, and no amount of checking would: a process with
 your privileges can read owner-accessible terminal state and edit owner-writable
 files directly.
 
+One Unix account may contain several isolated provider subscription profiles.
+This separation prevents accidental cross-account launches; it is not a security
+boundary against another process running as that Unix user.
+
+Direct source authorization follows that same boundary. The trusted prompt hook
+writes owner-private event objects plus compact, rotating, hash-chained ledger
+segments from the exact raw prompt bytes. A write-ahead transaction recovers a
+killed writer, and sealed-segment or index disagreement fails closed. Provider
+transcript matching is stronger local corroboration;
+the named `hook-ledger` fallback exists only for transcript lag or absence and
+is recorded as non-cryptographic. Agent messages and copied prose are notices,
+not source authority. A prompt that begins as a harness envelope — a
+`<task-notification`, `<cross-session-message`, `<system-reminder`, or another
+machine wrapper — is machine text that reached the same hook, and is refused
+both when it is recorded and when it is verified.
+
+Kit-owned state is verified under the strict owner-private rule: this uid owns
+it and it carries no group or other bit. A provider transcript is not
+kit-owned, and the provider writes it under the operator's umask — Codex
+creates every rollout `0644` and never changes it. A Codex rollout is therefore
+verified under a no-foreign-write rule instead: this uid owns it, and no group
+or other **write** bit is set. Forging authority evidence requires write
+access, so a read bit the provider itself set adds no reachable attack; refusing
+the mode outright only made Codex evidence unverifiable. The Claude path keeps
+the strict rule, because Claude writes its transcripts `0600` and verifies
+under it.
+
+A high-risk send also needs an immutable, expiring authority request created
+before approval. It binds the target, category, payload digest, scope, and
+source thread. The later verified source prompt must quote that request's exact
+token; changing any bound field or using an expired token refuses the send.
+
+Supervisor delegation adds a durable preflight and launch-state ledger, but its
+enforcement is cooperative for processes running as the same Unix user. Work
+launched through provider-native tools or Bash can bypass the supervisor API;
+such launches are unsupported and do not gain recorded source authority,
+preflight approval, or verified worker identity merely by existing. Launcher
+output is never identity proof; only a separate fresh inventory reconciliation
+can bind the actual provider, model, identity, and launch idempotency key.
+
 ## Data stored locally
 
 Private state may include:
@@ -38,6 +78,8 @@ Private state may include:
 - process IDs, start times, and generations;
 - recovery records, install receipts, and release receipts;
 - imported project aliases, provider names, and working directories;
+- provider account aliases, email descriptions, verification state, and
+  provider-supplied plan, health, quota, or reset descriptions when available;
 - service-definition receipts and launch records;
 - the expected shpool binary fingerprint;
 - cleanup eligibility and health events;
@@ -51,6 +93,12 @@ version, a fixed action label, a fixed outcome label, and a time. It contains no
 session ID, UUID, title, path, prompt, response, terminal output, IP address, or
 credential. Each append drops entries older than seven days and caps the file at
 1,000 records and 256 KiB.
+
+Provider authentication remains in each provider-owned `CLAUDE_CONFIG_DIR` or
+`CODEX_HOME`. Session Kit never copies or links tokens between profiles and never
+stores, prints, or logs token values in its registry, picker, detail output, or
+action log. Account email and status are private local metadata and should not be
+shared in public diagnostics.
 
 Internal IDs are hidden from normal dashboard rows. They stay available in
 owner-only detail and JSON output, and through an explicit search, because exact
@@ -85,6 +133,19 @@ truncate, compress, or archive journals.
 
 Open, move, kill, repair, recovery, fork, and cleanup actions use fresh live
 evidence. A stale, duplicate, partial, malformed, or unsafe target is refused.
+
+Changing a running conversation's subscription account is also a mutating
+action. It requires an explicit confirmation, the exact provider UUID and
+generation, no active turn, tool, hook, child, or background provider work, and
+a freshly verified target account. A conversation waiting for the operator may
+switch because its provider is idle. The new alias is committed only after the
+exact conversation resumes successfully; a failed change restores its private
+checkpoint and original binding before an exact resume is attempted on the
+original profile. A local kill switch blocks account selection and account
+changes without removing profile data. The switch is the owner-only
+`$XDG_STATE_HOME/session-kit/account-switching-off` state sentinel, defaulting
+to `~/.local/state/session-kit/account-switching-off`; its presence also blocks
+enrollment and does not stop an already-running provider.
 
 `k` accepts visible numbers, comma-separated lists, and ranges from a fresh
 dashboard. It validates every requested display number before starting, then

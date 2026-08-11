@@ -8,7 +8,7 @@ import gzip
 import hashlib
 import io
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import tarfile
@@ -26,17 +26,107 @@ BUILD_INPUTS = (
 )
 
 
-def tree_digest(root: Path) -> str:
+def entry_order(relative: str) -> tuple[str, ...]:
+    """Order entries by path component, never by raw string.
+
+    Sorting `Path` objects delegates to the interpreter's own path comparison,
+    so the archive layout and the tree digest would depend on the Python build
+    that produced them. Ordering by components is fixed by this file alone.
+    """
+    return PurePosixPath(relative).parts
+
+
+def digest_entries(entries: list[tuple[str, int, bytes]]) -> str:
     digest = hashlib.sha256()
-    for path in sorted(item for item in root.rglob("*") if item.is_file()):
-        relative = path.relative_to(root).as_posix()
-        mode = path.stat().st_mode & 0o777
+    for relative, mode, payload in sorted(
+        entries, key=lambda entry: entry_order(entry[0])
+    ):
         digest.update(relative.encode("utf-8"))
         digest.update(b"\0")
         digest.update(f"{mode:o}".encode("ascii"))
         digest.update(b"\0")
-        digest.update(hashlib.sha256(path.read_bytes()).digest())
+        digest.update(hashlib.sha256(payload).digest())
     return digest.hexdigest()
+
+
+def tree_digest(root: Path) -> str:
+    return digest_entries(
+        [
+            (
+                path.relative_to(root).as_posix(),
+                path.stat().st_mode & 0o777,
+                path.read_bytes(),
+            )
+            for path in root.rglob("*")
+            if path.is_file()
+        ]
+    )
+
+
+def require_reachable(commit: str) -> None:
+    """Refuse a commit no ref reaches: it can be collected, and then the
+    artifact's recorded source disappears from the repository."""
+    ancestor = subprocess.run(
+        ["git", "-C", str(ROOT), "merge-base", "--is-ancestor", commit, "HEAD"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if ancestor.returncode == 0:
+        return
+    refs = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(ROOT),
+            "for-each-ref",
+            "--contains",
+            commit,
+            "--count=1",
+            "--format=%(refname)",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    if refs.returncode == 0 and refs.stdout.strip():
+        return
+    raise RuntimeError(
+        f"release commit is not reachable from HEAD or any ref: {commit}"
+    )
+
+
+def verify_archive(
+    archive_path: Path,
+    prefix: str,
+    commit: str,
+    expected_digest: str,
+) -> None:
+    """Read the built archive back and prove what it contains and records."""
+    entries: list[tuple[str, int, bytes]] = []
+    with tarfile.open(archive_path, "r:gz") as archive:
+        for member in archive:
+            name = member.name
+            if name.startswith("/") or ".." in Path(name).parts:
+                raise RuntimeError(f"unsafe archive member: {name}")
+            if name != prefix and not name.startswith(f"{prefix}/"):
+                raise RuntimeError(f"archive member outside the prefix: {name}")
+            if member.isdir():
+                continue
+            if not member.isfile():
+                raise RuntimeError(f"unsupported archive member: {name}")
+            payload = archive.extractfile(member)
+            if payload is None:
+                raise RuntimeError(f"unreadable archive member: {name}")
+            entries.append(
+                (name[len(prefix) + 1 :], member.mode & 0o777, payload.read())
+            )
+    if digest_entries(entries) != expected_digest:
+        raise RuntimeError("archive content does not match the exported public tree")
+    records = [payload for relative, _, payload in entries if relative == "SOURCE.json"]
+    if not records:
+        raise RuntimeError("archive does not contain SOURCE.json")
+    if json.loads(records[0]).get("source_commit") != commit:
+        raise RuntimeError("archive does not record the requested commit")
 
 
 def require_committed_builder(commit: str) -> None:
@@ -60,7 +150,10 @@ def add_tree(archive: tarfile.TarFile, source: Path, prefix: str) -> None:
     root_info.mtime = 0
     archive.addfile(root_info)
 
-    for path in sorted(source.rglob("*")):
+    for path in sorted(
+        source.rglob("*"),
+        key=lambda item: entry_order(item.relative_to(source).as_posix()),
+    ):
         relative = path.relative_to(source).as_posix()
         info = tarfile.TarInfo(f"{prefix}/{relative}")
         info.mtime = 0
@@ -94,6 +187,7 @@ def main() -> int:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
+    require_reachable(args.commit)
     require_committed_builder(args.commit)
 
     output = args.output_dir.resolve()
@@ -139,6 +233,12 @@ def main() -> int:
                 while chunk := source.read(1024 * 1024):
                     compressed.write(chunk)
 
+    try:
+        verify_archive(archive_path, basename, args.commit, public_digest)
+    except Exception:
+        archive_path.unlink(missing_ok=True)
+        raise
+
     archive_digest = hashlib.sha256(archive_path.read_bytes()).hexdigest()
     checksum_path.write_text(
         f"{archive_digest}  {archive_path.name}\n",
@@ -150,6 +250,9 @@ def main() -> int:
         "builder_commit": args.commit,
         "archive": archive_path.name,
         "archive_sha256": archive_digest,
+        # The archive was read back after the build: its files match the exported
+        # tree digest and its SOURCE.json records this exact source commit.
+        "archive_verified": True,
         "public_tree_sha256": public_digest,
         "build_tool": "tools/build-release-artifact",
         "reproducible_timestamps": True,

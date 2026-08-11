@@ -14,15 +14,38 @@
 # Globals the entry script owns are assigned there, not here.
 # shellcheck disable=SC2154
 
+# Pin the transaction's launcher source before any current-release pointer can
+# move. A direct management entry from an older installation may source this
+# module through $install_root/current; resolving BASH_SOURCE later, after a
+# rollback flip, would silently select the rollback target's obsolete launcher.
+session_kit_launcher_source=$(
+  cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd
+)/deploy/session-kit-launcher
+
 install_launchers() {
-  local release_id=$1 helper
+  local release_id=$1 helper source destination temporary
+  # Launchers are recovery-capable and release-independent. Always install the
+  # copy belonging to the code performing this transaction, including for a
+  # rollback to a release whose older manager cannot read today's journal.
+  source=$session_kit_launcher_source
+  [[ -f $source && ! -L $source ]] || die "stable Session Kit launcher is unavailable"
   mkdir -p "$bin_dir"
   for helper in "${helpers[@]}"; do
-    install -m 0755 "$install_root/releases/$release_id/deploy/session-kit-launcher" \
-      "$bin_dir/$helper"
+    destination=$bin_dir/$helper
+    temporary=$(mktemp "$bin_dir/.${helper}.XXXXXX")
+    if ! install -m 0755 "$source" "$temporary" ||
+       ! mv -f -- "$temporary" "$destination"; then
+      rm -f -- "$temporary"
+      return 1
+    fi
   done
-  install -m 0755 "$install_root/releases/$release_id/bin/session-kit" \
-    "$bin_dir/session-kit"
+  destination=$bin_dir/session-kit
+  temporary=$(mktemp "$bin_dir/.session-kit.XXXXXX")
+  if ! install -m 0755 "$source" "$temporary" ||
+     ! mv -f -- "$temporary" "$destination"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
 }
 
 install_codex_themes() {
@@ -63,7 +86,7 @@ install_codex_themes() {
       rm -f -- "$temporary"
       return 1
     fi
-    if [[ ${SESSION_KIT_TEST_FAILPOINT:-} == theme-copy ]]; then
+    if lifecycle_failpoint_armed theme-copy; then
       rm -f -- "$temporary"
       die "isolated test failpoint during theme copy"
     fi
@@ -96,6 +119,22 @@ install_defaults() {
   fi
   # Kit-owned sk-*.tmTheme files track the release. Other themes are untouched.
   install_codex_themes "$release_id"
+}
+
+provider_hooks_tool=$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)/sessionkit_supervisor/provider_hooks.py
+
+configure_provider_hooks() {
+  local release_id=$1 action=${2:-auto}
+  [[ $action == auto ]] || [[ $action == enable || $action == disable ]] ||
+    die "invalid provider hook action: $action"
+  if [[ $action == auto ]]; then
+    action=disable
+    [[ -f $install_root/releases/$release_id/config/codex/hooks.json ]] && action=enable
+  fi
+  [[ -f $provider_hooks_tool && ! -L $provider_hooks_tool ]] ||
+    die "provider hook registration tool is unavailable"
+  python3 "$provider_hooks_tool" "$action" \
+      --claude-settings "$claude_settings" --codex-hooks "$codex_hooks"
 }
 
 configure_macos_shpool_shell() {
@@ -358,7 +397,7 @@ install_release() {
   [[ ! -e $staging ]] || die "staging path already exists"
   mkdir "$staging"
   local item
-  for item in bin lib bashrc config deploy systemd macos shpool-patch; do
+  for item in bin lib bashrc config deploy systemd macos shpool-patch extras; do
     [[ -e $source/$item ]] || continue
     cp -R "$source/$item" "$staging/$item"
   done
@@ -425,10 +464,16 @@ install_command() {
   fi
   begin_transaction install
   install_release "$source" "$release_id"
+  # Management stays on the newest successfully verified release even when
+  # the user later rolls the session payload back. This recovery pointer is
+  # deliberately independent of the selected runtime release.
+  atomic_symlink "$install_root/releases/$release_id" "$manager_link"
   atomic_symlink "$install_root/releases/$release_id" "$install_root/current"
   lifecycle_failpoint current
   install_launchers "$release_id"
   install_defaults "$release_id"
+  configure_provider_hooks "$release_id"
+  lifecycle_failpoint provider-hooks
   lifecycle_failpoint themes
   configure_initial_projects "$projects" "$noninteractive"
   install_platform_services "$release_id"
@@ -461,6 +506,9 @@ update_command() {
     esac
   done
   [[ $(platform) != unsupported ]] || die "update is supported only on Linux and macOS"
+  # Recovery is independent of the next source path. Restore a prior interrupted
+  # transaction before validating a new or now-missing source.
+  recover_pending_transaction
   if [[ -z $source && -r $receipt_path ]]; then
     source=$(python3 - "$receipt_path" <<'PY'
 import json,sys
@@ -473,6 +521,8 @@ PY
 )
   fi
   [[ -n $source ]] || die "update needs --source PATH"
+  source=$(cd -- "$source" && pwd -P) || die "source is unavailable"
+  check_source "$source"
   if [[ -z $login ]]; then
     if [[ -f $integration_marker && ! -L $integration_marker ]]; then
       login=enable
@@ -480,8 +530,17 @@ PY
       login=disable
     fi
   fi
-  local args=(--source "$source" --journal "$journal" --non-interactive --no-import-projects)
-  case "$login" in enable) args+=(--enable-login) ;; disable) args+=(--disable-login) ;; esac
+  local handoff_args=(--source "$source" --journal "$journal")
+  case "$login" in
+    enable) handoff_args+=(--enable-login) ;;
+    disable) handoff_args+=(--disable-login) ;;
+  esac
+  if [[ ${SESSION_KIT_UPDATE_HANDOFF:-0} != 1 ]]; then
+    [[ -f $source/bin/session-kit && ! -L $source/bin/session-kit &&
+       -x $source/bin/session-kit ]] || die "source management command is unsafe"
+    SESSION_KIT_UPDATE_HANDOFF=1 exec "$source/bin/session-kit" update "${handoff_args[@]}"
+  fi
+  local args=("${handoff_args[@]}" --non-interactive --no-import-projects)
   install_command "${args[@]}"
 }
 
@@ -523,6 +582,12 @@ PY
   fi
   validate_mutable_targets
   begin_transaction rollback
+  # A rollback may select a release that predates provider-hook activation and
+  # therefore cannot interpret this release's expanded transaction journal.
+  # Keep recovery pinned to the code that began the flip and restore the whole
+  # preimage on every ordinary failure before an older launcher can run.
+  rollback_transaction_pending=1
+  trap 'if [[ ${rollback_transaction_pending:-0} == 1 ]]; then recover_pending_transaction || true; fi' EXIT
   local previous source=
   previous=$(current_release_id)
   if [[ -r $receipt_path ]]; then
@@ -538,8 +603,9 @@ PY
   fi
   atomic_symlink "$install_root/releases/$target" "$install_root/current"
   lifecycle_failpoint current
-  install_launchers "$target"
   install_codex_themes "$target"
+  configure_provider_hooks "$target"
+  lifecycle_failpoint provider-hooks
   lifecycle_failpoint themes
   install_platform_services "$target"
   if [[ -f $integration_marker && ! -L $integration_marker ]]; then
@@ -548,6 +614,20 @@ PY
   fi
   write_ownership_markers
   write_receipt "$target" "$source" "$previous" "$(platform)"
+  # Refresh every stable launcher while the recovery journal still exists.
+  # The management launcher pins that journal to this pre-flip release, so it
+  # remains capable of restoring the transaction even though `current` now
+  # names the rollback target.
+  install_launchers "$target"
+  lifecycle_failpoint rollback-precommit
   commit_transaction
+  rollback_transaction_pending=0
+  trap - EXIT
+  # Stable launchers already resolve `current`, and their management entry pins
+  # recovery to the journal preimage while a transaction is pending. No
+  # post-commit launcher rewrite exists, so there is no kill window between
+  # journal removal and recovery-capable command installation.
+  lifecycle_failpoint rollback-postcommit
+  lifecycle_failpoint rollback-launchers
   printf 'Rolled back Session Kit to %s. Services were not restarted.\n' "$target"
 }

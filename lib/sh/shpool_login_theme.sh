@@ -2,7 +2,7 @@
 # Picker palette and terminal surface. Source this file; do not execute it.
 #
 # Source order: bin/shpool_login sources this module after it resolves
-# SCRIPT_DIR, sources bin/session_kit_common, and assigns PICKER_STYLE,
+# SCRIPT_DIR, sources bin/session_kit_common, and assigns PICKER_SCREEN, PICKER_STYLE,
 # PICKER_BOLD, PICKER_GREEN, and PICKER_RESET, and before it installs its first
 # trap.
 #
@@ -27,10 +27,10 @@ picker_green() {
 
 # The attachment that just ended painted its own frames; without a clear the
 # menu overprints the dead session's screen and reads as corruption (seen
-# live at the 2026-08-02 daemon restart). Gated on the same test as color:
-# a dumb or capability-less terminal must never receive the escapes.
+# live at the 2026-08-02 daemon restart). Screen control is independent of
+# color: NO_COLOR removes styling, not safe cursor and clear-screen control.
 picker_clear_screen() {
-  (( PICKER_STYLE )) && printf '\033[2J\033[H'
+  (( PICKER_SCREEN )) && printf '\033[2J\033[H'
   return 0
 }
 

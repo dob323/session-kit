@@ -18,7 +18,15 @@ UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
     re.IGNORECASE,
 )
+DEFAULT_PROC_ROOT = Path("/proc")
 PROVIDERS = ("claude", "codex")
+# Who a session's name belongs to. "human" is permanent; "automatic" is the
+# first-prompt claim one automatic pass takes and later passes respect.
+NAME_OWNERS = ("human", "automatic")
+# The one selection grammar, and the one sentence that describes it.
+ASCII_DIGITS_RE = re.compile(r"[0-9]+")
+MAX_SELECTION_SPAN = 200
+SELECTION_GRAMMAR = "use numbers such as 1,3,5, ranges such as 2-4, or all"
 MAX_OPERATIONAL_ID_BYTES = 128
 LEGACY_OPERATIONAL_ID_RE = re.compile(r"^main(?:[1-9][0-9]*)?$")
 GENERATED_OPERATIONAL_ID_RE = re.compile(
@@ -189,6 +197,113 @@ def _valid_automatic_title_failures(raw: Any) -> dict[str, int]:
     return failures
 
 
+def parse_number_selection(answer: Any, count: int) -> list[int]:
+    """One grammar for every place a person types session numbers.
+
+    Accepts ``all`` (and its ``a`` shorthand), comma- or space-separated
+    numbers, and inclusive ranges written ``2-5``, in any mixture. Returns the
+    chosen numbers in ascending order with duplicates collapsed; an empty
+    answer chooses nothing. Anything else raises with the one sentence every
+    surface says, so a person who learns the grammar in one place has learnt
+    it everywhere.
+
+    Only ASCII digits count. Unicode digits pass ``str.isdigit()`` and then
+    either mean something surprising or raise inside ``int()``, and a picker
+    is no place for a traceback.
+    """
+    if not isinstance(answer, str):
+        raise CollectionError(SELECTION_GRAMMAR)
+    text = answer.strip().casefold()
+    if not text:
+        return []
+    if text in {"a", "all"}:
+        return list(range(1, count + 1))
+    picked: set[int] = set()
+    for chunk in text.split(","):
+        # An empty entry between commas is a typo, not an empty choice.
+        parts = chunk.split()
+        if not parts:
+            raise CollectionError(SELECTION_GRAMMAR)
+        for part in parts:
+            first, separator, last = part.partition("-")
+            if separator:
+                if not (
+                    ASCII_DIGITS_RE.fullmatch(first) and ASCII_DIGITS_RE.fullmatch(last)
+                ):
+                    raise CollectionError(SELECTION_GRAMMAR)
+                low, high = int(first), int(last)
+                if low > high:
+                    raise CollectionError(SELECTION_GRAMMAR)
+                if high - low >= MAX_SELECTION_SPAN:
+                    # Refuse before building the set: a mistyped 1-99999999
+                    # must cost a sentence, not the memory of the machine.
+                    raise CollectionError(
+                        f"a range covers at most {MAX_SELECTION_SPAN} numbers"
+                    )
+                picked.update(range(low, high + 1))
+            elif ASCII_DIGITS_RE.fullmatch(part):
+                picked.add(int(part))
+            else:
+                raise CollectionError(SELECTION_GRAMMAR)
+    if not picked:
+        raise CollectionError(SELECTION_GRAMMAR)
+    if any(number < 1 or number > count for number in picked):
+        raise CollectionError(f"choose between 1 and {count}")
+    return sorted(picked)
+
+
+def _valid_pushed_titles(raw: Any) -> dict[str, str]:
+    """The exact title the kit last wrote into each provider's own store.
+
+    This is the discriminator for a provider-native human rename. Session Kit
+    pushes its own titles into Claude's transcript records and Codex's thread
+    table, so "the native store disagrees with us" means nothing on its own —
+    half the time the kit put that value there. A native title that differs
+    from the last value the kit itself pushed is somebody typing /rename.
+    """
+    titles: dict[str, str] = {}
+    if not isinstance(raw, Mapping):
+        return titles
+    for key, value in raw.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            continue
+        provider, separator, uuid = key.partition(":")
+        title = clean_text(value, 120)
+        if separator and provider in PROVIDERS and valid_uuid(uuid) and title:
+            titles[f"{provider}:{uuid.lower()}"] = title
+    return titles
+
+
+def _valid_name_ownership(raw: Any) -> dict[str, dict[str, str]]:
+    """Validate the durable record of who named each session.
+
+    ``human`` is an override: a person renamed the session through `sp name`
+    or the picker, and no automatic pass may ever rename it again — not after
+    a `sp name reset`, not after a restart. ``automatic`` is the one-shot
+    claim taken at a thread's first prompt, so no second automatic pass
+    re-titles work a first pass already named.
+    """
+    owners: dict[str, dict[str, str]] = {}
+    if not isinstance(raw, Mapping):
+        return owners
+    for key, value in raw.items():
+        if not isinstance(key, str) or not isinstance(value, Mapping):
+            continue
+        provider, separator, uuid = key.partition(":")
+        owner = value.get("owner")
+        if (
+            separator
+            and provider in PROVIDERS
+            and valid_uuid(uuid)
+            and owner in NAME_OWNERS
+        ):
+            owners[f"{provider}:{uuid.lower()}"] = {
+                "owner": str(owner),
+                "at": clean_text(value.get("at"), 40),
+            }
+    return owners
+
+
 def _valid_colors(
     raw: Any,
     *,
@@ -287,6 +402,25 @@ def valid_uuid(value: Any) -> str | None:
     if isinstance(value, str) and UUID_RE.fullmatch(value):
         return value.lower()
     return None
+
+
+def proc_root(environ: Mapping[str, str] | None = None) -> Path:
+    """Return the process table root, honouring the fixture root only in tests.
+
+    ``/proc`` is where every identity decision in the kit ultimately gets its
+    answer: which PIDs exist, when each started, what each is running, who its
+    parent is. ``SESSION_KIT_PROC_ROOT`` points that at a directory tree the
+    caller controls, which a test needs and production must never accept --
+    an attacker who can set one environment variable would otherwise be able
+    to hand-author the process table the kit proves session identity against.
+    The ``SESSION_KIT_TESTING`` gate is applied here so no reader can forget
+    it, and every reader in the tree goes through this function.
+    """
+    values = environ if environ is not None else os.environ
+    override = values.get("SESSION_KIT_PROC_ROOT")
+    if override and values.get("SESSION_KIT_TESTING") == "1":
+        return Path(override)
+    return DEFAULT_PROC_ROOT
 
 
 def automatic_naming_enabled(environ: Mapping[str, str] | None = None) -> bool:
@@ -411,9 +545,17 @@ def _command_json(
     load_json_file: Callable[[Path], Any],
     command_from_env: Callable[[str, str], list[str]],
 ) -> Any:
-    """Read one provider snapshot from a fixture or the configured command."""
+    """Read one provider snapshot from a fixture or the configured command.
+
+    The fixture variable replaces the provider's own answer with a file of the
+    caller's choosing, and that answer is what the inventory treats as the
+    truth about which sessions exist. Outside the isolated test harness it is
+    ignored, so no environment variable can substitute a fabricated roster for
+    what shpool and the provider CLIs actually report. ``command_env`` stays
+    ungated: pointing at a differently installed binary is real configuration.
+    """
     fixture = environ.get(fixture_env)
-    if fixture:
+    if fixture and environ.get("SESSION_KIT_TESTING") == "1":
         return load_json_file(Path(fixture).expanduser())
     prefix = command_from_env(command_env, default_command[0])
     return json.loads(runner([*prefix, *default_command[1:]], timeout))

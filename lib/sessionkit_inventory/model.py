@@ -143,10 +143,34 @@ def _provider_title_info(
     *,
     provider_title_is_explicit: bool = True,
     context_title: Callable[[str, str, int | None], str],
+    pushed_titles: Mapping[str, str] | None = None,
+    name_ownership: Mapping[str, Mapping[str, str]] | None = None,
 ) -> tuple[str, str]:
     key = f"{provider}:{uuid}" if uuid else ""
     if uuid:
         alias = aliases.get(key)
+        # A provider-native rename outranks the alias tier. The alias layer
+        # holds kit-authored names as well as typed ones, so an automatic
+        # title that was also written as an alias would otherwise mask the
+        # name a person just typed into /rename — which is the newest thing
+        # anyone has said about what this room is called. Reconciliation then
+        # promotes it into the alias for good; this keeps the row honest in
+        # the meantime.
+        last_kit_title = (pushed_titles or {}).get(key) or (automatic_titles or {}).get(
+            key, ""
+        )
+        # Divergence is the timestamp. `last_kit_title` is the last value the
+        # kit itself wrote into the provider's store — including the one
+        # `sp name` pushed — so a native title that differs from it can only
+        # have been typed after that push. Newer human act, newer name; an
+        # earlier `sp name` keeps its ownership but not its stale text.
+        if (
+            last_kit_title
+            and native_title
+            and provider_title_is_explicit
+            and native_title != last_kit_title
+        ):
+            return native_title, "native"
         if alias:
             return alias, "alias"
     if native_title and provider_title_is_explicit:
@@ -158,8 +182,9 @@ def _provider_title_info(
     context = context_title(provider, cwd, started_at_unix_ms)
     if context:
         return context, "context"
-    if uuid:
-        return f"{provider.title()} {uuid[:8]}", "uuid"
+    # Nothing named this session and its context yielded nothing either. The
+    # provider alone is a poor label but an honest one; a UUID prefix here
+    # used to put a raw identifier on every human surface at once.
     return provider.title(), "provider"
 
 
@@ -174,6 +199,8 @@ def _provider_title(
     *,
     provider_title_is_explicit: bool = True,
     provider_title_info: Callable[..., tuple[str, str]],
+    pushed_titles: Mapping[str, str] | None = None,
+    name_ownership: Mapping[str, Mapping[str, str]] | None = None,
 ) -> str:
     return provider_title_info(
         provider,
@@ -184,6 +211,8 @@ def _provider_title(
         started_at_unix_ms,
         automatic_titles,
         provider_title_is_explicit=provider_title_is_explicit,
+        pushed_titles=pushed_titles,
+        name_ownership=name_ownership,
     )[0]
 
 

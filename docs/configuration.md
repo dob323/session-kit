@@ -21,7 +21,55 @@ uses XDG locations where available.
 
 Private directories should be mode `0700`; private files should be mode `0600`.
 Sensitive proof files also require the expected owner, regular-file type, and
-link count.
+link count. Provider transcripts are the one exception, because the provider —
+not Session Kit — creates them under your umask: a Codex rollout is accepted
+when this uid owns it and no group or other write bit is set. See
+[Security and data](security-and-data.md).
+
+## Account profiles
+
+An account profile is a local alias for one Claude Code or Codex subscription
+login. It is not a Session Kit cloud account. Claude profiles launch with a
+profile-specific `CLAUDE_CONFIG_DIR`; Codex profiles launch with a
+profile-specific `CODEX_HOME`. These roots keep each provider's native login and
+local conversation data separate.
+
+```text
+sp account list
+sp account enroll <claude|codex> <alias> <email>
+sp account verify <claude|codex> <alias>
+sp account configure-feeds <absolute-roster-json> <absolute-advice-json>
+```
+
+`enroll` creates the owner-private profile location and registers the alias and
+email description. Sign in through the provider's normal interactive login.
+Session Kit does not copy, link, import, print, or log credentials from another
+profile. `verify` then checks that the provider's reported signed-in identity
+matches the registered description. An unverified or logged-out profile is not
+eligible for a recommendation or account change.
+
+Aliases are short labels intended for the home screen. `sp account list` keeps
+the registered identity and last verification time. Session detail shows the
+bound alias, email, and provider-supplied plan. The account-choice screen shows
+current roster health, usage, and any provider-qualified recommendation.
+Provider data that is missing or cannot be verified is shown as unknown rather
+than inferred.
+
+The default Claude and Codex homes remain usable as legacy profiles, but Session
+Kit does not invent an email identity for them. Enroll and verify a named profile
+before relying on account-aware recommendations or switching.
+
+Account changes are manual. Session Kit does not rotate a live thread when a
+quota threshold or timer is reached. The owner-only state sentinel
+`$XDG_STATE_HOME/session-kit/account-switching-off`, defaulting to
+`~/.local/state/session-kit/account-switching-off`, disables enrollment, new
+account selection, and switching. It does not delete profiles, change
+provider-owned login state, or stop running providers.
+
+`configure-feeds` stores two owner-controlled absolute paths in the private
+Session Kit state directory. Guided New uses a fresh roster for availability
+and provider-qualified advice for recommendations. Missing or stale feeds leave
+the choice unselected; they never guess an account.
 
 ## Inventory settings
 
@@ -48,6 +96,20 @@ sp name reset <terminal-number|shpool-id>
 
 Manual names take priority over provider titles, retained automatic names, and
 fallback descriptions.
+
+Renaming a session by hand also settles who owns its name, for good. Session Kit
+records the rename in `name_ownership` alongside the aliases, and every
+automatic naming path — the Claude title hook, the Codex auto-titler, `sp
+self-name`, and any queued title retry that outlives a restart — reads that
+record and leaves the session alone. `sp name reset` drops the name you gave and
+keeps the ownership: automatic naming does not come back and quietly rename a
+session you already named.
+
+Automatic naming claims a name the same way, once, at a thread's first prompt.
+The claim is what makes the Claude hook a no-op on its second firing and stops a
+later pass from re-titling a thread an earlier pass named. Pruning orphaned
+automatic titles clears spent automatic claims; it never clears a rename you
+made.
 
 ## Project aliases
 
@@ -168,6 +230,14 @@ processes if the proof is wrong, and depend on provider-native recovery being
 available. Quiet output alone never qualifies. Review the owner-only watchdog
 log and test manual `sp repair` before enabling this mode.
 
+The watchdog accepts a handoff marker only when its journal PID and monotonic
+timestamp belong to the current daemon generation, the marker is old enough,
+and no later successful attach for that session cancels it. A marker with
+unknown recent-output age is reported but never repaired automatically. A
+process-wide mismatch between listed sessions and serving-thread count is also
+reported once at manager level; it cannot identify a specific session and is
+never used to repair one.
+
 ## Watchdog alerts
 
 `SESSION_KIT_WATCHDOG_NOTIFY` is **unset by default, so the watchdog raises no
@@ -229,7 +299,9 @@ SESSION_KIT_ARCHIVE_DIR
 SESSION_KIT_PROJECTS_FILE
 SESSION_KIT_SHPOOL_CMD
 SESSION_KIT_CLAUDE_CMD
+CLAUDE_CONFIG_DIR
 SESSION_KIT_CODEX_HOME
+CODEX_HOME
 SESSION_KIT_CODEX_DB
 SESSION_KIT_BOOT_ID_FILE
 SESSION_KIT_AUTO_NAME

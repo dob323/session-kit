@@ -41,6 +41,13 @@ case "${1:-}" in
     }
     exec python3 "$CORE" lookup "$2"
     ;;
+  --detail)
+    [[ -n ${2:-} && -z ${3:-} ]] || {
+      echo "usage: shpool_status --detail <session-number>" >&2
+      exit 2
+    }
+    exec python3 "$CORE" detail "$2"
+    ;;
   --render-file)
     [[ -n ${2:-} && ( -z ${3:-} || ${3:-} == --rows ) && -z ${4:-} ]] || {
       echo "usage: shpool_status --render-file <snapshot.json> [--rows]" >&2
@@ -73,7 +80,7 @@ case "${1:-}" in
     exec python3 "$CORE" recovery-pending ack "$2" "$3" "$4"
     ;;
   *)
-    echo "usage: shpool_status [--rows|--waiting-count|--json|--strict-json|--guard-json|--lookup <selector>|--render-file <file> [--rows]|--lookup-file <file> <selector>|--recovery-pending-list|--recovery-pending-ack <generation> <id> <uuid>]" >&2
+    echo "usage: shpool_status [--rows|--waiting-count|--json|--strict-json|--guard-json|--detail <selector>|--lookup <selector>|--render-file <file> [--rows]|--lookup-file <file> <selector>|--recovery-pending-list|--recovery-pending-ack <generation> <id> <uuid>]" >&2
     exit 2
     ;;
 esac

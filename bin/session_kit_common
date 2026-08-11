@@ -45,9 +45,35 @@ sk_require_shpool() {
   [[ -n $SK_SHPOOL && -x $SK_SHPOOL ]] || sk_die "shpool executable unavailable"
 }
 
+# Reads a test-only hook variable. Returns 0 and sets SK_TEST_HOOK to its value
+# only when the isolated test harness armed it; otherwise returns 1 and leaves
+# SK_TEST_HOOK empty.
+#
+# Every one of these variables replaces evidence the kit would otherwise gather
+# from the machine -- the platform, whether a provider process really started.
+# Setting an environment variable is not a privilege, so honouring one outside
+# the harness would let any process that can reach this shell's environment
+# feed session-kit a fabricated answer. The single SESSION_KIT_TESTING gate
+# lives here so no caller can forget it, and an ungated attempt is reported
+# once rather than silently swallowed.
+sk_test_hook() {
+  local name=$1
+  SK_TEST_HOOK=${!name:-}
+  [[ -n $SK_TEST_HOOK ]] || return 1
+  if [[ ${SESSION_KIT_TESTING:-0} != 1 ]]; then
+    SK_TEST_HOOK=
+    if [[ ${SK_TEST_HOOK_NOTED:-} != *"|$name|"* ]]; then
+      SK_TEST_HOOK_NOTED="${SK_TEST_HOOK_NOTED:-|}$name|"
+      printf 'session-kit: ignoring %s: reserved for isolated tests\n' "$name" >&2
+    fi
+    return 1
+  fi
+  return 0
+}
+
 sk_platform() {
-  if [[ ${SESSION_KIT_TESTING:-0} == 1 && -n ${SESSION_KIT_TEST_PLATFORM:-} ]]; then
-    printf '%s\n' "$SESSION_KIT_TEST_PLATFORM"
+  if sk_test_hook SESSION_KIT_TEST_PLATFORM; then
+    printf '%s\n' "$SK_TEST_HOOK"
   else
     command uname -s 2>/dev/null
   fi
@@ -396,6 +422,9 @@ values = [
     row.get("mutation_rejection_reason") or "",
     conversation_provider,
     conversation_uuid,
+    str(row.get("terminal_number") or ""),
+    row.get("account_alias") or "",
+    "true" if row.get("account_switch_capable") is True else "false",
 ]
 for value in values:
     value = re.sub(r"[\t\r\n]+", " ", str(value))
@@ -407,7 +436,7 @@ sk_resolve() {
   local inventory=$1 selector=$2
   local -a fields=()
   while IFS= read -r field; do fields+=("$field"); done < <(sk_lookup_file "$inventory" "$selector") || return 2
-  [[ ${#fields[@]} -eq 18 ]] || return 2
+  [[ ${#fields[@]} -eq 21 ]] || return 2
   SK_ID=${fields[0]}
   SK_STARTED=${fields[1]}
   SK_STATUS=${fields[2]}
@@ -426,6 +455,9 @@ sk_resolve() {
   SK_MUTATION_REASON=${fields[15]}
   SK_CONVERSATION_PROVIDER=${fields[16]}
   SK_CONVERSATION_UUID=${fields[17]}
+  SK_NUMBER=${fields[18]}
+  SK_ACCOUNT_ALIAS=${fields[19]}
+  SK_ACCOUNT_CAPABLE=${fields[20]}
 }
 
 sk_require_mutation_target() {
@@ -471,11 +503,12 @@ sk_proc_is_exact() {
 # exactly what the launch record asked the shell to do.
 sk_provider_process_present() {
   local shell_pid=$1 shell_start=$2 provider=$3
-  local override=${SESSION_KIT_PROVIDER_PRESENCE_OVERRIDE:-}
-  if [[ -n $override ]]; then
+  if sk_test_hook SESSION_KIT_PROVIDER_PRESENCE_OVERRIDE; then
     # Test and diagnostic hook only; unset in normal operation. Checked before
-    # anything reads /proc, because a fixture's shell PIDs are synthetic.
-    [[ $override == present ]]
+    # anything reads /proc, because a fixture's shell PIDs are synthetic. This
+    # answer is the whole proof that a launch succeeded, so outside the harness
+    # sk_test_hook refuses it and the real process tree decides.
+    [[ $SK_TEST_HOOK == present ]]
     return
   fi
   sk_proc_is_exact "$shell_pid" "$shell_start" || return 1
@@ -783,7 +816,8 @@ rows=d.get("sessions", d if isinstance(d,list) else [])
 raise SystemExit(0 if any(r.get("name")==sys.argv[1] for r in rows) else 1)
 ' "$candidate" <<<"$json" ||
     [[ -e $SK_START_DIR/$candidate || -L $SK_START_DIR/$candidate ||
-       -e $SK_START_DIR/$candidate.expected || -L $SK_START_DIR/$candidate.expected ]]
+       -e $SK_START_DIR/$candidate.expected || -L $SK_START_DIR/$candidate.expected ||
+       -e $SK_START_DIR/$candidate.account || -L $SK_START_DIR/$candidate.account ]]
   do
     counter=$((counter + 1))
     candidate="${base}-${counter}"
@@ -817,6 +851,21 @@ sk_write_start_record() {
   printf '%s\t%s\t%s\t%s\n' "$provider" "$cwd" "$uuid" "$launch_mode" > "$tmp" || return 1
   chmod 600 "$tmp" 2>/dev/null || true
   mv -f "$tmp" "$SK_START_DIR/$shpool_id"
+}
+
+sk_write_account_record() {
+  local shpool_id=$1 provider=$2 alias=$3
+  [[ $provider =~ ^(claude|codex)$ &&
+     $alias =~ ^[a-z][a-z0-9_-]{0,11}$ ]] || return 1
+  umask 077
+  mkdir -p "$SK_START_DIR" || return 1
+  chmod 700 "$SK_START_DIR" 2>/dev/null || true
+  local path="$SK_START_DIR/$shpool_id.account"
+  [[ ! -e $path && ! -L $path ]] || return 1
+  local tmp="$SK_START_DIR/.${shpool_id}.account.$$"
+  printf '%s\t%s\n' "$provider" "$alias" > "$tmp" || return 1
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv -f -- "$tmp" "$path"
 }
 
 sk_capture_session_generation() {
@@ -900,6 +949,9 @@ sk_quarantine_start_record() {
   fi
   if [[ -f $SK_START_DIR/$shpool_id.expected && ! -L $SK_START_DIR/$shpool_id.expected ]]; then
     mv "$SK_START_DIR/$shpool_id.expected" "$destination.expected" || return 1
+  fi
+  if [[ -f $SK_START_DIR/$shpool_id.account && ! -L $SK_START_DIR/$shpool_id.account ]]; then
+    mv "$SK_START_DIR/$shpool_id.account" "$destination.account" || return 1
   fi
   printf '%s\n' "$destination"
 }
@@ -1103,13 +1155,49 @@ PY
   return 1
 }
 
-# No interactive confirmation (Dan 2026-08-02): the caller already selected
+# How a session is named to a person: its terminal number and its own title,
+# or its provider when it has neither. Never an internal ID — no human-readable
+# Session Kit output prints one, anywhere.
+sk_human_label() {
+  local title=${1:-} provider=${2:-} number=${3:-}
+  # A title is provider metadata, so it can carry terminal control bytes.
+  # Scrub before any of it reaches a screen.
+  title=$(printf '%s' "$title" | tr -d '[:cntrl:]' | tr -s '[:space:]' ' ')
+  title=${title#"${title%%[![:space:]]*}"}
+  title=${title%"${title##*[![:space:]]}"}
+  if [[ -n $number && -n $title ]]; then
+    printf 'session %s (%s)' "$number" "$title"
+  elif [[ -n $number ]]; then
+    printf 'session %s' "$number"
+  elif [[ -n $title ]]; then
+    printf '%s' "$title"
+  elif [[ -n $provider ]]; then
+    printf 'the %s session' "$provider"
+  else
+    printf 'the session'
+  fi
+}
+
+# A short token minted for one confirmation. It is not derived from any
+# session identifier and means nothing after this line is printed; it exists
+# so a person can see that two confirmations are two different actions.
+sk_safety_token() {
+  local token
+  token=$(od -An -N3 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
+  printf '%s' "${token:-000000}"
+}
+
+# No interactive confirmation (maintainer decision, 2026-08-02): the caller
+# already selected
 # an exact session under a frozen proof, and the line below names exactly
 # what is being acted on — that display is the safety net, a y/N added only
-# friction. Non-interactive automation still has to name the exact ID.
+# friction. Non-interactive automation still names the exact ID, as an
+# argument; the exact ID is never printed back.
 sk_confirm_exact() {
-  local action=$1 id=$2 title=$3 provider=$4
-  printf '\n  %s\n  %s  [%s]  %s\n' "$action" "$title" "$id" "$provider"
+  local action=$1 id=$2 title=$3 provider=$4 number=${5:-}
+  printf '\n  %s\n  %s  %s  [confirm %s]\n' \
+    "$action" "$(sk_human_label "$title" "$provider" "$number")" "$provider" \
+    "$(sk_safety_token)"
   if [[ ${SESSION_KIT_NONINTERACTIVE:-0} == 1 ]]; then
     [[ ${SESSION_KIT_CONFIRM_ID:-} == "$id" ]]
     return

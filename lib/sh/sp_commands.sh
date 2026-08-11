@@ -21,7 +21,7 @@ go_target() {
   local provider_pid=$SK_PROVIDER_PID provider_start=$SK_PROVIDER_START
   local daemon_pid=$SK_DAEMON_PID daemon_start=$SK_DAEMON_START
   if [[ $SK_STATUS != disconnected && $SK_STATUS != Disconnected ]]; then
-    sk_die "$id is attached; use 'sp takeover $id' for a confirmed takeover"
+    sk_die "$(sk_human_label "$SK_TITLE" "$SK_PROVIDER" "${SK_NUMBER:-}") is attached; use 'sp takeover $selector' for a confirmed takeover"
     return 1
   fi
   sk_revalidate "$id" "$started" "$provider" "$uuid" "$shell_pid" "$shell_start" "$provider_pid" "$provider_start" "$daemon_pid" "$daemon_start" || {
@@ -40,10 +40,11 @@ takeover_target() {
   local provider_pid=$SK_PROVIDER_PID provider_start=$SK_PROVIDER_START
   local daemon_pid=$SK_DAEMON_PID daemon_start=$SK_DAEMON_START
   if [[ $SK_STATUS == disconnected || $SK_STATUS == Disconnected ]]; then
-    sk_die "$id is ready, not attached; use 'sp go $id'"
+    sk_die "$(sk_human_label "$title" "$provider" "${SK_NUMBER:-}") is ready, not attached; use 'sp go $selector'"
     return 1
   fi
-  sk_confirm_exact "Take over attached session" "$id" "$title" "$provider" || {
+  sk_confirm_exact "Take over attached session" "$id" "$title" "$provider" \
+    "${SK_NUMBER:-}" || {
     echo "Takeover cancelled."
     return 1
   }
@@ -62,7 +63,7 @@ close_target() {
   local shell_pid=$SK_SHELL_PID shell_start=$SK_SHELL_START
   local provider_pid=$SK_PROVIDER_PID provider_start=$SK_PROVIDER_START
   local daemon_pid=$SK_DAEMON_PID daemon_start=$SK_DAEMON_START
-  sk_confirm_exact "Close session" "$id" "$title" "$provider" || {
+  sk_confirm_exact "Close session" "$id" "$title" "$provider" "${SK_NUMBER:-}" || {
     echo "Close cancelled."
     return 1
   }
@@ -89,11 +90,11 @@ close_target() {
   if [[ -e $SK_START_DIR/$id || -L $SK_START_DIR/$id ||
         -e $SK_START_DIR/$id.expected || -L $SK_START_DIR/$id.expected ]]; then
     if ! sk_quarantine_start_record "$id" closed >/dev/null; then
-      sk_die "session $id was closed, but its retained launch record could not be archived"
+      sk_die "the session was closed, but its retained launch record could not be archived"
       return 1
     fi
   fi
-  printf 'Closed exact session %s\n' "$id"
+  printf 'Closed %s\n' "$(sk_human_label "${title:-}" "${provider:-}")"
 }
 
 show_prune() {
@@ -118,8 +119,12 @@ for row in rows:
     value=row.get("shpool_id") if isinstance(row,dict) else None
     if not isinstance(value,str) or len(value.encode())>128 or pattern.fullmatch(value) is None:
         raise SystemExit(2)
-for row in rows:
-    print(f"  {row['shpool_id']}")
+for number, row in enumerate(rows, 1):
+    # The IDs above were validated, not displayed: a person prunes by
+    # confirming each candidate in turn, and never types one of these.
+    title = " ".join(str(row.get("title") or "").split()) or "empty shell"
+    title = "".join(character for character in title if character.isprintable())
+    print(f"  {number:2}  {title[:60]}")
 PY
   then
     sk_die "candidate list contains an unmanaged session ID; nothing was displayed or pruned"
@@ -165,12 +170,13 @@ prune_target() {
   id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["shpool_id"])' "$candidate_file") || return 1
   make_guard_snapshot || return 1
   sk_resolve "$SNAPSHOT" "$id" || {
-    sk_die "prune candidate no longer exists: $id"
+    sk_die "a prune candidate no longer exists; nothing was pruned"
     return 1
   }
   sk_require_mutation_target || return 1
   local title=$SK_TITLE provider=$SK_PROVIDER
-  sk_confirm_exact "Prune verified empty session" "$id" "$title" "$provider" || {
+  sk_confirm_exact "Prune verified empty session" "$id" "$title" "$provider" \
+    "${SK_NUMBER:-}" || {
     echo "Prune cancelled."
     return 1
   }
@@ -194,11 +200,12 @@ prune_target() {
   fi
   if (( sk_kill_status != 0 )); then
     sk_lock_release 9
-    sk_die "shpool refused to kill exact verified candidate: $id"
+    sk_die "shpool refused to close a verified-empty candidate; nothing was pruned"
     return 1
   fi
   sk_lock_release 9
-  printf 'Pruned exact verified-empty session %s\n' "$id"
+  printf 'Pruned %s\n' \
+    "$(sk_human_label "$title" "$provider" "${SK_NUMBER:-}")"
 }
 
 show_history() {
@@ -212,7 +219,7 @@ show_history_id() {
   local -a files=()
   while IFS= read -r path; do [[ -n $path ]] && files+=("$path"); done < <(history_files "$id")
   (( ${#files[@]} > 0 )) || {
-    sk_die "no live history for $id"
+    sk_die "no live history for $(sk_human_label "$SK_TITLE" "$SK_PROVIDER" "${SK_NUMBER:-}")"
     return 1
   }
   if [[ ${SESSION_KIT_NONINTERACTIVE:-0} == 1 ]]; then
@@ -258,10 +265,11 @@ color_target() {
   fi
   sk_lock_release 9
   if [[ $action == delete ]]; then
-    printf 'Reset color for exact %s session %s (stable hash color applies)\n' \
-      "$provider" "$id"
+    printf 'Reset the color for the exact %s %s (stable hash color applies)\n' \
+      "$provider" "$(sk_human_label "$SK_TITLE" "$provider" "${SK_NUMBER:-}")"
   else
-    printf 'Colored exact %s session %s: %s\n' "$provider" "$id" "$chosen"
+    printf 'Colored the exact %s %s: %s\n' "$provider" \
+      "$(sk_human_label "$SK_TITLE" "$provider" "${SK_NUMBER:-}")" "$chosen"
   fi
   printf 'Claude sessions show the color natively from their next start or resume.\n'
 }
@@ -283,9 +291,11 @@ import sys
 result = json.load(sys.stdin)
 moved = result.get("moved") or {}
 dropped = result.get("dropped") or []
-for key, color in moved.items():
-    provider, _, uuid = key.partition(":")
-    print(f"Recolored exact {provider} session {uuid}: {color}")
+for provider in sorted({key.partition(":")[0] for key in moved}):
+    colors = sorted(
+        color for key, color in moved.items() if key.startswith(provider + ":")
+    )
+    print(f"Recolored {len(colors)} exact {provider} session(s): {', '.join(colors)}")
 if dropped:
     print(f"Dropped {len(dropped)} stored color(s) outside the in-force palette.")
 if not moved and not dropped:
@@ -341,9 +351,10 @@ name_target() {
   }
   sk_lock_release 9
   if [[ $action == delete ]]; then
-    printf 'Reset local name for exact %s session %s\n' "$provider" "$id"
+    printf 'Reset the local name for the exact %s session\n' "$provider"
   else
-    printf 'Named exact %s session %s\n' "$provider" "$id"
+    printf 'Named the exact %s session %s\n' "$provider" \
+      "$(sk_human_label "$title" "$provider")"
   fi
 }
 
@@ -397,7 +408,7 @@ import json, sys
 d=json.load(open(sys.argv[1]))
 rows=(d.get("sessions") or {}).values()
 for i,row in enumerate(rows,1):
-    print(f"{i:3}  {row.get('provider','unknown'):6}  {row.get('title','')}  {row.get('uuid','')}")
+    print(f"{i:3}  {row.get('provider','unknown'):6}  {row.get('title','')}")
 PY
   echo "Recovery launches only through the reviewed login chooser."
 }
@@ -421,8 +432,10 @@ verify_start_target() {
   if sk_wait_for_provider "$id" "$expected_provider" "$expected_cwd" "$expected_uuid" \
     "$expected_boot_id" "$expected_started" "$expected_shell_pid" "$expected_shell_start" \
     "$expected_daemon_pid" "$expected_daemon_start" "$SK_EXPECT_LAUNCH_MODE"; then
-    printf 'Verified exact %s provider and cleared retained launch record for %s\n' "$expected_provider" "$id"
+    printf 'Verified the exact %s provider and cleared the retained launch record for %s\n' \
+      "$expected_provider" \
+      "$(sk_human_label "$SK_TITLE" "$expected_provider" "${SK_NUMBER:-}")"
     return 0
   fi
-  sk_die "exact provider is not active yet; record retained. Attach with 'sp go $id' and run 'exec bash -i' to retry"
+  sk_die "exact provider is not active yet; record retained. Attach with 'sp go $selector' and run 'exec bash -i' to retry"
 }

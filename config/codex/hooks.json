@@ -1,0 +1,27 @@
+{
+  "description": "Session Kit automatic project intake.",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "command": "python3 \"$HOME/.local/lib/session-kit/current/lib/sessionkit_supervisor/provider_hooks.py\" codex-hook",
+            "sessionKitProvenance": {
+              "owner": "session-kit",
+              "restore": {
+                "description": "added",
+                "event": "absent",
+                "file": "absent",
+                "group": "created",
+                "hooks": "absent"
+              },
+              "schemaVersion": 1
+            },
+            "timeout": 3,
+            "type": "command"
+          }
+        ]
+      }
+    ]
+  }
+}

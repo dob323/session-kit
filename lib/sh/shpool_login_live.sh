@@ -14,10 +14,18 @@
 # shellcheck disable=SC2154
 
 cleanup() {
+  picker_input_restore
   local path
   for path in "${TEMP_FILES[@]}"; do
     [[ -z $path || ! -f $path ]] || command rm -- "$path"
   done
+}
+
+picker_input_restore() {
+  if [[ -n ${PICKER_TTY_STATE:-} && -t 0 ]]; then
+    stty "$PICKER_TTY_STATE" < /dev/tty 2>/dev/null || true
+  fi
+  PICKER_TTY_STATE=""
 }
 
 # Every deliberate or forced picker exit records why, so "it dropped me to a
@@ -33,7 +41,7 @@ picker_live_seconds() {
   [[ $seconds =~ ^[0-9]+$ ]] || seconds=0
   # A repaint REPLACES the menu. A terminal that cannot be cleared would
   # stack copies down the screen instead, so it stays static.
-  (( PICKER_STYLE )) || seconds=0
+  (( PICKER_SCREEN )) || seconds=0
   # Never poll faster than a snapshot takes to collect.
   (( seconds == 0 || seconds >= 2 )) || seconds=2
   printf '%s' "$seconds"
@@ -57,6 +65,7 @@ except (OSError, ValueError):
 fields = (
     "display_shpool_id",
     "display_provider",
+    "account_alias",
     "display_title",
     "display_color",
     "agent_status",
@@ -65,16 +74,30 @@ fields = (
     "automatic_name_state",
     "terminal_number",
 )
+source_rows = [
+    row for row in data.get("sessions", []) if isinstance(row, dict)
+]
+# Terminal 1 is reserved for Fleet Supervisor. The renderer pins it before
+# drawing, so fingerprint the fresh pre-render view in that same order. Without
+# this normalization, every background collection looks different from the
+# already-pinned screen and triggers a full-screen repaint despite identical
+# visible content.
+slot_one = [
+    index
+    for index, row in enumerate(source_rows)
+    if isinstance(row.get("terminal_number"), int)
+    and not isinstance(row.get("terminal_number"), bool)
+    and row.get("terminal_number") == 1
+]
+if len(slot_one) == 1:
+    supervisor = source_rows.pop(slot_one[0])
+    source_rows.insert(0, supervisor)
 rows = [
     [row.get(name) for name in fields]
-    for row in data.get("sessions", [])
-    if isinstance(row, dict)
+    for row in source_rows
 ]
-picker = data.get("_picker") or {}
 shape = {
     "rows": rows,
-    "outside": len(data.get("outside_agents", [])),
-    "unavailable": picker.get("unavailable_total"),
     "stale": data.get("stale"),
     "page": page,
     "query": query,
@@ -120,6 +143,11 @@ picker_live_collect() {
   LIVE_DONE=
   if (( status != 0 )) || [[ ! -s $LIVE_FILE ]]; then
     LIVE_FILE=
+    sk_log_action picker_refresh "background_failed_status_$status" || true
+    if [[ -z $LIVE_WARNING ]]; then
+      LIVE_WARNING="Live refresh failed; showing the last trustworthy session list."
+      return 2
+    fi
     return 1
   fi
   local previous_snapshot=$SNAPSHOT previous_view=$VIEW
@@ -128,13 +156,20 @@ picker_live_collect() {
   if ! build_view; then
     SNAPSHOT=$previous_snapshot
     VIEW=$previous_view
+    sk_log_action picker_refresh background_invalid_snapshot || true
+    if [[ -z $LIVE_WARNING ]]; then
+      LIVE_WARNING="Live refresh returned invalid data; showing the last trustworthy session list."
+      return 2
+    fi
     return 1
   fi
   clamp_page
   refresh_pending_cache
-  local fingerprint
+  local fingerprint had_warning=0
+  [[ -z $LIVE_WARNING ]] || had_warning=1
+  LIVE_WARNING=""
   fingerprint=$(picker_view_fingerprint)
-  [[ $fingerprint != "$LIVE_FINGERPRINT" ]] || return 1
+  [[ $fingerprint != "$LIVE_FINGERPRINT" || $had_warning == 1 ]] || return 1
   LIVE_FINGERPRINT=$fingerprint
   return 0
 }
@@ -156,15 +191,23 @@ picker_read() {
   picker_exit input_closed
 }
 
-# A half-typed line lives in the terminal's own input queue, where this
-# process cannot see it: in canonical mode FIONREAD reports 0 until Enter is
-# pressed, on both Linux and macOS. So a repaint cannot be conditional on
-# "is anything typed" — instead the prompt reads through readline, which
-# re-echoes whatever is still queued after the screen is cleared. Nothing is
-# lost and nothing needs an ioctl.
+# Modal screens own the terminal until the person explicitly leaves them.
+# A signal that interrupts a plain Bash read must not silently return Help,
+# More, a project form, or a confirmation to the repainting home loop.
+picker_modal_read() {
+  local __sk_modal_var=$1 __sk_modal_prompt=$2
+  while true; do
+    if picker_read "$__sk_modal_var" "$__sk_modal_prompt"; then
+      return 0
+    fi
+  done
+}
+
+# Read and echo one character at a time. The picker owns the visible buffer, so
+# a repaint can redraw the exact half-typed command instead of erasing its echo.
 picker_read_live() {
   local __sk_live_var=$1 __sk_live_prompt=$2
-  local seconds waited=0
+  local seconds waited=0 buffer="" character="" read_status collect_status
   seconds=$(picker_live_seconds)
   if (( seconds == 0 )) || [[ ! -t 0 ]]; then
     picker_read "$__sk_live_var" "$__sk_live_prompt"
@@ -173,30 +216,112 @@ picker_read_live() {
   PICKER_INTERRUPTED=0
   LIVE_FINGERPRINT=$(picker_view_fingerprint)
   printf '%s' "$__sk_live_prompt"
-  while true; do
-    # The status MUST be captured inside the else: after a bare `if` with no
-    # else clause, $? is the status of the `if` statement itself, which is 0.
-    # Plain, NOT -e: readline would pull a half-typed line into its own
-    # buffer and drop it when the read times out. A canonical read leaves
-    # those characters in the terminal queue, where the next read collects
-    # them intact.
-    # shellcheck disable=SC2229
-    if IFS= read -r -t 1 "$__sk_live_var"; then
-      return 0
-    else
-      PICKER_LIVE_STATUS=$?
+
+  # Start in canonical mode. Complete lines and Ctrl-D take the ordinary path,
+  # which preserves any later lines already queued for a submenu. Only after a
+  # genuine one-second partial-line timeout do we take ownership of characters
+  # so a repaint can reproduce them.
+  # The indirection is deliberate: the caller passes the DESTINATION variable
+  # name, which the character loop below fills with `printf -v`.
+  # shellcheck disable=SC2229
+  if IFS= read -r -t 1 "$__sk_live_var"; then
+    return 0
+  else
+    read_status=$?
+  fi
+  if (( read_status <= 128 )); then
+    if (( PICKER_INTERRUPTED )); then
+      PICKER_INTERRUPTED=0
+      echo
+      return 1
     fi
-    if (( PICKER_LIVE_STATUS <= 128 )); then
+    picker_exit input_closed
+  fi
+  waited=1
+
+  PICKER_TTY_STATE=$(stty -g < /dev/tty 2>/dev/null || true)
+  if [[ -z $PICKER_TTY_STATE ]] ||
+     ! stty -icanon -echo min 0 time 0 < /dev/tty 2>/dev/null; then
+    PICKER_TTY_STATE=""
+    picker_read "$__sk_live_var" "$__sk_live_prompt"
+    return
+  fi
+  # Characters typed during the canonical second are already visible. Drain
+  # them into our buffer without echoing them a second time.
+  while true; do
+    character=""
+    if ! IFS= read -r -s -n 1 -t 0.01 character; then
+      break
+    fi
+    if [[ -z $character || $character == $'\r' ]]; then
+      printf -v "$__sk_live_var" '%s' "$buffer"
+      echo
+      picker_input_restore
+      return 0
+    fi
+    buffer+=$character
+  done
+
+  while true; do
+    character=""
+    # shellcheck disable=SC2229
+    if IFS= read -r -s -n 1 -t 1 character; then
+      # `read -n 1` returns an empty value for the newline delimiter.
+      if [[ -z $character || $character == $'\r' ]]; then
+        printf -v "$__sk_live_var" '%s' "$buffer"
+        echo
+        picker_input_restore
+        return 0
+      fi
+      case "$character" in
+        $'\177'|$'\b')
+          if [[ -n $buffer ]]; then
+            buffer=${buffer%?}
+            printf '\b \b'
+          fi
+          ;;
+        $'\004')
+          if [[ -z $buffer ]]; then
+            picker_exit input_closed
+          fi
+          printf -v "$__sk_live_var" '%s' "$buffer"
+          echo
+          picker_input_restore
+          return 0
+          ;;
+        *)
+          buffer+=$character
+          printf '%s' "$character"
+          ;;
+      esac
+      continue
+    else
+      read_status=$?
+    fi
+    if (( read_status <= 128 )); then
       if (( PICKER_INTERRUPTED )); then
         PICKER_INTERRUPTED=0
         echo
+        picker_input_restore
         return 1
       fi
+      picker_input_restore
       picker_exit input_closed
     fi
-    if picker_live_ready && picker_live_collect; then
-      echo
-      return 3
+    if picker_live_ready; then
+      picker_live_collect
+      collect_status=$?
+      if (( collect_status == 0 || collect_status == 2 )); then
+        # Ghostty renders faster than a whole menu can be rewritten. Batch the
+        # replacement as one frame so it never exposes the cleared screen, then
+        # move home and erase only the active display instead of clearing the
+        # terminal and its scrollback. Unsupported terminals ignore DEC mode
+        # 2026 and still receive an ordinary in-place redraw.
+        printf '\033[?2026h\033[H\033[J'
+        render_main
+        printf '%s%s' "$__sk_live_prompt" "$buffer"
+        printf '\033[?2026l'
+      fi
     fi
     waited=$(( waited + 1 ))
     if (( waited >= seconds )); then

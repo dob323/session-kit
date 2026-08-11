@@ -16,6 +16,21 @@ Codex theme files, the user-level self-name instructions, Claude title-hook
 coverage, active kill switches, and the private
 `release-acceptance.json` record. These migration checks are warnings: they do
 not alter provider state or make an otherwise healthy installation fail.
+
+These checks report the running installation rather than the files on disk, so
+they can fail an installation that installed cleanly:
+
+| Check | Reports | Fix it with |
+| --- | --- | --- |
+| `shpool-version` | the installed shpool against the 0.11.0 release the kit is tested and patched against | `cargo install shpool --version 0.11.0 --locked` |
+| `watchdog` | whether `session-kit-watchdog.service` is enabled and running, not only installed | `session-kit services enable` |
+| `units` | the enabled and active state of each Session Kit unit; the socket-activated and timer-activated units are reported without being required | `session-kit services enable` |
+| `linger` | whether logind keeps your user manager alive after logout | `loginctl enable-linger "$USER"` |
+| `hook-files` | whether each registered intake hook command resolves to a runnable file | `session-kit update` |
+
+`watchdog`, `units`, and `linger` read live state only when the systemd user
+manager answers on its own socket. When it is reachable only through the
+local-machine transport, doctor reports them as unchecked instead of guessing.
 Kill-switch findings print supported variable or sentinel names only, never
 their values.
 
@@ -189,6 +204,12 @@ required Linux daemon-thread evidence is unavailable. Manual `sp repair` still
 requires direct evidence of an unrecoverable handoff failure and an exact
 provider conversation.
 
+For automatic decisions, an old journal line is not enough. The watchdog
+requires a named handoff failure from the current daemon generation and ignores
+it when a later successful attach exists. Unknown recent-output age makes the
+condition report-only. A global serving-thread count mismatch warns about the
+manager but is never assigned to one session and never triggers a repair.
+
 ## Automatic cleanup did not run
 
 This is usually a safe refusal. A provider-exited terminal must remain detached
@@ -205,6 +226,12 @@ picker-file expiry and stale immutable-release garbage collection are currently
 Linux-only.
 
 ## Terminal cannot be opened
+
+If the daemon log for the named session contains the full heartbeat chain
+`joining heartbeat_h`, `waiting for heartbeat ack`, and a receive timeout, the
+optional `0001` patch prevents that delayed ack from destroying the session's
+terminal-serving thread. Rebuilding and restarting the daemon is required;
+repeatedly opening the already-wedged terminal cannot repair its lost thread.
 
 For direct shpool handoff failure evidence:
 

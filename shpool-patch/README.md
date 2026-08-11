@@ -1,7 +1,7 @@
 # Optional shpool 0.11.0 patches
 
 Session Kit uses official shpool 0.11.0 by default. This directory contains
-optional one-file source patches: `0001` for a heartbeat failure, `0002` for
+optional source patches: `0001` for a heartbeat failure, `0002` for
 input-mode loss on reattach, `0003` for sessions that become unkillable once
 their shell dies on its own, and `0004` for a daemon-wide deadlock in the
 detach handler. Apply them in numeric order; `0002`, `0003` and `0004` each
@@ -37,6 +37,12 @@ and continues. The acknowledgement receiver can treat the same timeout as
 fatal. That error can unwind the handler scope, leaving a listed session unable
 to accept another client.
 
+This exact chain was captured in production on 2026-08-09. The daemon logged
+`joining heartbeat_h`, `waiting for heartbeat ack`, and the receive timeout;
+later attempts to open the named listed session timed out after 300ms while
+attaching a new client stream. This is the evidence required for `0001`, not a
+generic attach error by itself.
+
 Typical evidence is:
 
 ```text
@@ -50,20 +56,25 @@ before sharing logs.
 
 ## Change
 
-The patch changes only the acknowledgement timeout branch:
+The patch makes a delayed acknowledgement recoverable without confusing it
+with the next heartbeat:
 
-```rust
-Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-```
+- heartbeat requests and acknowledgements carry matching request IDs;
+- the acknowledgement channel has one buffer slot, so a late ack cannot block
+  the shell-to-client thread;
+- a timed-out request is abandoned without ending the session scope;
+- a late ack for an abandoned request is discarded by ID.
 
 A disconnected channel still returns normally. A dead client is still detected
 by the existing client-stream write failure.
 
 ## Limits
 
-The repository does not claim a deterministic reproduction of the narrow race.
-The patch removes one fatal timeout path based on the upstream control flow. It
-does not prove that every unopenable session has this cause.
+The patch includes deterministic regressions that pause the shell-to-client
+thread after it writes a heartbeat, hold the ack past the 300ms timeout, and
+verify continued output, detach-and-reattach, repeated late-ack ID handling,
+and client loss during the delay. They do not prove that every unopenable
+session has this cause.
 
 Do not apply it for quiet output, a provider pause, a normal provider exit, or a
 generic attach failure without the matching acknowledgement evidence.
@@ -84,13 +95,14 @@ cargo build --locked --release --bin shpool
 sha256sum target/release/shpool
 ```
 
-`patched-binary.sha256` is a reference checksum from one reviewed build. A
-different Rust toolchain, target, or build environment can produce different
-bytes. Record the upstream tag, patch checksum, Rust version, target triple,
-build command, and resulting binary checksum for your own artifact.
+`patched-binary.sha256` is the reference checksum from the reviewed build with
+all four patches applied in numeric order. A different Rust toolchain, target,
+or build environment can produce different bytes. Record the upstream tag,
+patch checksums, Rust version, target triple, build command, and resulting
+binary checksum for your own artifact.
 
-The CI patch job checks that the patch applies to the pinned upstream tag and
-that the patched source builds.
+The CI patch job applies all four patches to the pinned upstream tag, runs the
+workspace tests, and builds the release binary.
 
 ## Activation and rollback
 

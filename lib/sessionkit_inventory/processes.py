@@ -147,6 +147,10 @@ def scan_process_table(
             "comm": comm,
             "cwd": cwd,
             "session_name": environ.get("SHPOOL_SESSION_NAME", ""),
+            "claude_config_dir": environ.get("CLAUDE_CONFIG_DIR", ""),
+            "codex_home": environ.get("CODEX_HOME", ""),
+            "account_alias": environ.get("SESSION_KIT_ACCOUNT_ALIAS", ""),
+            "account_capable": environ.get("SESSION_KIT_ACCOUNT_CAPABLE", ""),
         }
     return table
 
@@ -375,6 +379,10 @@ def scan_darwin_process_table(
             "session_name": environ.get("SHPOOL_SESSION_NAME", ""),
             "codex_thread_id": environ.get("CODEX_THREAD_ID", ""),
             "claude_session_id": environ.get("CLAUDE_SESSION_ID", ""),
+            "claude_config_dir": environ.get("CLAUDE_CONFIG_DIR", ""),
+            "codex_home": environ.get("CODEX_HOME", ""),
+            "account_alias": environ.get("SESSION_KIT_ACCOUNT_ALIAS", ""),
+            "account_capable": environ.get("SESSION_KIT_ACCOUNT_CAPABLE", ""),
         }
     return table
 

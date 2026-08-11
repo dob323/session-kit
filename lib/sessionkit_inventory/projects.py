@@ -22,6 +22,15 @@ from typing import Any, Iterable, Mapping, Sequence
 from urllib.parse import quote
 
 try:
+    from .common import CollectionError, parse_number_selection
+except ImportError:  # the picker and the installer run this file as a script
+    sys.path.insert(0, os.fspath(Path(__file__).resolve().parents[1]))
+    from sessionkit_inventory.common import (  # noqa: E402
+        CollectionError,
+        parse_number_selection,
+    )
+
+try:
     import tomllib
 except ImportError:  # Python 3.10 is supported on Linux.
     tomllib = None  # type: ignore[assignment]
@@ -521,33 +530,16 @@ def suggest_alias(cwd: str, existing: Sequence[Mapping[str, str]]) -> str:
 
 
 def select_rows(rows: Sequence[Mapping[str, str]], answer: str) -> list[dict[str, str]]:
-    """Resolve a "1,3-5" / "a" selection against a numbered list.
+    """Resolve a "1,3-5" / "all" selection against a numbered list.
 
-    One implementation so the installer and the picker can never disagree
-    about what a range means.
+    The grammar itself lives in ``common.parse_number_selection`` — one
+    implementation, so no two surfaces can disagree about what a range means.
     """
-    answer = answer.strip().lower()
-    if not answer:
-        return []
-    if answer == "a":
-        return [dict(row) for row in rows]
-    picked: set[int] = set()
-    for part in answer.split(","):
-        part = part.strip()
-        if not part:
-            raise ProjectError("use numbers, ranges such as 2-4, or a for all")
-        if "-" in part:
-            first, _, last = part.partition("-")
-            if not first.isdigit() or not last.isdigit() or int(first) > int(last):
-                raise ProjectError("use numbers, ranges such as 2-4, or a for all")
-            picked.update(range(int(first), int(last) + 1))
-        elif part.isdigit():
-            picked.add(int(part))
-        else:
-            raise ProjectError("use numbers, ranges such as 2-4, or a for all")
-    if not picked or any(number < 1 or number > len(rows) for number in picked):
-        raise ProjectError(f"choose between 1 and {len(rows)}")
-    return [dict(rows[number - 1]) for number in sorted(picked)]
+    try:
+        picked = parse_number_selection(answer, len(rows))
+    except CollectionError as reason:
+        raise ProjectError(str(reason)) from reason
+    return [dict(rows[number - 1]) for number in picked]
 
 
 def project_candidates(projects_file: Path) -> dict[str, Any]:

@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import base64
 import json
+import io
 import os
 from pathlib import Path
 import plistlib
+import signal
 import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import tarfile
 import time
 import unittest
 
@@ -19,6 +22,7 @@ from tests.support import THEME_COLORS
 REPO = Path(__file__).resolve().parents[1]
 RELEASE_A = "1" * 40
 RELEASE_B = "2" * 40
+LEGACY_PRE_HOOK_COMMIT = "5ff810b0d00ec4717184f0a1fadab541adf2b4ca"
 
 
 class InstallerTests(unittest.TestCase):
@@ -92,6 +96,63 @@ class InstallerTests(unittest.TestCase):
             )
         return result
 
+    def test_partial_provider_hook_activation_restores_preimages_and_commits_backups(self) -> None:
+        claude = self.home / ".claude"
+        claude.mkdir()
+        settings = claude / "settings.json"
+        original = b'{"existing":"claude-setting"}\n'
+        settings.write_bytes(original)
+        settings.chmod(0o600)
+        codex_hooks = self.home / ".codex" / "hooks.json"
+        claude_command = (
+            '"$HOME/.local/lib/session-kit/current/extras/hooks/sk_session_events.py"'
+        )
+
+        self.env["SESSION_KIT_TEST_FAILPOINT"] = "provider-hooks-claude"
+        failed = self.run_installer("--non-interactive", check=False)
+        self.assertNotEqual(0, failed.returncode)
+        journal_path = self.home / ".local/state/session-kit/lifecycle-transaction.json"
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        entries = {item["path"]: item for item in journal["entries"]}
+        self.assertEqual("file", entries[str(settings)]["kind"])
+        self.assertEqual(original, base64.b64decode(entries[str(settings)]["content"]))
+        self.assertEqual("absent", entries[str(codex_hooks)]["kind"])
+        activated_settings = json.loads(settings.read_text(encoding="utf-8"))
+        self.assertEqual(
+            claude_command,
+            activated_settings["hooks"]["UserPromptSubmit"][0]["hooks"][0][
+                "command"
+            ],
+        )
+        self.assertFalse(codex_hooks.exists())
+
+        self.env.pop("SESSION_KIT_TEST_FAILPOINT")
+        recovered = self.run_installer("--non-interactive")
+        self.assertIn(
+            "Recovered interrupted Session Kit install transaction", recovered.stdout
+        )
+        self.assertFalse(journal_path.exists())
+        recovered_settings = json.loads(settings.read_text(encoding="utf-8"))
+        self.assertEqual(
+            claude_command,
+            recovered_settings["hooks"]["UserPromptSubmit"][0]["hooks"][0][
+                "command"
+            ],
+        )
+        self.assertEqual(
+            (REPO / "config/codex/hooks.json").read_bytes(), codex_hooks.read_bytes()
+        )
+
+        backups = sorted(
+            (self.home / ".local/state/session-kit/backups").glob("lifecycle-*.json")
+        )
+        committed = json.loads(backups[-1].read_text(encoding="utf-8"))
+        committed_entries = {item["path"]: item for item in committed["entries"]}
+        self.assertEqual(
+            original, base64.b64decode(committed_entries[str(settings)]["content"])
+        )
+        self.assertEqual("absent", committed_entries[str(codex_hooks)]["kind"])
+
     def installed(
         self, *args: str, check: bool = True
     ) -> subprocess.CompletedProcess[str]:
@@ -139,6 +200,35 @@ class InstallerTests(unittest.TestCase):
                 "-q",
                 "-m",
                 "fixture",
+            ],
+            check=True,
+        )
+        return source
+
+    def legacy_source_fixture(self) -> Path:
+        """A committed source snapshot from before provider-hook activation."""
+        source = self.temp / "legacy-source"
+        source.mkdir()
+        archived = subprocess.check_output(
+            ["git", "archive", "--format=tar", LEGACY_PRE_HOOK_COMMIT], cwd=REPO
+        )
+        with tarfile.open(fileobj=io.BytesIO(archived), mode="r:") as archive:
+            archive.extractall(source, filter="data")
+        subprocess.run(["git", "init", "-q", source], check=True)
+        subprocess.run(["git", "-C", source, "add", "."], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                source,
+                "-c",
+                "user.name=Session Kit Tests",
+                "-c",
+                "user.email=session-kit-tests@invalid.example",
+                "commit",
+                "-q",
+                "-m",
+                "legacy fixture",
             ],
             check=True,
         )
@@ -404,6 +494,257 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(current.resolve().name, RELEASE_B)
         self.installed("rollback")
         self.assertEqual(current.resolve().name, RELEASE_A)
+
+    def test_legacy_rollback_keeps_modern_manager_for_forward_update(self) -> None:
+        legacy = self.legacy_source_fixture()
+        installed_legacy = subprocess.run(
+            [str(legacy / "install.sh"), "--non-interactive"],
+            cwd=legacy,
+            env=self.env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(
+            0,
+            installed_legacy.returncode,
+            installed_legacy.stdout + installed_legacy.stderr,
+        )
+        self.env["SESSION_KIT_RELEASE_ID"] = RELEASE_B
+        self.run_installer("--non-interactive")
+        root = self.home / ".local/lib/session-kit"
+        current = root / "current"
+        manager = root / "manager"
+        launcher = self.home / ".local/bin/session-kit"
+        release_b = root / "releases" / RELEASE_B
+        self.assertEqual(RELEASE_B, manager.resolve().name)
+
+        self.installed("rollback", "--to", RELEASE_A)
+
+        self.assertEqual(RELEASE_A, current.resolve().name)
+        self.assertEqual(RELEASE_B, manager.resolve().name)
+        self.assertFalse((self.home / ".codex/hooks.json").exists())
+        self.assertEqual(
+            (release_b / "deploy/session-kit-launcher").read_bytes(),
+            launcher.read_bytes(),
+        )
+
+        updated = self.installed("update", "--source", str(REPO))
+
+        self.assertIn("Installed Session Kit release", updated.stdout)
+        self.assertEqual(RELEASE_B, current.resolve().name)
+        self.assertEqual(RELEASE_B, manager.resolve().name)
+        self.assertTrue((self.home / ".codex/hooks.json").is_file())
+        for path in (
+            self.home / ".claude/settings.json",
+            self.home / ".codex/hooks.json",
+        ):
+            document = json.loads(path.read_text(encoding="utf-8"))
+            owned = [
+                hook
+                for groups in document["hooks"].values()
+                for group in groups
+                for hook in group["hooks"]
+                if hook.get("sessionKitProvenance", {}).get("owner")
+                == "session-kit"
+            ]
+            self.assertEqual(1, len(owned))
+        doctor = self.installed("doctor", "--json")
+        checks = {row["name"]: row for row in json.loads(doctor.stdout)["checks"]}
+        self.assertEqual("ok", checks["manager"]["status"])
+        self.assertEqual("ok", checks["manager-launcher"]["status"])
+        self.assertEqual("ok", checks["provider-hooks"]["status"])
+
+    def test_direct_manager_rollback_pins_preflip_launcher_source(self) -> None:
+        legacy = self.legacy_source_fixture()
+        installed_legacy = subprocess.run(
+            [str(legacy / "install.sh"), "--non-interactive"],
+            cwd=legacy,
+            env=self.env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(0, installed_legacy.returncode)
+        self.env["SESSION_KIT_RELEASE_ID"] = RELEASE_B
+        self.run_installer("--non-interactive")
+        root = self.home / ".local/lib/session-kit"
+        release_b = root / "releases" / RELEASE_B
+        launcher = self.home / ".local/bin/session-kit"
+        shutil.copy2(release_b / "bin/session-kit", launcher)
+
+        rolled_back = self.installed("rollback", "--to", RELEASE_A)
+
+        self.assertIn("Rolled back Session Kit", rolled_back.stdout)
+        self.assertEqual(RELEASE_A, (root / "current").resolve().name)
+        self.assertEqual(
+            (release_b / "deploy/session-kit-launcher").read_bytes(),
+            launcher.read_bytes(),
+        )
+        self.installed("doctor", "--json")
+
+    def test_management_launcher_fails_closed_without_manager_anchor(self) -> None:
+        self.run_installer("--non-interactive")
+        manager = self.home / ".local/lib/session-kit/manager"
+        manager.unlink()
+
+        result = self.installed("doctor", check=False)
+
+        self.assertEqual(78, result.returncode)
+        self.assertIn("unsafe manager link", result.stderr)
+
+    def test_rollback_to_release_without_provider_hooks_and_next_recovery_succeed(self) -> None:
+        legacy = self.legacy_source_fixture()
+        installed_legacy = subprocess.run(
+            [str(legacy / "install.sh"), "--non-interactive"],
+            cwd=legacy,
+            env=self.env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(
+            0, installed_legacy.returncode, installed_legacy.stdout + installed_legacy.stderr
+        )
+        legacy_release = self.home / ".local/lib/session-kit/releases" / RELEASE_A
+        self.assertFalse(
+            (legacy_release / "lib/sessionkit_supervisor/provider_hooks.py").exists()
+        )
+        self.assertFalse((legacy_release / "config/codex/hooks.json").exists())
+
+        self.env["SESSION_KIT_RELEASE_ID"] = RELEASE_B
+        self.run_installer("--non-interactive")
+        current = self.home / ".local/lib/session-kit/current"
+        self.assertEqual(RELEASE_B, current.resolve().name)
+        self.assertTrue((self.home / ".codex/hooks.json").is_file())
+
+        rolled_back = self.installed("rollback", "--to", RELEASE_A)
+        self.assertIn("Rolled back Session Kit", rolled_back.stdout)
+        self.assertEqual(RELEASE_A, current.resolve().name)
+        self.assertFalse((self.home / ".codex/hooks.json").exists())
+
+        self.env["SESSION_KIT_TEST_FAILPOINT"] = "current"
+        interrupted = self.installed(
+            "update", "--source", str(REPO), check=False
+        )
+        self.assertNotEqual(0, interrupted.returncode)
+        journal = self.home / ".local/state/session-kit/lifecycle-transaction.json"
+        self.assertTrue(journal.is_file())
+        self.env.pop("SESSION_KIT_TEST_FAILPOINT")
+        recovered = self.installed("update", "--source", str(REPO))
+        self.assertIn("Recovered interrupted Session Kit install", recovered.stdout)
+        self.assertFalse(journal.exists())
+
+    def test_sigkill_before_rollback_commit_uses_pinned_recovery_release(self) -> None:
+        legacy = self.legacy_source_fixture()
+        installed_legacy = subprocess.run(
+            [str(legacy / "install.sh"), "--non-interactive"],
+            cwd=legacy,
+            env=self.env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(
+            0, installed_legacy.returncode, installed_legacy.stdout + installed_legacy.stderr
+        )
+        self.env["SESSION_KIT_RELEASE_ID"] = RELEASE_B
+        self.run_installer("--non-interactive")
+
+        self.env["SESSION_KIT_TEST_FAILPOINT"] = "rollback-precommit"
+        self.env["SESSION_KIT_TEST_FAILPOINT_MODE"] = "kill"
+        killed = self.installed("rollback", "--to", RELEASE_A, check=False)
+        self.assertEqual(-signal.SIGKILL, killed.returncode)
+        current = self.home / ".local/lib/session-kit/current"
+        journal = self.home / ".local/state/session-kit/lifecycle-transaction.json"
+        launcher = self.home / ".local/bin/session-kit"
+        self.assertEqual(RELEASE_A, current.resolve().name)
+        self.assertTrue(journal.is_file())
+        self.assertEqual(
+            (self.home / ".local/lib/session-kit/releases" / RELEASE_B / "deploy/session-kit-launcher").read_bytes(),
+            launcher.read_bytes(),
+        )
+
+        self.env.pop("SESSION_KIT_TEST_FAILPOINT")
+        self.env.pop("SESSION_KIT_TEST_FAILPOINT_MODE")
+        recovered = self.installed("update", "--source", str(REPO))
+        self.assertIn("Recovered interrupted Session Kit rollback", recovered.stdout)
+        self.assertEqual(RELEASE_B, current.resolve().name)
+        self.assertFalse(journal.exists())
+
+    def test_sigkill_immediately_after_rollback_commit_keeps_stable_launcher(self) -> None:
+        legacy = self.legacy_source_fixture()
+        installed_legacy = subprocess.run(
+            [str(legacy / "install.sh"), "--non-interactive"],
+            cwd=legacy,
+            env=self.env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(
+            0, installed_legacy.returncode, installed_legacy.stdout + installed_legacy.stderr
+        )
+        self.env["SESSION_KIT_RELEASE_ID"] = RELEASE_B
+        self.run_installer("--non-interactive")
+
+        self.env["SESSION_KIT_TEST_FAILPOINT"] = "rollback-postcommit"
+        self.env["SESSION_KIT_TEST_FAILPOINT_MODE"] = "kill"
+        killed = self.installed("rollback", "--to", RELEASE_A, check=False)
+        self.assertEqual(-signal.SIGKILL, killed.returncode)
+        current = self.home / ".local/lib/session-kit/current"
+        journal = self.home / ".local/state/session-kit/lifecycle-transaction.json"
+        launcher = self.home / ".local/bin/session-kit"
+        self.assertEqual(RELEASE_A, current.resolve().name)
+        self.assertFalse(journal.exists())
+        self.assertEqual(
+            (self.home / ".local/lib/session-kit/releases" / RELEASE_B / "deploy/session-kit-launcher").read_bytes(),
+            launcher.read_bytes(),
+        )
+
+        self.env.pop("SESSION_KIT_TEST_FAILPOINT")
+        self.env.pop("SESSION_KIT_TEST_FAILPOINT_MODE")
+        recovered = self.installed("update", "--source", str(REPO))
+        self.assertEqual(RELEASE_B, current.resolve().name)
+        self.assertFalse(journal.exists())
+        self.assertIn("Installed Session Kit release", recovered.stdout)
+
+    def test_install_uninstall_preserves_colocated_user_hooks_byte_exact(self) -> None:
+        claude_settings = self.home / ".claude/settings.json"
+        codex_hooks = self.home / ".codex/hooks.json"
+        claude_settings.parent.mkdir()
+        codex_hooks.parent.mkdir()
+        claude_original = (
+            b'{ "hooks" : { "UserPromptSubmit" : [{"hooks":['
+            b'{"command":"python3 ~/.claude/hooks/quota_human_session.py"},'
+            b'{"command":"sh ~/.claude/hooks/nameintent_title.sh"}'
+            b']}]}, "keep" : true }\n'
+        )
+        codex_original = (
+            b'{"hooks":{"UserPromptSubmit":[{"hooks":['
+            b'{"command":"user-codex-hook","type":"command"}'
+            b']}]},"description":"mine"}\n'
+        )
+        for path, payload in (
+            (claude_settings, claude_original),
+            (codex_hooks, codex_original),
+        ):
+            path.write_bytes(payload)
+            path.chmod(0o600)
+
+        self.run_installer("--non-interactive")
+        active_claude = claude_settings.read_text(encoding="utf-8")
+        self.assertIn("quota_human_session.py", active_claude)
+        self.assertIn("nameintent_title.sh", active_claude)
+        self.assertIn("sessionKitProvenance", active_claude)
+        self.installed("uninstall")
+        self.assertEqual(claude_original, claude_settings.read_bytes())
+        self.assertEqual(codex_original, codex_hooks.read_bytes())
 
     def test_update_defaults_journals_off_and_allows_explicit_opt_in(self) -> None:
         self.run_installer("--journal", "on", "--non-interactive")
@@ -706,21 +1047,23 @@ class InstallerTests(unittest.TestCase):
         acceptance.chmod(0o600)
         self.env["SESSION_KIT_NO_COLOR"] = "secret-color-value"
 
-        result = self.installed("doctor", "--json")
+        result = self.installed("doctor", "--json", check=False)
 
+        self.assertNotEqual(0, result.returncode)
         self.assertNotIn("secret-color-value", result.stdout)
         names = {row["name"]: row for row in json.loads(result.stdout)["checks"]}
         self.assertEqual(names["naming-instructions"]["status"], "ok")
         self.assertEqual(names["naming-hook"]["status"], "ok")
         self.assertEqual(names["acceptance"]["status"], "ok")
         self.assertEqual(names["kill-switches"]["status"], "warn")
+        self.assertEqual(names["provider-hooks"]["status"], "fail")
         self.assertIn("SESSION_KIT_NO_COLOR", names["kill-switches"]["detail"])
 
         stale = json.loads(acceptance.read_text(encoding="utf-8"))
         stale["release_id"] = RELEASE_B
         acceptance.write_text(json.dumps(stale), encoding="utf-8")
         acceptance.chmod(0o600)
-        stale_result = self.installed("doctor", "--json")
+        stale_result = self.installed("doctor", "--json", check=False)
         stale_names = {
             row["name"]: row for row in json.loads(stale_result.stdout)["checks"]
         }
@@ -755,10 +1098,12 @@ class InstallerTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        result = self.installed("doctor", "--json")
+        result = self.installed("doctor", "--json", check=False)
 
+        self.assertNotEqual(0, result.returncode)
         names = {row["name"]: row for row in json.loads(result.stdout)["checks"]}
         self.assertEqual(names["naming-hook"]["status"], "warn")
+        self.assertEqual(names["provider-hooks"]["status"], "fail")
         self.assertIn("SessionStart", names["naming-hook"]["detail"])
         self.assertIn("UserPromptSubmit", names["naming-hook"]["detail"])
 
@@ -771,7 +1116,7 @@ class InstallerTests(unittest.TestCase):
             "run sp self-name once\n", encoding="utf-8"
         )
         claude = self.home / ".claude"
-        claude.mkdir()
+        claude.mkdir(exist_ok=True)
         (claude / "CLAUDE.md").write_text(
             "run sp self-name once\n", encoding="utf-8"
         )

@@ -10,3 +10,13 @@ __pycache__/
 venv/
 .DS_Store
 *.log
+
+# Test sandboxes. The suite builds each one with
+# `tempfile.TemporaryDirectory(dir=REPO)` so a test's fake HOME, state
+# directory and unix sockets sit on the same filesystem as the code under
+# test; roughly seventy prefixes do it (.commands-, .login-, .session-kit-…),
+# every one a hidden directory in the repository root with a random suffix. An
+# interrupted run leaves them behind, and one `git add -A` at the wrong moment
+# commits a mocked home. Ignore the whole class rather than chase prefixes.
+/.*/
+!/.github/

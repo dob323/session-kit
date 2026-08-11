@@ -94,6 +94,8 @@ installations on a persistent Mac account.
   per-user launchd jobs on macOS.
 - Do not add telemetry, prompt logging, terminal logging, or notifications by
   default.
+- Name roles, never people: no personal names in shipped files (see
+  [No personal names in shipped files](#no-personal-names-in-shipped-files)).
 
 A change that moves code between modules must not change behavior in the same
 commit, and every symbol an existing test patches on `lib/session_inventory.py`
@@ -101,6 +103,41 @@ must stay reachable through it. See
 [the modularization roadmap](docs/maintainers/modularization-roadmap.md) for the
 compatibility contract and the patch-point ledger.
 
+## No personal names in shipped files
+
+Everything the public export ships — code, comments, docstrings, tests,
+identifiers, configuration, prompts, and docs — names roles, not people. Write
+"the operator" or "the maintainer"; never a person's name. This covers
+identifiers as much as prose: a keyword argument or JSON key with a name in it
+ships just as publicly as a comment does.
+
+The same rule covers private account identifiers: real account aliases,
+usernames, hostnames, and email addresses never ship, in fixtures least of all.
+Test data uses neutral aliases and `@invalid.example` addresses. The project's
+own public GitHub slug is not private and is expected to appear.
+
+This is enforced, not advisory. `tools/public-scan --private-markers` rejects a
+release tree that contains a personal-name token, and it is the gate that
+`tools/build-public-tree` runs on every export. The scanner stores the blocked
+words only as one-way SHA-256 digests in `PRIVATE_TOKEN_DIGESTS`, so the
+scanner itself stays safe to publish, and it tests each underscore-separated
+part of an identifier as well as the whole token — `operator_confirmed` is
+fine, a name in that position is not.
+
+Adding a new blocked word means adding its digest, not the word:
+
+```
+python3 -c 'import hashlib; print(hashlib.sha256(b"word").hexdigest())'
+```
+
+Attribution required by an upstream licence is the one exception: an upstream
+copyright holder's name stays exactly as the licence requires.
+
+## Licensing
+
 By contributing, you agree that your contribution is licensed under the
-[MIT License](LICENSE). Changes to the shpool-derived patch remain under
-[Apache License 2.0](LICENSES/Apache-2.0.txt).
+[MIT License](LICENSE). Changes to the shpool-derived patches remain under
+[Apache License 2.0](LICENSES/Apache-2.0.txt), and changes to the vendored
+Maniple code under
+[its MIT licence](lib/sessionkit_supervisor/vendor/LICENSE). Third-party
+attribution lives in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).
