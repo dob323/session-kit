@@ -110,7 +110,8 @@ Session Kit follows [Semantic Versioning](https://semver.org/).
   verifier or an explicit `--allow-unverified` written onto the record. Duty
   receipts carry the same `launch_key` as run receipts, so the two families
   join directly. A forked test child that cannot exec now exits instead of
-  resuming the suite, and test sandboxes live outside the repository.
+  resuming the suite, and every test sandbox honours
+  `SESSION_KIT_TEST_EXEC_ROOT` for runs from deep checkouts.
 
 - The picker answers without attaching. `i<n>` peeks at what a session asked,
   how long it has waited, and the tail of its thread — read-only, nothing
