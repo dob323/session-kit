@@ -28,6 +28,7 @@ ASCII_DIGITS_RE = re.compile(r"[0-9]+")
 MAX_SELECTION_SPAN = 200
 SELECTION_GRAMMAR = "use numbers such as 1,3,5, ranges such as 2-4, or all"
 MAX_OPERATIONAL_ID_BYTES = 128
+STALL_DEFAULT_SECONDS = 2700
 LEGACY_OPERATIONAL_ID_RE = re.compile(r"^main(?:[1-9][0-9]*)?$")
 GENERATED_OPERATIONAL_ID_RE = re.compile(
     r"^s[0-9]{8}-[0-9]{6}-[1-9][0-9]*(?:-[1-9][0-9]*)?$"
@@ -44,6 +45,18 @@ def _positive_int(value: Any, default: int, low: int, high: int) -> int:
     except (TypeError, ValueError):
         return default
     return parsed if low <= parsed <= high else default
+
+
+def stall_threshold_seconds(environ: Mapping[str, str] | None = None) -> int:
+    """Return the one configured quiet-session threshold used by every surface."""
+
+    source = environ if environ is not None else os.environ
+    return _positive_int(
+        source.get("SESSION_KIT_STALL_SECONDS"),
+        STALL_DEFAULT_SECONDS,
+        60,
+        86400,
+    )
 
 
 def _positive_float(value: Any, default: float, low: float, high: float) -> float:

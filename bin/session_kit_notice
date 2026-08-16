@@ -1,0 +1,1451 @@
+#!/usr/bin/env python3
+"""session_kit_notice -- the door every notice uses that is NOT a picker row.
+
+The picker used to be the place four different things were told to a person:
+a repair that failed, a session reported quiet with nothing changed, a stalled
+session, and a question some other window was asking. Those are not "sessions
+waiting for you", and the picker is being narrowed to exactly that list. This
+program is where the other four go instead, so that narrowing costs nothing.
+
+    at the machine   -> the terminal session they are already sitting in
+    away, or unsure  -> the away transport (a phone-reachable notifier)
+    the picker       -> nothing, ever
+
+THE TERMINAL LEG ONLY APPLIES INSIDE A MANAGED SESSION. A person working in a
+terminal this kit does not manage has nothing attached, so presence reads away
+and every notice takes the away transport. That is not a fault -- there is no
+managed conversation to deliver into -- but it means an estate whose operator
+usually works outside the kit has ONE route, and leaving the away transport
+unset means it has none.
+
+THE PRESENCE RULE, in one sentence: they are at the machine only when a live,
+recent snapshot shows EXACTLY ONE attached session and that session has a valid
+recent UserPromptSubmit record; provider output is never presence evidence.
+Every other answer -- no snapshot, a stale one, nothing attached, SEVERAL
+attached, stale/missing/future input, or a question open in the target -- is
+away, because a duplicate notice costs them a glance and a missed one costs them
+the night.
+
+Why evidence and not a flag someone set: a declared presence is a guess that
+goes stale (the estate had one reading "at the keyboard" for two days while
+nobody was there). Why not `attached` alone: the snapshot contract defines it as
+"open in another window", and the watchdog beside this file exists partly
+because a session can stay wired to an SSH window that no longer exists. And why
+never a choice between two attached rows: nothing here ranks them, provider
+output age is not focus, and a notice into a Claude session PROMPTS that
+conversation -- so a guess does not merely display to the wrong window, it talks
+to the wrong conversation.
+
+THE TERMINAL ROUTE NEVER WRITES TO A PTY. It uses the session's own
+authenticated message socket (lib/sessionkit_messages/claude_socket.py), which
+is the vendor's interface for putting a line into a running session. Writing to
+a terminal a provider owns is how a screen gets corrupted, and this kit has
+already had one terminal handed over in the wrong mode.
+
+NO SILENT SUCCESS, AND DUPLICATES ONLY AS A SAFE FALLBACK. Every notice is
+latched by (class, key) and by the EVIDENCE behind it: the same thing said twice
+is not normally said twice, and stronger evidence about the same session is. A
+terminal send is first recorded as PROVISIONAL and suppresses nothing. It is
+promoted to landed only after reconciliation proves a receipt and the same
+attachment from immediately before the send through receipt confirmation. Any
+detach or uncertainty demotes it and fires the away leg. That can deliver one
+duplicate; it cannot safely be avoided because the receipt proves conversation
+acceptance, not that a person remained at the terminal.
+
+Commands
+    presence                 print the presence verdict as JSON; send nothing
+    route --class C --key K --subject S --body B [--evidence E]
+                             route one notice
+    sweep                    read the durable records and route what is new
+
+Configuration (all optional; every path defaults under the kit's state dir)
+    SESSION_KIT_NOTICE=off              disable every route (the kill switch)
+    SESSION_KIT_NOTICE_AWAY_CMD         the away transport. Takes the same
+                                        --type/--severity/--title/--body
+                                        contract the watchdog notifier takes,
+                                        so any conforming notifier fits -- but
+                                        it is NEVER inherited from that
+                                        notifier: see away_command() for why.
+                                        Unset means there is no away route and
+                                        every attempt says so.
+    SESSION_KIT_NOTICE_TERMINAL=off     never use the terminal route
+    SESSION_KIT_NOTICE_QUESTION_AWAY=hold
+                                        stop pushing another window's open
+                                        question to the away transport. The
+                                        default is `send`, because a class with
+                                        no route is what this file exists to
+                                        prevent; `hold` still records, logs and
+                                        counts the question rather than dropping
+                                        it.
+    SESSION_KIT_FLEET_DIR               where the stall flags and the question
+                                        inbox live (default ~/.local/state/fleet)
+    SESSION_KIT_NOTICE_SNAPSHOT_MAX_AGE seconds a snapshot may be old and still
+                                        answer the presence question (default 90)
+    SESSION_KIT_NOTICE_PRESENT_WITHIN   seconds of silence after which the one
+                                        attached session reads as a window left
+                                        open rather than one they are in (300)
+    SESSION_KIT_NOTICE_CONFIRM_SECONDS  how long to wait for a terminal notice to
+                                        appear in the target's own transcript
+                                        before calling it unconfirmed (6)
+    SESSION_KIT_NOTICE_MAX_AGE          seconds after which a record is counted
+                                        rather than named (21600)
+"""
+
+from __future__ import annotations
+
+import argparse
+import calendar
+import glob
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+from typing import Any, Mapping
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+
+from sessionkit_inventory import transcript_text, transcripts  # noqa: E402
+from sessionkit_inventory.attention import (  # noqa: E402
+    default_state_dir,
+    read_record,
+)
+
+try:
+    from sessionkit_messages import claude_socket
+except ImportError:  # pragma: no cover -- a tree without the messages module
+    claude_socket = None  # type: ignore[assignment]
+
+
+SCHEMA_VERSION = 1
+# One hour, matching the coalescing window the existing notifier already applies
+# to a warning. Callers that own their own incident discipline (the watchdog's
+# report_once, its per-session record latch) pass this; the record sweep passes
+# 0, which means "while this record exists, it has been said".
+DEFAULT_REPEAT_AFTER = 3600
+# Stall flags older than this mean the observer that writes them is not running.
+# The picker used the same bound; a dead observer's last opinion is not news.
+FLEET_FLAG_MAX_AGE = 300
+LATCH_ENTRIES = 400
+# Older than this and a record is COUNTED in the message rather than named in
+# it. It is never dropped for being old: age is not acknowledgement. Six hours
+# matches the watchdog's own quiet-report cooldown. Measured against the live
+# estate on 2026-08-15: 50 records, 21 sessions, ages 3.7h to 29.7h -- one
+# message names the newest five and counts the rest.
+DEFAULT_MAX_AGE = 21600
+# How many sessions one message names before it says "and N more". A notice is
+# a nudge to go and look, not the report itself.
+NAMED_IN_A_BATCH = 5
+# Same ranking `fix/attention-truth-line` gives the watchdog's record latch. A
+# record written before the evidence field existed reads as the weak kind,
+# which is what all of them were.
+EVIDENCE_STRENGTH = {"silence-only": 1, "daemon-marker": 2}
+
+CLASS_QUESTION = "background-question"
+
+
+# ---------------------------------------------------------------------------
+# small shared helpers
+# ---------------------------------------------------------------------------
+
+
+def _home() -> Path:
+    return Path(os.environ.get("HOME") or Path.home())
+
+
+def state_dir() -> Path:
+    return default_state_dir(os.environ, _home())
+
+
+def fleet_dir() -> Path:
+    configured = os.environ.get("SESSION_KIT_FLEET_DIR")
+    if configured:
+        return Path(configured)
+    return _home() / ".local" / "state" / "fleet"
+
+
+def enabled() -> bool:
+    return (os.environ.get("SESSION_KIT_NOTICE") or "on").strip().casefold() != "off"
+
+
+def log(message: str) -> None:
+    path = Path(
+        os.environ.get("SESSION_KIT_NOTICE_LOG") or (state_dir() / "notice.log")
+    )
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(f"{stamp} {message}\n")
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def read_json(path: Path, *, limit: int = 4 * 1024 * 1024) -> Any:
+    try:
+        if path.stat().st_size > limit:
+            return None
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return None
+
+
+def write_json_private(path: Path, payload: Any) -> bool:
+    """Replace one owner-only file atomically. False rather than an exception:
+    losing the bookkeeping must never stop the notice itself going out."""
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        temporary = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+        descriptor = os.open(
+            temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, sort_keys=True, indent=1)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        return True
+    except OSError:
+        return False
+
+
+def clean(value: object, limit: int, *, newlines: bool = False) -> str:
+    """Every field here is written by another process and ends up on a terminal
+    or in a chat message. Control characters cannot forge a line from either.
+
+    ``newlines`` keeps line breaks, and ONLY line breaks, for the one field
+    that is a list rather than a sentence: a batch body naming five sessions is
+    unreadable as one long line, which is what collapsing all whitespace did to
+    it. Everything below a space still goes, so a title cannot clear a screen
+    or forge a row.
+    """
+    text = "".join(
+        character
+        for character in str(value if value is not None else "")
+        if character >= " " or (newlines and character == "\n")
+        if character != "\x7f"
+    )
+    if not newlines:
+        return " ".join(text.split())[:limit]
+    kept = [" ".join(line.split()) for line in text.split("\n")]
+    return "\n".join(kept).strip("\n")[:limit]
+
+
+# ---------------------------------------------------------------------------
+# presence
+# ---------------------------------------------------------------------------
+
+
+def snapshot_is_live(document: object, *, max_age: float) -> bool:
+    """The same gate the watchdog trusts, plus an age bound.
+
+    `source: live` and `stale: false` say the snapshot was not served from a
+    cache. Neither says WHEN. A snapshot written an hour ago is a truthful
+    record of an hour ago, and reading an hour-old "attached" as "they are here"
+    is exactly the wrong-way failure: the notice would be delivered to an empty
+    chair.
+    """
+    if not isinstance(document, Mapping):
+        return False
+    if document.get("source") != "live" or document.get("stale") is not False:
+        return False
+    generated = document.get("generated_at")
+    if not isinstance(generated, str) or not generated:
+        # No stamp to check: accept it only from a command run just now, which
+        # is the caller's job to arrange (read_snapshot passes max_age=0 there).
+        return max_age <= 0
+    try:
+        # The stamp is UTC and says so. timegm reads it as UTC; mktime would
+        # read it as local time and put the snapshot hours into the future or
+        # the past depending on where the machine is.
+        moment = calendar.timegm(time.strptime(generated, "%Y-%m-%dT%H:%M:%SZ"))
+    except (TypeError, ValueError):
+        return False
+    age = time.time() - moment
+    # A stamp a few seconds ahead is clock skew. A stamp a MINUTE ahead is a
+    # clock nobody should be making a presence decision on, so the tolerance is
+    # small on purpose.
+    return -5 <= age <= max_age
+
+
+def read_snapshot(*, require_current: bool = False) -> tuple[Any, str]:
+    """(snapshot, where it came from). Never raises, never blocks for long.
+
+    ``require_current`` refuses the published fallback. A recent inventory is
+    enough for the ordinary presence verdict, but it cannot prove what stayed
+    attached across a send that just finished.
+    """
+    given = os.environ.get("SESSION_KIT_NOTICE_SNAPSHOT")
+    if given:
+        document = read_json(Path(given))
+        if snapshot_is_live(document, max_age=max_age_seconds()):
+            return document, "snapshot file"
+        return None, "the given snapshot is not live"
+    command = os.environ.get("SESSION_KIT_STATUS_CMD") or str(
+        Path(__file__).resolve().parent / "shpool_status"
+    )
+    if os.access(command, os.X_OK):
+        try:
+            # --strict-json, NEVER --json. `shpool_status` lists --json under
+            # "Modes that refresh the cached inventory as they run": its branch
+            # calls fill_pending_titles, which hydrates and PUSHES automatic
+            # titles, and it publishes snapshot state as it goes. Asking "are they
+            # here?" must not write anything, and on a 60-second watchdog that
+            # would have doubled this machine's inventory-refresh and
+            # title-push rate for the rest of its life.
+            #
+            # --strict-json is `snapshot --strict-live --no-write`: nothing is
+            # written, and it exits 3 rather than answer from stale, partial or
+            # ambiguous evidence. That refusal is the right one here, because
+            # the identity it hands back is the conversation this router will
+            # talk to -- and a refusal reads as presence unknown, which is away.
+            finished = subprocess.run(
+                [command, "--strict-json"], capture_output=True, text=True, timeout=30
+            )
+            if finished.returncode == 0:
+                document = json.loads(finished.stdout or "null")
+                # Straight from the manager a moment ago: its own freshness.
+                if snapshot_is_live(document, max_age=0) or snapshot_is_live(
+                    document, max_age=max_age_seconds()
+                ):
+                    return document, "the session manager"
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+    if require_current:
+        return None, "no current answer from the session manager"
+    published = state_dir() / "inventory.json"
+    document = read_json(published)
+    if snapshot_is_live(document, max_age=max_age_seconds()):
+        return document, "the published inventory"
+    return None, "no live snapshot"
+
+
+def max_age_seconds() -> float:
+    # 90 seconds: the watchdog collects fresh every 60, so a snapshot older
+    # than this is not the current state of the estate. They can walk away inside
+    # the window either way -- which is why presence needs the activity test as
+    # well, not just a young snapshot.
+    raw = os.environ.get("SESSION_KIT_NOTICE_SNAPSHOT_MAX_AGE") or "90"
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 90.0
+
+
+def active_within() -> float:
+    raw = os.environ.get("SESSION_KIT_NOTICE_PRESENT_WITHIN") or "300"
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 300.0
+
+
+def last_human_input(uuid: str) -> tuple[bool, float]:
+    """(a person typed here, how long ago). The only presence evidence used.
+
+    This used to read `recent_output_age_seconds` -- the session PRODUCING
+    output -- and call that presence. It is not. Provider output is autonomous:
+    a session works, prints, and keeps printing for as long as its turn takes,
+    with nobody in the room. A window they walked away from mid-turn looked more
+    present than one they were reading, and the notice was delivered into an
+    unattended conversation and latched as said.
+
+    So the evidence has to be INPUT: something only a person produces. The kit
+    already records exactly that. Claude Code's UserPromptSubmit hook fires when
+    a prompt is submitted, and config/claude/attention_hook.sh writes it to the
+    session's attention record with the timestamp -- its own comment for that
+    branch is "The person answered."
+
+    Limits, said plainly rather than papered over:
+
+      * A session with no hook installed, a Codex session, or one whose newest
+        record is a notification rather than a prompt, all read as NO evidence,
+        which is away. That is the conservative direction and it is deliberate.
+      * A prompt submitted by automation would look the same as a person
+        typing. Combined with "attached", that is a narrow case, and it fails
+        toward delivering a notice to a live terminal rather than toward
+        silence.
+    """
+    exact = (uuid or "").strip().lower()
+    if not exact:
+        return False, float("inf")
+    record = read_record(state_dir(), exact)
+    if not isinstance(record, Mapping):
+        return False, float("inf")
+    if str(record.get("hook_event") or "") != "UserPromptSubmit":
+        return False, float("inf")
+    stamp = record.get("recorded_at_ms")
+    if not isinstance(stamp, int) or isinstance(stamp, bool) or stamp <= 0:
+        return False, float("inf")
+    return True, max(0.0, time.time() - stamp / 1000)
+
+
+def presence(*, require_current: bool = False) -> dict[str, Any]:
+    """Are they at the machine, and if so WHICH session may carry a notice.
+
+    `attached` alone is not enough, and treating it as enough was wrong twice
+    over. The snapshot contract defines it as "open in another window"
+    (lib/sessionkit_inventory/SNAPSHOT.md) -- there is no focus in it, no
+    keyboard, no proof a person is there. The watchdog beside this file exists
+    partly BECAUSE a session can stay wired to an SSH window that no longer
+    exists, so an attached row can be an abandoned terminal. And a notice into
+    a Claude session is a `type=user` frame: the wrong session is not merely
+    written to, its conversation is PROMPTED.
+
+    So two conditions, and both are required:
+
+      * EXACTLY ONE session is attached. Two attached rows mean the machine
+        cannot say which window they are in -- nothing in the snapshot ranks them,
+        and provider output age is not focus (a session working by itself
+        prints constantly while they read another). Ambiguity takes the away
+        route; guessing prompts the wrong conversation.
+      * That session has a recent UserPromptSubmit hook record. Provider output
+        is autonomous and is not consulted. A record more than five seconds in
+        the future is not evidence; a backwards clock must not manufacture a
+        person who is no longer there.
+
+    Everything else -- no snapshot, a stale one, nothing attached, several
+    attached, or missing/stale/future input -- is away.
+    """
+    document, where = read_snapshot(require_current=require_current)
+    if document is None:
+        return {"present": False, "why": f"presence unknown ({where})", "targets": []}
+    attached = []
+    for row in document.get("sessions") or ():
+        if not isinstance(row, Mapping) or row.get("availability") != "attached":
+            continue
+        identity = row.get("identity")
+        attached.append(
+            {
+                "shpool_id": clean(row.get("shpool_id"), 80),
+                "provider": clean(row.get("provider"), 20),
+                "uuid": clean(
+                    (identity or {}).get("uuid") if isinstance(identity, Mapping) else "",
+                    40,
+                ),
+                "title": clean(row.get("display_title") or row.get("title"), 80),
+                "needs_you": row.get("needs_you") is True,
+                "age": row.get("recent_output_age_seconds"),
+            }
+        )
+    if not attached:
+        return {
+            "present": False,
+            "why": f"no terminal is attached to any session ({where})",
+            "targets": [],
+        }
+    if len(attached) > 1:
+        return {
+            "present": False,
+            "why": (
+                f"{len(attached)} terminals are attached and nothing here says which "
+                f"one they are in; guessing would prompt the wrong conversation ({where})"
+            ),
+            "targets": [],
+        }
+    only = attached[0]
+    typed, since = last_human_input(str(only.get("uuid") or ""))
+    bound = active_within()
+    if not typed:
+        return {
+            "present": False,
+            "why": (
+                f"the one attached session shows no sign of a person typing in it "
+                f"({where})"
+            ),
+            "targets": [],
+        }
+    if since > bound:
+        return {
+            "present": False,
+            "why": (
+                f"nobody has typed in the one attached session for {int(since)}s, "
+                f"so it reads as a window left open ({where})"
+            ),
+            "targets": [],
+        }
+    return {
+        "present": True,
+        "why": f"a person typed in the one attached session {int(since)}s ago ({where})",
+        "targets": [only],
+    }
+
+
+# ---------------------------------------------------------------------------
+# the latch
+# ---------------------------------------------------------------------------
+
+
+def latch_path() -> Path:
+    return Path(
+        os.environ.get("SESSION_KIT_NOTICE_LATCH") or (state_dir() / "notice-latch.json")
+    )
+
+
+def read_latch() -> dict[str, Any]:
+    document = read_json(latch_path())
+    if not isinstance(document, Mapping):
+        return {}
+    entries = document.get("notices")
+    return dict(entries) if isinstance(entries, Mapping) else {}
+
+
+def write_latch(entries: Mapping[str, Any]) -> bool:
+    ordered = sorted(
+        entries.items(),
+        key=lambda item: item[1].get("at_unix", 0) if isinstance(item[1], Mapping) else 0,
+    )
+    trimmed = dict(ordered[-LATCH_ENTRIES:])
+    return write_json_private(
+        latch_path(), {"schema_version": SCHEMA_VERSION, "notices": trimmed}
+    )
+
+
+def is_new_statement(stored: str, incoming: str) -> bool:
+    """Is this a new thing to say about the same key?
+
+    Deliberately the SAME rule `fix/attention-truth-line` gives the watchdog's
+    own record latch: strength, not novelty. A repeat of the same statement is
+    not new. An ESCALATION -- ordinary silence, and then the daemon's own
+    handoff failure for that session -- is. A downgrade is not: once the strong
+    thing has been said, saying the weak one afterwards adds nothing and would
+    let the two latches fight over the same event stream.
+
+    Evidence this table does not rank (a stall reason, an alert subject) is
+    compared as text, where any change is a change.
+    """
+    if stored == incoming:
+        return False
+    stored_rank = EVIDENCE_STRENGTH.get(stored)
+    incoming_rank = EVIDENCE_STRENGTH.get(incoming)
+    if stored_rank is not None and incoming_rank is not None:
+        return incoming_rank > stored_rank
+    return True
+
+
+def already_said(
+    entry: object,
+    evidence: str,
+    repeat_after: float,
+    source_at: float | None = None,
+) -> bool:
+    """One per incident AND per distinct evidence.
+
+    ONE RULE FOR THE STREAM, AND IT IS THE WATCHDOG'S. The watchdog decides
+    what a new incident is: it compares a session's output against the time of
+    its last record, and output since then means the session RECOVERED, so
+    whatever went quiet afterwards is a new incident and earns a new record.
+    This file invented a second rule -- one key per session, unchanged evidence
+    is said forever while any record exists -- and the two disagreed exactly
+    where it hurts: a genuine recovery followed by a second real failure wrote
+    a watchdog record and produced NO notice.
+
+    So the two are not reconciled by argument, they are reduced to one. A
+    record written AFTER the last thing said about that session is, by the
+    watchdog's own judgement, a new thing to say. `source_at` is that record's
+    own timestamp; when it is newer than the notice, this is not a repeat.
+    """
+    if not isinstance(entry, Mapping):
+        return False
+    if is_new_statement(clean(entry.get("evidence"), 200), evidence):
+        return False
+    # The SOURCE timestamp we acted on, not the wall-clock of sending. Those
+    # differ by milliseconds, and comparing against the send time would make
+    # "is this the same record?" a race.
+    said_at = entry.get("source_at")
+    if not isinstance(said_at, (int, float)) or isinstance(said_at, bool):
+        said_at = entry.get("at_unix")
+    if (
+        source_at is not None
+        and isinstance(said_at, (int, float))
+        and not isinstance(said_at, bool)
+        and source_at > float(said_at)
+    ):
+        # The observer wrote this AFTER we last spoke about the session, which
+        # is its way of saying the last one was over.
+        return False
+    stamp = entry.get("at_unix")
+    if not isinstance(stamp, (int, float)) or isinstance(stamp, bool):
+        return False
+    if not entry.get("landed"):
+        # A failed attempt is evidence of no delivery, not evidence that this
+        # notice was already said. Suppressing it here made a failed sweep
+        # report quiet=true and exit zero on the very next pass.
+        return False
+    if entry.get("reconciled") is not True or entry.get("state") != "reconciled":
+        # A terminal frame is written to the latch as provisional before its
+        # receipt and attachment interval are reconciled. It is evidence that
+        # a send may have happened, never evidence that the person was reached.
+        # Old latch entries predate this distinction and are retried once in
+        # the conservative direction rather than silently treated as proof.
+        return False
+    age = time.time() - float(stamp)
+    if repeat_after <= 0:
+        return True
+    return age < repeat_after
+
+
+# ---------------------------------------------------------------------------
+# the two routes
+# ---------------------------------------------------------------------------
+
+
+def away_command() -> str:
+    """The away transport, and it is NOT inherited from the watchdog notifier.
+
+    It would have been convenient to fall back to SESSION_KIT_WATCHDOG_NOTIFY.
+    It would also have been wrong: on the estate this was written for, that
+    notifier is an alert BOARD -- a page somebody goes and looks at -- and the
+    whole reason this router exists is that a board is not a person. Falling
+    back would have posted every notice to the same board twice and reported
+    the operator as reached. Unset means there is no away route, said out loud,
+    which is a wiring gap somebody can fix rather than a lie somebody believes.
+    """
+    return os.environ.get("SESSION_KIT_NOTICE_AWAY_CMD") or ""
+
+
+def send_away(notice_class: str, key: str, subject: str, body: str) -> tuple[bool, str]:
+    command = away_command()
+    if not command:
+        # Greppable and unmistakable. An estate with no away transport has no
+        # away route at all, and that has to read as a wiring fault rather than
+        # as a quiet night.
+        log(
+            "UNWIRED: SESSION_KIT_NOTICE_AWAY_CMD is not set, so nothing reaches "
+            f"them while they are away -- dropped: {subject}"
+        )
+        return False, "no away transport is configured (SESSION_KIT_NOTICE_AWAY_CMD)"
+    if not os.access(command, os.X_OK):
+        return False, f"the away transport {command} is not executable"
+    # Severity is pinned to warning exactly as the watchdog pins it: a notice
+    # about a session, delivered or not, must never fire a critical.
+    argv = [
+        command,
+        f"--type=session-kit.{notice_class}",
+        "--severity=warning",
+        f"--title={subject}",
+        f"--body={body}",
+        f"--class={notice_class}",
+        f"--key={key}",
+    ]
+    try:
+        finished = subprocess.run(argv, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        return False, "the away transport did not finish in 120s"
+    except OSError as error:
+        return False, f"the away transport could not run: {error!r}"
+    if finished.returncode != 0:
+        detail = clean(finished.stderr or finished.stdout, 160)
+        return False, f"the away transport exited {finished.returncode}: {detail}"
+    return True, "away transport accepted it"
+
+
+def notice_timeout() -> float:
+    raw = os.environ.get("SESSION_KIT_NOTICE_TIMEOUT") or "5"
+    try:
+        return max(1.0, float(raw))
+    except ValueError:
+        return 5.0
+
+
+def confirm_seconds() -> float:
+    """How long to wait for the message to appear in the target's transcript.
+
+    A live session writes its transcript as it renders, so this is normally a
+    fraction of a second. The bound exists so a sweep is never held up: an
+    unconfirmed notice is not lost, it takes the away route.
+    """
+    raw = os.environ.get("SESSION_KIT_NOTICE_CONFIRM_SECONDS") or "6"
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 6.0
+
+
+def terminal_targets(verdict: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """The session a notice may be put into. Never a choice between several.
+
+    `presence()` only ever hands one session over, and that is the point: this
+    used to rank several attached rows by provider output age, which is not
+    focus and would have prompted whichever conversation happened to be
+    printing. There is nothing to rank here now.
+
+    A session that is ASKING is skipped: a delivery over an open question
+    rendered on top of the dialog and pushed the question off their screen
+    (observed 2026-08-13), and a notice is precisely the thing that can wait.
+    """
+    return [
+        row
+        for row in verdict.get("targets") or ()
+        if isinstance(row, Mapping) and not row.get("needs_you")
+    ]
+
+
+def same_terminal_target(
+    expected: Mapping[str, Any], current: Mapping[str, Any]
+) -> bool:
+    """Is this still the exact managed conversation presence selected?"""
+    return all(
+        str(expected.get(field) or "") == str(current.get(field) or "")
+        for field in ("shpool_id", "provider", "uuid")
+    )
+
+
+def confirm_in_transcript(uuid: str, message_uuid: str, *, deadline: float) -> bool:
+    """Did the message actually land in the target's own conversation?
+
+    The transport is explicit that it cannot answer this: an accepted message
+    sends no receipt, so `send()` returns `sent-no-receipt` with
+    `delivered=False` and says the receipt of record is the message appearing
+    in the TARGET's own transcript. Reporting that as delivered -- which this
+    file used to do -- is the sender believing its own claim, and for a swept
+    record it then stayed suppressed while the record lived.
+
+    So the claim is checked where the transport says to check it. Read-only:
+    the conversation file is opened for reading and nothing else.
+    """
+    if not message_uuid:
+        return False
+    while True:
+        path = transcripts.locate_transcript("claude", uuid, environ=os.environ)
+        if path is not None:
+            try:
+                with open(path, "rb") as handle:
+                    # The tail is enough and is bounded: a transcript grows for
+                    # the life of a conversation and this runs on a watchdog
+                    # pass. Inspect the byte immediately before the window so
+                    # a cut first line can be discarded without throwing away
+                    # a complete line when the boundary happens to align.
+                    handle.seek(0, os.SEEK_END)
+                    size = handle.tell()
+                    start = max(0, size - 262144)
+                    if start:
+                        handle.seek(start - 1)
+                        boundary = handle.read(1)
+                    else:
+                        handle.seek(0)
+                        boundary = b"\n"
+                    tail = handle.read(262144)
+                    if boundary != b"\n":
+                        newline = tail.find(b"\n")
+                        tail = b"" if newline < 0 else tail[newline + 1 :]
+                    for raw in tail.splitlines():
+                        try:
+                            entry = json.loads(raw)
+                        except (ValueError, UnicodeError):
+                            continue
+                        if (
+                            isinstance(entry, dict)
+                            and entry.get("type") == "user"
+                            and entry.get("uuid") == message_uuid
+                            and transcript_text.render_transcript_entry(entry)
+                        ):
+                            return True
+            except OSError:
+                pass
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.25)
+
+
+def send_terminal(
+    verdict: Mapping[str, Any], subject: str, body: str
+) -> tuple[dict[str, Any] | None, str]:
+    """Attempt one terminal send and return an untrusted handoff record.
+
+    The returned attempt is deliberately provisional.  It says only what the
+    socket reported and whether the same target bracketed the send.  It cannot
+    become delivery until ``reconcile_terminal`` establishes the receipt and
+    closes the attachment interval after that receipt is knowable.
+    """
+    if (os.environ.get("SESSION_KIT_NOTICE_TERMINAL") or "on").strip().casefold() == "off":
+        return None, "the terminal route is switched off"
+    if claude_socket is None:
+        return None, "this tree has no session message client"
+    text = f"{subject}\n\n{body}"
+    reasons = []
+    for row in terminal_targets(verdict):
+        provider = str(row.get("provider") or "")
+        uuid = str(row.get("uuid") or "")
+        if provider != "claude" or not uuid:
+            # Codex sessions are reachable only through the app-server steer
+            # path, which is not in this repository. Naming it is the point:
+            # the notice goes to the away transport instead of nowhere.
+            reasons.append(f"{provider or 'unknown'} session cannot be addressed here")
+            continue
+        report = claude_socket.capability(uuid)
+        if not report.get("available"):
+            reasons.append(f"{uuid[:8]}: {report.get('reason') or 'unreachable'}")
+            continue
+        # Capability says only that the conversation has a receiver. It says
+        # nothing about whether the person is still at this terminal. Re-read
+        # the live estate AFTER capability and immediately before the send:
+        # detach, a second attachment, or a newly opened question invalidates
+        # the first verdict and must take the away route.
+        current_verdict = presence()
+        current_targets = (
+            terminal_targets(current_verdict)
+            if current_verdict.get("present")
+            else []
+        )
+        if (
+            len(current_targets) != 1
+            or not same_terminal_target(row, current_targets[0])
+        ):
+            reasons.append(
+                "presence changed before delivery: "
+                + clean(current_verdict.get("why"), 180)
+            )
+            continue
+        # Use the re-proved row from here onward. Any receipt or transcript
+        # confirmation below therefore occurs after the last presence check
+        # that authorised this delivery.
+        row = current_targets[0]
+        # A short receipt wait on purpose. A REFUSAL comes back over a local
+        # socket in milliseconds, and an acceptance sends nothing back at all,
+        # so waiting the module's full default would spend twenty seconds per
+        # notice learning nothing. Long enough to hear "held" or "denied";
+        # short enough that a sweep is not held up by good news.
+        outcome = claude_socket.send(
+            uuid,
+            text,
+            priority=(os.environ.get("SESSION_KIT_NOTICE_PRIORITY") or "next"),
+            sender="session-kit-notice",
+            timeout=notice_timeout(),
+        )
+        # This observation brackets the socket call, but it does NOT settle the
+        # handoff. Even a queue acknowledgement still needs the transcript's
+        # receipt of record, and that can take another six seconds. A current
+        # inventory can also have sampled attachment before its remaining
+        # collection work. Route records this attempt as provisional first;
+        # reconciliation makes a separate closing observation only after the
+        # transcript receipt is established.
+        delivered_verdict = presence(require_current=True)
+        delivered_targets = (
+            terminal_targets(delivered_verdict)
+            if delivered_verdict.get("present")
+            else []
+        )
+        interval_held = len(delivered_targets) == 1 and same_terminal_target(
+            row, delivered_targets[0]
+        )
+        closing_row = delivered_targets[0] if interval_held else row
+        return {
+            "target": dict(closing_row),
+            "uuid": uuid,
+            "queue_acknowledged": outcome.delivered is True,
+            "outcome_how": clean(outcome.how, 80),
+            "message_uuid": clean(outcome.extra.get("message_uuid"), 120),
+            "send_bracket_held": interval_held,
+            "send_bracket_why": clean(delivered_verdict.get("why"), 180),
+        }, f"terminal send is provisional ({clean(outcome.how, 80)})"
+    if not reasons:
+        return None, "every attached session is asking a question of its own"
+    return None, "; ".join(reasons[:4])
+
+
+def reconcile_terminal(attempt: Mapping[str, Any]) -> tuple[bool, str]:
+    """Promote only a transcript receipt followed by current same attachment."""
+    target = attempt.get("target")
+    if not isinstance(target, Mapping):
+        return False, "terminal attempt has no exact target to reconcile"
+    uuid = clean(attempt.get("uuid"), 40)
+    how = clean(attempt.get("outcome_how"), 80) or "unknown socket outcome"
+    name = clean(target.get("title"), 80) or uuid[:8]
+
+    if attempt.get("send_bracket_held") is not True:
+        return False, (
+            "presence changed during terminal delivery: "
+            + clean(attempt.get("send_bracket_why"), 180)
+            + f"; socket outcome was {how} and may have accepted the notice, "
+              "so away will also be attempted"
+        )
+
+    queue_acknowledged = attempt.get("queue_acknowledged") is True
+    if not queue_acknowledged and how not in {
+        claude_socket.SENT_NO_RECEIPT,
+        claude_socket.CLOSED_AFTER_SEND,
+    }:
+        return False, f"{uuid[:8]}: {how}"
+
+    # There is exactly one receipt of record on every promotion path: the
+    # target's own transcript. `delivered` from the socket means only that the
+    # session acknowledged queueing the frame; it earns this bounded wait but
+    # never bypasses it. The message UUID is present on every production shape
+    # that reached the queue or crossed the authenticated send boundary.
+    if not confirm_in_transcript(
+        uuid,
+        clean(attempt.get("message_uuid"), 120),
+        deadline=time.time() + confirm_seconds(),
+    ):
+        return False, (
+            f"{uuid[:8]}: {how}, and it never appeared in the conversation "
+            "-- a queue acknowledgement is not counted as delivered"
+        )
+    receipt_detail = f"confirmed in {name}'s own transcript ({how})"
+
+    # Start this collection only after the transcript receipt exists. Its
+    # attachment sample therefore cannot predate the receipt, unlike a manager
+    # collection that began while the queue acknowledgement was still the only
+    # evidence. A provisional write already exists, so uncertainty here cannot
+    # become a success latch.
+    reconciled_verdict = presence(require_current=True)
+    reconciled_targets = (
+        terminal_targets(reconciled_verdict)
+        if reconciled_verdict.get("present")
+        else []
+    )
+    if (
+        len(reconciled_targets) != 1
+        or not same_terminal_target(target, reconciled_targets[0])
+    ):
+        return False, (
+            "presence could not be proved through receipt confirmation: "
+            + clean(reconciled_verdict.get("why"), 180)
+            + f"; {receipt_detail}; away will also be attempted"
+        )
+    return True, (
+        f"{receipt_detail}; reconciled with the same attachment before send "
+        "and in a fresh read started after the transcript receipt"
+    )
+
+
+def route(
+    notice_class: str,
+    key: str,
+    subject: str,
+    body: str,
+    evidence: str = "",
+    repeat_after: float = DEFAULT_REPEAT_AFTER,
+    verdict: Mapping[str, Any] | None = None,
+    latch: dict[str, Any] | None = None,
+    record: bool = True,
+) -> dict[str, Any]:
+    """Route one notice. Returns what happened; never raises.
+
+    ``record=False`` sends without touching the latch. The sweep records even a
+    batch provisionally while its terminal handoff is being reconciled, then
+    removes that temporary batch entry and records the ITEMS the message was
+    about. A crash can therefore leave only a provisional entry, which
+    suppresses nothing and is discarded at the next sweep.
+    """
+    notice_class = clean(notice_class, 40) or "notice"
+    key = clean(key, 200)
+    subject = clean(subject, 200) or "Session Kit"
+    body = clean(body, 1200, newlines=True)
+    evidence = clean(evidence, 200)
+    identity = f"{notice_class}:{key}"
+
+    if not enabled():
+        return {"routed": False, "route": "none", "why": "notices are switched off",
+                "class": notice_class, "key": key}
+
+    owned_latch = record and latch is None
+    entries = (read_latch() if owned_latch else latch) if record else {}
+    if record and already_said(entries.get(identity), evidence, repeat_after):
+        return {"routed": False, "route": "latched", "why": "already said, same evidence",
+                "class": notice_class, "key": key}
+
+    verdict = presence() if verdict is None else verdict
+    landed, detail, where = False, "", "none"
+
+    terminal_authorized = bool(verdict.get("present"))
+    terminal_attempt: dict[str, Any] | None = None
+    if terminal_authorized:
+        terminal_attempt, detail = send_terminal(verdict, subject, body)
+        where = "terminal"
+        if terminal_attempt is not None:
+            provisional_recorded = True
+            if record:
+                entries[identity] = {
+                    "evidence": evidence,
+                    "at_unix": time.time(),
+                    "route": "terminal",
+                    "landed": False,
+                    "reconciled": False,
+                    "state": "provisional",
+                    "detail": clean(detail, 300),
+                }
+                # The provisional state must be durable before confirmation,
+                # including a sweep batch whose final per-item records are
+                # written by its caller after this route returns.
+                provisional_recorded = write_latch(entries)
+            if provisional_recorded:
+                landed, detail = reconcile_terminal(terminal_attempt)
+            else:
+                landed = False
+                detail = (
+                    "terminal send remained provisional because its latch record "
+                    "could not be written; away will also be attempted"
+                )
+    if not landed:
+        # Fail SAFE. Not present, presence unknown, no reachable session, a
+        # refused socket: every one of them ends here, because a notice they see
+        # twice costs a glance and one they never see costs the night.
+        if (
+            notice_class == CLASS_QUESTION
+            and not terminal_authorized
+            and not question_pushes_away()
+        ):
+            entries[identity] = {
+                "evidence": evidence, "at_unix": time.time(),
+                "route": "held", "landed": False,
+                "reconciled": True, "state": "reconciled",
+                "detail": "held: another window's question is not pushed automatically",
+            }
+            if owned_latch:
+                write_latch(entries)
+            log(f"HELD {identity}: {subject} -- a question is not pushed away from here")
+            return {"routed": False, "route": "held", "class": notice_class, "key": key,
+                    "why": "another window's open question is not pushed automatically; "
+                           "it stays in the question inbox with its own door",
+                    "terminal_detail": detail}
+        away_landed, away_detail = send_away(notice_class, key, subject, body)
+        detail = f"terminal: {detail or 'not attempted'}; away: {away_detail}"
+        landed, where = away_landed, "away"
+
+    if record:
+        entries[identity] = {
+            "evidence": evidence,
+            "at_unix": time.time(),
+            "route": where,
+            "landed": bool(landed),
+            "reconciled": True,
+            "state": "reconciled",
+            "detail": clean(detail, 300),
+        }
+        if owned_latch:
+            write_latch(entries)
+    log(
+        f"{'ROUTED' if landed else 'NOT ROUTED'} {identity} via {where}: "
+        f"{subject} -- {clean(detail, 200)}"
+    )
+    return {"routed": bool(landed), "route": where, "class": notice_class,
+            "key": key, "why": detail}
+
+
+def question_pushes_away() -> bool:
+    """Does another window's open question reach them when they are away?
+
+    YES by default, and that default is a change worth naming. This shipped as
+    `hold`, on the reasoning that an automatic question push reverses a ruling
+    the operator made by name ("only when i ask"). Review's answer, and it is
+    the better one: a log line and a latch entry are not a delivery route, and
+    the ruling was made when the picker still carried the question -- that
+    resting place is being removed. A class with no route is exactly what this
+    branch exists to prevent.
+
+    Two things make the push smaller than the one they objected to: it carries
+    that a decision is waiting and where, never the question or its options,
+    and it arrives inside the single coalesced message rather than as its own
+    buzz. `SESSION_KIT_NOTICE_QUESTION_AWAY=hold` restores the old ruling
+    exactly, in one word.
+    """
+    return (
+        os.environ.get("SESSION_KIT_NOTICE_QUESTION_AWAY") or "send"
+    ).strip().casefold() != "hold"
+
+
+# ---------------------------------------------------------------------------
+# the sweep: everything that lives in a durable record rather than a call
+# ---------------------------------------------------------------------------
+
+
+def watchdog_record_notices() -> list[dict[str, Any]]:
+    """The two watchdog outcomes the picker is losing: `failed` and `reported`.
+
+    `reported` -- quiet, and nothing changed -- had no route off the picker at
+    all, and it is the big one: the estate's own file held fifty of them, all
+    `reported`, over 21 sessions, when this was written. `failed` had exactly
+    one other route, a board row somebody has to go and look at.
+
+    `repaired` is not here on purpose. A repair that WORKED is not something a
+    person has to do anything about, and it keeps the route it already has.
+
+    The key is the SESSION, not the record: one wedged session wrote five
+    records in a day, and five messages about one session is the flood this
+    whole file exists to avoid.
+    """
+    path = Path(
+        os.environ.get("SESSION_KIT_WATCHDOG_REPAIRS")
+        or (state_dir() / "watchdog-repairs.json")
+    )
+    document = read_json(path)
+    if not isinstance(document, Mapping):
+        return []
+    notices: dict[str, dict[str, Any]] = {}
+    for item in document.get("repairs") or ():
+        if not isinstance(item, Mapping):
+            continue
+        outcome = clean(item.get("outcome"), 20)
+        if outcome not in {"reported", "failed"} or item.get("acknowledged"):
+            continue
+        session = clean(item.get("old_shpool_id"), 80)
+        if not session:
+            continue
+        title = clean(item.get("title"), 80) or "a session"
+        provider = (clean(item.get("provider"), 20) or "unknown").title()
+        stamp = item.get("at_unix_ms")
+        at_unix = (
+            float(stamp) / 1000
+            if isinstance(stamp, (int, float)) and not isinstance(stamp, bool)
+            else 0.0
+        )
+        reason = (
+            clean(item.get("reason"), 200)
+            or "no output for far longer than any normal pause"
+        )
+        if outcome == "failed":
+            notice = {
+                "class": "repair-failed",
+                "key": f"repair:{session}",
+                "evidence": "failed",
+                "line": f"{title} ({provider}) — automatic repair FAILED",
+                "subject": f"Automatic repair failed: {title}",
+                "body": (
+                    f"{title} ({provider}) stopped working and the automatic repair "
+                    f"did not succeed ({reason}). The conversation is saved."
+                ),
+            }
+        else:
+            notice = {
+                "class": "quiet-session",
+                "key": f"quiet:{session}",
+                # Strength, so an escalation from ordinary silence to the
+                # daemon's own handoff failure is a new thing to say.
+                "evidence": clean(item.get("evidence"), 60) or "silence-only",
+                "line": f"{title} ({provider}) — quiet, nothing changed",
+                "subject": f"Session quiet, nothing changed: {title}",
+                "body": (
+                    f"{title} ({provider}) was reported quiet and nothing was changed: "
+                    f"{reason}. Silence alone is never enough to act on, so no repair "
+                    f"was attempted."
+                ),
+            }
+        notice["at_unix"] = at_unix
+        identity = f"{notice['class']}:{notice['key']}"
+        # Several records, one session. The STRONGEST evidence wins, and among
+        # equally strong ones the newest -- so a later ordinary-silence record
+        # can never bury the daemon-marker record that came before it.
+        previous = notices.get(identity)
+        if (
+            previous is None
+            or is_new_statement(previous["evidence"], notice["evidence"])
+            or (
+                previous["evidence"] == notice["evidence"]
+                and at_unix >= previous["at_unix"]
+            )
+        ):
+            notices[identity] = notice
+    return list(notices.values())
+
+
+def stall_notices() -> list[dict[str, str]]:
+    document = read_json(fleet_dir() / "stalls.json")
+    if not isinstance(document, Mapping):
+        return []
+    generated = document.get("generated_at")
+    if not isinstance(generated, (int, float)) or isinstance(generated, bool):
+        return []
+    if time.time() - float(generated) > FLEET_FLAG_MAX_AGE:
+        # The observer is not running. Its last opinion is not current fact.
+        return []
+    said = {
+        "unanswered": "an answer is overdue",
+        "silent": "a response is overdue",
+        "orphan": "the session it belongs to is gone",
+    }
+    notices = []
+    for item in document.get("stalled") or ():
+        if not isinstance(item, Mapping):
+            continue
+        key = clean(item.get("key"), 120)
+        if not key:
+            continue
+        reason = clean(item.get("reason"), 40).casefold()
+        told = said.get(reason, "attention is overdue")
+        since = item.get("since")
+        notices.append(
+            {
+                "class": "stall",
+                "key": f"stall:{key}",
+                "evidence": reason or "stalled",
+                "line": f"a stalled session — {told}",
+                "subject": "A session has stalled",
+                "body": (
+                    f"A session flagged as stalled: {told}. Nothing was changed. "
+                    f"The session list has it when you are back."
+                ),
+                # A stall flag carries when the stall STARTED, which is what the
+                # age bound should read: the flag file is rewritten every minute.
+                "at_unix": (
+                    float(since)
+                    if isinstance(since, (int, float)) and not isinstance(since, bool)
+                    else time.time()
+                ),
+            }
+        )
+    return notices
+
+
+def question_notices() -> list[dict[str, str]]:
+    notices = []
+    for path in sorted(glob.glob(str(fleet_dir() / "inbox" / "*.json")))[:200]:
+        record = read_json(Path(path), limit=65536)
+        if not isinstance(record, Mapping) or record.get("state") != "open":
+            continue
+        identifier = clean(record.get("id"), 80) or Path(path).stem
+        session = record.get("session")
+        who = clean(
+            (session or {}).get("title") if isinstance(session, Mapping) else "", 60
+        ) or "another window"
+        header = clean(record.get("header"), 60) or "Decision"
+        asked = record.get("asked_at")
+        notices.append(
+            {
+                "class": CLASS_QUESTION,
+                "key": f"question:{identifier}",
+                "evidence": "open",
+                "line": f"{who} is waiting on a decision — {header}",
+                "subject": f"A window is waiting on a decision: {header}",
+                "body": f"{who} has an open question. It is in the question inbox.",
+                "at_unix": (
+                    float(asked)
+                    if isinstance(asked, (int, float)) and not isinstance(asked, bool)
+                    else time.time()
+                ),
+            }
+        )
+    return notices
+
+
+def max_record_age() -> float:
+    raw = os.environ.get("SESSION_KIT_NOTICE_MAX_AGE") or str(DEFAULT_MAX_AGE)
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return float(DEFAULT_MAX_AGE)
+
+
+def compose(
+    fresh: list[dict[str, Any]], older: list[dict[str, Any]]
+) -> tuple[str, str]:
+    """One message for everything new in this pass.
+
+    ONE MESSAGE, not one per item, and this is the whole design rather than a
+    nicety. Measured against the live estate: 50 records over 21 sessions, so a
+    notice-per-record router would have sent fifty messages in one night and a
+    notice-per-session one twenty-one. That is not a notification design, it is
+    a reason to turn notifications off. A person needs to know THAT something
+    wants looking at and roughly what; the list itself is a screen away.
+
+    The age bound decides what gets NAMED, not what gets said: the recent ones
+    are listed, and anything older is counted in the same message. Age is not
+    resolution, so an old unresolved record is never dropped -- it is just not
+    what the five named lines are spent on.
+    """
+    items = fresh + older
+    if len(items) == 1:
+        return items[0]["subject"], items[0]["body"]
+    counts: dict[str, int] = {}
+    for item in items:
+        counts[item["class"]] = counts.get(item["class"], 0) + 1
+    said = {
+        "quiet-session": "quiet",
+        "repair-failed": "repair failed",
+        "stall": "stalled",
+        CLASS_QUESTION: "waiting on a decision",
+    }
+    parts = [
+        f"{count} {said.get(name, name)}"
+        for name, count in sorted(counts.items(), key=lambda pair: -pair[1])
+    ]
+    subject = f"{len(items)} sessions need a look: " + ", ".join(parts)
+    named = (fresh + older)[:NAMED_IN_A_BATCH]
+    lines = [f"  · {item.get('line') or item['subject']}" for item in named]
+    body = "\n".join(lines)
+    rest = len(items) - len(named)
+    if rest:
+        body += f"\n  · and {rest} more"
+    if older:
+        body += (
+            f"\n\n{len(older)} of these have been unresolved for over "
+            f"{int(max_record_age() // 3600)}h."
+        )
+    return subject, body + "\n\nNothing was changed. The session list has them all."
+
+
+def sweep() -> dict[str, Any]:
+    """Route everything NEW in the durable records, in ONE message, and forget
+    what is gone.
+
+    Three separate jobs, and the middle one is the interesting one:
+
+      * decide what is new (the latch, per item);
+      * decide what is worth NAMING (the age bound). An older unresolved record
+        is still said -- it is counted in the message. It is NOT silently taken
+        into the latch and never sent, which is what this used to do: age is
+        not acknowledgement, and "we decided it was too old to mention" is the
+        silence-looks-like-success failure this whole branch exists to end.
+      * say it once (compose()).
+
+    Pruning matters as much as routing: the latch's lifetime is the record's
+    lifetime, so a session that breaks again after its old record retires is
+    allowed to speak again instead of being silenced forever by bookkeeping
+    nobody can see.
+    """
+    notices = watchdog_record_notices() + stall_notices() + question_notices()
+    entries = read_latch()
+    # A prior process may have stopped after sending a batch but before
+    # reconciliation. It is deliberately not a replay latch: the individual
+    # live records below still decide what must be said.
+    entries.pop("sessions:batch", None)
+    verdict = presence()
+    now = time.time()
+    bound = max_record_age()
+    fresh: list[dict[str, Any]] = []
+    older: list[dict[str, Any]] = []
+    latched = held = 0
+
+    for notice in notices:
+        identity = f"{notice['class']}:{notice['key']}"
+        if already_said(
+            entries.get(identity),
+            notice["evidence"],
+            0,
+            source_at=float(notice.get("at_unix") or 0) or None,
+        ):
+            latched += 1
+            continue
+        if notice["class"] == CLASS_QUESTION and not (
+            verdict.get("present") or question_pushes_away()
+        ):
+            # Only when the operator has switched the push back off by name.
+            entries[identity] = {
+                "evidence": notice["evidence"], "at_unix": now,
+                "route": "held", "landed": False,
+                "reconciled": True, "state": "reconciled",
+                "detail": "held: SESSION_KIT_NOTICE_QUESTION_AWAY=hold",
+            }
+            log(f"HELD {identity}: {notice['subject']}")
+            held += 1
+            continue
+        if bound and (now - float(notice.get("at_unix") or now)) > bound:
+            older.append(notice)
+        else:
+            fresh.append(notice)
+
+    routed = False
+    detail = ""
+    speaking = fresh + older
+    if speaking:
+        subject, body = compose(fresh, older)
+        single = len(speaking) == 1
+        result = route(
+            speaking[0]["class"] if single else "sessions",
+            speaking[0]["key"] if single else "batch",
+            subject,
+            body,
+            evidence=f"batch:{len(speaking)}",
+            repeat_after=0,
+            verdict=verdict,
+            latch=entries,
+            record=True,
+        )
+        routed = bool(result.get("routed"))
+        detail = str(result.get("why") or "")
+        if not single:
+            entries.pop("sessions:batch", None)
+        # Each item carries its own latch entry whatever the batch did, so one
+        # message covering ten sessions is ten things said -- and a batch that
+        # did NOT land leaves ten entries marked as not landed, which is what
+        # brings them back on the next pass.
+        for notice in speaking:
+            entries[f"{notice['class']}:{notice['key']}"] = {
+                "evidence": notice["evidence"], "at_unix": now,
+                # What we spoke ABOUT, so the next pass can tell the same
+                # record from a newer one exactly rather than by a clock race.
+                "source_at": float(notice.get("at_unix") or 0),
+                "route": result.get("route") or "none", "landed": routed,
+                "reconciled": True, "state": "reconciled",
+                "detail": clean(detail, 200),
+            }
+
+    live = {f"{notice['class']}:{notice['key']}" for notice in notices}
+    owned = ("quiet-session:", "repair-failed:", "stall:", f"{CLASS_QUESTION}:")
+    swept = {
+        identity: entry
+        for identity, entry in entries.items()
+        if not identity.startswith(owned) or identity in live
+    }
+    write_latch(swept)
+    return {
+        "seen": len(notices),
+        "new": len(speaking),
+        "messages": 1 if speaking else 0,
+        "routed": len(speaking) if routed else 0,
+        "held": held,
+        "latched": latched,
+        "older": len(older),
+        # ONE key, so a caller testing for "nothing happened" cannot be broken
+        # by JSON key ordering. The watchdog's suppression test read two keys in
+        # an order sort_keys never produces, so every idle pass logged a line
+        # that was supposed to be suppressed.
+        "quiet": not speaking and not held,
+        "away_transport": "set" if away_command() else "UNSET",
+        "why": detail if fresh and not routed else "",
+        "presence": verdict.get("why"),
+        "forgotten": len(entries) - len(swept),
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="session_kit_notice", description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("presence", help="print the presence verdict; send nothing")
+    one = commands.add_parser("route", help="route one notice")
+    one.add_argument("--class", dest="notice_class", required=True)
+    one.add_argument("--key", required=True)
+    one.add_argument("--subject", required=True)
+    one.add_argument("--body", default="")
+    one.add_argument("--evidence", default="")
+    one.add_argument("--repeat-after", type=float, default=DEFAULT_REPEAT_AFTER)
+    commands.add_parser("sweep", help="route what is new in the durable records")
+    arguments = parser.parse_args(argv)
+
+    if arguments.command == "presence":
+        print(json.dumps(presence(), sort_keys=True))
+        return 0
+    if arguments.command == "sweep":
+        if not enabled():
+            print(json.dumps({"seen": 0, "routed": 0, "quiet": True,
+                              "why": "notices are switched off"}))
+            return 0
+        answer = sweep()
+        print(json.dumps(answer, sort_keys=True))
+        # A sweep that had something to say and reached nobody is a FAILURE,
+        # and it used to exit 0 -- so an unwired away transport looked exactly
+        # like a healthy quiet night to systemd, to the watchdog, and to anyone
+        # reading a status. Silence has to be distinguishable from success.
+        if answer.get("messages") and not answer.get("routed"):
+            return 1
+        return 0
+    result = route(
+        arguments.notice_class,
+        arguments.key,
+        arguments.subject,
+        arguments.body,
+        evidence=arguments.evidence,
+        repeat_after=arguments.repeat_after,
+    )
+    print(json.dumps(result, sort_keys=True))
+    # Latched is not a failure: it means the thing was already said.
+    return 0 if result.get("routed") or result.get("route") in {"latched", "held"} else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

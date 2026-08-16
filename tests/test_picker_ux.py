@@ -1,71 +1,24 @@
-"""Phase 3 picker navigation: peek-and-reply, live filtering, jump, grouping,
-compact rows, and the single help table.
+"""Picker navigation: live filtering, jump, grouping, compact rows, and the
+single help table.
 
 The picker is the surface a person lives in all day, so every test here asks
 the same two questions of a new behaviour: does it show the truth, and can it
-change anything by accident. Peek is read-only until a reply is typed, the
-jump key marks rather than selects, grouping and compact only reorder or
-redraw what the unfiltered list already contained, and a filter previewed
-mid-typing is undone the moment the line turns out to be a command.
+change anything by accident. The jump key marks rather than selects, grouping
+and compact only reorder or redraw what the unfiltered list already contained,
+and a filter previewed mid-typing is undone the moment the line turns out to
+be a command.
 """
 
 from __future__ import annotations
 
 import json
-import os
 import re
-import sys
 import unittest
 
 from tests.support import REPO
 from tests.test_login import LoginFixture, inventory, row, run_pty
 
-sys.path.insert(0, os.fspath(REPO / "lib"))
-
-from sessionkit_events import peek as peek_module  # noqa: E402
-
 LOGIN = REPO / "bin" / "shpool_login"
-
-
-def thread_key(item: dict) -> str:
-    return f"{item['provider']}:{item['identity']['uuid']}"
-
-
-def write_event(
-    fixture: LoginFixture,
-    item: dict,
-    *,
-    event: str = "needs_input",
-    question: str | None = None,
-    ts_unix_ms: int,
-) -> None:
-    root = fixture.state / "events"
-    root.mkdir(mode=0o700, exist_ok=True)
-    path = root / f"{thread_key(item)}.jsonl"
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(
-            json.dumps(
-                {
-                    "event": event,
-                    "question": question,
-                    "source": "hook",
-                    "ts_unix_ms": ts_unix_ms,
-                },
-                separators=(",", ":"),
-            )
-            + "\n"
-        )
-    path.chmod(0o600)
-
-
-def write_exchange(fixture: LoginFixture, item: dict, entries: list[dict]) -> None:
-    threads = fixture.state / "messages" / "threads"
-    threads.mkdir(mode=0o700, parents=True, exist_ok=True)
-    path = threads / f"{thread_key(item)}.jsonl"
-    with path.open("a", encoding="utf-8") as handle:
-        for entry in entries:
-            handle.write(json.dumps(entry, separators=(",", ":")) + "\n")
-    path.chmod(0o600)
 
 
 def waiting_row(shpool_id: str, *, number: int, provider: str = "codex") -> dict:
@@ -89,103 +42,33 @@ def row_numbers(text: str) -> list[str]:
     return re.findall(r"(?m)^\s+(\d+)\s+\S.* \| (?:CLD|CDX|SHL|UNK) \|", text)
 
 
-class PeekTests(unittest.TestCase):
-    def test_peek_shows_the_question_and_the_last_exchange(self) -> None:
+class PeekIsGoneTests(unittest.TestCase):
+    """`i<n>` was documented in four places and never had a helper to run.
+
+    It is not a key any more, so it answers like any other key the picker does
+    not have, and nothing on any screen teaches it.
+    """
+
+    def test_i_is_an_unknown_key_and_changes_nothing(self) -> None:
         item = waiting_row("parser", number=1)
         fixture = LoginFixture(inventory(item))
         try:
-            write_event(
-                fixture,
-                item,
-                question="Should I also update the changelog?",
-                ts_unix_ms=1_700_000_000_000,
-            )
-            write_exchange(
-                fixture,
-                item,
-                [
-                    {
-                        "ts_unix_ms": 1_699_999_000_000,
-                        "dir": "out",
-                        "msg_id": "0a0a0a0a",
-                        "text": "Refactor the parser please",
-                        "via": "test",
-                    },
-                    {
-                        "ts_unix_ms": 1_700_000_000_000,
-                        "dir": "in",
-                        "msg_id": "0a0a0a0a",
-                        "text": "Should I also update the changelog?",
-                        "via": "test",
-                    },
-                ],
-            )
-            code, output = run_pty(fixture, b"i1\n\n\n")
-            self.assertEqual(2, code)
-            self.assertIn("It asked", output)
-            self.assertIn("Should I also update the changelog?", output)
-            self.assertIn("Latest messages", output)
-            self.assertIn("Refactor the parser please", output)
-            self.assertIn("Type a reply and press Enter", output)
-            # Looking is not acting: no session command ran at all.
+            code, output = run_pty(fixture, b"i1\nq\n")
+            self.assertEqual(0, code)
+            self.assertIn("There is no such key on this screen.", output)
+            self.assertNotIn("Peek", output)
             self.assertEqual([], fixture.sp_entries())
         finally:
             fixture.close()
 
-    def test_peek_reply_goes_out_through_sp_msg(self) -> None:
-        item = waiting_row("parser", number=4)
-        fixture = LoginFixture(inventory(item))
-        try:
-            write_event(
-                fixture, item, question="Which branch?", ts_unix_ms=1_700_000_000_000
-            )
-            code, output = run_pty(fixture, b"i4\nuse main\n\n\n")
-            self.assertEqual(2, code)
-            self.assertIn("Sent to session 4.", output)
-            self.assertEqual(
-                [["msg", "4", "use main"]],
-                [entry["args"] for entry in fixture.sp_entries()],
-            )
-        finally:
-            fixture.close()
-
-    def test_peek_open_hands_the_row_to_the_ordinary_open_path(self) -> None:
-        item = waiting_row("parser", number=2)
-        fixture = LoginFixture(inventory(item))
-        try:
-            code, _ = run_pty(fixture, b"i2\no\n\n\n")
-            self.assertEqual(2, code)
-            commands = [entry["args"][0] for entry in fixture.sp_entries()]
-            self.assertIn("picker-open", commands)
-        finally:
-            fixture.close()
-
-    def test_peek_refuses_a_number_that_is_not_on_the_page(self) -> None:
+    def test_no_screen_teaches_peek_any_more(self) -> None:
         fixture = LoginFixture(inventory(row("only", number=1)))
         try:
-            code, output = run_pty(fixture, b"i9\n\n")
-            self.assertEqual(2, code)
-            self.assertIn("Choose a number shown here", output)
-            self.assertEqual([], fixture.sp_entries())
-        finally:
-            fixture.close()
-
-    def test_bare_i_explains_itself_and_changes_nothing(self) -> None:
-        fixture = LoginFixture(inventory(row("only", number=1)))
-        try:
-            code, output = run_pty(fixture, b"i\n\n")
-            self.assertEqual(2, code)
-            self.assertIn("Use i followed by a session number", output)
-            self.assertEqual([], fixture.sp_entries())
-        finally:
-            fixture.close()
-
-    def test_a_session_with_nothing_recorded_says_so(self) -> None:
-        fixture = LoginFixture(inventory(row("quiet", number=3)))
-        try:
-            code, output = run_pty(fixture, b"i3\n\n\n")
-            self.assertEqual(2, code)
-            self.assertIn("No question and no messages are recorded", output)
+            code, output = run_pty(fixture, b"?\n\nq\n", columns=110)
+            self.assertEqual(0, code)
+            self.assertNotIn("Peek", output)
+            self.assertNotIn("i<n>", output)
+            self.assertNotIn("peek", output)
         finally:
             fixture.close()
 
@@ -203,7 +86,7 @@ class LiveFilterTests(unittest.TestCase):
                 b"/alp",
                 deferred=("Search: alp", b"ha\nq\n"),
             )
-            self.assertEqual(2, code)
+            self.assertEqual(0, code)
             preview = output[output.index("Search: alp") :]
             self.assertIn("Codex alpha", preview)
             self.assertNotIn("Codex bravo", preview)
@@ -228,8 +111,8 @@ class LiveFilterTests(unittest.TestCase):
                 b"/alp",
                 deferred=("Search: alp", b"\x7f\x7f\x7f\x7fg\nq\n"),
             )
-            self.assertEqual(2, code)
-            undone = output[output.rindex("No listed session is waiting on you.") :]
+            self.assertEqual(0, code)
+            undone = output[output.rindex("Nothing needs you.") :]
             self.assertIn("Codex bravo", undone)
             self.assertNotIn("Search:", undone)
         finally:
@@ -242,16 +125,17 @@ class LiveFilterTests(unittest.TestCase):
         try:
             code, output = run_pty(
                 fixture,
-                b"/alpha\n\n",
+                b"/alpha\nq\n",
                 env_updates={"SESSION_KIT_PICKER_FILTER_LIVE": "0"},
             )
-            self.assertEqual(2, code)
+            self.assertEqual(0, code)
             # Submitting still searches exactly as it always did.
             submitted = output[output.index("Search: alpha") :]
             self.assertIn("Codex alpha", submitted)
             self.assertNotIn("Codex bravo", submitted)
         finally:
             fixture.close()
+
 
 
 class JumpTests(unittest.TestCase):
@@ -264,9 +148,9 @@ class JumpTests(unittest.TestCase):
             )
         )
         try:
-            code, output = run_pty(fixture, b"g\ng\ng\n\n")
-            self.assertEqual(2, code)
-            announcements = re.findall(r"Session (\d+) wants you", output)
+            code, output = run_pty(fixture, b"g\ng\ng\nq\n")
+            self.assertEqual(0, code)
+            announcements = re.findall(r"Session (\d+) needs you", output)
             self.assertEqual(["2", "3", "2"], announcements)
             # The row is marked, never selected: no command ran.
             self.assertEqual([], fixture.sp_entries())
@@ -277,10 +161,45 @@ class JumpTests(unittest.TestCase):
     def test_jump_says_so_when_nothing_is_waiting(self) -> None:
         fixture = LoginFixture(inventory(row("calm", number=1)))
         try:
-            code, output = run_pty(fixture, b"g\n\n")
-            self.assertEqual(2, code)
-            self.assertIn("No listed session is waiting on you.", output)
+            code, output = run_pty(fixture, b"g\nq\n")
+            self.assertEqual(0, code)
+            self.assertIn("Nothing needs you.", output)
             self.assertNotIn("▸", output)
+        finally:
+            fixture.close()
+
+    def test_jump_repages_after_clearing_a_filter_and_draws_the_named_row(self) -> None:
+        sessions = [
+            row(f"ready-{number:02d}", number=number)
+            for number in range(1, 42)
+        ]
+        # Setup-incomplete sessions are in the attention projection without
+        # being sorted to the head of their availability group. Number 20 is
+        # therefore on a middle page after the search is cleared.
+        sessions[19]["setup_incomplete"] = True
+        fixture = LoginFixture(inventory(*sessions))
+        try:
+            code, output = run_pty(
+                fixture, b"/ready-01\ng\nq\n", lines=24, columns=110
+            )
+            self.assertEqual(0, code)
+            after = output[output.index("Session 20 needs you.") :]
+            self.assertIn("Codex ready-20", after)
+            marked = next(line for line in after.splitlines() if "Codex ready-20" in line)
+            self.assertIn("▸", marked)
+            self.assertIn("Search cleared to show session 20.", output)
+        finally:
+            fixture.close()
+
+    def test_jump_keeps_a_search_when_the_target_is_already_visible(self) -> None:
+        fixture = LoginFixture(inventory(waiting_row("asking", number=2)))
+        try:
+            code, output = run_pty(fixture, b"/asking\ng\nq\n", columns=100)
+            self.assertEqual(0, code)
+            after = output[output.index("Session 2 needs you.") :]
+            self.assertIn("Search: asking", after)
+            self.assertNotIn("Search cleared", output)
+            self.assertIn("▸", after)
         finally:
             fixture.close()
 
@@ -294,9 +213,9 @@ class GroupingTests(unittest.TestCase):
             )
         )
         try:
-            code, output = run_pty(fixture, b"\n")
-            self.assertEqual(2, code)
-            self.assertIn("Ready to open", output)
+            code, output = run_pty(fixture, b"q\n")
+            self.assertEqual(0, code)
+            self.assertIn("Ready", output)
             self.assertIn("Open elsewhere", output)
             self.assertNotIn("Grouping by", output)
         finally:
@@ -310,12 +229,12 @@ class GroupingTests(unittest.TestCase):
             )
         )
         try:
-            code, output = run_pty(fixture, b"group provider\n\n")
-            self.assertEqual(2, code)
+            code, output = run_pty(fixture, b"group provider\nq\n")
+            self.assertEqual(0, code)
             grouped = output[output.index("Grouping by provider.") :]
             self.assertIn("Claude", grouped)
             self.assertIn("Codex", grouped)
-            self.assertNotIn("Ready to open", grouped)
+            self.assertNotIn("Open elsewhere", grouped)
             self.assertEqual(["1", "2"], row_numbers(grouped))
         finally:
             fixture.close()
@@ -323,8 +242,8 @@ class GroupingTests(unittest.TestCase):
     def test_bare_group_cycles_state_provider_project(self) -> None:
         fixture = LoginFixture(inventory(row("one", number=1)))
         try:
-            code, output = run_pty(fixture, b"group\ngroup\ngroup\n\n")
-            self.assertEqual(2, code)
+            code, output = run_pty(fixture, b"group\ngroup\ngroup\nq\n")
+            self.assertEqual(0, code)
             self.assertEqual(
                 ["provider", "project", "state"],
                 re.findall(r"Grouping by (\w+)\.", output),
@@ -335,10 +254,10 @@ class GroupingTests(unittest.TestCase):
     def test_an_unknown_grouping_changes_nothing(self) -> None:
         fixture = LoginFixture(inventory(row("one", number=1)))
         try:
-            code, output = run_pty(fixture, b"group sideways\n\n")
-            self.assertEqual(2, code)
+            code, output = run_pty(fixture, b"group sideways\nq\n")
+            self.assertEqual(0, code)
             self.assertIn("Grouping is state, provider, or project", output)
-            self.assertIn("Ready to open", output)
+            self.assertIn("Ready", output)
         finally:
             fixture.close()
 
@@ -350,8 +269,8 @@ class GroupingTests(unittest.TestCase):
             inside["cwd"] = f"{fixture.primary_project}/lib/deep"
             outside["cwd"] = "/var/tmp/scratchpad"
             rewrite_inventory(fixture, inventory(inside, outside))
-            code, output = run_pty(fixture, b"group project\n\n")
-            self.assertEqual(2, code)
+            code, output = run_pty(fixture, b"group project\nq\n")
+            self.assertEqual(0, code)
             grouped = output[output.index("Grouping by project.") :]
             # "main" is the alias the fixture's projects.tsv gives that root,
             # and the row three directories inside it still belongs to it.
@@ -368,23 +287,39 @@ class GroupingTests(unittest.TestCase):
         item["project_name"] = "delegation core"
         fixture = LoginFixture(inventory(item))
         try:
-            code, output = run_pty(fixture, b"group project\n\n")
-            self.assertEqual(2, code)
+            code, output = run_pty(fixture, b"group project\nq\n")
+            self.assertEqual(0, code)
             self.assertIn("delegation core", output[output.index("Grouping by") :])
         finally:
             fixture.close()
 
 
 class CompactTests(unittest.TestCase):
+    def test_compact_removes_secondary_row_details_even_on_a_wide_screen(self) -> None:
+        item = row("delegated", number=1, provider="codex")
+        item["active_subagent_count"] = 2
+        item["worktree"] = {"branch": "feature/compact-proof"}
+        fixture = LoginFixture(inventory(item))
+        try:
+            code, output = run_pty(fixture, b"c\nq\n", columns=140)
+            self.assertEqual(0, code)
+            before, _, after = output.partition("Compact rows on.")
+            self.assertIn("2 subagents", before)
+            self.assertIn("worktree feature/compact-proof", before)
+            self.assertIn("2 subagents", after)
+            self.assertNotIn("worktree feature/compact-proof", after)
+        finally:
+            fixture.close()
+
     def test_compact_drops_headings_and_shows_more_sessions(self) -> None:
         sessions = [row(f"task-{number}", number=number) for number in range(1, 31)]
         fixture = LoginFixture(inventory(*sessions))
         try:
-            code, output = run_pty(fixture, b"c\n\n", lines=24, columns=100)
-            self.assertEqual(2, code)
+            code, output = run_pty(fixture, b"c\nq\n", lines=24, columns=100)
+            self.assertEqual(0, code)
             before, _, after = output.partition("Compact rows on.")
-            self.assertIn("Ready to open", before)
-            self.assertNotIn("Ready to open", after)
+            self.assertIn("Ready", before)
+            self.assertNotIn("Open elsewhere", after)
             self.assertGreater(len(row_numbers(after)), len(row_numbers(before)))
         finally:
             fixture.close()
@@ -392,11 +327,11 @@ class CompactTests(unittest.TestCase):
     def test_compact_can_be_turned_back_off(self) -> None:
         fixture = LoginFixture(inventory(row("one", number=1)))
         try:
-            code, output = run_pty(fixture, b"c\nc\n\n")
-            self.assertEqual(2, code)
+            code, output = run_pty(fixture, b"c\nc\nq\n")
+            self.assertEqual(0, code)
             self.assertIn("Compact rows on.", output)
             after = output[output.index("Compact rows off.") :]
-            self.assertIn("Ready to open", after)
+            self.assertIn("Ready", after)
         finally:
             fixture.close()
 
@@ -405,12 +340,28 @@ class CompactTests(unittest.TestCase):
         try:
             code, output = run_pty(
                 fixture,
-                b"\n",
+                b"q\n",
                 env_updates={"SESSION_KIT_PICKER_COMPACT": "1"},
             )
-            self.assertEqual(2, code)
-            self.assertNotIn("Ready to open", output)
+            self.assertEqual(0, code)
+            self.assertNotIn("Ready\n", output)
             self.assertEqual(["1"], row_numbers(output))
+        finally:
+            fixture.close()
+
+
+class BackOnlyScreenTests(unittest.TestCase):
+    """Read-only screens say so instead of eating what was typed at them."""
+
+    def test_help_refuses_a_line_it_cannot_act_on(self) -> None:
+        fixture = LoginFixture(inventory(row("one", number=1)))
+        try:
+            # A row number typed on the help screen used to be swallowed: the
+            # screen went back and nothing opened, with nothing said.
+            code, output = run_pty(fixture, b"?\n1\n\nq\n")
+            self.assertEqual(0, code)
+            self.assertIn("There is nothing to choose on this screen", output)
+            self.assertEqual([], fixture.sp_entries())
         finally:
             fixture.close()
 
@@ -451,40 +402,40 @@ class HelpTests(unittest.TestCase):
     def test_every_dispatched_key_is_in_the_help_table(self) -> None:
         fixture = LoginFixture(inventory(row("one", number=1)))
         try:
-            code, output = run_pty(fixture, b"?\n\n\n", columns=110)
-            self.assertEqual(2, code)
-            help_text = output[output.index("Session picker help") :]
+            code, output = run_pty(fixture, b"?\n\nq\n", columns=110)
+            self.assertEqual(0, code)
+            help_text = output[output.index("Picker help") :]
             expected = {
-                "q": "q / p",
-                "p": "q / p",
+                "q": "q",
+                "p": "Projects:",
                 "r": "r",
                 "m": "m",
                 "a": "a",
                 "g": "g",
+                "x": "x",
                 "c": "c",
-                "v": "v",
                 "u": "u",
                 "o": "o",
                 "n": "n",
-                "s": "s",
-                "i": "i<n>",
                 "\\?": "?",
                 "next": "next",
                 "prev": "prev",
                 "group": "group",
                 "group\\ *": "group",
-                "q\\ prune": "qp",
                 "compact": "c",
-                "qp": "qp",
-                "i[0-9]*": "i<n>",
-                "r[0-9]*": "r<n>",
-                "q[0-9]*": "q<n>",
-                "i\\ *": "i<n>",
-                "k\\ *": "k <numbers>",
-                "x\\ *": "x <number>",
-                "name\\ *": "name <number>",
-                "name\\ reset\\ *": "name reset #",
-                "fork\\ *": "fork <number>",
+                "h": "h number",
+                "h[0-9]*": "h number",
+                "h\\ *": "h number",
+                "k\\ *": "k numbers",
+                "k[0-9]*": "k numbers",
+                "name\\ *": "name number",
+                "name[0-9]*": "name number",
+                "name\\ reset\\ *": "name reset number",
+                "name\\ reset[0-9]*": "name reset number",
+                "fork\\ *": "fork number",
+                "fork[0-9]*": "fork number",
+                "model\\ *": "model number",
+                "model[0-9]*": "model number",
                 "/*": "/text",
             }
             missing = sorted(self.dispatched_keys() - set(expected))
@@ -504,67 +455,145 @@ class HelpTests(unittest.TestCase):
         finally:
             fixture.close()
 
+    def test_a_key_takes_its_number_with_or_without_the_space(self) -> None:
+        """k3, name3, and fork3 used to be unknown keys."""
+        for typed, command in (
+            (b"k9\nq\n", "picker-close"),
+            (b"k 9\nq\n", "picker-close"),
+            (b"name9\nBetter name\nq\n", "picker-name"),
+            (b"fork9\nq\n", "picker-fork"),
+        ):
+            with self.subTest(typed=typed):
+                fixture = LoginFixture(
+                    inventory(row("open1", number=9, provider="codex"))
+                )
+                try:
+                    code, output = run_pty(fixture, typed)
+                    self.assertEqual(0, code)
+                    self.assertNotIn("There is no such key", output)
+                    self.assertIn(
+                        command,
+                        [entry["args"][0] for entry in fixture.sp_entries()],
+                    )
+                finally:
+                    fixture.close()
+
+    def test_model_action_wires_the_displayed_row_to_the_existing_verb(self) -> None:
+        item = row("modeled", number=9, provider="codex")
+        item["model"] = "gpt-old"
+        fixture = LoginFixture(inventory(item))
+        models = fixture.base / "models.tsv"
+        models.write_text("codex\tgpt-new\n", encoding="utf-8")
+        try:
+            code, output = run_pty(
+                fixture,
+                b"model9\n1\nq\n",
+                columns=120,
+                env_updates={"SESSION_KIT_MODELS_FILE": str(models)},
+            )
+            self.assertEqual(0, code)
+            self.assertIn("gpt-old", output)
+            self.assertIn("1  gpt-new", output)
+            entries = fixture.sp_entries()
+            self.assertEqual("picker-change-model", entries[0]["args"][0])
+            self.assertEqual("gpt-new", entries[0]["args"][2])
+            self.assertEqual("modeled", entries[0]["proof"]["shpool_id"])
+        finally:
+            fixture.close()
+
+    def test_model_action_refuses_text_outside_the_configured_list(self) -> None:
+        item = row("modeled", number=9, provider="codex")
+        fixture = LoginFixture(inventory(item))
+        models = fixture.base / "models.tsv"
+        models.write_text("codex\tgpt-approved\n", encoding="utf-8")
+        try:
+            code, output = run_pty(
+                fixture,
+                b"model9\ngpt-made-up\nq\n",
+                env_updates={"SESSION_KIT_MODELS_FILE": str(models)},
+            )
+            self.assertEqual(0, code)
+            self.assertIn("not in this provider's configured list", output)
+            self.assertFalse(
+                any(
+                    entry["args"][0] == "picker-change-model"
+                    for entry in fixture.sp_entries()
+                )
+            )
+        finally:
+            fixture.close()
+
+    def test_model_menu_offers_only_models_the_provider_verb_accepts(self) -> None:
+        item = row("modeled", number=9, provider="claude")
+        fixture = LoginFixture(inventory(item))
+        models = fixture.base / "models.tsv"
+        models.write_text(
+            "*\tclaude-opus-5\n*\tgpt-5-codex\n*\topus-4.6\n",
+            encoding="utf-8",
+        )
+        try:
+            code, output = run_pty(
+                fixture,
+                b"model9\n1\nq\n",
+                env_updates={"SESSION_KIT_MODELS_FILE": str(models)},
+            )
+            self.assertEqual(0, code)
+            menu = output[output.index("Models") : output.index("Model number")]
+            self.assertIn("claude-opus-5", menu)
+            self.assertNotIn("gpt-5-codex", menu)
+            self.assertNotIn("opus-4.6", menu)
+            changed = [
+                entry
+                for entry in fixture.sp_entries()
+                if entry["args"][0] == "picker-change-model"
+            ]
+            self.assertEqual("claude-opus-5", changed[0]["args"][2])
+        finally:
+            fixture.close()
+
+    def test_zero_and_out_of_range_model_numbers_get_only_a_plain_refusal(self) -> None:
+        for requested in ("0", "9"):
+            with self.subTest(requested=requested):
+                item = row("modeled", number=9, provider="codex")
+                fixture = LoginFixture(inventory(item))
+                models = fixture.base / "models.tsv"
+                models.write_text("codex\tgpt-approved\n", encoding="utf-8")
+                try:
+                    code, output = run_pty(
+                        fixture,
+                        f"model9\n{requested}\nq\n".encode(),
+                        env_updates={"SESSION_KIT_MODELS_FILE": str(models)},
+                    )
+                    self.assertEqual(0, code)
+                    self.assertIn(
+                        "That model is not in this provider's configured list. Nothing changed.",
+                        output,
+                    )
+                    self.assertNotIn("sed:", output)
+                    self.assertFalse(
+                        any(
+                            entry["args"][0] == "picker-change-model"
+                            for entry in fixture.sp_entries()
+                        )
+                    )
+                finally:
+                    fixture.close()
+
     def test_help_is_reachable_from_more_and_from_needs_you(self) -> None:
         for label, payload in (
-            ("more", b"m\n?\n\n\n\n"),
-            ("needs you", b"a\n?\n\n\n\n"),
+            ("more", b"m\n?\n\n\nq\n"),
+            ("needs you", b"a\n?\n\n\nq\n"),
         ):
             with self.subTest(label=label):
                 fixture = LoginFixture(inventory(row("one", number=1)))
                 try:
                     code, output = run_pty(fixture, payload)
-                    self.assertEqual(2, code)
-                    self.assertIn("Session picker help", output)
+                    self.assertEqual(0, code)
+                    self.assertIn("Picker help", output)
                 finally:
                     fixture.close()
 
 
-class PeekProjectionTests(unittest.TestCase):
-    """The peek card itself, without a terminal in the way."""
-
-    peek = peek_module
-
-    def test_a_missing_row_has_no_card(self) -> None:
-        view = {"sessions": []}
-        self.assertIsNone(self.peek.build_peek(view, None, "/nonexistent", 3))
-
-    def test_control_characters_never_reach_the_card(self) -> None:
-        view = {
-            "sessions": [
-                {
-                    "terminal_number": 7,
-                    "title": "danger\x1b]0;evil\x07",
-                    "provider": "codex",
-                    "identity": {"uuid": "00000000-0000-4000-8000-000000000009"},
-                    "availability": "ready",
-                    "agent_status": "working",
-                }
-            ]
-        }
-        card = self.peek.build_peek(view, None, "/nonexistent", 7)
-        assert card is not None
-        self.assertNotIn("\x1b", card["title"])
-        self.assertNotIn("\x07", card["title"])
-        for line in self.peek.render_peek(card):
-            self.assertNotIn("\x1b", line)
-
-    def test_a_shell_session_offers_no_reply(self) -> None:
-        view = {
-            "sessions": [
-                {
-                    "terminal_number": 2,
-                    "title": "a plain shell",
-                    "provider": "shell",
-                    "identity": {"uuid": None},
-                    "availability": "ready",
-                    "agent_status": "idle",
-                }
-            ]
-        }
-        card = self.peek.build_peek(view, None, "/nonexistent", 2)
-        assert card is not None
-        self.assertFalse(card["can_reply"])
-        self.assertEqual("", card["thread_key"])
 
 
 if __name__ == "__main__":

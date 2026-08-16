@@ -509,6 +509,13 @@ class ReleaseToolTests(unittest.TestCase):
             )
         )
         self.assertEqual(boot["result"], "launcher-installed-and-current-switched")
+        floor = self.tree.state_dir.parent / "collection-sequence-floor.json"
+        self.assertEqual(
+            {"schema_version": 1, "last_collection_start": 1},
+            json.loads(floor.read_text(encoding="utf-8")),
+        )
+        self.assertEqual(0o600, file_mode(floor))
+        floor_bytes = floor.read_bytes()
         self.assertEqual(self.tree.root.joinpath("current").resolve(), release1)
         self.assertEqual(
             (self.tree.root / "launcher").read_bytes(),
@@ -544,6 +551,116 @@ class ReleaseToolTests(unittest.TestCase):
         self.assertEqual(rolled["action"], "rollback")
         self.assertEqual(rolled["previous_commit"], sha2)
         self.assertEqual(run([self.tree.bin_dir / "sp", "health"], env=env).stdout, "v1:sp:health\n")
+        self.assertEqual(floor_bytes, floor.read_bytes())
+
+    def test_bootstrap_copies_legacy_counter_and_preserves_existing_floor(self) -> None:
+        self.tree.build(self.repo, self.sha1)
+        make_sentinels(self.tree.home)
+        state = self.tree.state_dir.parent
+        counter = state / "collection-sequence.json"
+        counter.write_text(
+            json.dumps({"schema_version": 1, "last_collection_start": 87}) + "\n",
+            encoding="utf-8",
+        )
+        counter.chmod(0o600)
+
+        run(
+            [
+                RELEASE_TOOL,
+                "bootstrap",
+                *self.tree.activation_args(self.sha1, self.backup),
+            ]
+        )
+
+        floor = state / "collection-sequence-floor.json"
+        self.assertEqual(87, json.loads(floor.read_text())["last_collection_start"])
+
+        original = b'{ "last_collection_start" : 87, "schema_version" : 1 }\n'
+        floor.write_bytes(original)
+        floor.chmod(0o600)
+        sha2 = commit_runtime(self.repo, "v2")
+        self.tree.build(self.repo, sha2)
+        run(
+            [
+                RELEASE_TOOL,
+                "activate",
+                *self.tree.activation_args(sha2, self.backup),
+            ]
+        )
+        self.assertEqual(original, floor.read_bytes())
+
+    def test_bootstrap_refuses_underivable_floor_with_exact_remedy(self) -> None:
+        self.tree.build(self.repo, self.sha1)
+        make_sentinels(self.tree.home)
+        state = self.tree.state_dir.parent
+        inventory = state / "inventory.json"
+        inventory.write_text('{"sessions":[]}\n', encoding="utf-8")
+        inventory.chmod(0o600)
+        release = self.tree.release_root / self.sha1
+        expected = (
+            "session-kit-release: "
+            + release_module.collection_floor_remedy(
+                state, release / "bin/reset-collection-order.py"
+            )
+            + "\n"
+        )
+
+        refused = run(
+            [
+                RELEASE_TOOL,
+                "bootstrap",
+                *self.tree.activation_args(self.sha1, self.backup),
+            ],
+            check=False,
+        )
+
+        self.assertNotEqual(0, refused.returncode)
+        self.assertEqual(expected, refused.stderr)
+        self.assertFalse((state / "collection-sequence-floor.json").exists())
+        self.assertFalse((self.tree.root / "current").exists())
+
+    def test_floor_seed_preserves_each_existing_publication_lock_generation(
+        self,
+    ) -> None:
+        for generation in ("legacy", "versioned"):
+            with self.subTest(generation=generation):
+                state = self.tree.base / f"floor-lock-{generation}"
+                state.mkdir(mode=0o700)
+                counter = state / "collection-sequence.json"
+                counter.write_text(
+                    '{"schema_version":1,"last_collection_start":23}\n',
+                    encoding="utf-8",
+                )
+                counter.chmod(0o600)
+                legacy = state / "inventory.lock"
+                if generation == "legacy":
+                    legacy.write_bytes(b"legacy-lock-content\n")
+                    legacy.chmod(0o600)
+                else:
+                    legacy.write_bytes(release_module.LEGACY_INVENTORY_FENCE)
+                    legacy.chmod(0o400)
+                    versioned = state / "inventory-v2.lock"
+                    versioned.write_bytes(b"versioned-lock-content\n")
+                    versioned.chmod(0o600)
+                legacy_before = entry_evidence(legacy)
+                versioned_before = (
+                    entry_evidence(versioned) if generation == "versioned" else None
+                )
+
+                release_module.seed_collection_floor(
+                    state,
+                    self.tree.base / "reset-collection-order.py",
+                )
+
+                self.assertEqual(legacy_before, entry_evidence(legacy))
+                if versioned_before is not None:
+                    self.assertEqual(versioned_before, entry_evidence(versioned))
+                self.assertEqual(
+                    23,
+                    json.loads(
+                        (state / "collection-sequence-floor.json").read_text()
+                    )["last_collection_start"],
+                )
 
     def test_rollback_dry_run_refuses_new_launch_records_without_mutation(self) -> None:
         release1 = self.tree.build(self.repo, self.sha1)
@@ -694,6 +811,127 @@ class ReleaseToolTests(unittest.TestCase):
             "unsafe retained launch record symlink",
         ):
             release_module.validate_rollback_launch_records(self.tree.home)
+
+    def _capable_target(self) -> Path:
+        """A release directory whose runtime names the .launch suffix."""
+        target = self.tree.home / "target-fixture"
+        (target / "bin").mkdir(parents=True, exist_ok=True)
+        (target / "bin" / "session_kit_common").write_text(
+            "# fixture\nfor suffix in '' .account .launch .prompt; do :; done\n",
+            encoding="utf-8",
+        )
+        return target
+
+    def _legacy_target(self) -> Path:
+        target = self.tree.home / "legacy-target-fixture"
+        (target / "bin").mkdir(parents=True, exist_ok=True)
+        (target / "bin" / "session_kit_common").write_text(
+            "# fixture shared shell helpers\n", encoding="utf-8"
+        )
+        return target
+
+    def _current_family_records(self) -> Path:
+        launch_dir = self.tree.home / ".local/state/shpool-start"
+        launch_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+        launch_dir.chmod(0o700)
+        exact_uuid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        files = {
+            "main2": f"claude\t/srv/project\t{exact_uuid}\tfork\n",
+            "main2.expected": (
+                "claude\t/srv/project\tfixture-boot\t1700000000000"
+                f"\t1001\t10010\t10\t100\t{exact_uuid}\tfork\n"
+            ),
+            "main2.launch": "claude\t/srv/project\topus\tfork\n",
+            "main2.account": "claude\twren\n",
+            "main2.prompt": "continue the research\nsecond line of the prompt\n",
+        }
+        for name, content in files.items():
+            path = launch_dir / name
+            path.write_text(content, encoding="utf-8")
+            path.chmod(0o600)
+        return launch_dir
+
+    def test_rollback_launch_gate_passes_current_records_to_a_capable_target(
+        self,
+    ) -> None:
+        """The 16 Aug dead net: current records must not block a capable target."""
+        launch_dir = self._current_family_records()
+        legacy_start = launch_dir / "main3"
+        legacy_expected = launch_dir / "main3.expected"
+        exact_uuid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        legacy_start.write_text(
+            f"claude\t/srv/project\t{exact_uuid}\n", encoding="utf-8"
+        )
+        legacy_expected.write_text(
+            "claude\t/srv/project\tfixture-boot\t1700000000000"
+            f"\t1001\t10010\t10\t100\t{exact_uuid}\n",
+            encoding="utf-8",
+        )
+        legacy_start.chmod(0o600)
+        legacy_expected.chmod(0o600)
+        self.assertEqual(
+            2,
+            release_module.validate_rollback_launch_records(
+                self.tree.home, target_release=self._capable_target()
+            ),
+        )
+
+    def test_rollback_launch_gate_refuses_current_records_for_legacy_target(
+        self,
+    ) -> None:
+        self._current_family_records()
+        for target in (None, self._legacy_target()):
+            with self.assertRaisesRegex(
+                release_module.ReleaseError,
+                "new-format retained launch pair blocks older-release rollback",
+            ):
+                release_module.validate_rollback_launch_records(
+                    self.tree.home, target_release=target
+                )
+
+    def test_lone_launch_request_is_a_valid_current_record(self) -> None:
+        """A .launch request legitimately exists alone before creation."""
+        launch_dir = self.tree.home / ".local/state/shpool-start"
+        launch_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+        launch_dir.chmod(0o700)
+        request = launch_dir / "main2.launch"
+        request.write_text("claude\t/srv/project\topus\t\n", encoding="utf-8")
+        request.chmod(0o600)
+        self.assertEqual(
+            1,
+            release_module.validate_rollback_launch_records(
+                self.tree.home, target_release=self._capable_target()
+            ),
+        )
+        with self.assertRaisesRegex(
+            release_module.ReleaseError,
+            "new-format retained launch pair blocks older-release rollback",
+        ):
+            release_module.validate_rollback_launch_records(self.tree.home)
+
+    def test_current_record_safety_proofs_still_refuse(self) -> None:
+        launch_dir = self._current_family_records()
+        target = self._capable_target()
+        prompt = launch_dir / "main2.prompt"
+        prompt.chmod(0o644)
+        with self.assertRaisesRegex(
+            release_module.ReleaseError,
+            "unsafe retained launch record type, owner, mode, link count, or size",
+        ):
+            release_module.validate_rollback_launch_records(
+                self.tree.home, target_release=target
+            )
+        prompt.chmod(0o600)
+        launch = launch_dir / "main2.launch"
+        launch.unlink()
+        os.symlink("/does/not/exist", launch)
+        with self.assertRaisesRegex(
+            release_module.ReleaseError,
+            "unsafe retained launch record symlink",
+        ):
+            release_module.validate_rollback_launch_records(
+                self.tree.home, target_release=target
+            )
 
     def test_rollback_dry_run_refuses_unsafe_existing_creation_lock_read_only(
         self,

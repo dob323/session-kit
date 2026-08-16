@@ -10,6 +10,7 @@ explains, or a completion that offers a verb `sp help` does not.
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import re
@@ -17,13 +18,12 @@ import subprocess
 import tempfile
 import unittest
 
-from tests.support import REPO
+from tests.support import REPO, without_shpool
 
 
 SP = REPO / "bin" / "sp"
 SESSION_KIT = REPO / "bin" / "session-kit"
 STATUS = REPO / "bin" / "shpool_status"
-SUPERVISOR = REPO / "bin" / "supervisor"
 REAPER = REPO / "bin" / "shpool_reaper"
 WATCHDOG = REPO / "bin" / "session_kit_watchdog"
 RESUME = REPO / "bin" / "codex_resume_here"
@@ -39,7 +39,6 @@ ENTRY_POINTS = (
     (SP, ("help", "a", "b")),
     (SESSION_KIT, ("no-such-verb",)),
     (STATUS, ("--bogus",)),
-    (SUPERVISOR, ("no-such-verb",)),
     (REAPER, ("--bogus",)),
     (WATCHDOG, ("--bogus",)),
     (RESUME, ("--bogus",)),
@@ -66,16 +65,25 @@ class HelpFixture:
         self.temp.cleanup()
 
     def env(self, **extra: str) -> dict[str, str]:
-        return {
-            "HOME": os.fspath(self.home),
-            "PATH": f"{self.bin}:/usr/bin:/bin",
-            "XDG_STATE_HOME": os.fspath(self.base / "state"),
-            "XDG_CONFIG_HOME": os.fspath(self.base / "config"),
-            "XDG_DATA_HOME": os.fspath(self.base / "data"),
-            "PYTHONDONTWRITEBYTECODE": "1",
-            "SESSION_KIT_NONINTERACTIVE": "1",
-            **extra,
-        }
+        # `without_shpool` is load-bearing, not decoration. The suite-wide
+        # sandbox guard (tests/sandbox_guard.py) normally puts a refusing
+        # `shpool` on every child's PATH, and that would make
+        # test_help_is_reachable_without_shpool pass for the wrong reason:
+        # shpool would be present. This asks the guard for a machine with no
+        # session manager at all, which it delivers by removing its own stub
+        # AND any real binary, so the absence these tests need is real.
+        return without_shpool(
+            {
+                "HOME": os.fspath(self.home),
+                "PATH": f"{self.bin}:/usr/bin:/bin",
+                "XDG_STATE_HOME": os.fspath(self.base / "state"),
+                "XDG_CONFIG_HOME": os.fspath(self.base / "config"),
+                "XDG_DATA_HOME": os.fspath(self.base / "data"),
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "SESSION_KIT_NONINTERACTIVE": "1",
+                **extra,
+            }
+        )
 
     def run(self, *argv: object, **extra: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -140,7 +148,7 @@ class CommandHelpTests(unittest.TestCase):
         for group in (
             "Sessions",
             "Names and colors",
-            "Messages",
+            "Delegated work",
             "Accounts",
             "History and recovery",
             "Topics",
@@ -162,6 +170,17 @@ class CommandHelpTests(unittest.TestCase):
                 self.assertEqual(0, completed.returncode, completed.stderr)
                 self.assertEqual("", completed.stderr)
                 self.assertGreater(len(completed.stdout.splitlines()), 3)
+
+    def test_the_unavailable_topic_names_automatic_safe_cleanup(self) -> None:
+        """Quarantine documents the automatic path and its proof boundary."""
+        completed = self.fixture.run(SP, "help", "unavailable")
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        text = completed.stdout
+        self.assertIn("no session number", text)
+        self.assertIn("next cleanup pass", text)
+        self.assertIn("attach-and-exit", text)
+        self.assertIn("hard timeout", text)
+        self.assertIn("any surviving session process", text)
 
     def test_an_unknown_topic_names_the_topics_it_has(self) -> None:
         completed = self.fixture.run(SP, "help", "no-such-topic")
@@ -201,19 +220,56 @@ class CommandHelpTests(unittest.TestCase):
                 self.assertNotIn(f"sp {verb}", self.overview.stdout)
                 self.assertIn(f"sp {verb}", topic.stdout)
 
-    def test_the_msg_module_and_the_overview_still_agree(self) -> None:
-        module = subprocess.run(
-            ["bash", "-c", f'source "{REPO / "lib/sh/sp_msg.sh"}"; msg_usage'],
-            cwd=REPO,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
+    def test_sp_list_rejects_arguments_instead_of_silently_drawing_text(self) -> None:
+        completed = self.fixture.run(SP, "list", "--json")
+        self.assertEqual(2, completed.returncode)
+        self.assertEqual("", completed.stdout)
+        self.assertTrue(
+            completed.stderr.startswith("session-kit: sp list takes nothing else\n"),
+            completed.stderr,
         )
-        self.assertEqual(0, module.returncode, module.stderr)
-        for line in module.stdout.splitlines():
-            if line.strip():
-                self.assertIn(line, self.overview.stdout)
+
+    def test_bare_sp_is_the_same_listing_as_sp_list(self) -> None:
+        fake_shpool = self.fixture.bin / "shpool"
+        fake_shpool.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        fake_shpool.chmod(0o755)
+        fake_core = self.fixture.base / "inventory-core"
+        fake_core.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "assert sys.argv[1:] == ['render']\n"
+            "print('the unchanged session list')\n",
+            encoding="utf-8",
+        )
+        fake_core.chmod(0o755)
+        env = {
+            "SESSION_KIT_SHPOOL_CMD": os.fspath(fake_shpool),
+            "SESSION_KIT_INVENTORY_CORE": os.fspath(fake_core),
+        }
+        try:
+            bare = self.fixture.run(SP, **env)
+            explicit = self.fixture.run(SP, "list", **env)
+            self.assertEqual(0, bare.returncode, bare.stderr)
+            self.assertEqual(explicit.stdout, bare.stdout)
+            self.assertEqual("the unchanged session list\n", bare.stdout)
+        finally:
+            fake_shpool.unlink(missing_ok=True)
+            fake_core.unlink(missing_ok=True)
+
+    def test_usage_lists_every_new_picker_key_and_search_field(self) -> None:
+        usage = (REPO / "docs" / "usage.md").read_text(encoding="utf-8")
+        self.assertIn(
+            "model number    move an idle Claude or Codex conversation",
+            usage,
+        )
+        self.assertIn(
+            "x               show or hide machine sessions",
+            usage,
+        )
+        self.assertIn(
+            "/text           filter names, providers, accounts, models, and projects",
+            usage,
+        )
 
 
 class UniformHelpTests(unittest.TestCase):
@@ -243,6 +299,23 @@ class UniformHelpTests(unittest.TestCase):
                 self.assertEqual(2, completed.returncode, completed.stdout)
                 self.assertEqual("", completed.stdout)
                 self.assertNotEqual("", completed.stderr.strip())
+
+    def test_doctor_does_not_advertise_an_unimplemented_authority_mode(self) -> None:
+        dead_authority_mode = "doctor --" + "authority"
+        help_result = self.fixture.run(SESSION_KIT, "--help")
+        self.assertEqual(0, help_result.returncode, help_result.stderr)
+        self.assertNotIn(dead_authority_mode, help_result.stdout)
+
+        report = self.fixture.run(SESSION_KIT, "doctor", "--json")
+        self.assertNotEqual(0, report.returncode)
+        acceptance = next(
+            row
+            for row in json.loads(report.stdout)["checks"]
+            if row["name"] == "acceptance"
+        )
+        self.assertEqual("warn", acceptance["status"])
+        self.assertIn("release-acceptance.json", acceptance["detail"])
+        self.assertNotIn(dead_authority_mode, acceptance["detail"])
 
 
 class StatusModeDocumentationTests(unittest.TestCase):
@@ -275,6 +348,8 @@ class StatusModeDocumentationTests(unittest.TestCase):
     def test_the_read_only_modes_are_the_ones_that_never_build_state(self) -> None:
         self.assertEqual(
             [
+                "(no mode)",
+                "--rows",
                 "--strict-json",
                 "--guard-json",
                 "--render-file",
@@ -282,30 +357,61 @@ class StatusModeDocumentationTests(unittest.TestCase):
                 "--recovery-pending-list",
             ],
             self.modes("Read-only modes"),
-            "only the replay and no-write probe modes belong under read-only",
+            "the dashboards, replay paths, and no-write probes belong under read-only",
         )
         self.assertEqual(
-            ["--waiting-count", "--detail"],
+            ["--waiting-count", "--detail", "--json", "--lookup"],
             self.modes("refresh the cached inventory as they run:"),
         )
 
-    def test_the_title_filling_modes_match_the_ones_the_source_titles(self) -> None:
-        """The auto-title arm in the source is the definition; the text follows it."""
-        arm = re.search(r'case "\$\{1:-\}" in\n  ([^)]+)\)', self.source)
-        assert arm is not None
-        modes = [
-            part.strip().strip('"')
-            for part in arm.group(1).split("|")
-        ]
-        titled = self.modes("fill pending provider titles:")
-        self.assertEqual(
-            ["(no mode)" if mode == "" else mode for mode in modes],
-            titled,
-            "the source titles exactly these modes; the usage text must say so",
+    def test_naming_runs_on_refreshes_but_never_on_a_listing(self) -> None:
+        core = self.fixture.base / "status-core"
+        log = self.fixture.base / "status-core.log"
+        core.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json,os,pathlib,sys\n"
+            "with pathlib.Path(os.environ['STATUS_CORE_LOG']).open('a') as out:\n"
+            "    out.write(json.dumps(sys.argv[1:])+'\\n')\n"
+            "print('{}')\n",
+            encoding="utf-8",
         )
+        core.chmod(0o755)
+        env = {
+            "SESSION_KIT_INVENTORY_CORE": os.fspath(core),
+            "STATUS_CORE_LOG": os.fspath(log),
+        }
 
-    def test_the_mutating_recovery_mode_is_named_as_one(self) -> None:
-        self.assertIn("--recovery-pending-ack", self.section("changes recovery state"))
+        expected = {
+            (): [["render"]],
+            ("--rows",): [["render", "--rows"]],
+            ("--json",): [
+                ["automatic-title", "claude-pending"],
+                ["automatic-title", "codex-pending"],
+                ["snapshot"],
+            ],
+            ("--lookup", "7"): [
+                ["automatic-title", "claude-pending"],
+                ["automatic-title", "codex-pending"],
+                ["lookup", "7"],
+            ],
+        }
+        for argv, calls in expected.items():
+            with self.subTest(argv=argv):
+                log.unlink(missing_ok=True)
+                completed = self.fixture.run(STATUS, *argv, **env)
+                self.assertEqual(0, completed.returncode, completed.stderr)
+                observed = [
+                    json.loads(line)
+                    for line in log.read_text(encoding="utf-8").splitlines()
+                ]
+                self.assertEqual(calls, observed)
+
+    def test_the_mutating_recovery_modes_are_named_as_such(self) -> None:
+        mutating = self.section("change recovery state")
+        self.assertIn("--recovery-pending-ack", mutating)
+        # Writing down what a screen printed is a write, and a person reading
+        # this page is entitled to find it where the writes are listed.
+        self.assertIn("--recovery-remember-printed", mutating)
 
 
 class ExitCodeDocumentationTests(unittest.TestCase):

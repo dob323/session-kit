@@ -4,6 +4,24 @@ set -euo pipefail
 repo=$(cd -- "$(dirname -- "$0")/.." && pwd)
 export PYTHONDONTWRITEBYTECODE=1
 
+# The suite must not inherit the operator's window, and must not inherit a
+# kill switch their shell happened to export either. tests/__init__.py pins
+# this for every entry point, including a bare
+# `python3 -m unittest tests.test_inventory`; the same clearing happens here so
+# it also covers whatever this script starts outside Python. An exported
+# COLUMNS would answer shutil.get_terminal_size before the pin is reached, and
+# a set SESSION_KIT_NO_COLOR/NO_COLOR is a disabled live channel that `sp
+# doctor` reports and tests/test_install.py asserts against. Read
+# pin_terminal() in tests/__init__.py before changing either. A test that wants
+# a width, or wants colour, still sets it for itself and still wins.
+unset COLUMNS LINES SESSION_KIT_NO_COLOR NO_COLOR
+
+# An interrupted run leaves its sandbox in the repository, and any real provider
+# CLI it started inside that sandbox keeps running -- one pair was found alive a
+# day and twenty hours later. Clear both before starting, never anything younger
+# than two hours, so a run in flight is untouched.
+python3 "$repo/tests/sweep_sandboxes.py" || true
+
 # SESSION_KIT_TEST_EXEC_ROOT is deliberately NOT set here. The fixtures honour
 # it (sandboxes move out of the repository, which fixes sandbox litter and the
 # AF_UNIX path-length overflow on deep checkouts), but setting it also flips

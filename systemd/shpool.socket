@@ -1,5 +1,5 @@
 [Unit]
-Description=Shpool Shell Session Pooler
+Description=shpool session daemon socket
 
 [Socket]
 ListenStream=%t/shpool/shpool.socket

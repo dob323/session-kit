@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
+from enum import Enum
 import os
 from pathlib import Path
 import sys
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
-from .common import CollectionError, clean_text
+from .common import CollectionError, clean_text, proc_root as default_proc_root
 
 
 DARWIN_PLATFORM = "darwin"
@@ -58,8 +59,8 @@ def _proc_environ(path: Path) -> dict[str, str]:
     return values
 
 
-def _readable_by_us(entry: Path) -> bool:
-    """True when this process could read ``entry``'s restricted proc files.
+def _readable_by_us(entry: Path) -> bool | None:
+    """Whether this process could read ``entry``'s restricted proc files.
 
     ``/proc/<pid>/environ`` and ``/proc/<pid>/cwd`` are readable only by the
     process owner, so for any other uid the read always fails and the caller
@@ -67,14 +68,81 @@ def _readable_by_us(entry: Path) -> bool:
     scan from making one denied syscall per foreign process, which on a busy
     host with auditing on failed opens is a lot of log for no information.
 
-    Root is exempt, so it keeps reading everything.
+    Root is exempt, so it keeps reading everything. ``None`` preserves a failed
+    ownership check as unknown instead of turning it into a foreign process.
     """
     if os.getuid() == 0:
         return True
     try:
         return entry.stat().st_uid == os.getuid()
     except OSError:
-        return False
+        return None
+
+
+class ProcessTable(dict):
+    """A process table that remembers whether it saw everything.
+
+    Most readers ask "is this pid in the table?" and act on the answer. One
+    reader asks the opposite -- "is NOTHING in this tree holding that socket?"
+    -- and a table with a hole in it answers that question wrongly and
+    silently, because a process the scan lost is indistinguishable from a
+    process that was never there. Where the parent is known the loss is
+    recorded in place (see `_unreadable_process`); where even that could not be
+    read, the pid cannot be attributed to any tree, so the only honest record
+    is that this reading of the machine is not complete.
+
+    It is a plain dict in every other respect, so a caller that never asks
+    about absence is unaffected, and a hand-built fixture with no flag reads as
+    complete, which is what a fixture is.
+    """
+
+    complete: bool = True
+
+
+def table_is_complete(process_table: Mapping[int, Mapping[str, Any]]) -> bool:
+    """Whether this reading of the process table saw every process."""
+    return bool(getattr(process_table, "complete", True))
+
+
+def _unreadable_process(pid: int, ppid: int) -> dict[str, Any]:
+    """A process that exists, placed in the tree, saying nothing about itself.
+
+    Every field a reader might match on is empty, so nothing here can be
+    mistaken for evidence; `argv_unreadable` is the one positive statement,
+    and it is what a reader needs in order to refuse a verdict that rests on
+    absence. The parent is published because placing the process in the right
+    tree is the whole point -- a process nobody can attribute is a process
+    whose absence somebody will read as proof.
+
+    The start time is deliberately impossible. This entry is published exactly
+    when identity could NOT be confirmed, and every verifier in the kit
+    compares a recorded start tick against the live one before it acts on a
+    process; a stale-but-plausible value would let one of those confirm an
+    identity that no longer exists. -1 matches nothing, so they all refuse.
+    """
+    return {
+        "pid": pid,
+        "ppid": ppid,
+        "start_ticks": -1,
+        "cmdline": [],
+        "comm": "",
+        "cwd": "",
+        "argv_unreadable": True,
+        "environ_unreadable": True,
+        "session_name": "",
+        "claude_config_dir": "",
+        "codex_home": "",
+        "account_alias": "",
+        "account_capable": "",
+    }
+
+
+def _unreadable_shpool_process(pid: int, ppid: int) -> dict[str, Any]:
+    """An exact shpool name whose argv and generation cannot be trusted."""
+    process = _unreadable_process(pid, ppid)
+    process["comm"] = "shpool"
+    process["args_available"] = False
+    return process
 
 
 def scan_process_table(
@@ -85,7 +153,7 @@ def scan_process_table(
     proc_environ: Callable[[Path], dict[str, str]],
 ) -> dict[int, dict[str, Any]]:
     """Read one bounded process-table view from proc_root."""
-    table: dict[int, dict[str, Any]] = {}
+    table = ProcessTable()
     try:
         entries = sorted(
             (entry for entry in proc_root.iterdir() if entry.name.isdigit()),
@@ -103,22 +171,66 @@ def scan_process_table(
         try:
             before_pid, ppid, start_ticks = proc_stat(entry / "stat")
             if before_pid != pid:
+                # The directory entry and the file disagree about which
+                # process this is; nothing read here can be attributed.
+                table.complete = False
                 continue
+        except (OSError, ValueError):
+            # It was listed a moment ago and its stat will not read, so its
+            # parent is unknown and it cannot be placed in any tree. Unlike
+            # the cases below there is no slot to leave behind -- the only
+            # honest record is that this reading of the machine has a hole in
+            # it, and a reader that would conclude "nothing in this tree holds
+            # that socket" must not conclude it from a table with a hole.
+            table.complete = False
+            continue
+        try:
+            comm = clean_text(
+                (entry / "comm").read_text(encoding="utf-8", errors="replace"), 128
+            )
+        except (OSError, ValueError):
+            # A process whose stat read but whose argv did not is one that
+            # EXISTS and will not say what it is. Dropped, it left the table
+            # reading "no such process", so a reader asking "is anything in
+            # this tree holding that socket?" got "no" about a process it
+            # never saw — and answering that question with "no" is what puts
+            # a person's session behind the machine count. It stays, placed by
+            # its parent, with the ambiguity recorded the same way an
+            # unreadable environment is.
+            table[pid] = _unreadable_process(pid, ppid)
+            continue
+        try:
             cmdline = [
                 value.decode("utf-8", errors="replace")
                 for value in (entry / "cmdline").read_bytes().split(b"\0")
                 if value
             ]
-            comm = clean_text(
-                (entry / "comm").read_text(encoding="utf-8", errors="replace"), 128
-            )
-        except (OSError, ValueError):
-            continue
-        if _readable_by_us(entry):
+            args_available = True
+        except OSError:
+            # Keep only the one unreadable-argv process shape that affects
+            # daemon selection. Retaining every process whose arguments are
+            # hidden would turn an ordinary large process table into a field
+            # of false daemon candidates; an exact comm=shpool row is the
+            # bounded uncertainty this collector must carry forward.
+            if comm != "shpool":
+                table[pid] = _unreadable_process(pid, ppid)
+                continue
+            cmdline = []
+            args_available = False
+        # An own-uid environment that will not read is not the same fact as an
+        # empty one: `environ` needs PTRACE_MODE_READ, so a hardening change
+        # (yama, a container policy) can deny it for a live managed shell. Left
+        # indistinguishable, that shell looks like a session with no process at
+        # all — the exact state the auto-close engine treats as "nothing to
+        # preserve". Record the ambiguity and let the readers refuse.
+        environ_unreadable = False
+        readable = _readable_by_us(entry)
+        if readable:
             try:
                 environ = proc_environ(entry / "environ")
             except OSError:
                 environ = {}
+                environ_unreadable = True
             try:
                 cwd = os.readlink(entry / "cwd")
             except OSError:
@@ -129,15 +241,32 @@ def scan_process_table(
             # process can never supply a session name anyway.
             environ = {}
             cwd = ""
+            if readable is None:
+                environ_unreadable = True
         try:
             after_pid, after_ppid, after_start_ticks = proc_stat(entry / "stat")
         except (OSError, ValueError):
+            # It was there when the walk started and it is not answering now.
+            # The fields already read may describe a process that has since
+            # exec'd into something else, so they are not published — but the
+            # slot is, because "it exited" and "it exec'd into the window" are
+            # the same reading from here.
+            table[pid] = (
+                _unreadable_shpool_process(pid, ppid)
+                if not args_available
+                else _unreadable_process(pid, ppid)
+            )
             continue
         if (before_pid, ppid, start_ticks) != (
             after_pid,
             after_ppid,
             after_start_ticks,
         ):
+            table[pid] = (
+                _unreadable_shpool_process(pid, ppid)
+                if not args_available
+                else _unreadable_process(pid, ppid)
+            )
             continue
         table[pid] = {
             "pid": pid,
@@ -146,12 +275,16 @@ def scan_process_table(
             "cmdline": cmdline,
             "comm": comm,
             "cwd": cwd,
+            "environ_unreadable": environ_unreadable,
             "session_name": environ.get("SHPOOL_SESSION_NAME", ""),
             "claude_config_dir": environ.get("CLAUDE_CONFIG_DIR", ""),
             "codex_home": environ.get("CODEX_HOME", ""),
             "account_alias": environ.get("SESSION_KIT_ACCOUNT_ALIAS", ""),
             "account_capable": environ.get("SESSION_KIT_ACCOUNT_CAPABLE", ""),
         }
+        if not args_available:
+            table[pid]["args_available"] = False
+            table[pid]["argv_unreadable"] = True
     return table
 
 
@@ -335,12 +468,16 @@ def scan_darwin_process_table(
         )
     read_bsd = bsd_reader or (lambda pid: darwin_bsd_info(libproc, pid))
     read_args = args_reader or (lambda pid: darwin_procargs2(libc, pid))
-    table: dict[int, dict[str, Any]] = {}
+    table = ProcessTable()
     for pid in unique_pids:
         try:
             before = read_bsd(pid)
             generation = darwin_generation(before)
         except (OSError, ValueError):
+            # Same rule as the Linux scan: with no parent there is no tree to
+            # place this in, so the reading of the machine is incomplete and
+            # nobody may conclude an absence from it.
+            table.complete = False
             continue
         args_available = True
         try:
@@ -352,6 +489,7 @@ def scan_darwin_process_table(
             after = read_bsd(pid)
             after_generation = darwin_generation(after)
         except (OSError, ValueError):
+            table[pid] = _unreadable_process(pid, int(before.pbi_ppid))
             continue
         before_identity = (int(before.pbi_pid), int(before.pbi_ppid), generation)
         after_identity = (
@@ -360,6 +498,7 @@ def scan_darwin_process_table(
             after_generation,
         )
         if before_identity != after_identity or before_identity[0] != pid:
+            table[pid] = _unreadable_process(pid, int(before.pbi_ppid))
             continue
         table[pid] = {
             "pid": pid,
@@ -367,6 +506,11 @@ def scan_darwin_process_table(
             "start_ticks": generation,
             "generation_kind": "darwin-start-usec",
             "args_available": args_available,
+            # Darwin's argv read is denied for other uids and for hardened
+            # processes, so "no argv" here is routine. It is still an argv
+            # nobody read, and a reader deciding an absence must refuse it for
+            # the same reason it refuses one on Linux.
+            "argv_unreadable": not args_available,
             "cmdline": argv,
             "comm": clean_text(
                 decode_c_string(bytes(before.pbi_name))
@@ -418,27 +562,236 @@ def _is_shpool_daemon(process: Mapping[str, Any]) -> bool:
     return executable == "shpool" and "daemon" in argv[1:]
 
 
+def _is_unknown_shpool_daemon(process: Mapping[str, Any]) -> bool:
+    """Whether unreadable argv leaves an exact shpool comm as a candidate."""
+    return (
+        process.get("args_available") is False
+        and not process.get("cmdline")
+        and clean_text(process.get("comm"), 128) == "shpool"
+    )
+
+
+def _kit_socket_path(environ: Mapping[str, str]) -> str | None:
+    """Where a client started the way this kit starts one connects.
+
+    The pinned shpool resolves ``--socket``, then
+    ``$XDG_RUNTIME_DIR/shpool/shpool.socket``, then
+    ``~/.local/run/shpool/shpool.socket``. It does NOT read ``SHPOOL_SOCKET``:
+    that was checked against the pinned source and the installed binary after a
+    reviewer showed an earlier version of this code inventing support for it.
+    This kit passes no ``--socket``, so its client lands on one of the last two.
+    """
+    runtime_dir = environ.get("XDG_RUNTIME_DIR") or ""
+    if runtime_dir:
+        return os.path.normpath(f"{runtime_dir}/shpool/shpool.socket")
+    home = environ.get("HOME") or ""
+    if home:
+        return os.path.normpath(f"{home}/.local/run/shpool/shpool.socket")
+    return None
+
+
+# `/proc/net/unix` flags carry SO_ACCEPTCON for a socket that is listening.
+# Connected peers of a unix socket appear on their own rows carrying the same
+# pathname, so without this the first row for a path is as likely to be a
+# conversation with the daemon as the daemon's own listener.
+_ACCEPTCON = 0x10000
+
+
+def _listening_inodes(path: str, proc_root: Path) -> set[int] | None:
+    """Every listening unix socket bound at ``path``, per the kernel.
+
+    A pathname is not unique in this table. A daemon whose socket file was
+    replaced keeps its row while a new daemon binds the same path, and every
+    connected peer repeats the pathname too. Reading only the first match let a
+    stranger's inode stand in for ours, so all of them are collected and the
+    caller refuses if they do not agree on one holder. ``None`` means the
+    kernel table could not be read completely.
+    """
+    inodes: set[int] = set()
+    try:
+        raw = (proc_root / "net" / "unix").read_text(
+            encoding="utf-8", errors="replace"
+        )
+    except OSError:
+        return None
+    # proc's sequence-file records are newline terminated. An unterminated
+    # final record means the table was not read whole, so an earlier matching
+    # row cannot be treated as the only listener.
+    if not raw or not raw.endswith("\n"):
+        return None
+    lines = raw.splitlines()
+    if not lines or len(lines[0].split()) < 7:
+        return None
+    for line in lines[1:]:
+        fields = line.split(None, 7)
+        if len(fields) < 7:
+            return None
+        # Abstract and unnamed sockets legitimately have no pathname column.
+        if len(fields) == 7:
+            continue
+        # The pathname is the remainder of the line: it may contain spaces.
+        if os.path.normpath(fields[7].rstrip("\n")) != path:
+            continue
+        try:
+            if not int(fields[3], 16) & _ACCEPTCON:
+                continue
+            inodes.add(int(fields[6]))
+        except ValueError:
+            return None
+    return inodes
+
+
+class _SocketHolding(Enum):
+    HOLDS = "holds"
+    DOES_NOT_HOLD = "does-not-hold"
+    UNKNOWN = "unknown"
+
+
+def _holds_any_socket(
+    pid: int, inodes: set[int], proc_root: Path
+) -> _SocketHolding:
+    targets = {f"socket:[{inode}]" for inode in inodes}
+    try:
+        entries = list((proc_root / str(pid) / "fd").iterdir())
+    except OSError:
+        return _SocketHolding.UNKNOWN
+    unreadable = False
+    for entry in entries:
+        try:
+            if os.readlink(entry) in targets:
+                return _SocketHolding.HOLDS
+        except OSError:
+            unreadable = True
+    return (
+        _SocketHolding.UNKNOWN
+        if unreadable
+        else _SocketHolding.DOES_NOT_HOLD
+    )
+
+
+def _kit_daemons(
+    process_table: Mapping[int, Mapping[str, Any]],
+    is_shpool_daemon: Callable[[Mapping[str, Any]], bool],
+    *,
+    environ: Mapping[str, str] | None = None,
+    proc_root: Path | None = None,
+    require_socket_holder: bool = False,
+) -> list[int]:
+    """Which of the running daemons is the one serving this kit.
+
+    Counting every process named ``shpool`` was the wrong question: on 15 August
+    a review lane's own sandboxed daemon, on its own socket and holding nothing,
+    left the kit unable to identify a single one of the operator's ten live
+    sessions.
+
+    Two earlier answers were wrong in ways reviewers proved. Resolving a name
+    among the children of ANY daemon let a stranger's process take over one of
+    their rows. Inferring each daemon's socket from its command line and
+    environment is not authoritative either: the pinned shpool ignores
+    ``SHPOOL_SOCKET`` entirely, and under systemd socket activation it
+    disregards ``--socket`` and serves the listener it inherited, so both
+    strings can say the opposite of the truth.
+
+    The kernel is asked instead. The socket this kit's client connects to has an
+    inode in ``/proc/net/unix``; whichever daemon holds that inode open is the
+    one answering us. Nothing a command line or an environment says can change
+    that. When the question cannot be answered -- no ``/proc/net/unix``, no such
+    path, no holder, or more than one -- every daemon is returned and the caller
+    is exactly as strict as it was before any of this existed.
+    """
+    if not table_is_complete(process_table) and not require_socket_holder:
+        # A hole in the census invalidates every conclusion built on absence,
+        # so the census fast paths below refuse. The socket-holder question is
+        # different: its answer is the kernel's positive statement that one
+        # daemon holds the one listener inode at our path, and a process that
+        # vanished between readdir and stat cannot un-hold that listener. On a
+        # busy host some scan is nearly always churned, and treating every
+        # churned scan as "no daemon" unresolved every session on the board.
+        return []
+    daemons = sorted(
+        pid for pid, process in process_table.items() if is_shpool_daemon(process)
+    )
+    unknown = sorted(
+        pid
+        for pid, process in process_table.items()
+        if pid not in daemons and _is_unknown_shpool_daemon(process)
+    )
+    if unknown:
+        # An unreadable exact shpool command line is the same kind of evidence
+        # gap as an unreadable daemon fd directory: it cannot promote another
+        # namesake to the unique answer. A sole unknown is also not proof of a
+        # daemon, so return no selection rather than laundering it through the
+        # one-element fast path.
+        candidates = sorted((*daemons, *unknown))
+        if require_socket_holder:
+            return []
+        return candidates if len(candidates) > 1 else []
+    if len(daemons) <= 1 and not require_socket_holder:
+        return daemons
+    values = os.environ if environ is None else environ
+    path = _kit_socket_path(values)
+    if path is None:
+        return [] if require_socket_holder else daemons
+    root = default_proc_root(values) if proc_root is None else proc_root
+    inodes = _listening_inodes(path, root)
+    # More than one listener bound at our path means an old daemon's socket was
+    # replaced under it and both rows survive. Which one our client reached is
+    # not knowable from here, and three reviewers built the same attack out of
+    # guessing: a stranger holding the stale row got selected outright. One row
+    # or none.
+    if inodes is None or len(inodes) != 1:
+        return [] if require_socket_holder else daemons
+    holding = {pid: _holds_any_socket(pid, inodes, root) for pid in daemons}
+    # An unreadable descriptor directory or entry is not evidence that a
+    # daemon does not hold the listener. Until every candidate can be checked,
+    # uniqueness has not been established.
+    if _SocketHolding.UNKNOWN in holding.values():
+        return [] if require_socket_holder else daemons
+    holders = [
+        pid for pid, state in holding.items() if state is _SocketHolding.HOLDS
+    ]
+    # More than one daemon holding a listener on our path is a real state -- an
+    # old daemon whose socket file was replaced, or one that inherited the
+    # descriptor -- and there is no way to tell from here which one answered us.
+    # That is refusal, not a coin toss.
+    if len(holders) == 1:
+        return holders
+    return [] if require_socket_holder else daemons
+
+
 def shpool_roots(
     session_names: Iterable[str],
     process_table: Mapping[int, Mapping[str, Any]],
     *,
     is_shpool_daemon: Callable[[Mapping[str, Any]], bool],
+    daemon_pids: Sequence[int] | None = None,
 ) -> tuple[dict[str, int], dict[str, list[str]]]:
     """Map a shpool name only through a unique daemon direct child."""
     wanted = set(session_names)
-    daemons = [
-        pid for pid, process in process_table.items() if is_shpool_daemon(process)
-    ]
+    daemons = (
+        _kit_daemons(process_table, is_shpool_daemon)
+        if daemon_pids is None
+        else list(daemon_pids)
+    )
     roots: dict[str, int] = {}
     diagnostics: dict[str, list[str]] = {name: [] for name in wanted}
     if len(daemons) != 1:
         reason = (
-            f"expected one shpool daemon in the process table, found {len(daemons)}"
+            "expected one shpool daemon serving this kit in the process table, "
+            f"found {len(daemons)}"
         )
         for name in wanted:
             diagnostics[name].append(reason)
         return roots, diagnostics
     daemon = daemons[0]
+    # A daemon child whose environment would not read cannot state its session
+    # name, so every name that came up empty may in truth belong to it. The
+    # ambiguity travels with the row instead of being read as absence.
+    unreadable = sorted(
+        pid
+        for pid, process in process_table.items()
+        if process.get("ppid") == daemon and process.get("environ_unreadable")
+    )
     for name in wanted:
         candidates = sorted(
             pid
@@ -451,6 +804,11 @@ def shpool_roots(
             diagnostics[name].append(
                 f"expected one daemon child for {name!r}, found {len(candidates)}"
             )
+            if unreadable:
+                diagnostics[name].append(
+                    f"{len(unreadable)} daemon child process(es) have an "
+                    "unreadable environment; session names cannot be proven"
+                )
     return roots, diagnostics
 
 
@@ -458,14 +816,23 @@ def daemon_generation(
     process_table: Mapping[int, Mapping[str, Any]],
     *,
     is_shpool_daemon: Callable[[Mapping[str, Any]], bool],
+    daemon_pids: Sequence[int] | None = None,
+    require_socket_holder: bool = False,
 ) -> dict[str, int] | None:
-    candidates = [
-        process for process in process_table.values() if is_shpool_daemon(process)
-    ]
+    candidates = (
+        _kit_daemons(
+            process_table,
+            is_shpool_daemon,
+            require_socket_holder=require_socket_holder,
+        )
+        if daemon_pids is None
+        else list(daemon_pids)
+    )
     if len(candidates) != 1:
         return None
-    pid = candidates[0].get("pid")
-    start_ticks = candidates[0].get("start_ticks")
+    process = process_table[candidates[0]]
+    pid = process.get("pid")
+    start_ticks = process.get("start_ticks")
     if not isinstance(pid, int) or not isinstance(start_ticks, int):
         return None
     return {"pid": pid, "process_start_ticks": start_ticks}

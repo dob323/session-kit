@@ -7,7 +7,7 @@ if [[ $(uname -s 2>/dev/null) == Darwin && ${BASH_VERSINFO[0]} -lt 4 ]]; then
       exec "$modern_bash" "$0" "$@"
     fi
   done
-  echo "session-kit launcher: Homebrew Bash 4 or newer is required" >&2
+  echo "session-kit: macOS needs Homebrew Bash 4 or newer. Install it with: brew install bash python rust" >&2
   exit 69
 fi
 
@@ -18,19 +18,19 @@ set -euo pipefail
 # two releases.
 helper=${0##*/}
 case "$helper" in
-  session-kit|kit|sp|shpool_login|shpool_status|shpool_reaper|codex_resume_here) ;;
-  *) echo "session-kit launcher: unsupported helper: $helper" >&2; exit 64 ;;
+  session-kit|kit|sp|shpool_login|shpool_login_tui|shpool_login_launcher|shpool_status|shpool_reaper|codex_resume_here) ;;
+  *) echo "session-kit: unsupported helper: $helper" >&2; exit 64 ;;
 esac
 
 root=${SESSION_KIT_ROOT:-"$HOME/.local/lib/session-kit"}
 current=$root/current
 if [[ ! -L $current ]]; then
-  echo "session-kit launcher: missing release link: $current" >&2
+  echo "session-kit: missing release link: $current" >&2
   exit 69
 fi
 
 release_dir=$(cd -P -- "$current" 2>/dev/null && pwd) || {
-  echo "session-kit launcher: invalid release link: $current" >&2
+  echo "session-kit: invalid release link: $current" >&2
   exit 69
 }
 
@@ -44,27 +44,27 @@ if [[ $helper == session-kit ]]; then
   manager=$root/manager
   if [[ -L $manager ]]; then
     manager_dir=$(cd -P -- "$manager" 2>/dev/null && pwd) || {
-      echo "session-kit launcher: invalid manager link: $manager" >&2
+      echo "session-kit: invalid manager link: $manager" >&2
       exit 69
     }
     manager_name=${manager_dir##*/}
     manager_parent=$(cd -P -- "$root/releases" 2>/dev/null && pwd) || {
-      echo "session-kit launcher: release root is unavailable" >&2
+      echo "session-kit: release root is unavailable" >&2
       exit 69
     }
     [[ $manager_dir == "$manager_parent/$manager_name" &&
        $manager_name =~ ^[0-9a-f]{40}$ ]] || {
-      echo "session-kit launcher: manager escapes $root/releases" >&2
+      echo "session-kit: manager escapes $root/releases" >&2
       exit 78
     }
     [[ -x $manager_dir/bin/session-kit ]] || {
-      echo "session-kit launcher: manager command is unavailable" >&2
+      echo "session-kit: manager command is unavailable" >&2
       exit 69
     }
     release_dir=$manager_dir
     unset manager_dir manager_name manager_parent
   else
-    echo "session-kit launcher: unsafe manager link: $manager" >&2
+    echo "session-kit: unsafe manager link: $manager" >&2
     exit 78
   fi
   unset manager
@@ -118,7 +118,7 @@ if resolved.parent != releases.resolve(strict=True):
 print(resolved)
 PY
     ) || {
-      echo "session-kit launcher: pending recovery release is unsafe" >&2
+      echo "session-kit: pending recovery release is unsafe" >&2
       exit 78
     }
     [[ -z $recovery_release ]] || release_dir=$recovery_release
@@ -128,7 +128,7 @@ PY
 fi
 case "$release_dir" in
   "$root"/releases/*) ;;
-  *) echo "session-kit launcher: release escapes $root/releases" >&2; exit 78 ;;
+  *) echo "session-kit: release escapes $root/releases" >&2; exit 78 ;;
 esac
 
 if [[ $helper == session-kit ]]; then
@@ -139,7 +139,7 @@ else
   target=$release_dir/bin/$helper
 fi
 if [[ ! -x $target ]]; then
-  echo "session-kit launcher: helper missing from pinned release: $helper" >&2
+  echo "session-kit: helper missing from pinned release: $helper" >&2
   exit 69
 fi
 

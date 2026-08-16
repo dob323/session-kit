@@ -1,29 +1,8 @@
-"""Session Kit mass messaging: ledger, envelope, and the two delivery paths.
+"""Delivery clients for the vendors' own message channels.
 
-The package is deliberately separate from ``sessionkit_inventory``: the
-inventory is a read-only observer of sessions, while this package writes an
-operator ledger and speaks to live providers. Only a handful of inventory
-primitives are imported (atomic state writes, identity proof), never the
-collector's internals.
+One module per vendor channel, each answering the same question: did this
+message reach that session, and if not, exactly what stopped it. "Exactly" is
+the point -- the failure this package exists to end is one report ("not
+registered (possible trust prompt)") standing in for a missing binary, a dead
+session, a refused socket and a real trust prompt alike.
 """
-
-from .envelope import (
-    ENVELOPE_SEPARATOR,
-    MessageError,
-    compose_envelope,
-    new_msg_id,
-    split_thread_key,
-    thread_key,
-)
-from .ledger import Ledger, messages_root
-
-__all__ = [
-    "ENVELOPE_SEPARATOR",
-    "Ledger",
-    "MessageError",
-    "compose_envelope",
-    "messages_root",
-    "new_msg_id",
-    "split_thread_key",
-    "thread_key",
-]

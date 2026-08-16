@@ -1,5 +1,5 @@
 [Unit]
-Description=Hourly exact provider-exit cleanup check
+Description=Session Kit — hourly check for provider-exited sessions
 
 [Timer]
 OnCalendar=hourly

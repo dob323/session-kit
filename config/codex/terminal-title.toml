@@ -1,0 +1,26 @@
+# The kit-owned Codex tab title (K3). Deployed by the installer to
+# $CODEX_HOME/session-kit/terminal-title.toml; the live ~/.codex/config.toml is
+# never edited, and every kit-launched Codex session passes this value on its
+# own command line (`codex -c tui.terminal_title=...`), which overrides whatever
+# the personal config says for that one process. Nothing outside a kit session
+# changes.
+#
+# Why these two items: `activity` is the state glyph Codex paints while it
+# works, and `thread` is the thread name -- the exact string the kit writes when
+# a session is named, so the tab carries the kit's name and nothing else. The
+# default Codex title adds project, model, and git branch, which pushes the name
+# off the end of a narrow tab and gives the same window two different identities
+# depending on which vendor drew it.
+#
+# Verified live against codex-cli 0.145.0 on 2026-08-13: `codex doctor` reports
+# `title  terminal title configuration contains unknown item identifiers` for an
+# item it does not know, accepts both items below, and a `-c` override on the
+# command line wins over the file. `spinner` is an accepted alias of `activity`.
+#
+# This copy is owned by the release, like the kit's Codex themes: every install
+# and every update replaces the deployed file, so an edit made there is lost at
+# the next one. To change what kit sessions put on the tab, change this file in
+# the kit and install. To turn the whole feature off on both providers, set
+# SESSION_KIT_TAB_TITLE=off.
+[tui]
+terminal_title = ["activity", "thread"]

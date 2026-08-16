@@ -72,14 +72,16 @@ services_command() {
         # died. Every Linux install writes its unit file, so leaving it out of
         # enable installed it dead while every file-level check still passed.
         systemctl --user enable --now shpool.socket shpool-reaper.timer \
+          session-kit-subagent-sweep.timer \
           session-kit-watchdog.service
         ;;
       disable)
         systemctl --user disable --now session-kit-watchdog.service \
-          shpool-reaper.timer shpool.socket
+          shpool-reaper.timer session-kit-subagent-sweep.timer shpool.socket
         ;;
       status)
         systemctl --user --no-pager status shpool.socket shpool-reaper.timer \
+          session-kit-subagent-sweep.timer \
           session-kit-watchdog.service
         ;;
     esac

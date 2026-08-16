@@ -1,7 +1,22 @@
 # Restore useful recent context without streaming the unbounded raw journal.
-session_restore_mode = { lines = 500 }
+session_restore_mode = "simple"
 output_spool_lines = 1000
 vt100_output_spool_width = 200
 
 # Session-kit provides its own compact shpool-aware prompt marker.
 prompt_prefix = ""
+
+# Ctrl-q leaves a conversation running and hands the window back. The docs
+# tell people to press it, so the install has to make it true: stock shpool
+# 0.11 binds detach to the two-key chord Ctrl-Space Ctrl-q, and a lone Ctrl-q
+# does nothing at all. Shipping that instruction without shipping this binding
+# was the worst shape of documentation bug -- it passed for the one person
+# whose private config already had the binding, and was false for everybody
+# starting fresh (found in review, 2026-08-15).
+#
+# It REPLACES the default chord rather than adding to it, and shpool compiles
+# keybindings per attachment, so it applies to windows opened or reopened
+# after this file lands -- no daemon restart. Inner programs never see the key.
+[[keybinding]]
+binding = "Ctrl-q"
+action = "detach"

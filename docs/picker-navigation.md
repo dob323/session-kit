@@ -1,143 +1,149 @@
 # Picker navigation
 
-The session picker is the screen an SSH login lands on. This page covers the
-keys that move around it — peeking at a session, filtering, jumping to whatever
-is waiting on you, regrouping, and compacting the list — plus the optional
-desktop notification for sessions that have been waiting a while.
+Type `kit` from an ordinary shell to open Session Kit's session picker. The
+home screen keeps managed sessions, new-session choices, projects, closed
+sessions, and help in one place.
 
-Everything here is additive. The default screen, the default order, and every
-existing key behave exactly as they did; `?` inside the picker prints the full
-key table at any time.
+## Reading the list
 
-## Peek at a row: `i<number>`
+Sessions that are ready in this window appear before sessions open elsewhere.
+Within each group the order is `question`, `needs you`, `working`, then `idle`,
+followed by provider, newest activity, and stable session identity. Machine
+sessions sit behind one counted row.
 
-A row can say a session needs your reply without saying what it asked. `i3`
-answers that in place:
+A session row protects the facts that matter most as the terminal narrows:
+state, a nonzero subagent count, and last activity. The time may shorten to
+`3h` or `now`, then disappear at the narrowest width. Metadata and long names
+give up space first.
 
-```text
-  Session 3 · Codex · duck · needs your reply
-  parser refactor
-  /srv/project
-  Waiting 12 min for you.
+| State | Meaning |
+| --- | --- |
+| `question` | Claude has a blocking prompt open now. Codex does not claim this state yet. |
+| `needs you` | The provider has finished its turn and is waiting for you. |
+| `working` | The provider is driving the current turn. |
+| `idle` | A needs-you transcript has not moved for the configured window. |
 
-  It asked
-    Should I also update the changelog?
+`pending` is the placeholder for a value the kit cannot read. It is not a
+fifth state. The idle window is 30 minutes by default; an unreadable
+`<state>/session-idle-minutes` file disables the `idle` label instead of
+guessing.
 
-  Latest messages
-    you · 3h 4m ago
-      Refactor the parser please
-    it · 12 min ago
-      Should I also update the changelog?
+The model cell shows the conversation's current model when the provider record
+supplies one, so it follows an in-session model change. A shell has no model.
+Any model or account value the kit cannot read says `pending`.
 
-  Type a reply and press Enter · o: open the session · Enter: back
-```
+## Enter and back
 
-Opening a peek changes nothing: it reads the attention queue in read-only mode
-and the message thread the operator already has, so looking at a session never
-marks it seen, never synthesizes an event, and never attaches.
+Enter takes the most likely choice throughout the picker:
 
-Typing a reply sends it through `sp msg <number> "text"` — the same delivery,
-ledger, and receipts the message centre uses. `o` hands the row to the ordinary
-open path. Enter goes back to the list.
+- at home, it opens the top session; an empty session list opens New session;
+- New session starts with Claude Code selected;
+- a session open elsewhere defaults to Move it here;
+- a closed conversation defaults to Restore.
 
-`i` on its own explains itself; a number that is not on the current page is
-refused, exactly like every other numbered action.
+`b` backs out of a secondary screen. At the home screen, back means leave.
+Escape first clears typed input, then closes the current panel, returns from a
+secondary view, and finally leaves when nothing remains to clear or back out
+of. `q` leaves from an unfiltered home screen, and `Ctrl-D` leaves from
+anywhere.
 
-## Filter as you type: `/text`
+Nothing asks for confirmation. Guards run before the action, and the next line
+says what happened. A refusal changes nothing.
 
-`/` has always searched names, providers, projects, IDs, and conversation
-UUIDs. Now the list narrows while the line is still being typed: pause for a
-moment and the screen shows what the half-typed search selects, with the typed
-line still under it. Enter runs the identical search it always did.
+## The key-driven picker
 
-A previewed filter belongs to the line being typed. Rub the line out, or turn
-it into a different command, and the full list comes back before that command
-runs — no action is ever taken against a list you only glanced at.
+The home footer begins `↵ open <number>` or `↵ new`. As space narrows, footer
+segments survive in this priority: Enter, number selection, kill, new, more,
+needs you, help, history, leave.
 
-Set `SESSION_KIT_PICKER_FILTER_LIVE=0` to switch the preview off and keep the
-submit-only search.
+The main keys are:
 
-## Jump to what is waiting: `g`
+| Input | What it does |
+| --- | --- |
+| Enter | open the first visible session, or start New session when none is listed |
+| `<number>` | open that session, or show Move it here when it is open elsewhere |
+| `k <numbers>` | close one or more visible sessions; lists and ranges work |
+| `h <number>` | show history without opening the session |
+| `n` | start a new session |
+| `m` | open the More screen |
+| `a` | show sessions that need you |
+| `?` | show picker help |
+| `b`, `q` | back or leave |
 
-`g` moves to the next session that is waiting on you or has finished unopened,
-turning to its page and marking it with `▸`. Press it again for the next one;
-it wraps at the end. The row is marked, never selected: nothing opens,
-attaches, or is acknowledged by finding it. With nothing waiting it says so.
+A close keeps the number you typed while the picker refreshes, so the result
+and the next list still refer to the same selection. Searches match names,
+providers, accounts, models, and projects; they do not promise to match a
+translated state word.
 
-The Needs You screen (`a`) remains the full review surface — replies, prompt
-deliveries, and repair failures as well as sessions.
+## The cursor-driven picker
 
-## Group the list: `group`
+The cursor-driven screen adds arrows, Page Up, Page Down, Home, End, marks,
+live filtering, and mouse input. Digits create marks; commas and inclusive
+ranges such as `1,4,7-9` select a set. Enter on a marked set opens the action
+panel with Close selected.
 
-| Command | Grouping |
-|---|---|
-| `group` | cycle state → provider → project → state |
-| `group state` | ready to open / open elsewhere (the default) |
-| `group provider` | Claude / Codex / managed shell |
-| `group project` | one heading per project |
+Letters filter the list as they are typed. Escape clears that input before it
+backs out. The wheel scrolls. One click highlights a row and a second click
+opens it; clicking the mark column toggles its mark. The footer's Enter hint is
+clickable, but the other footer text is a key reference rather than a row of
+buttons. Hold the terminal's selection modifier, commonly Shift, when copying
+text while mouse reporting is active.
 
-Grouping only decides which rows sit together. Inside every group the order is
-the one the list has always used, and no row is added or removed.
+## Session actions
 
-Project grouping prefers the project an inventory row names for itself. Until
-rows carry that, it derives the project from the session's working directory:
-the alias from `projects.tsv` when the directory is inside a known project
-root, otherwise the directory's own name, otherwise `No project`.
+A regular session can offer:
 
-Start in a grouping with `SESSION_KIT_PICKER_GROUP=state|provider|project`.
+| Action | What it does |
+| --- | --- |
+| Open | open a session ready in this window |
+| Move it here | disconnect the other window and open the session here |
+| History | read settled session history |
+| Close | close the session and retain its recoverable conversation |
+| Change account | move the exact conversation to another enrolled account |
+| Change model | resume the exact conversation on a configured model |
+| Rename | set the session name |
+| Color | choose from the provider's palette |
 
-## Compact rows: `c`
+A marked set offers only actions safe for every target; today that means
+Close. A closed Claude or Codex conversation offers Restore first. A closed
+shell has no provider conversation to restore, so it offers History only.
 
-`c` drops the group headings and the trailing spacer and keeps only the primary
-state beside each name, so more sessions fit on one screen. Same rows, same
-numbers, same actions. `SESSION_KIT_PICKER_COMPACT=1` starts compact.
+Change model reads `~/.config/session-kit/models.tsv`, one
+`provider<TAB>model` entry per line. An empty file produces an empty panel; the
+kit never invents a model name.
 
-## Desktop notifications for waiting sessions (off by default)
+## Machine sessions
 
-The picker's Needs You screen is the guaranteed record of what is waiting. If
-you also want a desktop popup when a session has been waiting a while, the
-watchdog can send one through the notifier it already uses:
+Drills, workers, and automation-created sessions are machine sessions. They
+stay behind one counted row until expanded. The row also says when one of them
+needs you.
 
-```bash
-export SESSION_KIT_WATCHDOG_NOTIFY="$HOME/.local/bin/notify-desktop"
-export SESSION_KIT_ATTENTION_NOTIFY=1
-```
+Creation records the origin. `sp new --origin machine` declares automation;
+`--origin human` declares a person. A new session started from inside another
+managed session defaults to machine origin, while one started by the picker
+defaults to human origin. Restore and repair preserve the recorded origin.
 
-`extras/notify-desktop` is a working example of the notifier contract
-(`--type`, `--severity`, `--title`, `--body`) using `notify-send` on Linux and
-`osascript` on macOS. Copy it and change the last few lines to reach a phone,
-a chat room, or an alert hub instead.
+## Closed sessions
 
-Restraint is the point:
+Closing records the provider, exact conversation, title, directory, and close
+order in the private closed-session ledger. The picker deliberately shows
+`login time unknown` rather than presenting the close timestamp as a login
+time. Restore brings an exact Claude or Codex conversation back; shell rows
+retain history only.
 
-- **Off unless asked for.** No variable, no notification.
-- **Never critical.** These are always `warning`, so automation can never wake
-  a phone that only pages on critical.
-- **One alert per wait.** A session that keeps waiting is announced once; a
-  *new* question from the same session is a new wait and is announced again.
-- **Nothing under the threshold.** Default ten minutes, so a question answered
-  in the same minute is never announced at all.
-- **Read-only.** The queue is projected without mutating it, so an alert can
-  never be what created the state it reports.
-- **One switch to silence everything.** The watchdog sentinel
-  (`~/.no_shpool_watchdog`) stops these as well.
+If the ledger exceeds the normal safety ceiling, the picker refuses the
+ordinary path and names the bounded recovery command. No confirmation prompt
+is needed because a successful close is recoverable from this list.
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `SESSION_KIT_ATTENTION_NOTIFY` | `0` | `1` turns queue notifications on |
-| `SESSION_KIT_ATTENTION_NOTIFY_AFTER_SECONDS` | `600` | how long a session must have been waiting |
-| `SESSION_KIT_ATTENTION_NOTIFY_COOLDOWN_SECONDS` | `3600` | how often one unbroken wait may repeat |
-| `SESSION_KIT_ATTENTION_ALERT_TYPE` | `session-kit.attention` | the `--type` value passed to the notifier |
-| `SESSION_KIT_ATTENTION_NOTIFY_STATE` | `$XDG_STATE_HOME/session-kit/attention-notified.json` | which waits have already been announced |
+## Refresh and release changes
 
-## Picker view variables
+The list refreshes in the background. Search, page, grouping, compact mode, and
+the jump marker survive an action. A picker that notices a newly selected
+release reopens through the current launcher at a safe point and carries its
+view forward. If the new target is degraded, the existing picker remains in
+place.
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `SESSION_KIT_PICKER_GROUP` | `state` | grouping the picker starts in |
-| `SESSION_KIT_PICKER_COMPACT` | `0` | `1` starts with compact rows |
-| `SESSION_KIT_PICKER_FILTER_LIVE` | `1` | `0` disables filter-as-you-type |
-| `SESSION_KIT_PICKER_REFRESH_SECONDS` | `5` | background refresh cadence; `0` disables it |
-
-Grouping and compact chosen with a key last for that picker window. The
-variables decide how the next one starts.
+The two picker implementations have separate layout engines but share the
+inventory, state vocabulary, session order, and proof-bound actions. See
+[Troubleshooting](troubleshooting.md#which-picker-kit-opens) for selection
+and fallback details.

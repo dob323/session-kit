@@ -1,0 +1,616 @@
+#!/usr/bin/env python3
+"""Drive the launch path the way a person does, against a stub that has no daemon.
+
+This is the release gate that used to be a person. It builds a sandbox with its
+own HOME, its own state directory and a fake `shpool` that implements verbs and
+starts nothing, then runs the kit's real `bashrc/shpool.bashrc` inside a pty and
+reads what actually happened.
+
+ISOLATION IS THE POINT, and it is not a mode — it is the only mode. A real
+daemon in a review fixture can answer that fixture's client and make its
+session names look authoritative; mixing those names with the operator
+daemon's process tree can hide or misidentify live sessions. Every path this
+drill hands to the kit is asserted to live inside its own sandbox before a
+single step runs, and the drill refuses itself otherwise. There is no flag
+that points it at the operator's estate.
+
+The husk rides here as a standing regression. Tab is IFS whitespace, so
+`IFS=$'\\t' read` collapses a run of tabs and drops the empty fields between
+them. The launch record's fourth field is the launch key, and it is EMPTY for
+every `sp new --model` nobody passed `--launch-key` to: the six generation
+fields shifted one place left, the cross-check refused a record that was armed
+perfectly, and three sessions in one night became shells with no provider.
+Step 2 arms that exact shape and fails if the provider does not start.
+
+Usage:
+    tools/operator-drill                  # every step
+    tools/operator-drill --steps 1,2      # a subset
+    tools/operator-drill --json           # machine-readable summary
+    tools/operator-drill --release <dir>  # drive another release tree
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import pty
+import re
+import select
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import termios
+import time
+
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[()][AB0]")
+REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+
+# A drill sandbox always carries this file, and the stub refuses to run against
+# a state directory that has no such marker above it. A stub reachable from an
+# ordinary PATH would be a worse bug than the one it tests for.
+SANDBOX_MARK = ".session-kit-drill-sandbox"
+STUB_MARK = "session-kit-drill-stub"
+
+STEPS = ("1", "2", "3", "4")
+
+
+class IsolationError(Exception):
+    """The drill would have touched something outside its own sandbox."""
+
+
+def visible(text: str) -> str:
+    return ANSI.sub("", text)
+
+
+# The fake `shpool`: verbs only. It never forks a daemon, never opens a socket,
+# and refuses the daemon verb out loud so a future step cannot quietly acquire
+# one. Its own fence is the sandbox marker: pointed anywhere else, it exits.
+SHPOOL_STUB = r"""#!/usr/bin/env bash
+# session-kit drill stub — %s. Verbs only: no daemon, no socket.
+set -u
+state=${DRILL_STUB_STATE:?stub state directory is required}
+root=${DRILL_SANDBOX:?stub sandbox root is required}
+if [[ ! -e $root/%s || $state != "$root"/* ]]; then
+  printf 'operator-drill stub: refusing a state directory outside the sandbox\n' >&2
+  exit 3
+fi
+mkdir -p "$state/sessions" "$state/events"
+verb=${1:-}
+shift || true
+case "$verb" in
+  daemon)
+    printf 'operator-drill stub: a drill never starts a daemon\n' >&2
+    exit 3
+    ;;
+  attach)
+    name=""
+    directory=""
+    while (($#)); do
+      case "$1" in
+        --dir) directory=$2; shift 2 ;;
+        --background|--force) shift ;;
+        --cmd) shift 2 ;;
+        *) name=$1; shift ;;
+      esac
+    done
+    [[ -n $name ]] || exit 2
+    printf '%%s\n' "${directory:-$PWD}" > "$state/sessions/$name"
+    printf 'attach %%s\n' "$name" >> "$state/events/log"
+    cd -- "${directory:-$PWD}" || exit 1
+    export SHPOOL_SESSION_NAME=$name
+    exec "${DRILL_STUB_SHELL:-/bin/bash}" -i
+    ;;
+  list)
+    printf '{"sessions":['
+    separator=""
+    for path in "$state"/sessions/*; do
+      [[ -e $path ]] || continue
+      printf '%%s{"name":"%%s","status":"Disconnected"}' "$separator" "${path##*/}"
+      separator=","
+    done
+    printf ']}\n'
+    ;;
+  detach)
+    printf 'detach %%s\n' "${1:-${SHPOOL_SESSION_NAME:-unknown}}" >> "$state/events/log"
+    ;;
+  kill)
+    for name in "$@"; do
+      command rm -f -- "$state/sessions/$name"
+      printf 'kill %%s\n' "$name" >> "$state/events/log"
+    done
+    ;;
+  *)
+    exit 2
+    ;;
+esac
+""" % (STUB_MARK, SANDBOX_MARK)
+
+
+def write_stub(sandbox: str) -> str:
+    """Put the stub on a PATH only this run can see."""
+    binaries = os.path.join(sandbox, "bin")
+    os.makedirs(binaries, mode=0o700, exist_ok=True)
+    path = os.path.join(binaries, "shpool")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(SHPOOL_STUB)
+    os.chmod(path, 0o700)
+    return binaries
+
+
+def assert_isolated(sandbox: str, environment: dict) -> list:
+    """Refuse the run unless every path the kit will read is a fixture path.
+
+    Called before the first session shell exists. It reads only what it was
+    handed, so the tests can drive it with a hostile environment and get the
+    refusal instead of a daemon.
+    """
+    sandbox = os.path.realpath(sandbox)
+    home = os.path.realpath(os.path.expanduser("~"))
+    if not os.path.isdir(sandbox):
+        raise IsolationError("the sandbox directory does not exist")
+    if not os.path.exists(os.path.join(sandbox, SANDBOX_MARK)):
+        raise IsolationError("the sandbox carries no drill marker")
+    if sandbox == home or sandbox.startswith(home + os.sep):
+        raise IsolationError("the sandbox is inside the operator's home")
+
+    def inside(value: str) -> bool:
+        resolved = os.path.realpath(value)
+        return resolved == sandbox or resolved.startswith(sandbox + os.sep)
+
+    for name in (
+        "HOME",
+        "XDG_STATE_HOME",
+        "XDG_RUNTIME_DIR",
+        "SESSION_KIT_STATE_DIR",
+        "SESSION_KIT_START_DIR",
+        "SESSION_KIT_JOURNAL_DIR",
+        "SHPOOL_SOCKET",
+        "DRILL_STUB_STATE",
+    ):
+        value = environment.get(name)
+        if not value:
+            raise IsolationError(f"{name} is unset, so the kit would read the real one")
+        if not inside(value):
+            raise IsolationError(f"{name} points outside the sandbox: {value}")
+
+    socket = environment["SHPOOL_SOCKET"]
+    if os.path.exists(socket):
+        raise IsolationError("the fixture socket path already exists; something is listening")
+
+    stub = environment.get("SESSION_KIT_SHPOOL_CMD", "")
+    if not stub or not inside(stub):
+        raise IsolationError("SESSION_KIT_SHPOOL_CMD is not the sandbox stub")
+    with open(stub, encoding="utf-8") as handle:
+        if STUB_MARK not in handle.read(4096):
+            raise IsolationError("the stub file is not the drill's stub")
+
+    resolved = shutil.which("shpool", path=environment.get("PATH", ""))
+    if not resolved or os.path.realpath(resolved) != os.path.realpath(stub):
+        raise IsolationError("`shpool` on the drill PATH is not the stub")
+
+    return [
+        f"sandbox {sandbox}",
+        f"stub {stub} (no daemon verb)",
+        f"socket fixture {socket} (absent)",
+        "HOME, state, start, journal and runtime dirs all inside the sandbox",
+    ]
+
+
+# ---------------------------------------------------------------- terminal --
+class Terminal:
+    """One command on a real pty, driven the way a person drives one."""
+
+    def __init__(self, argv, cwd=None, env=None, rows=45, columns=140):
+        self.argv = argv
+        self.raw = bytearray()
+        self.pid, self.fd = pty.fork()
+        if self.pid == 0:  # pragma: no cover - the child execs immediately
+            try:
+                if cwd:
+                    os.chdir(cwd)
+                environment = dict(os.environ)
+                environment["TERM"] = "xterm-256color"
+                # The drill can run from inside a managed session; a child that
+                # inherited that name would look like a nested one.
+                environment.pop("SHPOOL_SESSION_NAME", None)
+                if env:
+                    environment.update(env)
+                os.execvpe(argv[0], argv, environment)
+            finally:
+                os._exit(127)
+        # Without a window size the session shell never draws or answers.
+        fcntl.ioctl(
+            self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, columns, 0, 0)
+        )
+        self.status = None
+
+    def pump(self, seconds: float) -> None:
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            ready, _, _ = select.select([self.fd], [], [], 0.1)
+            if not ready:
+                continue
+            try:
+                chunk = os.read(self.fd, 65536)
+            except OSError:
+                return
+            if not chunk:
+                return
+            self.raw.extend(chunk)
+
+    def screen(self) -> str:
+        return visible(self.raw.decode("utf-8", "replace"))
+
+    def close(self) -> None:
+        if self.status is None:
+            try:
+                os.kill(self.pid, 9)
+                os.waitpid(self.pid, 0)
+            except (ProcessLookupError, ChildProcessError):
+                pass
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+
+
+# ------------------------------------------------------------------ report --
+class Report:
+    """PASS, FAIL, SKIP with the evidence each verdict was read from."""
+
+    def __init__(self, quiet: bool = False) -> None:
+        self.results = []
+        self.quiet = quiet
+
+    def _record(self, verdict: str, step: str, summary: str, evidence) -> None:
+        entry = {
+            "verdict": verdict,
+            "step": step,
+            "summary": summary,
+            "evidence": list(evidence or []),
+        }
+        self.results.append(entry)
+        if self.quiet:
+            return
+        print(f"{verdict} {step}: {summary}", flush=True)
+        for line in entry["evidence"]:
+            print(f"    {line}", flush=True)
+
+    def passed(self, step, summary, evidence=None) -> None:
+        self._record("PASS", step, summary, evidence)
+
+    def failed(self, step, summary, evidence=None) -> None:
+        self._record("FAIL", step, summary, evidence)
+
+    def skipped(self, step, summary, evidence=None) -> None:
+        self._record("SKIP", step, summary, evidence)
+
+    def exit_code(self) -> int:
+        return 1 if any(r["verdict"] == "FAIL" for r in self.results) else 0
+
+    def payload(self) -> dict:
+        return {"steps": self.results, "failed": self.exit_code() != 0}
+
+
+# ------------------------------------------------------------------- drill --
+class Sandbox:
+    """The whole world the drill is allowed to touch."""
+
+    def __init__(self, release: str) -> None:
+        self.release = release
+        self.root = os.path.realpath(tempfile.mkdtemp(prefix="session-kit-drill."))
+        open(os.path.join(self.root, SANDBOX_MARK), "w").close()
+        self.home = os.path.join(self.root, "home")
+        self.state = os.path.join(self.root, "state")
+        self.start = os.path.join(self.root, "state", "shpool-start")
+        self.stub_state = os.path.join(self.root, "stub")
+        self.runtime = os.path.join(self.root, "run")
+        self.project = os.path.join(self.root, "project")
+        for directory in (
+            self.home,
+            self.state,
+            self.start,
+            self.stub_state,
+            self.runtime,
+            self.project,
+        ):
+            os.makedirs(directory, mode=0o700, exist_ok=True)
+        self.binaries = write_stub(self.root)
+        self.provider_log = os.path.join(self.root, "provider.log")
+        self.boot = os.path.join(self.root, "boot-id")
+        with open(self.boot, "w", encoding="utf-8") as handle:
+            handle.write("drill-boot\n")
+        provider = os.path.join(self.binaries, "claude")
+        with open(provider, "w", encoding="utf-8") as handle:
+            handle.write(
+                "#!/usr/bin/env bash\n"
+                'printf "PROVIDER-STARTED %s\\n" "$*" >> "$DRILL_PROVIDER_LOG"\n'
+                'exec sleep "${DRILL_PROVIDER_SECONDS:-20}"\n'
+            )
+        os.chmod(provider, 0o700)
+        # The session shell takes the launch path, not the journal wrapper.
+        open(os.path.join(self.home, ".no_shpool_journal"), "w").close()
+        with open(os.path.join(self.home, ".bashrc"), "w", encoding="utf-8") as handle:
+            handle.write(f"source {self.release}/bashrc/shpool.bashrc\n")
+        self.name = "s20260101-000000-424242"
+
+    @property
+    def environment(self) -> dict:
+        stub = os.path.join(self.binaries, "shpool")
+        return {
+            "HOME": self.home,
+            "XDG_STATE_HOME": self.state,
+            "XDG_RUNTIME_DIR": self.runtime,
+            "SESSION_KIT_STATE_DIR": self.state,
+            "SESSION_KIT_START_DIR": self.start,
+            "SESSION_KIT_JOURNAL_DIR": os.path.join(self.state, "shpool-journal"),
+            "SESSION_KIT_BOOT_ID_FILE": self.boot,
+            "SESSION_KIT_INVENTORY_CORE": f"{self.release}/lib/session_inventory.py",
+            "SESSION_KIT_RELEASE_DIR": self.release,
+            "SESSION_KIT_SHPOOL_CMD": stub,
+            "SHPOOL_SOCKET": os.path.join(self.stub_state, "shpool.socket"),
+            "DRILL_SANDBOX": self.root,
+            "DRILL_STUB_STATE": self.stub_state,
+            "DRILL_PROVIDER_LOG": self.provider_log,
+            "PATH": self.binaries + ":" + os.environ.get("PATH", ""),
+        }
+
+    def remove(self) -> None:
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    # ------------------------------------------------------------ records --
+    def arm(self, boot: str = "drill-boot", model: str | None = None) -> str:
+        """Write the start record and return the inner script that arms the rest.
+
+        The sidecars carry the running shell's own generation, so they can only
+        be written from inside the session shell — exactly as `sp` writes them
+        from the launcher it just spawned.
+        """
+        start = os.path.join(self.start, self.name)
+        with open(start, "w", encoding="utf-8") as handle:
+            handle.write(f"claude\t{self.project}\t\tnew\n")
+        os.chmod(start, 0o600)
+        for suffix in (".expected", ".launch", ".account"):
+            try:
+                os.unlink(start + suffix)
+            except FileNotFoundError:
+                pass
+        inner = (
+            'shell_start=$(awk "{print \\$22}" /proc/$$/stat); '
+            'daemon_start=$(awk "{print \\$22}" /proc/$PPID/stat); '
+            f'printf "claude\\t{self.project}\\t{boot}\\t1\\t%s\\t%s\\t%s\\t%s\\t\\tnew\\n" '
+            f'"$$" "$shell_start" "$PPID" "$daemon_start" > "{start}.expected"; '
+            f'chmod 600 "{start}.expected"; '
+        )
+        if model:
+            # Armed the way `sp new --model` arms it: the launch key is EMPTY.
+            # This is the husk's exact shape.
+            inner += (
+                f'printf "claude\\t{self.project}\\t{model}\\t\\t{boot}\\t1\\t%s\\t%s\\t%s\\t%s\\n" '
+                f'"$$" "$shell_start" "$PPID" "$daemon_start" > "{start}.launch"; '
+                f'chmod 600 "{start}.launch"; '
+            )
+        return inner + f"source {self.release}/bashrc/shpool.bashrc"
+
+    def provider_argv(self) -> str:
+        try:
+            with open(self.provider_log, encoding="utf-8") as handle:
+                return handle.read().strip()
+        except OSError:
+            return ""
+
+    def forget_provider(self) -> None:
+        try:
+            os.truncate(self.provider_log, 0)
+        except OSError:
+            pass
+
+    def run_session(self, inner: str, timeout: float = 45, stop_text: str = "") -> tuple:
+        """One session shell under the stub, with its records already armed.
+
+        Waiting stops the moment the provider starts, or the moment the screen
+        says the thing the step was watching for — a step that expects a
+        refusal should not pay a full timeout to read one.
+        """
+        environment = self.environment
+        environment["SHPOOL_SESSION_NAME"] = self.name
+        environment["SHPOOL_JOURNAL"] = "disabled"
+        terminal = Terminal(
+            ["bash", "--noprofile", "--norc", "-ic", inner, "drill-inner"],
+            cwd=self.project,
+            env=environment,
+        )
+        end = time.monotonic() + timeout
+        started = False
+        while time.monotonic() < end:
+            terminal.pump(0.3)
+            if "PROVIDER-STARTED" in self.provider_argv():
+                started = True
+                break
+            if stop_text and stop_text in terminal.screen():
+                break
+        return terminal, started
+
+
+# ------------------------------------------------------------------- steps --
+def step_launch(report: Report, sandbox: Sandbox) -> None:
+    sandbox.forget_provider()
+    terminal, started = sandbox.run_session(
+        sandbox.arm(), stop_text="provider not started"
+    )
+    evidence = [f"provider argv: {sandbox.provider_argv()[:120]}"]
+    screen = terminal.screen()[-300:]
+    terminal.close()
+    if started:
+        report.passed("1 launch", "the kit's launch path started a provider under the stub", evidence)
+    else:
+        report.failed(
+            "1 launch",
+            "the launch path started nothing",
+            evidence + [f"screen: {screen!r}"],
+        )
+
+
+def step_model_launch(report: Report, sandbox: Sandbox) -> None:
+    sandbox.forget_provider()
+    # A failing step reads its refusal off the screen rather than paying the
+    # whole timeout: the husk announces itself as a retained launch record.
+    terminal, started = sandbox.run_session(
+        sandbox.arm(model="claude-opus-5"), stop_text="provider not started"
+    )
+    argv = sandbox.provider_argv()
+    evidence = [
+        "records armed as `sp new --model` arms them: launch key EMPTY",
+        f"provider argv: {argv[:120]}",
+    ]
+    screen = terminal.screen()[-300:]
+    terminal.close()
+    if started and "--model claude-opus-5" in argv:
+        report.passed(
+            "2 model launch",
+            "a model launch with no launch key starts its provider",
+            evidence,
+        )
+    else:
+        report.failed(
+            "2 model launch",
+            "the tab-collapse husk is back: a model launch started nothing",
+            evidence + [f"screen: {screen!r}"],
+        )
+
+
+def step_stale_record(report: Report, sandbox: Sandbox) -> None:
+    """A record from another boot must start nothing, and say why."""
+    sandbox.forget_provider()
+    terminal, started = sandbox.run_session(
+        sandbox.arm(boot="a-previous-boot"),
+        timeout=20,
+        stop_text="provider not started",
+    )
+    screen = terminal.screen()
+    terminal.close()
+    said_so = "stale or mismatched launch record" in screen
+    evidence = [
+        "the expected record carries a boot id from another boot",
+        f"provider argv: {sandbox.provider_argv()[:80] or '(none)'}",
+        f"screen: {screen[-200:]!r}",
+    ]
+    if not started and said_so:
+        report.passed(
+            "3 stale record",
+            "a launch record from another boot starts nothing and says so",
+            evidence,
+        )
+    else:
+        report.failed(
+            "3 stale record",
+            "a stale launch record was acted on, or its refusal was silent",
+            evidence,
+        )
+
+
+def step_no_daemon(report: Report, sandbox: Sandbox) -> None:
+    """Nothing in the run acquired a daemon or a socket."""
+    environment = sandbox.environment
+    refused = subprocess.run(
+        [environment["SESSION_KIT_SHPOOL_CMD"], "daemon"],
+        env={**os.environ, **environment},
+        capture_output=True,
+        text=True,
+    )
+    log = os.path.join(sandbox.stub_state, "events", "log")
+    events = ""
+    if os.path.exists(log):
+        with open(log, encoding="utf-8") as handle:
+            events = handle.read().strip()
+    socket_exists = os.path.exists(environment["SHPOOL_SOCKET"])
+    evidence = [
+        f"stub daemon verb: exit {refused.returncode} · {refused.stderr.strip()}",
+        f"stub events: {events or '(none)'}",
+        f"fixture socket present: {socket_exists}",
+    ]
+    if refused.returncode == 3 and not socket_exists and "daemon" not in events:
+        report.passed("4 no daemon", "the run started no daemon and opened no socket", evidence)
+    else:
+        report.failed("4 no daemon", "the drill reached for a daemon", evidence)
+
+
+RUNNERS = {
+    "1": step_launch,
+    "2": step_model_launch,
+    "3": step_stale_record,
+    "4": step_no_daemon,
+}
+
+
+def run(report: Report, release: str, wanted) -> int:
+    if not os.path.exists("/proc/self/stat"):
+        report.skipped(
+            "0 isolation",
+            "the drill reads process generations from /proc; this platform has none",
+            ["run it on Linux, where the launch path's generation check lives"],
+        )
+        return report.exit_code()
+    sandbox = Sandbox(release)
+    try:
+        try:
+            evidence = assert_isolated(sandbox.root, sandbox.environment)
+        except IsolationError as error:
+            report.failed(
+                "0 isolation",
+                f"the drill refused itself: {error}",
+                ["no session shell was started, and no step ran"],
+            )
+            return report.exit_code()
+        report.passed(
+            "0 isolation",
+            "every path the kit will read is a fixture path",
+            evidence,
+        )
+        for step in STEPS:
+            if step in wanted:
+                RUNNERS[step](report, sandbox)
+    finally:
+        sandbox.remove()
+    return report.exit_code()
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--steps", default=",".join(STEPS))
+    parser.add_argument(
+        "--release",
+        default=REPO,
+        help="the release tree to drive; defaults to the tree this file lives in",
+    )
+    parser.add_argument("--json", action="store_true", help="print a machine-readable summary")
+    args = parser.parse_args(argv)
+
+    wanted = {piece.strip() for piece in args.steps.split(",") if piece.strip()}
+    unknown = sorted(wanted - set(STEPS))
+    if unknown:
+        print(
+            f"operator-drill: no step {', '.join(unknown)}. Steps 1-{len(STEPS)} work.",
+            file=sys.stderr,
+        )
+        return 2
+    release = os.path.realpath(args.release)
+    if not os.path.isfile(os.path.join(release, "bashrc", "shpool.bashrc")):
+        print(f"operator-drill: {release} is not a release tree", file=sys.stderr)
+        return 2
+
+    report = Report(quiet=args.json)
+    if not args.json:
+        print(f"operator drill · release {release} · isolated", flush=True)
+    code = run(report, release, wanted)
+    if args.json:
+        print(json.dumps(report.payload(), indent=2))
+    return code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

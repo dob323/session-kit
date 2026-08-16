@@ -11,6 +11,16 @@ from tests.support import REPO
 
 
 class PublicExportTests(unittest.TestCase):
+    def test_third_party_notice_names_every_shipped_shpool_patch(self) -> None:
+        notice = (REPO / "THIRD_PARTY_NOTICES").read_text(encoding="utf-8")
+        patches = sorted(
+            (REPO / "shpool-patch").glob("[0-9][0-9][0-9][0-9]-*.patch")
+        )
+        self.assertEqual(6, len(patches))
+        for patch in patches:
+            self.assertIn(f"shpool-patch/{patch.name}", notice)
+        self.assertNotIn("Maniple", notice)
+
     def make_source(self, root: Path) -> tuple[Path, str]:
         source = root / "source"
         shutil.copytree(
@@ -92,7 +102,9 @@ class PublicExportTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             for relative in (
                 "LICENSES/Apache-2.0.txt",
+                "bin/reset-collection-order.py",
                 "deploy/session-kit-release",
+                "extras/statusline-quota-refresh.example",
                 "lib/sessionkit_inventory/lifecycle.py",
                 "lib/sessionkit_inventory/projects.py",
                 "lib/sessionkit_inventory/providers.py",
@@ -111,6 +123,12 @@ class PublicExportTests(unittest.TestCase):
                 "tools/check-doc-links",
             ):
                 self.assertTrue((destination / relative).is_file(), relative)
+            for relative in (
+                "LICENSES/MIT-maniple.txt",
+                "docs/build-tracks-2026-08-12.md",
+                "tools/reset-collection-order.py",
+            ):
+                self.assertFalse((destination / relative).exists(), relative)
             source_record = json.loads(
                 (destination / "SOURCE.json").read_text(encoding="utf-8")
             )

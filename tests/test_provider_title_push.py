@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -199,6 +200,8 @@ class ProviderTitlePushTest(unittest.TestCase):
             environment = {
                 "SESSION_KIT_CONFIG": os.fspath(config_file),
                 "HOME": os.fspath(home),
+                "CODEX_HOME": os.fspath(home / ".codex"),
+                "SESSION_KIT_CODEX_HOME": os.fspath(home / ".codex"),
             }
             with mock.patch.dict(os.environ, environment, clear=False):
                 stdout = io.StringIO()
@@ -337,6 +340,44 @@ class ClaudeAiTitleTests(unittest.TestCase):
                 "", inventory_core.read_claude_ai_title("not-a-uuid", home)
             )
 
+    def test_a_title_in_an_account_profile_is_found(self) -> None:
+        """The read side has to search the profile the session ran on.
+
+        A session launched on an enrolled account runs with CLAUDE_CONFIG_DIR
+        set, so its transcript is written under that profile and never under
+        the default root. Reading only the default root returned "no title",
+        every caller read that as "the provider never set one", and the name
+        the kit could already see was never pushed anywhere the window shows.
+        """
+        with tempfile.TemporaryDirectory() as raw:
+            home = Path(raw)
+            profile = home / ".local/share/session-kit/accounts/claude/primary"
+            project = profile / "projects" / "-srv-app"
+            project.mkdir(parents=True, mode=0o700)
+            # The default root exists and holds nothing: the live shape.
+            (home / ".claude" / "projects").mkdir(parents=True, mode=0o700)
+            exact = uuid_for(91)
+            (project / f"{exact}.jsonl").write_text(
+                json.dumps(
+                    {
+                        "type": "ai-title",
+                        "aiTitle": "Count the great lakes",
+                        "sessionId": exact,
+                    }
+                )
+                + "\n"
+                + json.dumps(
+                    {"type": "agent-color", "agentColor": "blue", "sessionId": exact}
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            signals = inventory_core.read_claude_transcript_signals(exact, home)
+
+            self.assertEqual("Count the great lakes", signals["ai_title"])
+            self.assertEqual("blue", signals["agent_color"])
+
     def test_transcript_signals_return_last_color_and_reject_junk(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             home = Path(raw)
@@ -381,6 +422,9 @@ class ClaudeAiTitleTests(unittest.TestCase):
                     "ai_title": "Count leap years",
                     "agent_name": "Leap year audit",
                     "agent_color": "green",
+                    "pending_ask_user_question": False,
+                    "pending_tool_use": False,
+                    "pending_tool_use_at_unix_ms": None,
                 },
                 signals,
             )
@@ -1221,6 +1265,24 @@ class AutoTitleFromHookTests(unittest.TestCase):
                 ],
             )
 
+    def test_read_only_bounce_lookup_never_appends_to_the_session_index(self) -> None:
+        uuid = "00000000-0000-4000-8000-000000000049"
+        with tempfile.TemporaryDirectory() as base:
+            codex = self._bounce_codex_root(
+                Path(base),
+                uuid,
+                "Read Only Launch Lookup",
+                "an unrelated first prompt",
+            )
+
+            self.assertEqual(
+                "Read Only Launch Lookup",
+                inventory_core.codex_bounce_prepare(
+                    uuid, codex, mirror_index=False
+                ),
+            )
+            self.assertFalse((codex / "session_index.jsonl").exists())
+
     def test_bounce_honors_an_echo_shaped_index_entry_as_deliberate(
         self,
     ) -> None:
@@ -1500,11 +1562,18 @@ class CodexPendingAutoTitleTests(unittest.TestCase):
             ) as live:
                 titled = self._run(base, codex)
             self.assertEqual(1, len(titled))
-            live.assert_called_once_with(
-                Path(base) / ".local" / "state" / "session-kit",
-                uuid,
-                titled[0]["title"],
+            live.assert_called_once()
+            call = live.call_args
+            self.assertEqual(
+                (
+                    Path(base) / ".local" / "state" / "session-kit",
+                    uuid,
+                    titled[0]["title"],
+                ),
+                call.args,
             )
+            self.assertGreater(call.kwargs["timeout_seconds"], 0)
+            self.assertTrue(call.kwargs["still_automatic"]())
 
     def test_auto_title_live_rename_honors_kill_switch(self) -> None:
         import time
@@ -1580,12 +1649,20 @@ class CodexPendingAutoTitleTests(unittest.TestCase):
             # Self-terminating: the index entry excludes it next pass.
             self.assertEqual([], self._run(base, codex))
 
-    def test_never_touches_named_stale_or_indexed_threads(self) -> None:
+    def test_never_touches_named_or_indexed_threads(self) -> None:
+        """Age is not evidence of anything; a name is.
+
+        The titler used to skip threads older than a week, which left them
+        nameless forever (ledger B6). Age no longer decides: what protects a
+        thread is a real name in the database or a deliberate entry in the
+        session index. An old thread whose title is still the prompt it
+        started with is exactly the thread nobody has named.
+        """
         import time
 
         now = int(time.time())
         named = "00000000-0000-4000-8000-000000000052"
-        stale = "00000000-0000-4000-8000-000000000053"
+        old_echo = "00000000-0000-4000-8000-000000000053"
         indexed = "00000000-0000-4000-8000-000000000054"
         with tempfile.TemporaryDirectory() as raw:
             base = Path(raw)
@@ -1593,7 +1670,7 @@ class CodexPendingAutoTitleTests(unittest.TestCase):
                 base,
                 [
                     (named, "Real Name", "unrelated prompt", now - 60),
-                    (stale, "old echo", "old echo", now - 8 * 86400),
+                    (old_echo, "old echo", "old echo", now - 8 * 86400),
                     (indexed, "echo text", "echo text", now - 60),
                 ],
             )
@@ -1602,7 +1679,19 @@ class CodexPendingAutoTitleTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
-            self.assertEqual([], self._run(base, codex))
+            titled = self._run(base, codex)
+            self.assertEqual([old_echo], [item["uuid"] for item in titled])
+            entries = [
+                json.loads(line)
+                for line in (codex / "session_index.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertEqual(
+                "Kept Name",
+                [e["thread_name"] for e in entries if e["id"] == indexed][-1],
+            )
+            self.assertEqual([], [e for e in entries if e["id"] == named])
 
     def test_heals_database_title_from_curated_index_entry(self) -> None:
         import sqlite3
@@ -1746,6 +1835,29 @@ class NameOwnershipTests(unittest.TestCase):
             record = self._document(home)["name_ownership"][f"codex:{self.UUID}"]
             self.assertEqual("automatic", record["owner"])
             self.assertTrue(record["at"])
+
+    def test_only_an_untouched_automatic_claim_can_be_released(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            home, env = self._sandbox(Path(raw))
+            self.assertEqual(
+                "", inventory_core.claim_automatic_name("codex", self.UUID, environ=env)
+            )
+            self.assertTrue(
+                inventory_core.release_automatic_name_claim(
+                    "codex", self.UUID, environ=env
+                )
+            )
+            self.assertEqual("", inventory_core.name_owner("codex", self.UUID, environ=env))
+
+            self._human_rename(home, "codex", self.UUID, "the operator named this")
+            self.assertFalse(
+                inventory_core.release_automatic_name_claim(
+                    "codex", self.UUID, environ=env
+                )
+            )
+            self.assertEqual(
+                "human", inventory_core.name_owner("codex", self.UUID, environ=env)
+            )
 
     def test_a_human_rename_takes_ownership_and_never_gives_it_back(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -2220,6 +2332,145 @@ class NativeRenameOwnershipTests(unittest.TestCase):
                 "kit test", self._document(config)["aliases"][key]
             )
 
+    def test_codex_rename_survives_titler_and_restore_on_both_surfaces(self) -> None:
+        """A settled Codex /rename is adopted before restore can overwrite it."""
+        import sqlite3
+        import time
+
+        uuid = uuid_for(302)
+        key = f"codex:{uuid}"
+        automatic = "Crawl Budget Report Review"
+        chosen = "A Hand Chosen Title"
+        chosen_again = "A Hand Chosen Title Again"
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            base.chmod(0o700)
+            home, config, env = self._sandbox(base)
+            state = base / "state"
+            state.mkdir(mode=0o700)
+            codex = home / ".codex"
+            codex.mkdir(mode=0o700)
+            database = codex / "state_5.sqlite"
+            connection = sqlite3.connect(database)
+            connection.execute(
+                "CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT,"
+                " first_user_message TEXT, updated_at INTEGER)"
+            )
+            connection.execute(
+                "INSERT INTO threads VALUES (?, ?, ?, ?)",
+                (
+                    uuid,
+                    "trace the cdn purge failure",
+                    "trace the cdn purge failure",
+                    int(time.time()),
+                ),
+            )
+            connection.commit()
+            connection.close()
+            env.update(
+                {
+                    "SESSION_KIT_CONFIG": str(config),
+                    "SESSION_KIT_STATE_DIR": str(state),
+                    "SESSION_KIT_CODEX_HOME": str(codex),
+                    "SESSION_KIT_CODEX_LIVE_RENAME": "0",
+                }
+            )
+            with mock.patch.dict(os.environ, env, clear=False):
+                inventory_core.mutate_canonical_automatic_title(
+                    {"state_dir": state},
+                    "codex",
+                    uuid,
+                    automatic,
+                    overwrite=True,
+                )
+                seeded = inventory_core.propagate_provider_title(
+                    "codex", uuid, automatic, environ=env
+                )
+                self.assertEqual([], seeded["provider_title_warnings"])
+
+                # This is the exact store shape Codex /rename leaves: the
+                # index and threads.title carry the same operator-typed name.
+                with (codex / "session_index.jsonl").open(
+                    "a", encoding="utf-8"
+                ) as index:
+                    index.write(
+                        json.dumps({"id": uuid, "thread_name": chosen}) + "\n"
+                    )
+                connection = sqlite3.connect(database)
+                connection.execute(
+                    "UPDATE threads SET title = ? WHERE id = ?", (chosen, uuid)
+                )
+                connection.commit()
+                connection.close()
+
+                inventory_core.codex_pending_auto_titles(environ=env)
+                document = self._document(config)
+                self.assertEqual(chosen, document["aliases"][key])
+                self.assertEqual("human", document["name_ownership"][key]["owner"])
+                self.assertNotIn(key, document.get("automatic_titles", {}))
+                self.assertEqual(
+                    "human",
+                    inventory_core.name_owner("codex", uuid, environ=env),
+                )
+
+                # Restore runs this exact alias-push path before launching the
+                # provider. It must re-assert the adopted name, never the old
+                # automatic title.
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    status = inventory_core._alias_command(
+                        argparse.Namespace(
+                            alias_action="push", provider="codex", uuid=uuid
+                        ),
+                        inventory_core.load_config(),
+                    )
+                self.assertEqual(0, status, output.getvalue())
+
+                # Human ownership is not a reason to ignore later native
+                # news. Rename the restored thread again, reconcile again,
+                # and restore again through the real alias-push path.
+                with (codex / "session_index.jsonl").open(
+                    "a", encoding="utf-8"
+                ) as index:
+                    index.write(
+                        json.dumps({"id": uuid, "thread_name": chosen_again}) + "\n"
+                    )
+                connection = sqlite3.connect(database)
+                connection.execute(
+                    "UPDATE threads SET title = ? WHERE id = ?",
+                    (chosen_again, uuid),
+                )
+                connection.commit()
+                connection.close()
+
+                inventory_core.codex_pending_auto_titles(environ=env)
+                document = self._document(config)
+                self.assertEqual(chosen_again, document["aliases"][key])
+                self.assertEqual(chosen_again, document["pushed_titles"][key])
+                self.assertEqual("human", document["name_ownership"][key]["owner"])
+                self.assertNotIn(key, document.get("automatic_titles", {}))
+
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    status = inventory_core._alias_command(
+                        argparse.Namespace(
+                            alias_action="push", provider="codex", uuid=uuid
+                        ),
+                        inventory_core.load_config(),
+                    )
+                self.assertEqual(0, status, output.getvalue())
+
+            latest = inventory_core.read_codex_session_index(
+                codex / "session_index.jsonl"
+            )
+            connection = sqlite3.connect(database)
+            stored = connection.execute(
+                "SELECT title FROM threads WHERE id = ?", (uuid,)
+            ).fetchone()[0]
+            connection.close()
+            self.assertEqual(chosen_again, latest[uuid])
+            self.assertEqual(chosen_again, stored)
+
     def _refuse_automatic(self, config: Path, base: Path, uuid: str) -> None:
         state = base / "state"
         state.mkdir(mode=0o700, exist_ok=True)
@@ -2401,6 +2652,178 @@ class NativeRenameOwnershipTests(unittest.TestCase):
                 ),
             )
             self.assertEqual({}, self._document(config).get("name_ownership", {}))
+
+
+class AccountProfileReadersTests(unittest.TestCase):
+    """A session on an enrolled account keeps its transcript in that
+    account's profile, not under ``~/.claude``. Three readers answered this
+    question and only one of them had been widened, so the window's own name
+    and every queued title retry stayed blind to account sessions."""
+
+    def profile(self, home: Path, alias: str) -> Path:
+        profile = (
+            home / ".local" / "share" / "session-kit" / "accounts" / "claude" / alias
+        )
+        (profile / "projects" / "-srv-project").mkdir(parents=True)
+        return profile
+
+    def test_a_bounce_is_requested_for_a_session_on_an_account(self) -> None:
+        """"" with clear=False means "defer, a name may still arrive", so the
+        picker never asked for the one safe provider bounce and the window
+        title stayed stale until the person typed something. That is the
+        second half of "it didn't rename the session"."""
+        import datetime as dt
+
+        uuid = uuid_for(120)
+        with tempfile.TemporaryDirectory() as raw:
+            home = Path(raw) / "home"
+            sessions = home / ".claude" / "sessions"
+            sessions.mkdir(parents=True)
+            (home / ".claude" / "projects").mkdir(parents=True)
+            intent = sessions / f"{uuid}.nameintent"
+            intent.write_text("Count The Great Lakes\n", encoding="utf-8")
+            stamp = (
+                dt.datetime.fromtimestamp(
+                    intent.stat().st_mtime - 120, dt.timezone.utc
+                )
+                .isoformat()
+                .replace("+00:00", "Z")
+            )
+            profile = self.profile(home, "fixture")
+            (profile / "projects" / "-srv-project" / f"{uuid}.jsonl").write_text(
+                json.dumps(
+                    {
+                        "type": "user",
+                        "message": {"role": "user", "content": "who plays tonight"},
+                        "timestamp": stamp,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                ("Count The Great Lakes", False),
+                inventory_core.claude_bounce_prepare(uuid, home=home),
+            )
+
+    def test_a_title_retry_is_judged_for_a_session_on_an_account(self) -> None:
+        """Every queued retry answered "defer" on every pass for an account
+        session, so a title push that failed once was never retried and its
+        entry never left the ledger."""
+        names = sys.modules["sessionkit_inventory.names"]
+        uuid = uuid_for(121)
+        with tempfile.TemporaryDirectory() as raw:
+            home = Path(raw) / "home"
+            (home / ".claude" / "projects").mkdir(parents=True)
+            profile = self.profile(home, "fixture")
+            (profile / "projects" / "-srv-project" / f"{uuid}.jsonl").write_text(
+                json.dumps({"type": "user", "sessionId": uuid}) + "\n",
+                encoding="utf-8",
+            )
+
+            verdict = names._provider_title_retry_disposition(
+                "claude",
+                uuid,
+                "Some Title",
+                {"HOME": os.fspath(home)},
+                codex_home=lambda *a, **k: home / ".codex",
+                codex_title_echoes_prompt=lambda *a, **k: False,
+                home_resolver=lambda: home,
+                transcript_signals=inventory_core.read_claude_transcript_signals,
+                read_session_index=lambda *a, **k: {},
+            )
+
+            self.assertEqual("retry", verdict)
+
+
+class TwoProfilesHoldOneConversationTests(unittest.TestCase):
+    """An account switch leaves the same conversation id in two profiles.
+
+    Which one describes the session has to be decided by evidence. Sorting
+    the roots by alias and letting "the last record win" handed the answer to
+    whichever profile sorted last, so a stale copy could out-rank the file the
+    live session is writing -- and an unrecognised name from a stale copy is
+    adopted as a person's rename, which wins for good.
+    """
+
+    def profile(self, home: Path, alias: str) -> Path:
+        profile = (
+            home / ".local" / "share" / "session-kit" / "accounts" / "claude" / alias
+        )
+        (profile / "projects" / "-srv-project").mkdir(parents=True)
+        return profile
+
+    def write(self, path: Path, uuid: str, title: str, color: str) -> None:
+        path.write_text(
+            json.dumps({"type": "ai-title", "aiTitle": title, "sessionId": uuid})
+            + "\n"
+            + json.dumps(
+                {"type": "agent-color", "agentColor": color, "sessionId": uuid}
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    def test_the_newest_copy_wins_not_the_alphabetically_last(self) -> None:
+        uuid = uuid_for(122)
+        with tempfile.TemporaryDirectory() as raw:
+            home = Path(raw) / "home"
+            (home / ".claude" / "projects").mkdir(parents=True)
+            live = (
+                self.profile(home, "aaa-live")
+                / "projects"
+                / "-srv-project"
+                / f"{uuid}.jsonl"
+            )
+            stale = (
+                self.profile(home, "zzz-stale")
+                / "projects"
+                / "-srv-project"
+                / f"{uuid}.jsonl"
+            )
+            self.write(live, uuid, "The live title", "cyan")
+            self.write(stale, uuid, "A stale copy", "red")
+            old = time.time() - 86_400
+            os.utime(stale, (old, old))
+
+            signals = inventory_core.read_claude_transcript_signals(uuid, home)
+
+            self.assertEqual("The live title", signals["ai_title"])
+            self.assertEqual("cyan", signals["agent_color"])
+
+    def test_a_fifth_profile_cannot_hide_the_current_one(self) -> None:
+        """The read stops after a few files. Taken in alias order that cut-off
+        could exclude the profile actually in use; taken newest-first it
+        cannot."""
+        uuid = uuid_for(123)
+        with tempfile.TemporaryDirectory() as raw:
+            home = Path(raw) / "home"
+            (home / ".claude" / "projects").mkdir(parents=True)
+            old = time.time() - 86_400
+            for alias in ("aaa", "bbb", "ccc", "ddd"):
+                path = (
+                    self.profile(home, alias)
+                    / "projects"
+                    / "-srv-project"
+                    / f"{uuid}.jsonl"
+                )
+                path.write_text(
+                    json.dumps({"type": "user", "sessionId": uuid}) + "\n",
+                    encoding="utf-8",
+                )
+                os.utime(path, (old, old))
+            current = (
+                self.profile(home, "zzz-current")
+                / "projects"
+                / "-srv-project"
+                / f"{uuid}.jsonl"
+            )
+            self.write(current, uuid, "The fifth is current", "green")
+
+            signals = inventory_core.read_claude_transcript_signals(uuid, home)
+
+            self.assertEqual("The fifth is current", signals["ai_title"])
 
 
 if __name__ == "__main__":

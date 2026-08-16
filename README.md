@@ -4,17 +4,25 @@
 [![Latest release](https://img.shields.io/github/v/release/dob323/session-kit?include_prereleases)](https://github.com/dob323/session-kit/releases)
 [![License](https://img.shields.io/github/license/dob323/session-kit)](LICENSE)
 
-A local status and safety layer for shpool sessions running Claude Code, Codex,
-or shells over SSH.
+Session Kit is a local status and safety layer for shpool sessions running
+Claude Code, Codex, or shells over SSH. It gives every session a stable place
+in one picker, then proves live identity again before it opens, moves, closes,
+or restores anything.
 
-![Session Kit dashboard showing ready and open sessions grouped by provider](docs/assets/session-kit-dashboard.png)
+![The Session Kit picker showing ready and open sessions grouped by provider](docs/assets/session-kit-picker.png)
 
-The image is rendered from the real picker with demo-only session data by
-`tools/render-readme-dashboard`; it is not a mock of a different interface.
+## What it is
 
-Session Kit gives each managed terminal a stable number, useful name, color,
-reply state, and exact provider identity. It keeps the terminal alive when a
-provider exits and refuses actions when live identity cannot be proved.
+Every session gets a number, a useful name, a colour, a model, a state, and an
+exact provider identity. One list holds all of them. Nothing asks for
+confirmation: guards run first, the action is refused when the evidence is not
+good enough, and a completed action says what happened. A close is recoverable
+from Closed sessions.
+
+Session Kit also supplies guarded account and model changes, optional local
+history, per-session colours, project shortcuts, health checks, immutable local
+releases, and atomic update and rollback. It has no hosted account, analytics,
+update beacon, or telemetry.
 
 > [!WARNING]
 > Session Kit is a public beta for Linux with systemd and macOS 14 or newer.
@@ -22,39 +30,58 @@ provider exits and refuses actions when live identity cannot be proved.
 > be recovered. Session Kit is not a boundary against another process running
 > as the same Unix user.
 
-## Highlights
+## The picker
 
-- One on-demand picker for Claude Code, Codex, and shell sessions.
-- First-install discovery of project folders already known to Claude Code and
-  Codex, with no filesystem-wide scan.
-- `needs your reply`, working, idle, quiet, provider-exited, and subagent state.
-- Exact open, move, close, reopen, fork, repair, and recovery checks.
-- Separate Claude Code and Codex subscription profiles, selected when a session
-  starts or changed later with an explicit confirmation.
-- Manual names plus guarded 2–5 word agent self-names.
-- Per-provider colors, so two live sessions do not share one until the palette
-  runs out, and a Claude session and a Codex session never share one at all.
-- A visible `title pending` state when a Codex bar still needs a safe refresh.
-- Immutable local releases with atomic update and rollback.
-- Optional terminal journals, off by default.
-- No Session Kit hosted account, analytics, update beacon, or telemetry.
+Type `kit` from an ordinary shell. Ready sessions appear before sessions that
+are open elsewhere; attention decides the order inside each group. Machine
+sessions such as drills and workers stay behind one counted row.
 
-Normal rows hide shpool IDs and provider UUIDs. Use `sp detail`, JSON output, or
-an explicit search when diagnosis requires exact identity.
+Enter takes the most likely option on every screen:
 
-## Install the beta release
+- on the home screen, it opens the top row, or starts a new session when the
+  list is empty;
+- New session defaults to Claude Code;
+- a session open elsewhere defaults to moving it into this window;
+- `b` goes back, including from the home screen where back means leave.
+
+The key-driven footer starts with `↵ open <number>` or `↵ new`. At narrow
+widths it keeps the most useful segments first: Enter, number selection, kill,
+new, more, needs you, help, history, then leave. A close keeps the session
+number you typed, so the result and the refreshed list still refer to the same
+selection. The cursor-driven screen adds arrows and mouse input; both screens
+use the same state words and safety checks.
+
+| State | Meaning |
+| --- | --- |
+| `question` | Claude has a blocking prompt open right now. Codex does not claim this state yet. |
+| `needs you` | The provider has finished its turn and the session is waiting for you. |
+| `working` | The provider is driving the current turn. |
+| `idle` | A needs-you transcript has not moved for the configured window, 30 minutes by default. |
+| `pending` | The kit cannot currently read the value; this is a placeholder, not a state. |
+
+An unreadable `<state>/session-idle-minutes` file disables the `idle` label
+instead of guessing. `sp detail` also shows live child shells and workers that
+are at least an hour old, with their age.
+
+A picker already running during an upgrade reloads itself from the new release
+at a safe refresh point and keeps its view. If the new launcher cannot start,
+the old picker stays in place and reports the degraded target.
+
+See [Picker navigation](docs/picker-navigation.md) for every key, action, and
+fallback.
+
+## Install
 
 Download the archive, checksum, and provenance files attached to the
-[`v0.3.0` release](https://github.com/dob323/session-kit/releases/tag/v0.3.0).
-Beta releases are published as GitHub prereleases, so `releases/latest` does not
-resolve to them; browse [all releases](https://github.com/dob323/session-kit/releases)
-or name the tag explicitly, as below. Release assets are named by commit, not by
-version. With the GitHub CLI:
+[`v0.4.0` release](https://github.com/dob323/session-kit/releases/tag/v0.4.0).
+Beta releases are GitHub prereleases, so browse
+[all releases](https://github.com/dob323/session-kit/releases) or name the tag
+explicitly. Assets are named by commit rather than by version.
 
 ```bash
 mkdir session-kit-download
 cd session-kit-download
-gh release download v0.3.0 --repo dob323/session-kit
+gh release download v0.4.0 --repo dob323/session-kit
 if command -v sha256sum >/dev/null; then
   sha256sum --check session-kit-*.sha256
 else
@@ -68,133 +95,136 @@ session-kit doctor
 session-kit services enable
 ```
 
-The preflight is read-only. Installation copies an immutable release and
-systemd or launchd definitions, but it does not start, stop, restart, or enable
-a service. Review the definitions before `services enable`. The guided
-installer can add the shell integration; journals remain off unless you
-explicitly enable them. On a new interactive installation, it also shows the
-existing project folders recorded by Claude Code and Codex and offers to import
-them as local Session Kit shortcuts.
+The archive contains the complete public source, documentation, tools, and
+tests. Installation copies the runtime subset — `bin`, `lib`, `bashrc`,
+`config`, `deploy`, `systemd`, `macos`, `shpool-patch`, and `extras` — into an
+immutable local release.
 
-For requirements, manual asset download, and activation checks, read
-[Install Session Kit](docs/install.md). Use `main` only for development after
-reviewing and testing its exact commit.
+The preflight is read-only. Activation writes service definitions and refreshes
+the kit watchdog already in use. On Linux it reloads the user manager, enables
+new timers systemd has never seen, and try-restarts the running watchdog; it never
+re-enables a timer you disabled and never restarts the session manager. On
+macOS it refreshes an already loaded kit watchdog. `session-kit services
+enable` starts the full reviewed set.
 
-## Use it
+Install and upgrade also seed the collection-order floor when an older
+installation has none. The seed is copied exactly from trusted current state;
+if that state cannot be proved, activation refuses and prints the exact
+installed recovery command instead of inventing a value.
 
-SSH opens a normal shell. Type `kit` when you want the session picker.
+For requirements, manual downloads, shell integration, and activation checks,
+read [Install Session Kit](docs/install.md).
+
+## Recommended terminal: Ghostty
+
+Session Kit is developed and tested against Ghostty. Titles and session colours
+work with stock Ghostty: no display-related Ghostty setting is required. Any
+terminal with truecolour support can run the kit; the cursor-driven picker also
+has a reduced-colour fallback, and `NO_COLOR` or `SESSION_KIT_NO_COLOR` turns
+colour off.
+
+The display has four distinct pieces:
+
+- **Claude status line.** The installer registers
+  `~/.claude/statusline.sh`. Line 1 shows the session name, model, account,
+  host, working directory, and context use. Line 2 is a quota extension point:
+  it shows the 5-hour and 7-day windows when your own refresher supplies the
+  documented cache, otherwise `quota --`.
+- **Codex status bar.** Codex draws its own status bar. Session Kit does not
+  replace it; it supplies the terminal-title items and the session theme as
+  per-launch options without editing `~/.codex/config.toml`.
+- **Terminal title.** Opening, moving, or creating a session pushes its name to
+  the window or tab; returning to the picker restores `session kit`. Set
+  `SESSION_KIT_TAB_TITLE=off` to disable these pushes.
+- **Session colours.** Claude and Codex use separate identity-derived palettes,
+  applied to provider chrome and picker rows so two live sessions remain easy
+  to tell apart.
+
+[Display setup](docs/usage.md#display-setup) documents the installed files,
+Claude quota-refresher contract, Codex behaviour, title ownership, palettes,
+and terminal fallback in full.
+
+## Day 2
+
+The maintenance surface stays small:
 
 ```text
-kit
-sp list
-sp account list
-sp account enroll <claude|codex> <alias> <email>
-sp account verify <claude|codex> <alias>
-sp new [claude|codex|shell] [project-alias] [--account <alias>]
-session-kit projects discover
-session-kit projects import
-session-kit projects candidates
-session-kit projects import --select 1,3-4
-session-kit projects add <alias> <claude|codex|shell> /absolute/path
-session-kit projects here
-session-kit projects ignore /absolute/path
-sp go <terminal-number|shpool-id>
-sp takeover <terminal-number|shpool-id>
-sp name <terminal-number|shpool-id> <title>
-sp name reset <terminal-number|shpool-id>
-sp close <terminal-number|shpool-id>
-sp repair <terminal-number|shpool-id>
-sp detail <terminal-number|shpool-id>
-sp find <text>
-sp history <terminal-number|shpool-id>
-sp health
-sp recover
-sp prune
+session-kit doctor
+session-kit update --source <release-directory>
+session-kit rollback [--to <release-id>]
+session-kit services enable
+session-kit services disable
+session-kit services status
+sp help
+sp help exit-codes
+sp help selectors
 ```
 
-The picker accepts one visible number to open a session. `k` accepts visible
-numbers, comma-separated lists, and small ranges. Every action uses a frozen
-private proof and rechecks live identity immediately before changing anything.
-A cached or stale dashboard is read-only.
-
-Claude Code profiles keep their provider state in separate
-`CLAUDE_CONFIG_DIR` directories. Codex profiles use separate `CODEX_HOME`
-directories. Session Kit stores the alias and verified account description, not
-provider tokens. It never copies credentials between profiles, and it never
-changes a live thread's account automatically. See [Use Session Kit](docs/usage.md#accounts)
-for enrollment, guided creation, and guarded account changes.
-
-If a new Codex process started before its thread acquired a name, the row shows
-`title pending`. A detached, proven-idle provider can refresh automatically on
-open. An attached provider is never restarted automatically; its action menu
-offers an explicit refresh only when the exact provider is idle and has no
-subagents.
-
-## shpool
-
-Session Kit runs on top of [shpool](https://github.com/shell-pool/shpool) and
-does not vendor or replace it. `shpool-patch/` carries local patches against
-released shpool versions, each with the evidence that justified it and the
-conditions under which it should not be applied. One of them, `0004`, fixes a
-detach deadlock in shpool 0.11.0 that can freeze every managed session at once;
-read [the patch notes](shpool-patch/README.md) before deciding what to run.
-
-Rebuilding or reinstalling shpool replaces the binary you patched. `session-kit
-doctor` records the shpool binary it validated at install time and warns when it
-changes, so a silent downgrade is caught by a health check rather than by a
-frozen terminal.
+Updates install an immutable release and atomically move `current`. Rollback
+selects a verified release already on the machine. The management launcher
+stays new enough to recover the transaction even when the selected runtime is
+older. Read [Update and roll back](docs/update-and-rollback.md) before changing
+releases.
 
 ## Safety and privacy
 
-Session Kit treats a provider UUID and exact process generation as identity.
-Titles, numbers, directories, timestamps, and terminal output are display
-context only. Missing, duplicated, changed, or partial evidence fails closed.
+Identity is the provider UUID plus the exact process generation. Titles,
+numbers, directories, timestamps, and terminal output are display context.
+Missing, duplicated, changed, or partial evidence fails closed. A picker using
+the last confirmed snapshot remains readable but will not act until refresh
+succeeds.
 
-The default local footprint is privacy-minimal:
+The default local footprint is deliberately small:
 
-- journals and notifications are off;
+- history and notifications are off;
 - provider transcripts remain in provider-owned storage;
-- the picker action log stores only fixed action and outcome labels;
-- private state is owner-only and never uploaded by Session Kit.
+- the picker action log stores fixed action and outcome labels rather than
+  terminal contents;
+- private state is owner-only and Session Kit uploads none of it.
 
-Optional journals can contain prompts, credentials, source code, and command
-output. Read [Security and local data](docs/security-and-data.md) before
-enabling them.
+Optional history can contain prompts, credentials, source code, and command
+output. Read [Security and local data](docs/security-and-data.md) before turning
+it on. The watchdog logs without sending anything until a notifier is
+configured; see [Watchdog alerts](docs/configuration.md#watchdog-alerts).
 
-The watchdog raises no alert anywhere until you configure a notifier. It detects
-and logs either way, but with nothing wired up the only record is the owner-only
-watchdog log. See [Watchdog alerts](docs/configuration.md#watchdog-alerts).
+## shpool
+
+Session Kit runs on [shpool](https://github.com/shell-pool/shpool) and does not
+vendor or replace it. `shpool-patch/` carries six optional patches with their
+scope and checks. Patch `0004` fixes a detach deadlock in shpool 0.11.0;
+patches `0005` and `0006` preserve the attached shell's exit status and
+coalesce resize bursts. Read [the patch notes](shpool-patch/README.md) before
+choosing a binary.
+
+Rebuilding shpool replaces a patched binary. `session-kit doctor` records the
+binary validated at install time and reports a later change.
 
 ## Documentation
 
 - [Install](docs/install.md)
 - [Configure](docs/configuration.md)
 - [Use Session Kit](docs/usage.md)
+- [Picker navigation](docs/picker-navigation.md)
 - [Projects](docs/projects.md)
-- [Message your sessions](docs/messaging.md)
-- [The Fleet Supervisor](docs/supervisor.md)
 - [Claude Code and Codex integration](docs/provider-integration.md)
 - [Security and local data](docs/security-and-data.md)
 - [Troubleshoot](docs/troubleshooting.md)
 - [Update and roll back](docs/update-and-rollback.md)
 - [Uninstall](docs/uninstall.md)
 - [Architecture](docs/architecture.md)
+- [Voice contract](docs/voice.md)
 - [Maintainer release process](docs/maintainers/release-process.md)
 
 ## Contributing and support
 
-Bug reports, feature requests, documentation fixes, and pull requests are
-welcome. Reports about provider compatibility, lifecycle safety, privacy, and
-clean installation are the most useful, especially from operating systems and
-hardware the maintainer cannot test.
+Bug reports, documentation fixes, and pull requests are welcome. Reports about
+provider compatibility, lifecycle safety, privacy, and clean installation are
+especially useful. Maintenance is best-effort; a change may be declined when
+it weakens the identity or safety model. Read [Contributing](CONTRIBUTING.md)
+before opening a pull request.
 
-Session Kit is maintained by one person alongside other work. Replies are
-best-effort rather than guaranteed, and a pull request may be declined when it
-would weaken the identity and safety model even if the code is sound. Read
-[Contributing](CONTRIBUTING.md) before opening a pull request.
-
-Report vulnerabilities through the [Security policy](SECURITY.md), never through
-a public issue.
+Report vulnerabilities through the [security policy](SECURITY.md), never in a
+public issue.
 
 ## License
 

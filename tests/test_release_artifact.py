@@ -128,7 +128,18 @@ class ReleaseArtifactTests(unittest.TestCase):
                 names = archive.getnames()
                 self.assertIn(f"{basename}/SOURCE.json", names)
                 self.assertIn(f"{basename}/LICENSES/Apache-2.0.txt", names)
+                self.assertIn(f"{basename}/bin/reset-collection-order.py", names)
                 self.assertIn(f"{basename}/deploy/session-kit-release", names)
+                self.assertIn(
+                    f"{basename}/extras/statusline-quota-refresh.example", names
+                )
+                self.assertNotIn(f"{basename}/LICENSES/MIT-maniple.txt", names)
+                self.assertNotIn(
+                    f"{basename}/docs/build-tracks-2026-08-12.md", names
+                )
+                self.assertNotIn(
+                    f"{basename}/tools/reset-collection-order.py", names
+                )
                 self.assertTrue(all(not name.startswith("/") for name in names))
                 self.assertTrue(
                     all(".." not in Path(name).parts for name in names),

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from concurrent.futures import ThreadPoolExecutor
 import json
 import os
@@ -12,6 +13,7 @@ from unittest import mock
 
 from tests.test_inventory import inventory_core, inventory_fixture, uuid_for
 from tests.support import REPO
+from sessionkit_inventory import lifecycle, snapshot as snapshot_module, state_io
 
 
 def pending_session(provider: str, uuid: str, title: str) -> dict:
@@ -68,6 +70,12 @@ class PendingRecoveryTests(unittest.TestCase):
         self.state = Path(self.temp.name) / "state"
         self.state.mkdir()
         self.state.chmod(0o700)
+        self.data = Path(self.temp.name) / "data"
+        self.data.mkdir(mode=0o700)
+        self.data_environment = mock.patch.dict(
+            os.environ, {"SESSION_KIT_DATA_DIR": str(self.data)}
+        )
+        self.data_environment.start()
         self.pending_path = self.state / "recovery-pending.json"
         self.pending_path.write_text(
             json.dumps(pending_document(), sort_keys=True), encoding="utf-8"
@@ -79,6 +87,11 @@ class PendingRecoveryTests(unittest.TestCase):
             "max_proc_nodes": 8192,
             "max_proc_depth": 32,
         }
+        paths = inventory_core._state_paths(self.config)
+        inventory_core.atomic_write_json(
+            paths["collection_sequence_floor"],
+            {"schema_version": 1, "last_collection_start": 1},
+        )
         self.boot_file = Path(self.temp.name) / "boot-id"
         self.old_boot_env = os.environ.get("SESSION_KIT_BOOT_ID_FILE")
         os.environ["SESSION_KIT_BOOT_ID_FILE"] = str(self.boot_file)
@@ -88,7 +101,162 @@ class PendingRecoveryTests(unittest.TestCase):
             os.environ.pop("SESSION_KIT_BOOT_ID_FILE", None)
         else:
             os.environ["SESSION_KIT_BOOT_ID_FILE"] = self.old_boot_env
+        self.data_environment.stop()
         self.temp.cleanup()
+
+    def test_failed_pending_publication_preserves_the_loss_for_retry(self) -> None:
+        """Loss evidence lands before inventory and manifest discard its source."""
+        lost_uuid = uuid_for(91)
+        live_uuid = uuid_for(92)
+        generation = {"pid": 12345, "process_start_ticks": 67890}
+        boot_id = "retry-boot"
+
+        def row(name: str, uuid: str) -> dict:
+            return {
+                "shpool_id_raw": name,
+                "shpool_id": name,
+                "provider": "codex",
+                "title": name,
+                "started_at_unix_ms": 1_700_000_000_000,
+                "identity": {"uuid": uuid, "confidence": "exact"},
+                "recovery": {
+                    "available": True,
+                    "provider": "codex",
+                    "uuid": uuid,
+                    "cwd": "/srv/project",
+                    "argv": ["codex", "resume", uuid],
+                    "command": f"codex resume {uuid}",
+                },
+            }
+
+        def inventory(*rows: dict) -> dict:
+            return {
+                "schema_version": inventory_core.SCHEMA_VERSION,
+                "generated_at": "2026-08-15T12:00:00Z",
+                "source": "live",
+                "stale": False,
+                "warnings": [],
+                "daemon_generation": copy.deepcopy(generation),
+                "sessions": [copy.deepcopy(item) for item in rows],
+                "outside_agents": [],
+            }
+
+        lost = row("lost", lost_uuid)
+        survivor = row("survivor", live_uuid)
+        previous = inventory(lost, survivor)
+        current = inventory(survivor)
+        paths = inventory_core._state_paths(self.config)
+        self.pending_path.unlink()
+        inventory_core.atomic_write_json(paths["inventory"], previous)
+        inventory_core.atomic_write_json(
+            paths["manifest"],
+            {
+                "schema_version": inventory_core.SCHEMA_VERSION,
+                "generated_at": previous["generated_at"],
+                "boot_id": boot_id,
+                "daemon_generation": copy.deepcopy(generation),
+                "sessions": {
+                    item["shpool_id_raw"]: pending_session(
+                        item["provider"],
+                        item["identity"]["uuid"],
+                        item["title"],
+                    )
+                    for item in previous["sessions"]
+                },
+                "outside_agents": {},
+            },
+        )
+        lifecycle.record_close_intent(
+            self.state, provider="codex", uuid=lost_uuid
+        )
+        real_atomic = inventory_core.atomic_write_json
+
+        def run_snapshot(*, fail_pending: bool) -> dict:
+            def injected_atomic(path: Path, payload: object) -> None:
+                if fail_pending and path == paths["pending"]:
+                    raise OSError("injected recovery-pending write failure")
+                real_atomic(path, payload)
+
+            def enqueue(paths_arg, now, before, *, boot_id):
+                return inventory_core.enqueue_lost_conversations(
+                    paths_arg,
+                    now,
+                    before,
+                    boot_id=boot_id,
+                    config=self.config,
+                )
+
+            with mock.patch.object(
+                inventory_core, "atomic_write_json", side_effect=injected_atomic
+            ):
+                return snapshot_module.snapshot(
+                    write_state=True,
+                    config=self.config,
+                    schema_version=inventory_core.SCHEMA_VERSION,
+                    load_config=lambda: self.config,
+                    state_paths=inventory_core._state_paths,
+                    state_lock=inventory_core.StateLock,
+                    read_state_json=inventory_core._read_state_json,
+                    collect_live=lambda _settings: copy.deepcopy(current),
+                    boot_id_factory=lambda: boot_id,
+                    persist_last_exact=lambda *_args, **_kwargs: None,
+                    apply_provider_exit_states=lambda *_args, **_kwargs: None,
+                    prune_inactive_state=lambda *_args, **_kwargs: None,
+                    read_terminal_registry=lambda *_args, **_kwargs: {
+                        "schema_version": inventory_core.SCHEMA_VERSION,
+                        "boot_id": boot_id,
+                        "next_number": 1,
+                        "bindings": {},
+                    },
+                    read_terminal_retirements=lambda *_args, **_kwargs: {},
+                    apply_terminal_numbers=lambda _inv, registry, **_kwargs: registry,
+                    terminal_retirement_payload=lambda retired, boot_id: {
+                        "schema_version": inventory_core.SCHEMA_VERSION,
+                        "boot_id": boot_id,
+                        "retired": retired,
+                    },
+                    atomic_write_json=real_atomic,
+                    quarantine_orphaned_provider_untitled_markers=lambda *_args, **_kwargs: [],
+                    update_recovery_state=inventory_core.update_recovery_state,
+                    enqueue_lost_conversations=enqueue,
+                    apply_session_origins=lambda *_args, **_kwargs: None,
+                    capture_bounce_receipts=lambda _root: frozenset(),
+                    capture_bounce_cleanup_generations=lambda _root: frozenset(),
+                    capture_lifecycle_generations=lambda _root: frozenset(),
+                    capture_origin_generations=lambda _root: frozenset(),
+                    capture_provider_untitled_generations=lambda _root: frozenset(),
+                    capture_session_color_generations=lambda _root: frozenset(),
+                    prune_origins=lambda *_args, **_kwargs: 0,
+                    publish_session_colors=lambda *_args, **_kwargs: 0,
+                    cold_inventory=lambda message: inventory_core._cold_inventory(
+                        message
+                    ),
+                )
+
+        with self.assertRaisesRegex(OSError, "injected recovery-pending"):
+            run_snapshot(fail_pending=True)
+        self.assertFalse(self.pending_path.exists())
+        self.assertEqual(
+            ["lost", "survivor"],
+            [
+                item["shpool_id_raw"]
+                for item in inventory_core._read_state_json(paths["inventory"])[
+                    "sessions"
+                ]
+            ],
+        )
+        self.assertEqual(
+            ["lost", "survivor"],
+            sorted(
+                inventory_core._read_state_json(paths["manifest"])["sessions"]
+            ),
+        )
+
+        run_snapshot(fail_pending=False)
+        queued = inventory_core.list_pending(self.config)["entries"]
+        self.assertIn(lost_uuid, {item["uuid"] for item in queued})
+        projected = inventory_core.recovery_list_payload(self.config)["entries"]
+        self.assertIn(lost_uuid, {item["uuid"] for item in projected})
 
     def test_list_flattens_primary_and_queued_generations(self) -> None:
         listed = inventory_core.list_pending(self.config)
@@ -139,10 +307,36 @@ class PendingRecoveryTests(unittest.TestCase):
             claude["uuid"],
             collector=lambda _: json.loads(json.dumps(live)),
         )
-        self.assertNotIn(uuid_for(1), {item["uuid"] for item in result["remaining"]["entries"]})
+        self.assertTrue(result["evidence_retained"])
+        self.assertIn(uuid_for(1), {item["uuid"] for item in result["remaining"]["entries"]})
         stored = json.loads(self.pending_path.read_text())
-        self.assertNotIn("old-claude", stored["sessions"])
-        self.assertEqual(1, len(stored["queued_generations"]))
+        self.assertIn("old-claude", stored["sessions"])
+        self.assertEqual(2, len(stored["queued_generations"]))
+
+    def test_a_missing_closed_row_keeps_tombstoned_recovery_acknowledgeable(
+        self,
+    ) -> None:
+        lifecycle.record_close_intent(
+            self.state, provider="claude", uuid=uuid_for(1)
+        )
+        before = self.pending_path.read_bytes()
+        payload = inventory_core.list_pending(self.config)
+        target = next(row for row in payload["entries"] if row["uuid"] == uuid_for(1))
+        self.assertIn(f"claude:{uuid_for(1)}", " ".join(payload["diagnostics"]))
+        live = inventory_core.build_inventory(
+            *inventory_fixture(1), now=1_800_000_000
+        )
+
+        result = inventory_core.acknowledge_pending(
+            self.config,
+            target["source_generation_key"],
+            target["old_shpool_id"],
+            target["uuid"],
+            collector=lambda _: json.loads(json.dumps(live)),
+        )
+
+        self.assertTrue(result["evidence_retained"])
+        self.assertEqual(before, self.pending_path.read_bytes())
 
     def test_duplicate_queued_identity_prefers_newest_generation(self) -> None:
         duplicate_uuid = uuid_for(44)
@@ -262,9 +456,12 @@ class PendingRecoveryTests(unittest.TestCase):
             results = [future.result(timeout=10) for future in futures]
         self.assertEqual(2, len(results))
         remaining = inventory_core.list_pending(self.config)["entries"]
-        self.assertEqual(["older-codex"], [item["old_shpool_id"] for item in remaining])
+        self.assertEqual(
+            ["old-claude", "old-codex", "older-codex"],
+            [item["old_shpool_id"] for item in remaining],
+        )
         stored = json.loads(self.pending_path.read_text())
-        self.assertEqual({}, stored["sessions"])
+        self.assertEqual({"old-claude", "old-codex"}, set(stored["sessions"]))
         self.assertEqual(1, len(stored["queued_generations"]))
 
     def test_daemon_change_queues_shpool_but_not_outside_root(self) -> None:
@@ -289,6 +486,59 @@ class PendingRecoveryTests(unittest.TestCase):
         self.assertEqual(
             "outside",
             scopes[f"outside:codex:{uuid_for(77)}"],
+        )
+
+    def test_generation_pending_is_reproved_before_manifest_advance(self) -> None:
+        self._write_old_manifest(boot_id="old-boot", include_shpool=True)
+        self.boot_file.write_text("new-boot\n", encoding="utf-8")
+        paths = inventory_core._state_paths(self.config)
+        manifest_before = paths["manifest"].read_bytes()
+        replacement = self.state / ".prior-empty-pending"
+        inventory_core.atomic_write_json(
+            replacement,
+            {
+                "schema_version": inventory_core.SCHEMA_VERSION,
+                "source_boot_id": "old-boot",
+                "source_daemon_generation": {
+                    "pid": 10,
+                    "process_start_ticks": 100,
+                },
+                "sessions": {},
+                "outside_agents": {},
+            },
+        )
+        real_prove = state_io._prove_published_descriptor
+        attacked = False
+
+        def replace_after_proof(descriptor: int, path: Path) -> None:
+            nonlocal attacked
+            real_prove(descriptor, path)
+            if path == paths["pending"] and not attacked:
+                attacked = True
+                os.replace(replacement, path)
+                directory = os.open(self.state, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+
+        with mock.patch.object(
+            state_io, "_prove_published_descriptor", replace_after_proof
+        ), self.assertRaisesRegex(
+            inventory_core.CollectionError,
+            "pending recovery evidence changed before inventory/manifest advance",
+        ):
+            inventory_core.update_recovery_state(paths, self._new_inventory())
+
+        self.assertTrue(attacked)
+        self.assertEqual(manifest_before, paths["manifest"].read_bytes())
+        inventory_core.update_recovery_state(paths, self._new_inventory())
+        offered = inventory_core.flatten_pending(
+            inventory_core._read_state_json(paths["pending"])
+        )["entries"]
+        self.assertEqual(
+            {uuid_for(1), uuid_for(77)},
+            {entry["uuid"] for entry in offered},
         )
 
     def test_daemon_change_with_outside_only_creates_no_pending_queue(self) -> None:

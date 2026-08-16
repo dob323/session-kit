@@ -116,7 +116,11 @@ set_journal_choice() {
         (umask 077; : > "$HOME/.no_shpool_journal")
       fi
       ;;
-    *) die "--journal must be on or off" ;;
+    preserve)
+      # Keep whatever the operator has: sentinel present stays present,
+      # absent stays absent. Rollovers and updates land here by default.
+      ;;
+    *) die "--journal must be on, off, or preserve" ;;
   esac
 }
 
@@ -132,12 +136,8 @@ enable_login() {
     printf 'session-kit-integration-v1 %s\n' "$release_id" > "$integration_marker"
     chmod 600 "$integration_marker"
   fi
-  if [[ $(platform) == macos ]]; then
-    printf 'SSH picker enabled in %s, %s, and %s\n' \
-      "$bashrc_path" "$bash_profile_path" "$zshrc_path"
-  else
-    printf 'SSH picker enabled in %s\n' "$bashrc_path"
-  fi
+  [[ ${1:-} == --quiet ]] ||
+    printf 'Login integration is on. Turn it off with: session-kit disable-login\n'
 }
 
 disable_login() {
@@ -147,5 +147,6 @@ disable_login() {
       die "refusing to remove unsafe integration marker"
     command rm -- "$integration_marker"
   fi
-  printf 'SSH picker disabled. Existing sessions and journals were not changed.\n'
+  [[ ${1:-} == --quiet ]] ||
+    printf 'Login integration is off. Existing sessions and history were not changed.\n'
 }

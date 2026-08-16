@@ -8,20 +8,18 @@ import unittest
 REPO = Path(__file__).resolve().parents[1]
 
 
-def bounded_restore_settings(path: Path) -> dict[str, int]:
+def restore_settings(path: Path) -> dict[str, object]:
     text = path.read_text(encoding="utf-8")
-    patterns = {
-        "restore_lines": (
-            r"(?m)^session_restore_mode\s*=\s*"
-            r"\{\s*lines\s*=\s*([0-9]+)\s*\}\s*$"
-        ),
+    modes = re.findall(r"(?m)^session_restore_mode\s*=\s*(.+?)\s*$", text)
+    if len(modes) != 1:
+        raise ValueError(f"{path}: expected one session_restore_mode assignment")
+    values: dict[str, object] = {"mode": modes[0]}
+    for name, pattern in {
         "output_spool_lines": r"(?m)^output_spool_lines\s*=\s*([0-9]+)\s*$",
         "vt100_output_spool_width": (
             r"(?m)^vt100_output_spool_width\s*=\s*([0-9]+)\s*$"
         ),
-    }
-    values: dict[str, int] = {}
-    for name, pattern in patterns.items():
+    }.items():
         matches = re.findall(pattern, text)
         if len(matches) != 1:
             raise ValueError(f"{path}: expected one {name} assignment")
@@ -30,17 +28,21 @@ def bounded_restore_settings(path: Path) -> dict[str, int]:
 
 
 class ShpoolExampleConfigTests(unittest.TestCase):
-    def test_bounded_restore_contract(self) -> None:
+    def test_simple_restore_contract(self) -> None:
+        """Reattach must never replay spooled TUI frames.
+
+        Replaying the vt100 spool interleaves cells from different frames of
+        a cell-diffing TUI (Claude Code, Codex) — the braided corruption seen
+        live on 2026-08-12. "simple" emits nothing and lets the program
+        redraw itself; clean reading lives in `sp history`. The spool bounds
+        stay finite so daemon memory is bounded.
+        """
         for relative in ("config/shpool.example.toml", "shpool/config.toml"):
             with self.subTest(relative=relative):
-                config = bounded_restore_settings(REPO / relative)
-                self.assertEqual(500, config["restore_lines"])
+                config = restore_settings(REPO / relative)
+                self.assertEqual('"simple"', config["mode"])
                 self.assertEqual(1000, config["output_spool_lines"])
                 self.assertEqual(200, config["vt100_output_spool_width"])
-                self.assertLessEqual(
-                    config["restore_lines"],
-                    config["output_spool_lines"],
-                )
 
 
 if __name__ == "__main__":

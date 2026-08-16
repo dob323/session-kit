@@ -1,6 +1,6 @@
 # Install Session Kit
 
-Session Kit `v0.3.0` is a public beta for Linux with systemd and macOS 14 or
+Session Kit `v0.4.0` is a public beta for Linux with systemd and macOS 14 or
 newer. Install the accepted release artifact under a single-user account where
 provider conversations are recoverable.
 
@@ -12,7 +12,7 @@ are named by source commit rather than by version.
 ```bash
 mkdir session-kit-download
 cd session-kit-download
-gh release download v0.3.0 --repo dob323/session-kit
+gh release download v0.4.0 --repo dob323/session-kit
 if command -v sha256sum >/dev/null; then
   sha256sum --check session-kit-*.sha256
 else
@@ -39,16 +39,18 @@ FAIL  units     shpool.socket disabled/inactive; shpool-reaper.timer disabled/in
 ```
 
 That is the expected result at this point, not a broken install: the installer
-writes the unit files and deliberately never enables them, and doctor gates on
-the services being live. It turns green after
+writes the unit files and refreshes the user service manager, but it does not
+enable shpool or the watchdog on a fresh install. It may enable only a newly
+introduced timer that has no prior enabled/disabled policy. Doctor turns green after
 [Activate safely](#activate-safely) below. Everything else doctor checks —
 files, permissions, provider readers, kill switches — is meaningful right now.
 
 On the first interactive install, Session Kit reads the project paths already
 recorded by Claude Code and Codex, shows the existing directories it found,
 and offers to import all of them. Discovery reads Claude's local project map
-and history plus Codex's configured projects and stored thread directories. It
-does not walk the home directory or search the rest of the filesystem.
+and history plus Codex's configured projects and stored conversation
+directories. It does not walk the home directory or search the rest of the
+filesystem.
 
 For unattended installation, project import stays off unless it is requested:
 
@@ -63,7 +65,7 @@ an install or update.
 
 Without the GitHub CLI, download the `.tar.gz`, `.sha256`, and
 `.provenance.json` assets from the
-[`v0.3.0` release](https://github.com/dob323/session-kit/releases/tag/v0.3.0),
+[`v0.4.0` release](https://github.com/dob323/session-kit/releases/tag/v0.4.0),
 and put them in one empty directory. The checksum file covers the archive. Use
 `sha256sum --check` on Linux or
 `shasum -a 256 --check` on macOS. The provenance file records the exact source
@@ -73,7 +75,9 @@ Cloning `main` is the development path, not the normal installation path. If
 you use it, review and test the exact commit before installation.
 
 `./install.sh --check` is read-only. The installer copies files and user-service
-definitions but does not start, stop, restart, or enable a service.
+definitions. The real install performs the bounded service refresh described
+under [What installation changes](#what-installation-changes); it never starts,
+stops, or restarts shpool.
 
 ## Requirements
 
@@ -87,14 +91,14 @@ Linux additionally requires:
 
 - Linux with readable `/proc`;
 - a systemd user manager;
-- Bash 4 or newer;
+- Bash 4.2 or newer (the picker's fallback clock uses `printf '%(%s)T'`; Bash 5 preferred);
 - Python 3.10 or newer.
 
 macOS additionally requires:
 
 - macOS 14 or newer on Apple Silicon or Intel;
 - an active desktop login so the per-user launchd GUI domain exists;
-- Homebrew Bash 4 or newer;
+- Homebrew Bash 4.2 or newer (Bash 5 preferred);
 - Python 3.11 or newer.
 
 The preflight checks the platform-specific tools it uses. Linux includes
@@ -178,9 +182,9 @@ Without one the build stops at ``error: linker `cc` not found``.
 
 **No compiler on the target machine?** You do not need one.
 [Getting a static shpool binary](../extras/build-static-binary.md) builds a
-fully static musl binary inside a throwaway container and copies it out;
-nothing is installed on the host, and the result runs on any x86-64 Linux
-regardless of glibc version.
+fully static musl binary for the build host's architecture inside a throwaway
+container and copies it out; nothing is installed on the host, and the result
+does not depend on the target's glibc version.
 
 Read the [shpool](#shpool) section below before running either route on a
 machine you intend to rely on.
@@ -216,7 +220,7 @@ silently replaced. The system Apple Bash is not used for managed sessions.
 
 ## shpool
 
-Use official shpool 0.11.0 by default. Session Kit ships four optional source
+Use official shpool 0.11.0 by default. Session Kit ships six optional source
 patches against that release and installs none of them automatically. Review
 [the patch guide](../shpool-patch/README.md) before deciding.
 
@@ -224,7 +228,7 @@ Read about `0004` first. Stock 0.11.0 can deadlock on detach and make every
 managed session unreachable at once — the daemon stays alive and accepting
 connections while every list, attach, and detach blocks forever, and it does not
 recover on its own. One stalled SSH window is enough to trigger it. The other
-three patches address narrower problems.
+five patches address narrower problems.
 
 If you apply a patch, record the resulting binary's fingerprint as the last step
 of the rebuild. The patch guide gives the exact command. Skipping it leaves the
@@ -242,7 +246,7 @@ Without one, use the container build in
 produce the same 0.11.0 binary; the container route leaves no toolchain behind.
 
 Replacing a running shpool binary normally requires a daemon restart, which
-ends its managed terminal processes. The Session Kit installer never replaces
+ends the session processes it holds. The Session Kit installer never replaces
 shpool or restarts its daemon.
 
 ## What installation changes
@@ -254,10 +258,11 @@ The installer:
 2. selects it through the `current` link;
 3. installs stable commands under `$HOME/.local/bin`;
 4. creates missing private configuration and state;
-5. writes inactive systemd units or launchd templates;
-6. asks before adding guarded shell integration;
+5. writes systemd units or launchd templates and refreshes the service manager
+   without restarting shpool;
+6. adds guarded shell integration, off with `--disable-login`;
 7. backs up each startup file before changing it;
-8. asks whether to enable terminal journals, defaulting to off;
+8. leaves session history recording off, on with `--journal on`;
 9. leaves health notifications off.
 
 On Linux, login integration changes `.bashrc`. On macOS, it changes `.bashrc`
@@ -265,37 +270,17 @@ and `.bash_profile` for managed Bash sessions and adds only the Session Kit
 command path to `.zshrc`. A normal zsh SSH login remains a normal shell and the
 picker opens only when you type `kit`.
 
-One provider file is registered rather than only laid down: the automatic
-project intake hook, added to `~/.claude/settings.json` and `~/.codex/hooks.json`
-under `UserPromptSubmit`. Both files are backed up before the edit and re-read
-after it. Session Kit adds one provenance-marked handler inside a compatible
-matcher group; it does not claim that group. Existing handlers, including
-other `UserPromptSubmit` commands in the same group, remain byte-for-byte
-untouched. The registration is idempotent — installing again changes nothing.
-Configuration JSON with duplicate keys, a linked path ancestor, or more than
-one Session Kit-owned handler is refused instead of being normalized.
+The installer does not change provider conversation storage, restart shpool,
+attach to a session, or close a session. On Linux it reloads unit definitions,
+may enable a newly introduced timer that has no recorded policy, and
+`try-restart`s an already running watchdog. On macOS it kickstarts an already
+loaded watchdog. A fresh watchdog and the shpool service remain off until
+explicit activation.
 
-A managed `sp new codex --prompt-file ...` keeps the source file until its
-private handoff is durable and the audit append succeeds. Provider acceptance
-and supervisor intake are separate proofs. The prompt is consumed only after
-the fsynced intake proof matches the exact conversation, turn, content digest,
-and managed shell generation. Any started process without that proof moves the
-prompt to `sp prompt-quarantine list` as **Needs You** and never replays it.
-Use `ingest` to retry supervisor intake without contacting Codex, `resume` to
-reopen the exact accepted conversation, or `discard` to retain it for 30-day
-recovery.
-
-**Codex asks you to trust that hook once.** Codex trusts a command hook by the
-exact hash of the registered wrapper file, so the first Codex session after
-installation prompts to review it, and until you accept, Codex skips the hook
-and no Codex project is recorded automatically. The same prompt returns
-whenever a release changes that file — see `docs/update-and-rollback.md`.
-
-The installer does not change provider storage, start a service, restart
-shpool, attach to a session, or close a session.
-
-Noninteractive installation leaves login integration and journals off unless
-their explicit flags are supplied.
+Apart from the documented interactive project-import offer, the installer
+states what it chose and the command that changes it. `--enable-login`,
+`--disable-login`, and `--journal on|off` decide those choices up front, and an
+unattended install adds nothing to a shell it was not asked to touch.
 
 ## Optional components
 
@@ -338,18 +323,25 @@ shpool.
 Activation does not require a reboot. Update and rollback do not restart a
 loaded shpool daemon.
 
-Use a new test session first. Confirm that disconnecting SSH leaves it running,
-a provider quit leaves the managed terminal alive, exact reopen works, and
-`k <numbers>` resolves each number to one exact session under a frozen proof.
+## Display setup
+
+Session Kit installs Claude's two-line status display, Codex's status-bar and
+terminal-title integration, and the session color environment. See
+[Display setup](usage.md#display-setup) for what each segment shows, the quota
+extension point, title behavior, and terminal colors. Ghostty needs no special
+display setting: its stock configuration supports the titles and colors the
+kit emits.
+
+Use a new test session first. Confirm that disconnecting SSH leaves it
+running, a provider quit leaves the conversation restorable, exact reopen
+works, and marking numbers in the picker resolves each one to one exact
+session under a frozen proof.
 
 ## Evaluate without installing
 
 The full repository test suite is the Linux development test path and uses
-temporary fixtures:
-
-```bash
-tests/run
-```
+temporary fixtures. From a reviewed source checkout, run its `tests/run`
+script before installation.
 
 Do not run active-session commands merely to inspect the source.
 
@@ -357,13 +349,3 @@ macOS CI runs its native adapter checks plus focused installer, export, release,
 privacy, and documentation tests on Apple Silicon and Intel. Real acceptance
 also requires a disposable shpool session because GitHub-hosted CI does not
 load a user LaunchAgent or start provider TUIs.
-
-## Provider config directory permissions
-
-Activation writes one hook into `~/.claude/settings.json` and
-`~/.codex/hooks.json`, so it refuses a config directory another account could
-write. Group-writable is allowed only when the directory is yours and its group
-is your own single-member private group, which is what a private-group
-distribution with a 002 umask creates; a shared group or a world-writable
-directory is refused. `./install.sh --check` reports this before anything is
-written and prints the repair to run, such as `chmod g-w ~/.claude`.

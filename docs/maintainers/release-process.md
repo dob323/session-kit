@@ -1,185 +1,120 @@
 # Maintainer release process
 
-This is the public release checklist, not an installation guide.
+This is the public release checklist, not an installation guide. A release is
+one reviewed commit carried unchanged through export, artifact creation, tag,
+and release assets.
 
 ## Version and support policy
 
-The first release is `v0.1.0` with beta maturity. Follow Semantic Versioning
-and never move or reuse a tag.
+The release documented by this tree is `v0.4.0` and remains beta software.
+Follow Semantic Versioning and never move or reuse a tag.
 
-Before `1.0.0`, document incompatible command, configuration, or state changes
-in the changelog. Until the first tag, only current `main` receives fixes. Each
-beta minor line is supported for 90 days after its first release or for 30 days
-after the next beta minor release, whichever ends later. Security fixes may
-require upgrading to the latest patch.
+Before `1.0.0`, put every incompatible command, configuration, or private-state
+change in the changelog. Each beta minor line is supported for 90 days after
+its first release or for 30 days after the next beta minor release, whichever
+ends later. A security fix may require upgrading to the latest patch.
 
 ## Release gates
 
-1. The public tree and reachable Git history pass secret and private-data scans.
-2. No private account names, paths, hostnames, UUIDs, transcripts, incident
-   timestamps, credentials, or internal services remain.
-3. License, notices, security policy, changelog, support policy, and behavior
-   documentation agree.
-4. Ubuntu 22.04 and 24.04 pass on Python 3.10 through 3.13. Native macOS 15
-   runners pass on Apple Silicon and Intel with Python 3.13 and Homebrew Bash.
-5. Bash syntax, ShellCheck, Ruff, Python syntax, type baseline, and branch
-   coverage pass.
-6. Local documentation links pass.
-7. The optional shpool patch applies to its pinned upstream tag and builds.
-8. Clean disposable Linux and at least one supported macOS account pass
-   preflight, install, doctor, picker, provider exit, exact reopen, close safety
-   display, update, rollback, and uninstall checks. Native CI covers every
-   architecture claimed by the release; the notes distinguish CI coverage from
-   real-device coverage.
-9. Unsupported operating systems, macOS versions, architectures, and service
-   models fail closed. macOS watchdog repair also refuses to run because it
-   requires Linux daemon-thread evidence.
-10. Journals and notifications default off.
-11. Normal logs contain no prompt, response, terminal, credential, or journal
-    content.
-12. Automatic cleanup begins only after its timer is enabled and then requires
-    72 continuous hours with every exact predicate unchanged.
-13. The public export includes every runtime, test, license, and documentation
-    file declared by the reviewed manifest.
-14. The release archive is reproducible and its checksum and provenance record
-    match the candidate commit.
-15. The public repository has no earlier or conflicting tag that changes the
-    declared first-release version. Private-source tags are not copied into the
-    public history.
-16. Every version reference that ships to a reader names the version being
-    released. Beta releases are GitHub prereleases, so `releases/latest` returns
-    404 and a documented download must name its tag. Check the `README.md`
-    install section and release link, and the CHANGELOG heading:
-
-    ```bash
-    grep -rn "v0\.[0-9]\+\.[0-9]\+" README.md CHANGELOG.md docs/*.md \
-      | grep -v CHANGELOG.md:
-    ```
-
-    Every hit outside the CHANGELOG's own version history must be the version
-    being released.
+1. Scan the public tree and its reachable history for secrets and private data.
+   No private account names, hostnames, UUIDs, transcripts, incident details,
+   credentials, or internal services may remain.
+2. Make the README, changelog, notices, security policy, voice contract, and
+   behavior documentation agree with the shipped code.
+3. Run Bash syntax and ShellCheck, Python syntax and type checks, Ruff, branch
+   coverage, documentation links, manifest coverage, and public-export tests.
+4. Test Ubuntu 22.04 and 24.04 with supported Python versions. Run native macOS
+   CI on Apple Silicon and Intel, and keep CI evidence distinct from real-device
+   acceptance.
+5. Apply all selected shpool patches to the pinned upstream commit, run its
+   workspace tests, build it, and record the patch set, toolchain, target, host,
+   command, and checksum.
+6. On clean disposable accounts, test preflight, install, doctor, both picker
+   screens, provider exit and exact reopen, close safety, display integration,
+   update, rollback, and uninstall.
+7. Confirm unsupported platforms and unsafe evidence fail closed. Journals,
+   notifications, automatic repair, and automatic close must remain off by
+   default.
+8. Confirm ordinary logs contain no prompt, response, terminal, credential, or
+   journal content. Automatic cleanup must still require 72 continuous hours
+   with every exact safety predicate unchanged after its timer is enabled.
+9. Confirm the export contains every file in the reviewed manifest, the release
+   archive is reproducible, and the checksum and provenance record name the
+   candidate commit.
+10. Search every shipped README and documentation directory, including nested
+    directories, for version strings. Reader-facing references must name
+    `v0.4.0`; the changelog may retain older release headings.
 
 ## Build a candidate
 
-Use a fresh clone at one exact commit:
+Use a clean clone at one full commit and keep that commit fixed. Run the
+repository's preflight and complete test suite, documentation-link checker, and
+private-data scanner. Those source-maintainer programs live under `tools/` and
+are intentionally absent from an installed machine.
 
-```bash
-git clone https://github.com/dob323/session-kit.git session-kit-candidate
-cd session-kit-candidate
-git checkout <full-candidate-commit>
-test -z "$(git status --short)"
-./install.sh --check
-tests/run
-tools/check-doc-links
-tools/public-scan . --git-history
-```
-
-The private source history may contain private operational context, so that
-command scans it for credentials without treating known private project names
-as a release failure. After the exported tree is committed in the public
-repository, run the strict gate there:
-
-```bash
-tools/public-scan . --git-history --private-markers
-```
-
-Do not publish a history that fails the strict gate. Rewriting a branch does
-not remove data from existing clones; investigate any credential match and
-rotate the credential before publication.
-
-Build the reviewed public tree and release artifact outside the source:
-
-```bash
-tools/build-public-tree \
-  --commit <full-candidate-commit> \
-  --destination ../session-kit-public
-tools/build-release-artifact \
-  --commit <full-candidate-commit> \
-  --output-dir ../session-kit-artifacts
-```
-
-Rebuild the artifact in another empty directory and compare the archive,
+Build the public tree into an empty directory outside the source worktree, then
+run the strict private-marker scan against the exported tree and its history.
+Build the release artifact from the same candidate commit into another empty
+directory. Repeat the artifact build elsewhere and compare the archive,
 checksum, and provenance bytes.
 
-Release metadata schema 1 is the pre-package layout. Schema 2 adds the package
-marker and common helpers. Schema 3 also requires lifecycle, provider, and
-private-state modules. Schema 4 adds provider project discovery and import.
-New builds emit schema 4; verification retains the bounded older schemas for
-installed rollback targets.
+The release manifest uses `schema_version` 1. The lifecycle metadata uses
+`lifecycle_schema_version` 2. Verification may understand older installed
+rollback targets, but a new release must emit those current values; do not
+describe internal package-layout generations as public schema versions.
 
 ## Acceptance
 
-The installer must not start or restart services. On macOS it creates inactive
-LaunchAgent templates only; the operator must run `session-kit services enable`
-while logged into the Mac desktop. Update and rollback must not reload services.
-Record process and daemon generations before and after each acceptance step.
+Install, update, and rollback perform a bounded service refresh. On Linux they
+reload user-unit definitions, may enable only a newly introduced timer with no
+prior enablement policy, and `try-restart` an already running watchdog. On
+macOS they kickstart an already loaded watchdog. They never restart shpool or
+the reaper. Record the selected release, service definitions, process
+generations, and daemon generation before and after each lifecycle step.
 
 Test at least:
 
-- fresh login and normal terminal fallback;
-- Claude Code and Codex reply alerts;
-- semantic color and no-color output;
-- IDs hidden on normal rows and present in detail, JSON, and explicit search;
-- provider exit leaving the managed terminal alive;
-- exact reopen without latest-directory fallback;
-- same-session move between two SSH windows;
-- `k <number>` exact-target display, promptless action, and cached-state
-  refusal;
-- 72-hour cleanup boundary after timer enablement, reset conditions, and
-  retained provider history;
-- update and rollback with detached sessions;
+- a normal shell login and an on-demand `kit` launch;
+- the key-driven picker and the managed-Bash TUI opt-in and fallback;
+- Claude Code and Codex attention, status, titles, semantic colors, and
+  no-color output;
+- IDs hidden on ordinary rows and available only in detail, JSON, and explicit
+  search;
+- provider exit leaving exact recoverable history, followed by one exact
+  reopen without a latest-directory fallback;
+- moving the same session between two terminals;
+- key-driven `k`, list, range, and `all` targeting, plus TUI typed marks and
+  the default Close action, all under frozen proof and cached-state refusal;
+- the 72-hour cleanup boundary, every reset condition, and retained provider
+  history;
+- update and rollback while sessions stay detached and recoverable;
 - uninstall retaining private data.
 
-For macOS, also test on at least one release-listed device with macOS 14 or
-newer, Python 3.11 or newer, Homebrew Bash 4 or newer, and official shpool
-0.11.0. Run native CI on every supported architecture and state which
-architectures had real-device acceptance:
-
-- the outer login may remain zsh while shpool starts the exact configured modern
-  Bash executable;
-- `kern.boottime` remains stable during acceptance, while fixture tests prove a
-  changed boot identity invalidates saved process generations without requiring
-  a release-device reboot;
-- list, picker, new, attach, takeover, resume, fork, naming, journals, reaper,
-  and manual prune use native Darwin process identity;
-- PID churn cannot satisfy a saved process generation, and `kern.boottime`
-  changes after a real reboot;
-- Claude Code and Codex preserve exact conversation identity and reply state;
-- an SSH disconnect and reconnect preserve the managed terminal while the GUI
-  user LaunchAgent domain is available;
-- service enable refuses an already reachable unmanaged shpool daemon;
-- service disable refuses while any shpool session remains and unloads the
-  watchdog and reaper before shpool;
-- the watchdog reports findings, and repair mode makes no change and fails with
-  the documented Linux-evidence error;
-- update, rollback, and uninstall preserve live sessions and private data.
-
-The native macOS CI jobs validate both architectures, the Darwin adapter, and
-fixture-based lifecycle and export behavior. They do not replace real shpool,
-provider, launchd, disconnect, or reboot acceptance on dedicated Macs. Release
-notes must name the exact operating system, architecture, shpool, Claude Code,
-Codex, Python, and Bash versions that passed that gate.
+For macOS, also test on a release-listed device with macOS 14 or newer, Python
+3.11 or newer, Homebrew Bash 4 or newer, and official shpool 0.11.0. Exercise
+native process generations, rapid PID churn, stable boot identity, inventory,
+both providers, SSH disconnect and reconnect, explicit service enable and safe
+disable, watchdog report mode, repair-mode refusal, and lifecycle changes with
+live sessions. Release notes must name the exact OS, architecture, provider,
+Python, Bash, and shpool versions used, and say which evidence came only from
+CI.
 
 ## Publish
 
-After every gate passes, publishing is ONE tool invocation — the manual
-six-step sequence this section used to describe is how the v0.2.0 tag and its
-artifact ended up built from different commits, and it must not come back:
+Add the date to the `0.4.0` changelog section and commit it before publishing.
+The source repository's release publisher is the only supported publication
+path; it is a maintainer tool and is intentionally omitted from the public
+export and installed tree.
 
-1. add the release date to `CHANGELOG.md` and commit;
-2. rehearse: `tools/publish-release --version vX.Y.Z --commit <C> --dry-run …`
-   (throwaway clones only; exercises every gate);
-3. run the same command without `--dry-run`: it exports commit C, creates the
-   public commit, tags it, builds the artifact from the same C, and proves
-   tag == archive == export byte-for-byte before printing the push and
-   `gh release create` commands (or run once with `--push`, which asks for a
-   typed yes — never both);
-4. verify the printed chain record (`session-kit-vX.Y.Z.chain.json`), then
-   links and downloads from a logged-out view.
+First rehearse against throwaway clones. The rehearsal must export the chosen
+commit, create the public commit and tag, build the artifact from that same
+commit, and prove tag, archive, and export agree byte for byte. Then run the
+same publication once for real, either printing the push and GitHub-release
+commands for review or using its guarded push mode, never both.
 
-The tool refuses dirty trees, unreachable commits, existing tags, version
-drift, scan failures, and every override under `--push`. If it refuses,
-fix the cause — do not fall back to manual tagging.
-
-Repository visibility and GitHub security settings are separate administrative
-changes. Perform them only after the final repository and history audit.
+Verify the generated chain record and inspect links and downloads from a
+logged-out view. The publisher must refuse a dirty tree, unreachable commit,
+existing tag, version drift, scan failure, or override during guarded push. Fix
+the refusal; do not fall back to manual tagging. Repository visibility and
+GitHub security settings remain separate administrative changes after the
+final repository and history audit.

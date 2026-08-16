@@ -8,9 +8,7 @@ if [[ $(uname -s 2>/dev/null) == Darwin && ${BASH_VERSINFO[0]} -lt 4 ]]; then
       exec "$modern_bash" "$0" "$@"
     fi
   done
-  printf '%s\n' 'session-kit: install Homebrew Bash, Python, Rust, and shpool first' >&2
-  printf '%s\n' '  brew install bash python rust' >&2
-  printf '%s\n' '  cargo install shpool --version 0.11.0 --locked' >&2
+  printf '%s\n' 'session-kit: macOS needs Homebrew Bash 4 or newer. Install it with: brew install bash python rust' >&2
   exit 69
 fi
 
@@ -33,6 +31,9 @@ case "$(uname -s 2>/dev/null || true)" in
     service_root=${SESSION_KIT_SERVICE_ROOT:-${SESSION_KIT_SYSTEMD_ROOT:-"${XDG_CONFIG_HOME:-"$HOME/.config"}/systemd/user"}}
     ;;
 esac
+# Session recordings. The kit writes nothing larger, and nothing ages them
+# out: they go when the session they belong to is closed or pruned.
+journal_dir=${SESSION_KIT_JOURNAL_DIR:-"${XDG_STATE_HOME:-"$HOME/.local/state"}/shpool-journal"}
 bashrc_path=${SESSION_KIT_BASHRC:-"$HOME/.bashrc"}
 # One completion file, installed under each command name that takes
 # arguments, in the directory bash-completion loads user files from. Set
@@ -44,21 +45,40 @@ bash_profile_path=${SESSION_KIT_BASH_PROFILE:-"$HOME/.bash_profile"}
 zshrc_path=${SESSION_KIT_ZSHRC:-"$HOME/.zshrc"}
 integration_marker=${SESSION_KIT_INTEGRATION_MARKER:-"$state_root/integration-ready-v1"}
 receipt_path=$state_root/install.json
+claude_statusline_backups=$state_root/claude-statusline-backups.json
+claude_integration_ledger=$state_root/claude-integration.json
 manager_link=$install_root/manager
 shpool_config=${XDG_CONFIG_HOME:-"$HOME/.config"}/shpool/config.toml
 login_start="# >>> session-kit managed integration >>>"
 login_end="# <<< session-kit managed integration <<<"
-helpers=(kit sp shpool_login shpool_status shpool_reaper codex_resume_here)
+helpers=(kit sp shpool_login shpool_login_tui shpool_login_launcher shpool_status shpool_reaper codex_resume_here)
 systemd_units=(
   shpool.service
   shpool.socket
   shpool-reaper.service
   shpool-reaper.timer
+  session-kit-subagent-sweep.service
+  session-kit-subagent-sweep.timer
+  session-kit-watchdog.service
+)
+# Long-running kit processes that hold their own code: bash keeps the inode it
+# exec'd, so one of these goes on running the release it started with until it
+# is restarted. Deliberately excludes shpool.service and shpool.socket --
+# restarting the session daemon ends every managed session.
+# Timers an update may enable when systemd has never heard of them. A new
+# timer that ships disabled is a rule that silently does not run.
+systemd_timer_units=(
+  session-kit-subagent-sweep.timer
+)
+systemd_restart_units=(
   session-kit-watchdog.service
 )
 launchd_units=(
   com.session-kit.shpool.plist
   com.session-kit.reaper.plist
+  com.session-kit.watchdog.plist
+)
+launchd_restart_units=(
   com.session-kit.watchdog.plist
 )
 launchd_template_root=$config_root/launchd
@@ -113,19 +133,29 @@ usage: session-kit <command> [arguments]
 
 Check and repair
   session-kit doctor [--json]      check every installed part and report
-  session-kit doctor --authority [--json] [--days N] [--session PROVIDER:UUID]
-                                   report the evidence behind source authority
   session-kit services <enable|disable|status>
                                    the user services: manager, reaper, watchdog
 
 Projects
   session-kit projects <discover|import|list>
                                    find, adopt, and show project shortcuts
-  session-kit projects add ALIAS <claude|codex|shell> /absolute/path
+  session-kit projects add [ALIAS] /absolute/path
+                                   one entry per directory; which provider
+                                   opens it is chosen when a session starts
+  session-kit projects default ALIAS <claude|codex|shell|any>
+                                   what it opens with unless you name another
+  session-kit projects normalize   fold a directory listed twice into one entry
   session-kit projects ignore /absolute/path
+  session-kit projects unignore /absolute/path
+  session-kit projects launch-plan [ALIAS]
+                                   what `sp new` would start there, and whether
+                                   its startup command is approved
+  session-kit projects approve-startup [ALIAS]
+                                   approve that project's startup command
+  session-kit projects check PATH  validate a session-kit.toml
 
 Releases
-  session-kit update [--source PATH] [--enable-login|--disable-login] [--journal on|off]
+  session-kit update [--source PATH] [--enable-login|--disable-login] [--journal on|off] [--force]
                                    install a newer release from a source tree
   session-kit rollback [--to COMMIT]
                                    return to a release already on this machine
@@ -139,15 +169,18 @@ Removal
 
 From a cloned repository:
   ./install.sh --check
-  ./install.sh [--enable-login|--disable-login] [--journal on|off]
+  ./install.sh [--enable-login|--disable-login] [--journal on|off] [--force]
                [--import-projects|--no-import-projects] [--non-interactive]
+
+The installer asks nothing. Login integration is on and history recording is
+off unless a flag says otherwise, and the install states what it chose.
 
 Day-to-day session commands are `sp`; run `sp help` for those, `sp help
 exit-codes` for the statuses every Session Kit command returns, and `sp help
 completion` for tab completion.
 
-Session Kit keeps transcripts, journals, and status data on this machine. It
-does not send telemetry. Uninstalling never deletes journals or archives.
+Session Kit keeps session history and status data on this machine. It does
+not send telemetry. Uninstalling never deletes history.
 EOF
 }
 
@@ -294,7 +327,7 @@ case "$command_name" in
   doctor) doctor_command "$@" ;;
   projects)
     [[ -L $install_root/current ]] || die "Session Kit is not installed"
-    projects_tool "$install_root/current" "$@"
+    projects_command "$@"
     ;;
   update) update_command "$@" ;;
   rollback) rollback_command "$@" ;;

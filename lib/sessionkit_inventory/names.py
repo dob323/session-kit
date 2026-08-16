@@ -38,6 +38,7 @@ from .common import (
 )
 from .providers_codex import _codex_state_databases
 from .state_io import StateLock, _read_bounded_owner_file, _state_paths
+from .transcripts import claude_roots
 
 
 def _alias_document_from_bytes(
@@ -491,6 +492,44 @@ def claim_automatic_name(
     return ""
 
 
+def release_automatic_name_claim(
+    config: Mapping[str, Any],
+    provider: str,
+    uuid: str,
+    *,
+    atomic_write_json: Callable[[Path, Any], None],
+    config_path: Callable[[], Path],
+    private_alias_document: Callable[..., dict[str, Any]],
+    private_alias_parent: Callable[[Path], None],
+) -> bool:
+    """Release an automatic claim that never produced a durable name."""
+    exact_uuid = valid_uuid(uuid)
+    if provider not in PROVIDERS or not exact_uuid:
+        return False
+    path = config_path()
+    paths = _state_paths(config)
+    key = f"{provider}:{exact_uuid}"
+    with StateLock(paths["root"], paths["config_lock"]):
+        with StateLock(paths["root"], paths["lock"]):
+            private_alias_parent(path)
+            document = private_alias_document(path, allow_missing=True)
+            owners = _valid_name_ownership(document.get("name_ownership"))
+            if (
+                owners.get(key, {}).get("owner") != "automatic"
+                or key in _valid_aliases(document.get("aliases"))
+                or key in _valid_automatic_titles(document.get("automatic_titles"))
+            ):
+                return False
+            owners.pop(key, None)
+            if owners:
+                document["name_ownership"] = dict(sorted(owners.items()))
+            else:
+                document.pop("name_ownership", None)
+            atomic_write_json(path, document)
+            verified = private_alias_document(path, allow_missing=False)
+            return not _name_owner(verified, key)
+
+
 def mutate_canonical_self_name(
     config: Mapping[str, Any],
     provider: str,
@@ -678,12 +717,15 @@ def prune_automatic_titles(
     exact_active_title_keys: Callable[[Mapping[str, Any]], set[str]],
     private_alias_document: Callable[..., dict[str, Any]],
     private_alias_parent: Callable[[Path], None],
+    revalidate_inventory: Callable[[], Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Apply only the exact orphan set previously exposed by a dry-run token."""
     path = config_path()
     paths = _state_paths(config)
     with StateLock(paths["root"], paths["config_lock"]):
         with StateLock(paths["root"], paths["lock"]):
+            if revalidate_inventory is not None:
+                inventory = revalidate_inventory()
             private_alias_parent(path)
             document = private_alias_document(path, allow_missing=True)
             titles = _valid_automatic_titles(document.get("automatic_titles"))
@@ -884,14 +926,21 @@ def _provider_title_retry_disposition(
         if not home_raw:
             return "defer"
         home = Path(home_raw)
-        try:
-            transcripts = [
-                path
-                for path in (home / ".claude" / "projects").glob(f"*/{uuid}.jsonl")
-                if path.is_file() and not path.is_symlink()
-            ]
-        except OSError:
-            return "defer"
+        # Every profile, not just the default root. An account session keeps
+        # its transcript under that account's profile, so this glob found
+        # nothing and answered "defer" on every pass: a title push that
+        # failed once was never retried for an account session, and its entry
+        # never left the retry ledger.
+        transcripts: list[Path] = []
+        for root in claude_roots({**environ, "HOME": home_raw}):
+            try:
+                transcripts.extend(
+                    path
+                    for path in (root / "projects").glob(f"*/{uuid}.jsonl")
+                    if path.is_file() and not path.is_symlink()
+                )
+            except OSError:
+                continue
         if not transcripts:
             return "defer"
         native = transcript_signals(uuid, home)["agent_name"]
@@ -1101,35 +1150,46 @@ def claude_pending_native_hydrations(
         uuid = valid_uuid(str((item.get("identity") or {}).get("uuid") or ""))
         if not uuid:
             continue
-        signals = transcript_signals(uuid, home)
         pushes: list[str] = []
         warnings: list[str] = []
-        # A /rename lands in agent-name, the same record the kit pushes to.
-        # Whatever is there now that the kit did not put there is a person's
-        # name for this conversation, and it wins for good.
-        adopted = adopt_native("claude", uuid, signals["agent_name"], environ=env)
-        if adopted:
-            hydrated.append({"uuid": uuid, "adopted_native_rename": adopted})
-            continue
-        title = signals["ai_title"]
-        # A session someone renamed keeps that name on its prompt bar. The
-        # provider's own ai-title is the automatic tier and never outranks it.
-        if (
-            naming_enabled
-            and f"claude:{uuid}" not in owned
-            and title
-            and not signals["agent_name"]
-            and item.get("native_title") == title
-            and item.get("provider_title_state") == "pending"
-        ):
-            result = propagate_title("claude", uuid, title, environ=env)
-            pushes.extend(result["provider_title_pushes"])
-            warnings.extend(result["provider_title_warnings"])
-        color = session_color("claude", uuid, colors)
-        if color and not signals["agent_color"]:
-            result = propagate_color("claude", uuid, color, environ=env)
-            pushes.extend(result["provider_color_pushes"])
-            warnings.extend(result["provider_color_warnings"])
+        # One session's file cannot cost every other session its colour and
+        # its name. This pass walks every live Claude session and its output
+        # is discarded by both callers (`bin/shpool_status`, `sp_core.sh`),
+        # so anything raised here used to end the pass in silence: from the
+        # first damaged transcript onward nobody got named or coloured and
+        # nothing anywhere said why. Each session is now its own blast
+        # radius, and the reason is carried out in the result.
+        try:
+            signals = transcript_signals(uuid, home)
+            # A /rename lands in agent-name, the same record the kit pushes
+            # to. Whatever is there now that the kit did not put there is a
+            # person's name for this conversation, and it wins for good.
+            adopted = adopt_native("claude", uuid, signals["agent_name"], environ=env)
+            if adopted:
+                hydrated.append({"uuid": uuid, "adopted_native_rename": adopted})
+                continue
+            title = signals["ai_title"]
+            # A session someone renamed keeps that name on its prompt bar. The
+            # provider's own ai-title is the automatic tier and never outranks
+            # it.
+            if (
+                naming_enabled
+                and f"claude:{uuid}" not in owned
+                and title
+                and not signals["agent_name"]
+                and item.get("native_title") == title
+                and item.get("provider_title_state") == "pending"
+            ):
+                result = propagate_title("claude", uuid, title, environ=env)
+                pushes.extend(result["provider_title_pushes"])
+                warnings.extend(result["provider_title_warnings"])
+            color = session_color("claude", uuid, colors)
+            if color and not signals["agent_color"]:
+                result = propagate_color("claude", uuid, color, environ=env)
+                pushes.extend(result["provider_color_pushes"])
+                warnings.extend(result["provider_color_warnings"])
+        except Exception as exc:  # noqa: BLE001 - one session, not the pass
+            warnings.append(f"{type(exc).__name__}: {exc}")
         if pushes or warnings:
             hydrated.append({"uuid": uuid, "pushes": pushes, "warnings": warnings})
     return hydrated

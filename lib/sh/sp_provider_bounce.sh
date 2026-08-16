@@ -12,6 +12,55 @@
 # Globals the entry script owns are assigned there, not here.
 # shellcheck disable=SC2154
 
+# The bounce marker, written whole or not written at all.
+#
+# The file has three readable states and each one means something different to
+# a different reader: absent is "no bounce", naming a conversation is "bounce
+# this one, nobody has yet", and EMPTY is the session shell's receipt that it
+# has taken the instruction and is relaunching. Collection removes a marker
+# only in that last state, because emptiness is the only one that proves the
+# bounce already happened.
+#
+# A plain `> file` redirect truncates before it writes, so it passes through
+# the empty state on its way to the full one. A collection landing in that
+# split second reads the receipt for a bounce nobody has performed, removes
+# the marker, and the shell later finds no instruction where it was told to
+# look -- it takes the ordinary provider exit and the session closes. A rename
+# has no such moment: the marker appears already complete.
+sk_write_bounce_marker() {
+  local id=$1 uuid=$2
+  local directory="$SK_STATE_DIR/provider-bounce"
+  local temporary reservation generation
+  ( umask 077; mkdir -p "$directory" ) 2>/dev/null || return 1
+  # Repairs a directory an older release created before the umask was right;
+  # a marker readable by anything else is state somebody else can forge.
+  chmod 700 "$directory" 2>/dev/null || true
+  # Created 0600 by mktemp, and dot-prefixed so it is never mistaken for a
+  # session ID; the marker sweep removes a stray one after the same grace it
+  # gives every other file here.
+  # The reservation remains for this session's lifetime. Therefore mktemp can
+  # never hand a later request the same receipt generation while any stale
+  # collector for this session can still be in flight.
+  reservation=$(mktemp \
+    "$directory/.generation.$id.taken.XXXXXXXXXXXX" 2>/dev/null) || return 1
+  generation=${reservation##*.}
+  temporary=$(mktemp "$directory/.$id.XXXXXXXXXXXX" 2>/dev/null) || {
+    command rm -f -- "$reservation" 2>/dev/null
+    return 1
+  }
+  # The third line names this request generation. The non-hex padding keeps
+  # that generation beyond the first 64 bytes, so provider shells already
+  # running the previous release still parse the UUID exactly and fall back to
+  # their safe legacy receipt name.
+  if ! printf '%s\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n%s\n' \
+       "$uuid" "$generation" > "$temporary" 2>/dev/null ||
+     ! mv -f -- "$temporary" "$directory/$id" 2>/dev/null; then
+    command rm -f -- "$temporary" "$reservation" 2>/dev/null
+    return 1
+  fi
+  return 0
+}
+
 # One safe provider bounce: a new-mode Codex booted before its thread title
 # existed, so its status bar shows the conversation ID forever. When the human
 # opens such a session and a title now exists, terminate the exact idle TUI —
@@ -24,8 +73,9 @@
 # the signal. App-server sessions keep the server and socket alive and restart
 # only their one generation-bound remote TUI.
 picker_bounce_codex() {
-  local id=$1 mode=${2:-automatic}
+  local id=$1 mode=${2:-automatic} reason=${3:-name}
   [[ $mode == automatic || $mode == explicit ]] || return 2
+  [[ $reason == name || $reason == color ]] || return 2
   [[ ${SK_PROOF_PROVIDER:-} == codex ]] || return 1
   local uuid=${SK_PROOF_UUID:-}
   [[ -n $uuid ]] || return 1
@@ -91,17 +141,34 @@ PY
   python3 "$INVENTORY_CORE" platform process-is \
     "$refresh_pid" "$refresh_start" codex \
     >/dev/null 2>&1 || return 1
-  # Only a real name is worth a restart: Codex seeds threads.title with the
-  # raw first prompt, and bouncing on that echo burns the one-shot restart
-  # before the true title exists. A refusal here leaves the untitled marker
-  # in place so a later reopen retries once the thread is really named.
-  local bounce_title
-  bounce_title=$(python3 "$INVENTORY_CORE" codex-bounce-title "$uuid" 2>/dev/null) || return 1
-  [[ -n $bounce_title ]] || return 1
-  ( umask 077
-    mkdir -p "$SK_STATE_DIR/provider-bounce" &&
-      printf '%s\n' "$uuid" > "$SK_STATE_DIR/provider-bounce/$id"
-  ) 2>/dev/null || return 1
+  # Only a real name is worth a restart FOR A NAME: Codex seeds threads.title
+  # with the raw first prompt, and bouncing on that echo burns the one-shot
+  # restart before the true title exists. A refusal here leaves the untitled
+  # marker in place so a later reopen retries once the thread is really named.
+  #
+  # A colour change is a different question with a different answer. The
+  # window's theme is chosen at launch from the conversation's stored colour,
+  # so a recolour needs a restart whether or not anybody has named the thread
+  # -- and requiring a title here left every unnamed session stuck showing the
+  # colour it picked for itself. The colour must exist, or the restart would
+  # change nothing; the name is irrelevant to it.
+  local bounce_title=""
+  if [[ $reason == color ]]; then
+    # The colour has to be one a restart can actually paint: Codex reads its
+    # theme from the command line the launcher builds, so the kit theme file
+    # for this colour must exist. `color effective` alone proves nothing --
+    # it falls back to a hash of the identity and succeeds for any uuid.
+    python3 "$INVENTORY_CORE" color bounce-ready codex "$uuid" >/dev/null 2>&1 || return 1
+    # Still mirror a real name into the session index when one exists, since
+    # the relaunched status bar reads only that; its absence never blocks the
+    # recolour, and whether one existed decides the marker below.
+    bounce_title=$(python3 "$INVENTORY_CORE" codex-bounce-title "$uuid" 2>/dev/null) ||
+      bounce_title=""
+  else
+    bounce_title=$(python3 "$INVENTORY_CORE" codex-bounce-title "$uuid" 2>/dev/null) || return 1
+    [[ -n $bounce_title ]] || return 1
+  fi
+  sk_write_bounce_marker "$id" "$uuid" || return 1
   # The decision above ran on a snapshot taken before the create lock was
   # released; re-prove idleness on FRESH state immediately before the TERM,
   # or a turn that started meanwhile gets killed mid-work.
@@ -142,6 +209,13 @@ if str(row.get("agent_status") or "").casefold() not in (
     "reply optional",
 ):
     raise SystemExit(1)
+# The same quiet test as the first pass, on fresh state. This recheck exists
+# to catch work that STARTED during the race window, and output arriving in
+# the last two minutes is exactly that evidence -- a status that still reads
+# idle while the window is printing is the case this refuses.
+age = row.get("recent_output_age_seconds")
+if isinstance(age, int) and not isinstance(age, bool) and age < 120:
+    raise SystemExit(1)
 raise SystemExit(0)
 PY
   then
@@ -156,7 +230,18 @@ PY
   fi
   command rm -f -- "$recheck"
   if kill -TERM "$refresh_pid" 2>/dev/null; then
-    command rm -f -- "$untitled"
+    # The marker is a one-shot: it is written when a window boots before its
+    # name exists, and every later remedy -- the automatic retry at reopen and
+    # the picker's "apply the pending title" action -- requires it. Spending it
+    # on a restart that applied no name would strand an unnamed session's
+    # status bar on its conversation ID for the rest of that window's life,
+    # with both remedies gone. Only a restart that carried a name clears it.
+    if [[ -n $bounce_title ]]; then
+      command rm -f -- "$untitled"
+    fi
+    # Whatever the reason, the window has restarted, so it has read the
+    # colour the kit holds. A pending recolour is no longer pending.
+    command rm -f -- "$SK_STATE_DIR/provider-recolor/$id"
     picker_action_event title_refresh provider_restarted
   else
     command rm -f -- "$SK_STATE_DIR/provider-bounce/$id"
@@ -173,8 +258,9 @@ PY
 # intent (exit 3 = the window already renamed live, so the marker is
 # dropped without any restart).
 picker_bounce_claude() {
-  local id=$1 mode=${2:-automatic}
+  local id=$1 mode=${2:-automatic} reason=${3:-name}
   [[ $mode == automatic || $mode == explicit ]] || return 2
+  [[ $reason == name || $reason == color ]] || return 2
   [[ ${SK_PROOF_PROVIDER:-} == claude ]] || return 1
   local uuid=${SK_PROOF_UUID:-}
   [[ -n $uuid ]] || return 1
@@ -222,19 +308,30 @@ PY
     "$pid" "$start" claude \
     >/dev/null 2>&1 || return 1
   local bounce_title bounce_rc
-  bounce_title=$(python3 "$INVENTORY_CORE" claude-bounce-title "$uuid" 2>/dev/null)
-  bounce_rc=$?
-  if (( bounce_rc == 3 )); then
-    # A real prompt followed the name intent, so the live window already
-    # carries the name; the pending-boot marker is stale, never the title.
-    command rm -f -- "$untitled"
-    return 1
+  if [[ $reason == color ]]; then
+    # A recolour is not a rename. Claude reads its colour from the transcript
+    # record at start or resume, so the restart is what applies it, and an
+    # unnamed session needs it exactly as much as a named one -- requiring a
+    # name intent here is what left unnamed sessions uncolourable. What must
+    # exist is the RECORD the resumed window will read: without it the restart
+    # costs the person their window and paints nothing.
+    python3 "$INVENTORY_CORE" color bounce-ready claude "$uuid" >/dev/null 2>&1 || return 1
+    # Whether this restart will also apply a name decides the marker below;
+    # it never blocks the recolour.
+    bounce_title=$(python3 "$INVENTORY_CORE" claude-bounce-title "$uuid" 2>/dev/null) ||
+      bounce_title=""
+  else
+    bounce_title=$(python3 "$INVENTORY_CORE" claude-bounce-title "$uuid" 2>/dev/null)
+    bounce_rc=$?
+    if (( bounce_rc == 3 )); then
+      # A real prompt followed the name intent, so the live window already
+      # carries the name; the pending-boot marker is stale, never the title.
+      command rm -f -- "$untitled"
+      return 1
+    fi
+    [[ $bounce_rc -eq 0 && -n $bounce_title ]] || return 1
   fi
-  [[ $bounce_rc -eq 0 && -n $bounce_title ]] || return 1
-  ( umask 077
-    mkdir -p "$SK_STATE_DIR/provider-bounce" &&
-      printf '%s\n' "$uuid" > "$SK_STATE_DIR/provider-bounce/$id"
-  ) 2>/dev/null || return 1
+  sk_write_bounce_marker "$id" "$uuid" || return 1
   local recheck
   recheck=$(mktemp "$SK_STATE_DIR/bounce-recheck.json.XXXXXX") || {
     command rm -f -- "$SK_STATE_DIR/provider-bounce/$id"
@@ -270,6 +367,13 @@ if str(row.get("agent_status") or "").casefold() not in (
     "reply optional",
 ):
     raise SystemExit(1)
+# The same quiet test as the first pass, on fresh state. This recheck exists
+# to catch work that STARTED during the race window, and output arriving in
+# the last two minutes is exactly that evidence -- a status that still reads
+# idle while the window is printing is the case this refuses.
+age = row.get("recent_output_age_seconds")
+if isinstance(age, int) and not isinstance(age, bool) and age < 120:
+    raise SystemExit(1)
 raise SystemExit(0)
 PY
   then
@@ -284,7 +388,14 @@ PY
   fi
   command rm -f -- "$recheck"
   if kill -TERM "$pid" 2>/dev/null; then
-    command rm -f -- "$untitled"
+    # Same one-shot rule as the Codex bounce: a restart that applied no name
+    # leaves the marker in place, so the pending-title remedies survive.
+    if [[ -n $bounce_title ]]; then
+      command rm -f -- "$untitled"
+    fi
+    # Whatever the reason, the window has restarted, so it has read the
+    # colour the kit holds. A pending recolour is no longer pending.
+    command rm -f -- "$SK_STATE_DIR/provider-recolor/$id"
     picker_action_event title_refresh provider_restarted
   else
     command rm -f -- "$SK_STATE_DIR/provider-bounce/$id"

@@ -16,6 +16,8 @@
 # remains usable even though that older entry script never assigned them.
 claude_settings=${claude_settings:-${SESSION_KIT_CLAUDE_SETTINGS:-${SESSION_KIT_CLAUDE_HOME:-"$HOME/.claude"}/settings.json}}
 codex_hooks=${codex_hooks:-${SESSION_KIT_CODEX_HOOKS:-${SESSION_KIT_CODEX_HOME:-${CODEX_HOME:-"$HOME/.codex"}}/hooks.json}}
+claude_statusline_backups=${claude_statusline_backups:-${SESSION_KIT_STATE_DIR:-${XDG_STATE_HOME:-"$HOME/.local/state"}/session-kit}/claude-statusline-backups.json}
+claude_integration_ledger=${claude_integration_ledger:-${SESSION_KIT_STATE_DIR:-${XDG_STATE_HOME:-"$HOME/.local/state"}/session-kit}/claude-integration.json}
 
 atomic_symlink() {
   local target=$1 destination=$2
@@ -57,8 +59,7 @@ import sys
 
 
 # One rule, applied wherever this file decides whether a provider directory may
-# be written through, and the same rule
-# lib/sessionkit_supervisor/provider_hooks.py applies: no other account may be
+# be written through: no other account may be
 # able to write it. A distribution that gives every account a private group and
 # a 002 umask leaves a provider's own config directory group-writable, which
 # exposes it to nobody, so that one shape is allowed. Every condition must hold
@@ -192,6 +193,7 @@ import json
 import os
 import pathlib
 import pwd
+import re
 import stat
 import sys
 import tempfile
@@ -200,8 +202,7 @@ import uuid
 
 
 # One rule, applied wherever this file decides whether a provider directory may
-# be written through, and the same rule
-# lib/sessionkit_supervisor/provider_hooks.py applies: no other account may be
+# be written through: no other account may be
 # able to write it. A distribution that gives every account a private group and
 # a 002 umask leaves a provider's own config directory group-writable, which
 # exposes it to nobody, so that one shape is allowed. Every condition must hold
@@ -269,6 +270,31 @@ def atomic_json(path, payload):
         except FileNotFoundError:
             pass
 
+def is_claude_settings(path):
+    home = pathlib.Path.home()
+    claude_root = pathlib.Path(
+        os.environ.get("SESSION_KIT_CLAUDE_HOME", home / ".claude")
+    )
+    default_settings = pathlib.Path(
+        os.environ.get(
+            "SESSION_KIT_CLAUDE_SETTINGS", claude_root / "settings.json"
+        )
+    )
+    if path == default_settings:
+        return True
+    accounts_root = pathlib.Path(
+        os.environ.get("XDG_DATA_HOME", home / ".local/share")
+    ) / "session-kit" / "accounts" / "claude"
+    try:
+        relative = path.relative_to(accounts_root)
+    except ValueError:
+        return False
+    return bool(
+        len(relative.parts) == 2
+        and relative.parts[1] == "settings.json"
+        and re.fullmatch(r"[A-Za-z0-9._-]+", relative.parts[0])
+    )
+
 def capture(path):
     try:
         info = path.lstat()
@@ -277,6 +303,11 @@ def capture(path):
     if stat.S_ISLNK(info.st_mode):
         return {"path": str(path), "kind": "symlink", "target": os.readlink(path)}
     if stat.S_ISREG(info.st_mode):
+        # Claude settings owned by another account are deliberately skipped by
+        # the integration writer. Do not read or later replace them merely to
+        # journal a transaction that cannot change them.
+        if info.st_uid != os.geteuid() and is_claude_settings(path):
+            return {"path": str(path), "kind": "untouched"}
         return {
             "path": str(path),
             "kind": "file",
@@ -287,6 +318,9 @@ def capture(path):
 
 def restore(entry):
     path = pathlib.Path(entry["path"])
+    kind = entry["kind"]
+    if kind == "untouched":
+        return
     try:
         info = path.lstat()
     except FileNotFoundError:
@@ -295,7 +329,6 @@ def restore(entry):
         raise SystemExit(f"session-kit: refusing incompatible transaction state: {path}")
     if info is not None:
         path.unlink()
-    kind = entry["kind"]
     if kind == "absent":
         return
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -356,9 +389,17 @@ elif operation == "recover":
         path = pathlib.Path(path_raw)
         if not path.is_absolute() or path.name != expected_name:
             raise SystemExit("session-kit: invalid recorded provider hook target")
-        current = pathlib.Path(path.anchor)
-        for part in path.parent.relative_to(current).parts:
-            current = current / part
+        home = pathlib.Path.home()
+        try:
+            relative = path.parent.relative_to(home)
+        except ValueError:
+            current = pathlib.Path(path.anchor)
+            relative = path.parent.relative_to(current)
+        else:
+            current = home
+        for part in (".", *relative.parts):
+            if part != ".":
+                current = current / part
             try:
                 ancestor = current.lstat()
             except FileNotFoundError:
@@ -386,7 +427,60 @@ elif operation == "recover":
             validate_recorded_config(possible_settings, "settings.json")
             validate_recorded_config(possible_hooks, "hooks.json")
             core_count += 2
-    theme_entries = entries[core_count:]
+    # Releases after provider-hook activation also transaction the two
+    # kit-owned Claude files and every enrolled Claude profile's settings.
+    # They are appended after themes so an older pending journal retains the
+    # exact prefix the recovery code above already understands.
+    trailing_entries = entries[core_count:]
+    claude_root = pathlib.Path(
+        os.environ.get("SESSION_KIT_CLAUDE_HOME", pathlib.Path.home() / ".claude")
+    )
+    accounts_root = pathlib.Path(
+        os.environ.get("XDG_DATA_HOME", pathlib.Path.home() / ".local/share")
+    ) / "session-kit" / "accounts" / "claude"
+
+    def recorded_claude_integration(path_raw):
+        path = pathlib.Path(path_raw)
+        state_root = pathlib.Path(os.environ.get(
+            "SESSION_KIT_STATE_DIR",
+            pathlib.Path(os.environ.get("XDG_STATE_HOME", pathlib.Path.home() / ".local/state")) / "session-kit",
+        ))
+        if path in {
+            state_root / "claude-statusline-backups.json",
+            state_root / "claude-integration.json",
+        }:
+            validate_recorded_config(path_raw, path.name)
+            return True
+        if path in {
+            claude_root / "hooks" / "nameintent_title.sh",
+            claude_root / "statusline.sh",
+        }:
+            validate_recorded_config(path_raw, path.name)
+            return True
+        try:
+            relative = path.relative_to(accounts_root)
+        except ValueError:
+            return False
+        if (
+            len(relative.parts) == 2
+            and relative.parts[1] == "settings.json"
+            and re.fullmatch(r"[A-Za-z0-9._-]+", relative.parts[0])
+        ):
+            validate_recorded_config(path_raw, "settings.json")
+            return True
+        return False
+
+    seen_integration = set()
+    while trailing_entries:
+        candidate = trailing_entries[-1]
+        candidate_path = candidate.get("path") if isinstance(candidate, dict) else None
+        if not isinstance(candidate_path, str) or not recorded_claude_integration(candidate_path):
+            break
+        if candidate_path in seen_integration:
+            raise SystemExit("session-kit: duplicate Claude integration transaction target")
+        seen_integration.add(candidate_path)
+        trailing_entries.pop()
+    theme_entries = trailing_entries
     expected_themes = [
         f"sk-{color}.tmTheme"
         for color in (
@@ -422,9 +516,17 @@ elif operation == "recover":
         ):
             raise SystemExit("session-kit: invalid recorded theme transaction targets")
         parent = next(iter(parents))
-        current = pathlib.Path(parent.anchor)
-        for part in parent.relative_to(current).parts:
-            current = current / part
+        home = pathlib.Path.home()
+        try:
+            relative = parent.relative_to(home)
+        except ValueError:
+            current = pathlib.Path(parent.anchor)
+            relative = parent.relative_to(current)
+        else:
+            current = home
+        for part in (".", *relative.parts):
+            if part != ".":
+                current = current / part
             try:
                 ancestor = current.lstat()
             except FileNotFoundError:
@@ -506,6 +608,29 @@ transaction_core_targets() {
 transaction_targets() {
   transaction_core_targets
   codex_theme_layout targets
+  claude_integration_targets
+}
+
+# Claude reads these files outside the kit's release and config roots. Record
+# every one before an install changes it, including the settings of already
+# enrolled account profiles. The default settings file is already a legacy
+# core target, so it is deliberately not repeated here.
+claude_integration_targets() {
+  local claude_root accounts_root account alias
+  claude_root=${SESSION_KIT_CLAUDE_HOME:-$HOME/.claude}
+  printf '%s\n' \
+    "$claude_root/hooks/nameintent_title.sh" \
+    "$claude_root/statusline.sh"
+  accounts_root=${XDG_DATA_HOME:-$HOME/.local/share}/session-kit/accounts/claude
+  if [[ -d $accounts_root && ! -L $accounts_root ]]; then
+    for account in "$accounts_root"/*; do
+      [[ -d $account && ! -L $account ]] || continue
+      alias=${account##*/}
+      [[ $alias =~ ^[A-Za-z0-9._-]+$ ]] || continue
+      printf '%s\n' "$account/settings.json"
+    done
+  fi
+  printf '%s\n' "$claude_statusline_backups" "$claude_integration_ledger"
 }
 
 begin_transaction() {
@@ -518,9 +643,6 @@ begin_transaction() {
   local -a targets=()
   mapfile -t targets < <(transaction_targets)
   lifecycle_transaction begin "$transaction_path" "$action" "${targets[@]}" "$@"
-  if [[ $action == uninstall ]]; then
-    configure_provider_hooks "" disable
-  fi
 }
 
 commit_transaction() {

@@ -19,7 +19,6 @@ why the fixture UUIDs below start with distinctive hex rather than zeros.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -27,9 +26,10 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
-from tests.support import REPO
+from tests.support import REPO, run
 
 
 CORE = REPO / "lib" / "session_inventory.py"
@@ -70,9 +70,6 @@ MACHINE_CHANNELS = {
     ),
     "bin/shpool_status": "--json, --strict-json, --guard-json, --lookup",
     "lib/session_inventory.py": "every JSON subcommand, including lookup",
-    "lib/sessionkit_supervisor/prompt_quarantine.py": (
-        "prompt-quarantine list --json returns captured picker selection keys"
-    ),
 }
 
 
@@ -109,6 +106,7 @@ def session(
     title: str,
     availability: str = "ready",
     status: str = "idle",
+    aged_children: list[dict] | None = None,
 ) -> dict:
     identity = (
         {
@@ -143,6 +141,7 @@ def session(
         "cwd": "/srv/project",
         "needs_you": status == "needs your reply",
         "subagents": [],
+        "aged_children": list(aged_children or ()),
         "setup_incomplete": False,
         "color": "blue",
         "display_color": "blue",
@@ -164,6 +163,18 @@ def fixture_inventory() -> dict:
                 uuid=CLAUDE_UUID,
                 shpool_id=CLAUDE_SHPOOL,
                 title="Fleet rebuild",
+                aged_children=[
+                    {
+                        "kind": "worker",
+                        "provider": "codex",
+                        "title": "Verifier",
+                        "age_seconds": 2 * 3600 + 11 * 60,
+                        # Machine evidence may remain in the snapshot; detail
+                        # renders only the safe title and age.
+                        "pid": 98765,
+                        "uuid": CODEX_UUID,
+                    }
+                ],
             ),
             session(
                 number=3,
@@ -207,18 +218,28 @@ class HumanOutputHasNoIdentifiersTests(unittest.TestCase):
         "detail_by_number",
         "detail_unknown",
         "waiting_count",
-        "queue_titles",
-        "msg_resolve_refusal",
         "recovery_manifest_display",
         "sp_usage",
         "status_usage",
         "sp_recover",
         "sp_prune",
         "sp_color_reconcile",
-        "picker_unread_replies",
-        "prompt_quarantine_list",
-        "picker_prompt_quarantine",
+        "picker_needs_you",
     )
+    SURFACE_TESTS = {
+        "render": "HumanOutputHasNoIdentifiersTests.test_the_dashboard_and_its_rows_name_sessions_without_identifiers",
+        "render_rows": "HumanOutputHasNoIdentifiersTests.test_the_dashboard_and_its_rows_name_sessions_without_identifiers",
+        "detail_by_number": "HumanOutputHasNoIdentifiersTests.test_detail_shows_a_person_everything_except_the_identifiers",
+        "detail_unknown": "HumanOutputHasNoIdentifiersTests.test_a_selector_that_matches_nothing_says_so_without_echoing_state",
+        "waiting_count": "HumanOutputHasNoIdentifiersTests.test_the_waiting_count_is_a_number",
+        "recovery_manifest_display": "HumanOutputHasNoIdentifiersTests.test_the_recovery_display_fields_carry_no_identifier",
+        "sp_usage": "HumanOutputHasNoIdentifiersTests.test_the_command_help_teaches_selectors_without_printing_one",
+        "status_usage": "HumanOutputHasNoIdentifiersTests.test_the_command_help_teaches_selectors_without_printing_one",
+        "sp_recover": "ShellRendererTests.test_the_recovery_list_names_conversations_not_identifiers",
+        "sp_prune": "ShellRendererTests.test_the_prune_candidate_list_names_candidates",
+        "sp_color_reconcile": "ShellRendererTests.test_color_reconcile_reports_counts_not_conversations",
+        "picker_needs_you": "HumanOutputHasNoIdentifiersTests.test_picker_needs_you_redacts_question_and_stall_identifiers",
+    }
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -240,42 +261,6 @@ class HumanOutputHasNoIdentifiersTests(unittest.TestCase):
         cls.shpool = base / "shpool"
         cls.shpool.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
         cls.shpool.chmod(0o755)
-        event_root = cls.state / "events"
-        event_root.mkdir(mode=0o700)
-        (event_root / f"claude:{CLAUDE_UUID}.jsonl").write_text(
-            "\n".join(
-                json.dumps(record, separators=(",", ":"))
-                for record in (
-                    {
-                        "event": "turn_done",
-                        "question": None,
-                        "source": "hook",
-                        "ts_unix_ms": 1_700_000_001_000,
-                    },
-                    {
-                        "event": "needs_input",
-                        "question": None,
-                        "source": "hook",
-                        "ts_unix_ms": 1_700_000_003_000,
-                    },
-                )
-            )
-            + "\n",
-            encoding="utf-8",
-        )
-        (event_root / f"codex:{CODEX_UUID}.jsonl").write_text(
-            json.dumps(
-                {
-                    "event": "needs_input",
-                    "question": None,
-                    "source": "synth",
-                    "ts_unix_ms": 1_700_000_002_000,
-                },
-                separators=(",", ":"),
-            )
-            + "\n",
-            encoding="utf-8",
-        )
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -328,14 +313,21 @@ class HumanOutputHasNoIdentifiersTests(unittest.TestCase):
         text = self._core("detail", "2")
         self._assert_clean("detail_by_number", text)
         self.assertIn("Fleet rebuild", text)
-        self.assertIn("claude", text)
-        self.assertIn("Last response", text)
+        self.assertIn("Claude", text)
         self.assertIn("Opened", text)
-        self.assertRegex(text, r"Last response\s+Nov 14, 2023 at")
+        self.assertIn("Verifier", text)
+        self.assertIn("2h 11m", text)
+        self.assertRegex(text, r"Opened\s+Nov 14, 2023 at")
+        # Last response and Waiting since came from the retired attention
+        # queue; a detail view now renders from the inventory row alone.
+        self.assertNotIn("Last response", text)
         self.assertNotIn("Waiting since", text)
         waiting = self._core("detail", "3")
         self._assert_clean("detail_waiting", waiting)
-        self.assertRegex(waiting, r"Waiting since\s+Nov 14, 2023 at")
+        # The collector records the provider's own words; the screen speaks
+        # the kit's one vocabulary.
+        self.assertIn("needs you", waiting)
+        self.assertNotIn("needs your reply", waiting)
         # `sp detail` used to be `lookup`, which is the machine mode and does
         # carry them. Prove the two are genuinely different surfaces.
         machine = self._core("lookup", "2")
@@ -348,30 +340,6 @@ class HumanOutputHasNoIdentifiersTests(unittest.TestCase):
 
     def test_the_waiting_count_is_a_number(self) -> None:
         self._assert_clean("waiting_count", self._core("waiting-count"))
-
-    def test_the_attention_queue_titles_never_fall_back_to_a_thread_key(
-        self,
-    ) -> None:
-        library = os.fspath(REPO / "lib")
-        if library not in sys.path:
-            sys.path.insert(0, library)
-        from sessionkit_events.queue import build_attention_queue
-
-        queue = build_attention_queue(
-            fixture_inventory(), self.state, now_ms=1_800_000_000_000
-        )
-        # thread_key is a machine field and is expected to hold the key; the
-        # human-readable fields are what this scan covers.
-        human = "\n".join(
-            str(item.get("title", "")) + " " + str(item.get("question") or "")
-            for item in queue["items"]
-        )
-        self._assert_clean("queue_titles", human)
-
-    def test_a_refused_message_target_names_no_session(self) -> None:
-        self._assert_clean(
-            "msg_resolve_refusal", self._core("msg", "resolve", "--target", "99")
-        )
 
     def test_the_recovery_display_fields_carry_no_identifier(self) -> None:
         library = os.fspath(REPO / "lib")
@@ -386,68 +354,6 @@ class HumanOutputHasNoIdentifiersTests(unittest.TestCase):
             for entry in manifest.get("sessions", {}).values()
         )
         self._assert_clean("recovery_manifest_display", human)
-
-    def test_the_pickers_unread_reply_rows_name_no_thread(self) -> None:
-        """The reply section renders from thread keys and must print none.
-
-        Covered end-to-end in tests.test_picker_message; this is the entry
-        that keeps the section inside the scan's registry, so it cannot be
-        rewritten later without someone answering for the identifiers.
-        """
-        source = (REPO / "lib" / "sh" / "shpool_login_render.sh").read_text(
-            encoding="utf-8"
-        )
-        start = source.index("picker_unread_reply_rows() {")
-        block = source[start : source.index("\nREPLIES\n", start)]
-        # The key is the join column and never a printed field: it may reach
-        # a path or a dict lookup, never a rendered line.
-        for rendered in ("index.append", "lines.append", "print("):
-            self.assertIn(rendered, block)
-        for line in block.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("lines.append") or stripped.startswith("print("):
-                self.assertNotIn("key", stripped, f"a thread key reaches: {stripped}")
-
-    def test_prompt_quarantine_human_surfaces_name_no_selection_key(self) -> None:
-        quarantine = self.state / "prompt-human-surface"
-        quarantine.mkdir(mode=0o700)
-        prompt = quarantine / f"{CODEX_UUID}.prompt.intake_pending"
-        prompt.write_text("fixture prompt\n", encoding="utf-8")
-        prompt.chmod(0o600)
-        environment = {
-            **os.environ,
-            "HOME": os.fspath(self.home),
-            "SESSION_KIT_START_DIR": os.fspath(quarantine),
-            "SESSION_KIT_SHPOOL_CMD": os.fspath(self.shpool),
-        }
-        completed = subprocess.run(
-            [os.fspath(SP), "prompt-quarantine", "list"],
-            env=environment,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
-        output = completed.stdout + completed.stderr
-        self._assert_clean("prompt_quarantine_list", output)
-        self.assertIn("Codex prompt intake pending", output)
-        self.assertNotIn(hashlib.sha256(prompt.name.encode()).hexdigest()[:12], output)
-
-        # The picker renderer accepts the captured machine key only into its
-        # private q-number index. Its printed row is built from a state/title
-        # whitelist and age. The end-to-end rendering and actions are covered
-        # by tests.test_login.
-        source = (REPO / "lib" / "sh" / "shpool_login_render.sh").read_text(
-            encoding="utf-8"
-        )
-        start = source.index("picker_prompt_quarantine_rows() {")
-        block = source[start : source.index("\nPY\n", start)]
-        self.assertIn('index.append(f"q{number}\\t{key}', block)
-        self.assertNotIn("lines.append(f\"{key}", block)
-        self._assert_clean(
-            "picker_prompt_quarantine",
-            "Needs You · prompt delivery\nq1 Codex prompt intake pending | 1m old",
-        )
 
     def test_the_command_help_teaches_selectors_without_printing_one(self) -> None:
         for surface, argv in (
@@ -465,6 +371,77 @@ class HumanOutputHasNoIdentifiersTests(unittest.TestCase):
                 )
                 self._assert_clean(surface, completed.stdout + completed.stderr)
 
+    def test_picker_needs_you_redacts_question_and_stall_identifiers(self) -> None:
+        """Drive the real PTY screen; a copied renderer cannot prove S7."""
+        from tests.test_login import LoginFixture, inventory, row, run_pty
+
+        first = row(SHELL_SHPOOL, number=1, provider="shell")
+        first["title"] = first["display_title"] = "Import monitor"
+        second = row("ordinary", number=2, provider="codex")
+        second["identity"]["uuid"] = CODEX_UUID
+        second["title"] = second["display_title"] = "Release monitor"
+        fixture = LoginFixture(inventory(first, second))
+        fleet = fixture.home / ".local" / "state" / "fleet"
+        inbox = fleet / "inbox"
+        inbox.mkdir(parents=True)
+        (inbox / "question.json").write_text(
+            json.dumps(
+                {
+                    "state": "open",
+                    "asked_at": time.time() - 300,
+                    "header": f"Decision for {CODEX_UUID[:8]}",
+                    "session": {"uuid": CLAUDE_UUID, "title": CLAUDE_UUID[:8]},
+                }
+            ),
+            encoding="utf-8",
+        )
+        (inbox / "ordinary-numbers.json").write_text(
+            json.dumps(
+                {
+                    "state": "open",
+                    "asked_at": time.time() - 120,
+                    "header": "Backfill 20260813 decaface",
+                    "session": {"uuid": "", "title": None},
+                }
+            ),
+            encoding="utf-8",
+        )
+        (fleet / "stalls.json").write_text(
+            json.dumps(
+                {
+                    "generated_at": time.time(),
+                    "stalled": [
+                        {
+                            "key": SHELL_SHPOOL,
+                            "reason": SHELL_UUID[:8],
+                            "since": time.time() - 600,
+                        },
+                        {
+                            "key": CODEX_UUID,
+                            "reason": "silent",
+                            "since": time.time() - 900,
+                        },
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        try:
+            code, output = run_pty(fixture, b"a\n\nq\n", columns=140)
+            self.assertEqual(0, code)
+            self._assert_clean("picker_needs_you", output)
+            self.assertIn("Question · Decision for", output)
+            self.assertIn("Question · Decision for Decision · a session", output)
+            self.assertIn("Question · Backfill 20260813 decaface · a session", output)
+            self.assertNotIn("· None ·", output)
+            self.assertIn(
+                "Stalled · Import monitor · Managed shell · attention overdue",
+                output,
+            )
+            self.assertIn("Stalled · Release monitor · Codex · response overdue", output)
+        finally:
+            fixture.close()
+
     def test_every_human_surface_is_registered(self) -> None:
         """A new human surface joins this scan or fails this test.
 
@@ -473,15 +450,15 @@ class HumanOutputHasNoIdentifiersTests(unittest.TestCase):
         `shpool_status` modes are the two doors a person comes through.
         """
         covered = set(self.SURFACES)
-        tested = {
-            name
-            for name in covered
-            if any(
-                f'"{name}"' in Path(__file__).read_text(encoding="utf-8")
-                for _ in (0,)
+        self.assertEqual(covered, set(self.SURFACE_TESTS))
+        for surface, qualified in self.SURFACE_TESTS.items():
+            class_name, method_name = qualified.split(".", 1)
+            owner = globals().get(class_name)
+            self.assertIsNotNone(owner, f"{surface}: missing test class {class_name}")
+            self.assertTrue(
+                hasattr(owner, method_name),
+                f"{surface}: missing test {qualified}",
             )
-        }
-        self.assertEqual(covered, tested)
 
         # The `sp` verbs that print to a person, and the mode each one is.
         sp_source = (REPO / "bin" / "sp").read_text(encoding="utf-8")
@@ -493,8 +470,6 @@ class HumanOutputHasNoIdentifiersTests(unittest.TestCase):
             "prune",
             "find",
             "history",
-            "msg",
-            "prompt-quarantine",
         }
         for verb in human_verbs:
             self.assertIn(f"  sp {verb}", sp_source, f"sp {verb} left the usage text")
@@ -508,6 +483,19 @@ class HumanOutputHasNoIdentifiersTests(unittest.TestCase):
         # that quietly drops one of these notes is itself a review event.
         for path in MACHINE_CHANNELS:
             self.assertTrue((REPO / path).is_file(), path)
+
+    def test_the_invariant_catches_an_injected_leaking_row(self) -> None:
+        """Prove the scanner fails, rather than only proving fixtures pass."""
+        original = self.snapshot.read_bytes()
+        leaking = fixture_inventory()
+        leaking["sessions"][0]["title"] = f"Leak {CLAUDE_UUID}"
+        leaking["sessions"][0]["display_title"] = f"Leak {CLAUDE_UUID}"
+        try:
+            self.snapshot.write_text(json.dumps(leaking), encoding="utf-8")
+            with self.assertRaises(AssertionError):
+                self._assert_clean("injected_leak", self._core("render"))
+        finally:
+            self.snapshot.write_bytes(original)
 
 
 class ShellRendererTests(unittest.TestCase):
@@ -547,37 +535,73 @@ class ShellRendererTests(unittest.TestCase):
         )
 
     def test_the_recovery_list_names_conversations_not_identifiers(self) -> None:
-        program = self._block("show_recovery() {")
-        with tempfile.NamedTemporaryFile(
-            "w", suffix=".json", delete=False, dir=REPO, prefix=".human-output-"
-        ) as handle:
-            json.dump(
-                {
-                    "sessions": {
-                        CLAUDE_SHPOOL: {
-                            "provider": "claude",
-                            "title": "Fleet rebuild",
-                            "uuid": CLAUDE_UUID,
-                        },
-                        CODEX_SHPOOL: {
-                            "provider": "codex",
-                            "title": "",
-                            "uuid": CODEX_UUID,
-                        },
-                    }
-                },
-                handle,
-            )
-            manifest = handle.name
+        """The closed list is a screen, so it is driven as one.
+
+        `sp recover` now merges two sources — the conversations somebody closed
+        on purpose and the ones a crash took — and the merge itself carries
+        identifiers so a restore can use them. What must never carry one is the
+        list a person reads, so the whole command is run and its output judged.
+        """
+        from tests.test_commands import CommandFixture
+
+        fixture = CommandFixture()
         try:
-            output = self._run(program, manifest)
+            manifest = fixture.state / "recovery-manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sessions": {
+                            CODEX_SHPOOL: {
+                                "provider": "codex",
+                                "title": "",
+                                "uuid": CODEX_UUID,
+                                "cwd": "/srv/project",
+                                "crashed_at_unix_ms": 1_000,
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            manifest.chmod(0o600)
+            # The ledger itself, not a stub: `sp recover` reads the one
+            # projection now, and that reads the file.
+            ledger = fixture.home / ".local" / "share" / "session-kit"
+            ledger.mkdir(parents=True, exist_ok=True)
+            (ledger / "closed-sessions.jsonl").write_text(
+                json.dumps(
+                    {
+                        "provider": "claude",
+                        "uuid": CLAUDE_UUID,
+                        "title": "Fleet rebuild",
+                        "title_source": "alias",
+                        "cwd": "/srv/project",
+                        "closed_at_unix_ms": 2_000,
+                        "origin": "human",
+                        "shpool_id": "",
+                        "account_alias": "",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            transcripts = fixture.home / ".claude" / "projects" / "-srv-project"
+            transcripts.mkdir(parents=True, exist_ok=True)
+            (transcripts / f"{CLAUDE_UUID}.jsonl").write_text(
+                '{"type":"user"}\n', encoding="utf-8"
+            )
+            env = fixture.env()
+            shown = run([SP, "recover"], env=env)
+            output = shown.stdout + shown.stderr
             self._assert_clean("sp_recover", output)
             self.assertIn("Fleet rebuild", output)
+            # A crashed session with no title is still named, never blank.
+            self.assertIn("Codex", output)
         finally:
-            Path(manifest).unlink()
+            fixture.close()
 
-    def test_the_prune_candidate_list_numbers_candidates(self) -> None:
-        program = self._block("printf 'Verified prune candidates:")
+    def test_the_prune_candidate_list_names_candidates(self) -> None:
+        program = self._block("printf 'Idle and empty for")
         with tempfile.NamedTemporaryFile(
             "w", suffix=".json", delete=False, dir=REPO, prefix=".human-output-"
         ) as handle:
@@ -595,13 +619,20 @@ class ShellRendererTests(unittest.TestCase):
             output = self._run(program, candidates)
             self._assert_clean("sp_prune", output)
             self.assertIn("Fleet rebuild", output)
-            self.assertIn(" 2 ", output)
+            # A candidate with no title is still named, never left blank.
+            self.assertIn("empty shell", output)
         finally:
             Path(candidates).unlink()
 
     def test_color_reconcile_reports_counts_not_conversations(self) -> None:
         text = self.SOURCE.read_text(encoding="utf-8")
-        start = text.index("printf '%s' \"$payload\" | python3 -c '")
+        # Anchor on the block that actually prints this summary. Another command
+        # gained an identically shaped `payload | python3 -c '` block ahead of
+        # this one, and searching from the top of the file then extracted that
+        # program instead -- which failed to compile and looked like a broken
+        # renderer rather than a test looking in the wrong place.
+        marker = text.index("Recolored")
+        start = text.rindex("printf '%s' \"$payload\" | python3 -c '", 0, marker)
         body_start = text.index("'", text.index("python3 -c '", start) + 11) + 1
         program = text[body_start : text.index("\n'\n", body_start)]
         output = self._run(
@@ -617,8 +648,9 @@ class ShellRendererTests(unittest.TestCase):
             ),
         )
         self._assert_clean("sp_color_reconcile", output)
-        self.assertIn("Recolored 1 exact claude session(s)", output)
-        self.assertIn("Recolored 1 exact codex session(s)", output)
+        self.assertIn("Recolored 1 Claude session: blue", output)
+        self.assertIn("Recolored 1 Codex session: lime", output)
+        self.assertNotIn("session(s)", output)
 
 
 class NoRevealFlagTests(unittest.TestCase):

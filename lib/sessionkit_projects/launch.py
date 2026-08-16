@@ -36,6 +36,8 @@ from .identity import Project, Resolver
 
 PROVIDERS = ("claude", "codex", "shell")
 DEFAULT_PROVIDER = "shell"
+# The shortcut kind of a project that keeps no default provider at all.
+ANY_PROVIDER = "any"
 APPROVAL_FILE = "startup-approvals.tsv"
 MAX_APPROVAL_BYTES = 256 * 1024
 
@@ -153,7 +155,17 @@ def launch_plan(
             provider, decisions["provider"] = str(value), "manifest"
     if provider is None and project.shortcut_provider in PROVIDERS:
         provider, decisions["provider"] = project.shortcut_provider, "shortcut"
-    if provider is None:
+    if provider is None and project.shortcut_provider == ANY_PROVIDER:
+        # The project is on the list with no default provider, so there is
+        # nothing to fall back to and nothing to guess: the caller names one
+        # when the session starts. Falling through to the default would open a
+        # shell in a directory the person asked to work in.
+        decisions["provider"] = "unset"
+        notes.append(
+            "this project has no default provider; name one when you start a "
+            "session in it"
+        )
+    elif provider is None:
         provider, decisions["provider"] = DEFAULT_PROVIDER, "default"
 
     account = None

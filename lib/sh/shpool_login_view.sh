@@ -24,25 +24,34 @@ picker_group_mode() {
 
 build_view() {
   local fresh
+  # A new list is a new count.
+  VIEW_ITEM_COUNT=
   new_temp login-view || return 1
   fresh=$NEW_TEMP
-  if ! python3 - "$SNAPSHOT" "$fresh" "$QUERY" "$(picker_group_mode)" \
-       "${SK_PROJECTS_FILE:-}" <<'PY'
+  if ! PYTHONPATH="$MODULE_DIR/..${PYTHONPATH:+:$PYTHONPATH}" \
+       python3 - "$SNAPSHOT" "$fresh" "$QUERY" "$(picker_group_mode)" \
+       "${SK_PROJECTS_FILE:-}" "${PICKER_MACHINE_EXPANDED:-0}" <<'PY'
 import json
 import os
 import re
 import sys
 import unicodedata
 
-source, destination, query, group_mode, projects_file = sys.argv[1:6]
+from sessionkit_inventory.model import (
+    canonical_session_order_key,
+    classify_top_level_sessions,
+    session_is_unavailable,
+)
+
+source, destination, query, group_mode, projects_file, expanded_text = sys.argv[1:7]
 with open(source, encoding="utf-8") as handle:
     data = json.load(handle)
 
 if group_mode not in {"state", "provider", "project"}:
     group_mode = "state"
 needle = query.casefold()
+machine_expanded = expanded_text == "1"
 provider_order = {"claude": 0, "codex": 1, "shell": 2, "unknown": 3}
-availability_order = {"ready": 0, "attached": 1}
 provider_titles = {
     "claude": "Claude",
     "codex": "Codex",
@@ -66,20 +75,20 @@ def matches(row):
         row.get("provider"),
         row.get("display_provider"),
         row.get("account_alias"),
+        row.get("model"),
         row.get("title"),
         row.get("display_title"),
         row.get("native_title"),
         row.get("cwd"),
         identity.get("uuid"),
         row.get("terminal_number"),
+        *(
+            child.get("title")
+            for child in (row.get("subagents") or [])
+            if isinstance(child, dict)
+        ),
     )
     return not needle or any(needle in str(value or "").casefold() for value in fields)
-
-def natural_id(value):
-    return tuple(
-        int(part) if part.isdigit() else part.casefold()
-        for part in re.split(r"([0-9]+)", str(value or ""))
-    )
 
 def load_project_roots(path):
     # projects.tsv is alias<TAB>provider<TAB>absolute path. Longest root first
@@ -138,41 +147,59 @@ def group_label(row):
     if group_mode == "project":
         return project_label(row)
     return (
-        "Ready to open"
+        "Ready"
         if row.get("availability") == "ready"
         else "Open elsewhere"
     )
 
 rows = []
-unavailable_total = 0
-for original in data.get("sessions", []):
+human_rows, expandable_machine_rows, orphan_subagents = classify_top_level_sessions(
+    data.get("sessions", [])
+)
+for item in orphan_subagents:
+    item["origin"] = "machine"
+    item["_picker_subagent_orphan"] = True
+all_machine_rows = expandable_machine_rows + orphan_subagents
+unavailable_total = sum(
+    session_is_unavailable(item)
+    for item in human_rows + all_machine_rows
+    if isinstance(item, dict)
+)
+machine_rows = [item for item in expandable_machine_rows if matches(item)]
+subagent_orphan_count = sum(matches(item) for item in orphan_subagents)
+visible_sources = human_rows + (
+    [item for item in expandable_machine_rows if matches(item)]
+    if machine_expanded
+    else []
+)
+for original in visible_sources:
     if not isinstance(original, dict):
         continue
-    number = original.get("terminal_number")
-    if (
-        isinstance(number, bool)
-        or not isinstance(number, int)
-        or number <= 0
-    ):
-        unavailable_total += 1
+    if session_is_unavailable(original):
         continue
+    number = original.get("terminal_number")
     if not matches(original):
         continue
     row = dict(original)
     row["_picker_group_label"] = group_label(row)
+    # How long this session has been waiting. The renderer has always known how
+    # to say it -- and the field it reads was never written by anything, so a
+    # row waiting two hours and a row waiting two minutes read identically and
+    # the only number on either was its creation date. The moment a waiting
+    # session went quiet IS the moment it started waiting, which is the last
+    # output it produced.
+    if row.get("needs_you"):
+        waiting_since = row.get("recent_output_at_unix_ms")
+        if (
+            isinstance(waiting_since, int)
+            and not isinstance(waiting_since, bool)
+            and waiting_since > 0
+        ):
+            row["_picker_waiting_since_unix_ms"] = waiting_since
     rows.append(row)
 
 def default_order(row):
-    return (
-        availability_order.get(row.get("availability"), 9),
-        not bool(row.get("needs_you")),
-        provider_order.get(
-            row.get("display_provider") or row.get("provider"), 9
-        ),
-        row.get("recent_output_at_unix_ms") is None,
-        -(row.get("recent_output_at_unix_ms") or 0),
-        natural_id(row.get("shpool_id_raw")),
-    )
+    return canonical_session_order_key(row)
 
 def grouped_order(row):
     # Grouping only decides which rows sit together. Inside every group the
@@ -194,6 +221,55 @@ def grouped_order(row):
         )
     return (0, default_order(row))
 
+# What needs the operator, computed from the WHOLE snapshot: a search is a
+# view control, and a session waiting on a person does not stop waiting
+# because the list is filtered to something else. A row whose shell generation
+# could not be proven has no number to act on, and it is the row most likely
+# to need attention -- it is listed as unavailable rather than dropped.
+attention = []
+for original in sorted(
+    (
+        item
+        for item in human_rows + all_machine_rows
+        if isinstance(item, dict)
+        and not session_is_unavailable(item)
+        and (
+            item.get("blocking_question")
+            or item.get("needs_you")
+            or item.get("setup_incomplete")
+        )
+    ),
+    key=default_order,
+):
+    number = original.get("terminal_number")
+    if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
+        number = 0
+    attention.append(
+        {
+            "number": number,
+            "uuid": str((original.get("identity") or {}).get("uuid") or ""),
+            "title": clean(
+                original.get("display_title") or original.get("title") or "a session",
+                60,
+            ),
+            "provider": provider_title(original),
+            "origin": "machine" if original.get("origin") == "machine" else "human",
+            "subagent_orphan": original.get("_picker_subagent_orphan") is True,
+            "state": (
+                "pending"
+                if original.get("setup_incomplete")
+                else "question"
+                if original.get("blocking_question")
+                else "needs you"
+            ),
+            "waiting_since_unix_ms": (
+                original.get("recent_output_at_unix_ms")
+                if original.get("needs_you")
+                else None
+            ),
+        }
+    )
+
 rows.sort(key=grouped_order)
 for row in rows:
     row["title"] = clean(row.get("title"), 120)
@@ -205,6 +281,9 @@ for row in rows:
     )
     row["native_title"] = clean(row.get("native_title"), 120)
     row["account_alias"] = clean(row.get("account_alias"), 20)
+    row["model"] = clean(row.get("model"), 80)
+    row["display_model"] = clean(row.get("display_model"), 80)
+    row["model_state"] = clean(row.get("model_state"), 40)
 
 outside = []
 for original in data.get("outside_agents", []):
@@ -230,12 +309,46 @@ outside.sort(
 projected = dict(data)
 projected["sessions"] = rows
 projected["outside_agents"] = outside
+stall_subjects = {}
+for original in human_rows:
+    identity = original.get("identity") or {}
+    subject = {
+        "title": clean(
+            original.get("display_title") or original.get("title") or "a session",
+            60,
+        ),
+        "provider": provider_title(original),
+    }
+    for key in {
+        str(identity.get("uuid") or ""),
+        str(original.get("shpool_id_raw") or ""),
+        str(original.get("shpool_id") or ""),
+    } - {""}:
+        stall_subjects[key] = subject
 projected["_picker"] = {
     "query": query,
     "group_mode": group_mode,
-    "source_total": len(data.get("sessions", [])),
+    "source_total": len(human_rows) + (
+        len(expandable_machine_rows) if machine_expanded else 0
+    ),
     "source_outside_total": len(data.get("outside_agents", [])),
     "unavailable_total": unavailable_total,
+    "attention": attention,
+    "stall_subjects": stall_subjects,
+    "machine_count": len(machine_rows),
+    "subagent_orphan_count": subagent_orphan_count,
+    "machine_expandable_count": sum(
+        matches(item) for item in expandable_machine_rows
+    ),
+    "machine_expanded": machine_expanded,
+    "machine_needs_you": sum(
+        bool(
+            item.get("blocking_question")
+            or item.get("needs_you")
+            or item.get("setup_incomplete")
+        )
+        for item in machine_rows
+    ),
 }
 with open(destination, "w", encoding="utf-8") as handle:
     json.dump(projected, handle, sort_keys=True, separators=(",", ":"))
@@ -274,9 +387,10 @@ total = len(rows)
 def page_lines(first, last, paged):
     selected = rows[first:min(last, len(rows))]
 
-    # Summary/search and stale notice. Attention and advanced counts stay on
-    # one line below the session list.
-    lines = 2 if picker.get("query") else 1
+    # Search and stale notice. The attention summary line that used to sit
+    # below the session list is gone (operator ruling, 2026-08-15), so nothing
+    # here reserves a row for it.
+    lines = 2 if picker.get("query") else (1 if rows else 0)
     if data.get("stale"):
         lines += 1
 
@@ -286,25 +400,33 @@ def page_lines(first, last, paged):
     previous_label = None
     for row in selected:
         label = row.get("_picker_group_label")
-        if row.get("_picker_supervisor_pin"):
-            lines += 1  # pinned heading
-            previous_label = None
-        elif not compact and label != previous_label:
+        if not compact and label != previous_label:
             lines += 1  # group heading
             previous_label = label
         lines += 1
 
-    if not selected:
+    if first == 0 and picker.get("machine_count"):
+        lines += 1
+
+    if not selected and (
+        picker.get("query")
+        or not isinstance(picker.get("machine_count"), int)
+        or picker.get("machine_count", 0) <= 0
+    ):
         lines += 1
     if paged:
         lines += 1
-    lines += banner_lines  # one attention cue and/or live warning
+    lines += banner_lines  # the live warning, when there is one
     # Spacer, compact footer, and input prompt. Compact mode drops the spacer.
     lines += 2 if compact else 3
     return lines
 
+# The row count is printed with the size: the next caller needs exactly this
+# number, and it used to start its own interpreter to count the same rows in
+# the same file.
 if total == 0:
     print(1)
+    print(0)
     raise SystemExit
 
 for size in range(total, 0, -1):
@@ -318,17 +440,52 @@ for size in range(total, 0, -1):
 else:
     # Very short terminals still get one item and can scroll safely.
     print(1)
+print(total)
 PY
 }
 
 view_item_count() {
+  # The count the last page sizing produced, when there has been one for this
+  # view. build_view clears it, so a stale number can never outlive the list it
+  # counted.
+  if [[ ${VIEW_ITEM_COUNT:-} =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$VIEW_ITEM_COUNT"
+    return 0
+  fi
   python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(len(d.get("sessions",[])))' "$VIEW"
 }
 
 page_count() {
   local total
   total=$(view_item_count)
+  [[ $total =~ ^[0-9]+$ ]] || total=0
   printf '%s\n' "$(( total == 0 ? 1 : (total + PAGE_SIZE - 1) / PAGE_SIZE ))"
+}
+
+view_index_for_number() {
+  local number=$1
+  [[ $number =~ ^[0-9]+$ ]] || return 1
+  python3 - "$VIEW" "$number" <<'PY'
+import json
+import sys
+
+path, wanted_text = sys.argv[1:3]
+wanted = int(wanted_text)
+with open(path, encoding="utf-8") as handle:
+    rows = json.load(handle).get("sessions", [])
+for index, row in enumerate(rows):
+    if isinstance(row, dict) and row.get("terminal_number") == wanted:
+        print(index)
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+page_for_number() {
+  local number=$1 index
+  [[ $PAGE_SIZE =~ ^[0-9]+$ && $PAGE_SIZE -ge 1 ]] || return 1
+  index=$(view_index_for_number "$number") || return 1
+  printf '%s\n' "$(( index / PAGE_SIZE + 1 ))"
 }
 
 clamp_page() {
@@ -356,6 +513,30 @@ for row in rows[first : first + page_size]:
     number = row.get("terminal_number")
     if isinstance(number, int) and not isinstance(number, bool) and number > 0:
         print(number)
+PY
+}
+
+# The terminal number of the top row of the page as it is currently sliced:
+# the row Enter opens and the number the footer names. One source for both, so
+# the promise and the action can never disagree. Empty view: status 1.
+first_number_on_page() {
+  python3 - "$VIEW" "$PAGE" "$PAGE_SIZE" <<'PY'
+import json
+import sys
+
+path, page_text, size_text = sys.argv[1:4]
+page, page_size = int(page_text), int(size_text)
+with open(path, encoding="utf-8") as handle:
+    data = json.load(handle)
+rows = data.get("sessions", [])
+if not rows:
+    raise SystemExit(1)
+pages = max(1, (len(rows) + page_size - 1) // page_size)
+page = min(max(page, 1), pages)
+number = rows[(page - 1) * page_size].get("terminal_number")
+if not isinstance(number, int):
+    raise SystemExit(1)
+print(number)
 PY
 }
 
@@ -404,7 +585,7 @@ PY
 
 require_live_actions() {
   view_is_live || {
-    echo "  Live session state is unavailable. Cached rows are read-only; refresh and try again."
+    echo "  Showing a cached list. Actions are off until it refreshes."
     echo "  Nothing changed."
     return 1
   }

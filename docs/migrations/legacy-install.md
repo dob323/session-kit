@@ -54,12 +54,15 @@ let it reach the public repository.
    --check`. It validates the platform, the required commands, the source
    provenance, and the lifecycle roots without writing anything, and it refuses
    a Git worktree with uncommitted or untracked files.
-5. Install the target release without activating it: `./install.sh
-   --non-interactive --no-import-projects` creates the immutable release,
-   selects it through `current`, installs the stable launchers, and writes
-   inactive service definitions. On a first install, non-interactive leaves the
-   shell integration and journals off unless their flags are supplied, and no
-   installation path starts a service.
+5. Install the target release with `./install.sh --non-interactive
+   --no-import-projects`. It creates the immutable release, selects it through
+   `current`, installs the stable launchers, and writes service definitions. On
+   Linux it reloads the user manager and may enable a newly introduced kit timer
+   when systemd has no prior decision for it; on macOS a first install leaves
+   LaunchAgents unloaded. An already-running watchdog is refreshed on either
+   platform. The shpool daemon is never restarted by this step. Non-interactive
+   installation leaves shell integration and journals off unless their flags
+   are supplied.
 6. Copy the mutable configuration and state once, from the frozen source.
    Verify the copied bytes, checksums, file types, modes, and owners before
    anything reads them as live.

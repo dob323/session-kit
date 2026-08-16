@@ -1,5 +1,5 @@
 [Unit]
-Description=Recover sessions whose terminal dies inside shpool
+Description=Session Kit — restore sessions whose terminal dies
 # The watchdog reads the daemon's log and inventory; it must not start before
 # the daemon exists, but it must not fail if the daemon is restarted either.
 Wants=shpool.service
@@ -7,6 +7,11 @@ After=shpool.service
 
 [Service]
 Type=simple
+# The same PATH the other kit services carry: a user manager's default PATH
+# has no ~/.cargo/bin or ~/.local/bin, so without this line the watchdog
+# cannot find shpool on a machine that installed it per-user and crash-loops
+# from the first start (found by the fresh-machine install proof).
+Environment=PATH=%h/.cargo/bin:%h/.local/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
 # Resolved through the `current` release link at exec time, so a restart always
 # picks up the active release. The stable-launcher whitelist covers only the
 # five original helpers; adding a sixth would mean re-bootstrapping, which is a

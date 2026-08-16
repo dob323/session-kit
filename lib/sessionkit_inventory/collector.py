@@ -26,19 +26,20 @@ from .common import (
     _valid_pushed_titles,
     automatic_naming_enabled,
     clean_text,
-    natural_name_key,
     proc_root as gated_proc_root,
     shpool_id_mutation_policy,
     valid_uuid,
 )
 from .model import (
+    SHELL_PROCESS_NAMES,
     _agent_identity,
     _base_agent,
     _empty_recovery,
     _shell_title,
+    canonical_session_order_key,
     recovery_spec,
 )
-from .processes import _children_index, _process_age
+from .processes import _children_index, _process_age, table_is_complete
 from .providers import _parse_shpool_payload
 from .providers_claude import _is_native_claude
 from .providers_codex import (
@@ -50,6 +51,375 @@ from .providers_codex import (
 
 PROVIDER_ORDER = {"claude": 0, "codex": 1, "shell": 2, "unknown": 3}
 AVAILABILITY_ORDER = {"ready": 0, "attached": 1}
+AGED_CHILD_SECONDS = 60 * 60
+
+
+def _aged_shell_children(
+    root_pid: int | None,
+    tree: Sequence[int],
+    process_table: Mapping[int, Mapping[str, Any]],
+    current_time: float,
+    ignored: frozenset[int],
+) -> list[dict[str, Any]]:
+    """Known child shells at least an hour old, from this census only.
+
+    The shpool root is the session shell and is intentionally excluded.  A
+    churned census may have unrelated holes, but every entry returned here is
+    positive evidence already present in the session's proven process tree.
+    """
+    if not root_pid:
+        return []
+    result: list[dict[str, Any]] = []
+    for pid in tree:
+        if pid == root_pid or pid in ignored:
+            continue
+        process = process_table.get(pid, {})
+        comm = clean_text(process.get("comm"), 80)
+        if comm.casefold() not in SHELL_PROCESS_NAMES:
+            continue
+        age = _process_age(pid, process_table, current_time)
+        if age is None or age < AGED_CHILD_SECONDS:
+            continue
+        result.append(
+            {
+                "kind": "shell",
+                "title": comm,
+                "age_seconds": age,
+            }
+        )
+    return result
+
+
+def _safe_worker_title(child: Mapping[str, Any], pid: int | None) -> str:
+    provider = clean_text(child.get("provider"), 20).casefold()
+    uuid = valid_uuid(child.get("uuid"))
+    fallbacks = {
+        fallback
+        for fallback in (
+            f"PID {pid}" if pid is not None else "",
+            uuid,
+            uuid[:8] if uuid else "",
+        )
+        if fallback
+    }
+    title = clean_text(child.get("title"), 120)
+    if not title or title in fallbacks:
+        return f"{provider.title()} worker" if provider in PROVIDERS else "Worker"
+    return title
+
+
+def _attach_aged_workers(
+    rows: Sequence[dict[str, Any]],
+    process_table: Mapping[int, Mapping[str, Any]],
+    current_time: float,
+) -> None:
+    """Add hour-old workers without changing subagent count or state.
+
+    A Codex spawn edge may be pid-less while the exact child also has its own
+    live session row.  That exact provider+UUID join may reuse the row's
+    process age; an edge with no matching live process remains ageless.
+    """
+    live_by_identity: dict[tuple[str, str], Mapping[str, Any]] = {}
+    for row in rows:
+        identity = row.get("identity")
+        if not isinstance(identity, Mapping):
+            continue
+        provider = clean_text(row.get("provider"), 20).casefold()
+        uuid = valid_uuid(identity.get("uuid"))
+        if provider in PROVIDERS and uuid:
+            live_by_identity[(provider, uuid)] = row
+
+    for row in rows:
+        existing = row.get("aged_children")
+        aged = (
+            [dict(item) for item in existing if isinstance(item, Mapping)]
+            if isinstance(existing, Sequence)
+            and not isinstance(existing, (str, bytes))
+            else []
+        )
+        seen: set[tuple[str, object]] = set()
+        subagents = row.get("subagents")
+        if isinstance(subagents, Sequence) and not isinstance(
+            subagents, (str, bytes)
+        ):
+            for raw_child in subagents:
+                if not isinstance(raw_child, Mapping):
+                    continue
+                raw_pid = raw_child.get("pid")
+                pid = (
+                    raw_pid
+                    if isinstance(raw_pid, int)
+                    and not isinstance(raw_pid, bool)
+                    and raw_pid > 0
+                    else None
+                )
+                provider = clean_text(raw_child.get("provider"), 20).casefold()
+                uuid = valid_uuid(raw_child.get("uuid"))
+                age = _process_age(pid, process_table, current_time) if pid else None
+                if age is None and provider in PROVIDERS and uuid:
+                    matched = live_by_identity.get((provider, uuid))
+                    matched_age = (
+                        matched.get("process_age_seconds") if matched else None
+                    )
+                    if (
+                        isinstance(matched_age, int)
+                        and not isinstance(matched_age, bool)
+                        and matched_age >= 0
+                    ):
+                        age = matched_age
+                if age is None or age < AGED_CHILD_SECONDS:
+                    continue
+                key: tuple[str, object]
+                if pid is not None:
+                    key = ("pid", pid)
+                elif provider in PROVIDERS and uuid:
+                    key = (provider, uuid)
+                else:
+                    continue
+                if key in seen:
+                    continue
+                seen.add(key)
+                aged.append(
+                    {
+                        "kind": "worker",
+                        "provider": provider if provider in PROVIDERS else "",
+                        "title": _safe_worker_title(raw_child, pid),
+                        "age_seconds": age,
+                    }
+                )
+        aged.sort(
+            key=lambda item: (
+                -int(item.get("age_seconds") or 0),
+                str(item.get("kind") or ""),
+                str(item.get("title") or "").casefold(),
+            )
+        )
+        row["aged_children"] = aged
+
+# Value-taking global options printed by the installed CLI's `codex help`.
+# Keep this synchronized with that grammar so option values cannot be mistaken
+# for the first positional (the subcommand, when one is present).
+CODEX_GLOBAL_OPTIONS_WITH_VALUES = frozenset(
+    {
+        "-c",
+        "--config",
+        "--enable",
+        "--disable",
+        "--remote",
+        "--remote-auth-token-env",
+        "-i",
+        "--image",
+        "-m",
+        "--model",
+        "--local-provider",
+        "-p",
+        "--profile",
+        "-s",
+        "--sandbox",
+        "-C",
+        "--cd",
+        "--add-dir",
+        "-a",
+        "--ask-for-approval",
+    }
+)
+CODEX_GLOBAL_FLAG_OPTIONS = frozenset(
+    {
+        "--strict-config",
+        "--oss",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--dangerously-bypass-hook-trust",
+        "--search",
+        "--no-alt-screen",
+        "-h",
+        "--help",
+        "-V",
+        "--version",
+    }
+)
+CODEX_VARIADIC_GLOBAL_OPTIONS = frozenset({"-i", "--image"})
+# Subcommands that mean no person converses with this Codex: a headless run,
+# a non-interactive review, or the stdio MCP server. From the installed CLI's
+# own `codex help` (0.145). Anything not PROVEN machine stays out -- misreading
+# a person's session as machine would hide it, which is the worse direction --
+# so management/utility verbs (login, mcp, remote-control, sandbox, resume,
+# ...) are deliberately absent. ``app-server`` is deliberately absent too: it
+# is the kit's OWN plumbing for every managed Codex session, human windows
+# included (X17 -- listing it here hid two real sessions). Whether an
+# app-server session is machine-driven is a question about its DRIVER, not
+# its argv, and needs driver evidence, not this list.
+CODEX_MACHINE_SUBCOMMANDS = frozenset({"exec", "review", "mcp-server"})
+# The npm wrapper starts Codex as `node .../bin/codex ...`: argv[0] is node
+# and the real grammar begins at argv[1]. Resolve only that exact, confident
+# shape -- anything else keeps the wrapper-blind reading and errs visible.
+_CODEX_WRAPPER_INTERPRETERS = frozenset({"node", "nodejs"})
+# The App Server is a socket, and the question X16 asked about it is who holds
+# that socket. The kit starts one for EVERY managed Codex session, so its argv
+# separates nothing (X17: reading `app-server` as machine hid two of the operator's own
+# windows). The client on the other end does separate them: a person's window
+# is a Codex TUI attached to that exact socket with `--remote`, and a worker
+# nobody types into has only the coordination broker the kit starts with
+# `--socket <same path>`. Both are positive readings. Everything else -- no
+# client, an argv that will not parse, a server younger than the window that
+# follows it -- is not evidence, and an absence of evidence keeps the row in
+# the person's list.
+CODEX_APP_SERVER_SUBCOMMAND = "app-server"
+# The managed login shell starts the server, the broker, and then the window,
+# in that order and within the same second. Under this age "no window yet" is
+# a session still booting, not a verdict about who drives it.
+CODEX_APP_SERVER_WINDOW_GRACE_SECONDS = 60
+
+
+def _codex_effective_argv(exact_argv: Sequence[Any]) -> Sequence[Any]:
+    if (
+        len(exact_argv) >= 2
+        and isinstance(exact_argv[0], str)
+        and isinstance(exact_argv[1], str)
+        and Path(exact_argv[0]).name in _CODEX_WRAPPER_INTERPRETERS
+        and Path(exact_argv[1]).name == "codex"
+    ):
+        return exact_argv[1:]
+    return exact_argv
+
+
+def _codex_first_positional(exact_argv: Sequence[Any]) -> str | None:
+    """Return Codex's first confidently parsed positional, if there is one.
+
+    Unknown separate-form options and malformed argv are deliberately
+    ambiguous.  Callers must keep those sessions visible rather than risk
+    hiding an interactive root.
+    """
+    exact_argv = _codex_effective_argv(exact_argv)
+    index = 1
+    while index < len(exact_argv):
+        argument = exact_argv[index]
+        if not isinstance(argument, str) or not argument:
+            return None
+        if not argument.startswith("-"):
+            return argument
+        if "=" in argument:
+            index += 1
+            continue
+        if argument in CODEX_GLOBAL_OPTIONS_WITH_VALUES:
+            if index + 1 >= len(exact_argv):
+                return None
+            value = exact_argv[index + 1]
+            if (
+                not isinstance(value, str)
+                or not value
+                or value.startswith("-")
+            ):
+                return None
+            index += 2
+            if argument in CODEX_VARIADIC_GLOBAL_OPTIONS:
+                while index < len(exact_argv):
+                    value = exact_argv[index]
+                    if not isinstance(value, str) or not value:
+                        return None
+                    if value.startswith("-"):
+                        break
+                    index += 1
+            continue
+        if argument in CODEX_GLOBAL_FLAG_OPTIONS:
+            index += 1
+            continue
+        return None
+    return None
+
+
+def _unix_endpoint_path(value: Any) -> str:
+    """The filesystem path an endpoint names, with or without the scheme.
+
+    The server is told `unix:///run/x/app.sock` and the broker is told the
+    bare path, so the two only compare after the scheme comes off.
+    """
+    if not isinstance(value, str) or not value:
+        return ""
+    return value[len("unix://") :] if value.startswith("unix://") else value
+
+
+def _option_value(argv: Sequence[Any], option: str) -> str:
+    """Read one option's value in either the separate or the joined form."""
+    joined = f"{option}="
+    for index, argument in enumerate(argv):
+        if not isinstance(argument, str):
+            continue
+        if argument == option:
+            value = argv[index + 1] if index + 1 < len(argv) else ""
+            return value if isinstance(value, str) else ""
+        if argument.startswith(joined):
+            return argument[len(joined) :]
+    return ""
+
+
+def _codex_app_server_driver(
+    provider_pid: Any,
+    exact_argv: Sequence[Any],
+    tree: Iterable[int],
+    process_table: Mapping[int, Mapping[str, Any]],
+    server_age_seconds: Any,
+) -> str:
+    """Who holds this Codex App Server's socket: a person, a program, nobody.
+
+    Answers "person", "program", or "unknown", reading only the managed
+    shell's own process tree.  Only "program" is a machine verdict; every
+    uncertain reading answers "unknown" and leaves the row visible, which is
+    the direction X17 proved is the safe one to be wrong in.
+
+    "Program" is reached by NOT finding a window, so it is only ever as good
+    as the reading of the tree. A process whose argv the scan could not take
+    -- denied, or gone by the time it was asked -- may BE the window, and a
+    broker beside a missed window is observationally identical to a broker
+    with no window at all. So a tree with a hole in it proves nothing about
+    absence and answers "unknown". Finding the window still answers "person":
+    a positive reading is not weakened by a hole elsewhere.
+    """
+    if _codex_first_positional(exact_argv) != CODEX_APP_SERVER_SUBCOMMAND:
+        return "unknown"
+    socket = _unix_endpoint_path(
+        _option_value(_codex_effective_argv(exact_argv), "--listen")
+    )
+    if not socket:
+        return "unknown"
+    program = False
+    complete = True
+    for pid in tree:
+        if pid == provider_pid:
+            continue
+        process = process_table.get(pid)
+        argv = process.get("cmdline") if isinstance(process, Mapping) else None
+        if (
+            not isinstance(process, Mapping)
+            or process.get("argv_unreadable") is True
+            or not isinstance(argv, Sequence)
+            or isinstance(argv, (str, bytes))
+        ):
+            complete = False
+            continue
+        argv = list(argv)
+        # A window attached to this exact server is a person, whether the npm
+        # wrapper or the vendored binary is the one carrying the argument.
+        if _unix_endpoint_path(_option_value(argv, "--remote")) == socket:
+            return "person"
+        if _unix_endpoint_path(_option_value(argv, "--socket")) == socket:
+            program = True
+    if not program:
+        # A server with no client at all has not been driven by anybody yet.
+        return "unknown"
+    if not complete or not table_is_complete(process_table):
+        # Something went unread. The window is the thing whose absence is
+        # being claimed, so one unread process is enough to withdraw the
+        # claim -- and a process the scan lost before it could read a parent
+        # is not even attributable to a tree, so a hole anywhere on the
+        # machine could be the window that belongs to THIS one.
+        return "unknown"
+    if (
+        isinstance(server_age_seconds, bool)
+        or not isinstance(server_age_seconds, int)
+        or server_age_seconds < CODEX_APP_SERVER_WINDOW_GRACE_SECONDS
+    ):
+        return "unknown"
+    return "program"
 
 
 def _provider_profile_path(raw: Any, fallback: Path) -> Path | None:
@@ -343,7 +713,7 @@ def apply_retained_setup_attributions(
                 continue
             item["display_provider"] = provider
             item["setup_incomplete"] = True
-            item["display_title"] = f"{provider.title()} setup incomplete"
+            item["display_title"] = f"{provider.title()} pending"
             if uuid and launch_mode == "resume":
                 item["_terminal_identity_hint"] = {
                     "provider": provider,
@@ -352,6 +722,144 @@ def apply_retained_setup_attributions(
     finally:
         os.close(directory_fd)
     return inventory
+
+
+def _census_chain(
+    process_table: Mapping[int, Mapping[str, Any]],
+    children: Mapping[int, Sequence[int]] | None = None,
+) -> frozenset[int]:
+    """This process, what spawned it, and what it spawned.
+
+    The census can run inside the very shell it is titling; its own chain
+    must never count as that session's running program. Its own children are
+    the same thing one step further out: a collection verb that shells out to
+    a helper would otherwise report that helper as the session's work for as
+    long as it runs."""
+    chain: set[int] = set()
+    pid = os.getpid()
+    for _ in range(64):
+        if pid in chain or pid <= 1:
+            break
+        chain.add(pid)
+        parent = process_table.get(pid, {}).get("ppid")
+        if not isinstance(parent, int):
+            break
+        pid = parent
+    if children is not None:
+        pending = [os.getpid()]
+        while pending:
+            current = pending.pop()
+            for child in children.get(current, ()):  # type: ignore[arg-type]
+                if child not in chain:
+                    chain.add(child)
+                    pending.append(child)
+    return frozenset(chain)
+
+
+ProviderClaim = tuple[str, int, str]
+
+
+def _proven_ancestor(
+    ancestor_pid: int,
+    descendant_pid: int,
+    process_table: Mapping[int, Mapping[str, Any]],
+) -> bool:
+    """Prove one same-snapshot process lineage without trusting a bare PID.
+
+    Every link must carry a readable generation, and a parent cannot have
+    started after its alleged child.  That last check closes the snapshot race
+    where an exited parent PID is recycled after the child row was read.
+    """
+    current_pid = descendant_pid
+    seen: set[int] = set()
+    for _ in range(128):
+        if current_pid in seen or current_pid <= 0:
+            return False
+        current = process_table.get(current_pid)
+        if not isinstance(current, Mapping):
+            return False
+        recorded_pid = current.get("pid", current_pid)
+        current_start = current.get("start_ticks")
+        if (
+            isinstance(recorded_pid, bool)
+            or recorded_pid != current_pid
+            or isinstance(current_start, bool)
+            or not isinstance(current_start, int)
+            or current_start <= 0
+        ):
+            return False
+        if current_pid == ancestor_pid:
+            return True
+        if current.get("argv_unreadable") is True:
+            return False
+        parent_pid = current.get("ppid")
+        if (
+            isinstance(parent_pid, bool)
+            or not isinstance(parent_pid, int)
+            or parent_pid <= 0
+        ):
+            return False
+        parent = process_table.get(parent_pid)
+        if not isinstance(parent, Mapping):
+            return False
+        parent_recorded_pid = parent.get("pid", parent_pid)
+        parent_start = parent.get("start_ticks")
+        if (
+            isinstance(parent_recorded_pid, bool)
+            or parent_recorded_pid != parent_pid
+            or isinstance(parent_start, bool)
+            or not isinstance(parent_start, int)
+            or parent_start <= 0
+            or parent_start > current_start
+            or parent.get("argv_unreadable") is True
+        ):
+            return False
+        seen.add(current_pid)
+        current_pid = parent_pid
+    return False
+
+
+def _lineage_owner(
+    root_pid: int | None,
+    claims: Sequence[ProviderClaim],
+    process_table: Mapping[int, Mapping[str, Any]],
+) -> tuple[ProviderClaim, list[ProviderClaim]] | None:
+    """Choose an exact owner only when all rival-looking claims are workers."""
+    if not isinstance(root_pid, int) or not claims:
+        return None
+    if len(claims) == 1:
+        # A sole claim inside this session's own subtree is the answer, not an
+        # adjudication among rivals. Requiring a hole-free whole-machine census
+        # before returning it let any unrelated process dying mid-scan
+        # unresolve every session on the board at once.
+        return claims[0], []
+    if not table_is_complete(process_table):
+        return None
+    if any(
+        not _proven_ancestor(root_pid, candidate_pid, process_table)
+        for _, candidate_pid, _ in claims
+    ):
+        return None
+    roots = [
+        claim
+        for claim in claims
+        if not any(
+            other_pid != claim[1]
+            and _proven_ancestor(other_pid, claim[1], process_table)
+            for _, other_pid, _ in claims
+        )
+    ]
+    if len(roots) != 1:
+        return None
+    owner = roots[0]
+    workers = [claim for claim in claims if claim != owner]
+    if not all(
+        worker_pid != owner[1]
+        and _proven_ancestor(owner[1], worker_pid, process_table)
+        for _, worker_pid, _ in workers
+    ):
+        return None
+    return owner, workers
 
 
 def build_inventory(
@@ -417,6 +925,30 @@ def build_inventory(
         codex_default_home = ""
         codex_profile_rows = {}
 
+    codex_parent_by_child: dict[str, set[str]] = {}
+
+    def remember_codex_edges(edges: Mapping[str, Any]) -> None:
+        for raw_parent, raw_children in edges.items():
+            parent = valid_uuid(raw_parent)
+            if not parent or not isinstance(raw_children, Sequence):
+                continue
+            for child in raw_children:
+                if not isinstance(child, Mapping):
+                    continue
+                child_uuid = valid_uuid(child.get("uuid"))
+                if child_uuid:
+                    codex_parent_by_child.setdefault(child_uuid, set()).add(parent)
+
+    remember_codex_edges(codex_edges)
+    for profile_rows in codex_profile_rows.values():
+        if (
+            isinstance(profile_rows, Sequence)
+            and not isinstance(profile_rows, (str, bytes))
+            and len(profile_rows) >= 2
+            and isinstance(profile_rows[1], Mapping)
+        ):
+            remember_codex_edges(profile_rows[1])
+
     def codex_rows_for_pid(
         candidate_pid: int,
     ) -> tuple[Mapping[str, Mapping[str, Any]], Mapping[str, Sequence[dict[str, Any]]]]:
@@ -443,6 +975,7 @@ def build_inventory(
         (item["name"] for item in shpool_sessions), process_table
     )
     child_index = _children_index(process_table)
+    own_processes = _census_chain(process_table, child_index)
     recent_outputs = recent_output_by_shpool_id or {}
     mapped_claude: set[int] = set()
     mapped_codex: set[int] = set()
@@ -485,6 +1018,88 @@ def build_inventory(
             ):
                 codex_candidates.append((candidate_pid, candidate_uuid))
         codex_candidates = sorted(set(codex_candidates))
+        provider_claims: list[ProviderClaim] = [
+            ("claude-agent", candidate_pid, claude_by_pid[candidate_pid]["uuid"])
+            for candidate_pid in claude_candidates
+        ]
+        provider_claims.extend(
+            ("claude-native", candidate_pid, candidate_uuid)
+            for candidate_pid, candidate_uuid in native_claude_candidates
+        )
+        provider_claims.extend(
+            ("codex", candidate_pid, candidate_uuid)
+            for candidate_pid, candidate_uuid in codex_candidates
+        )
+        lineage = _lineage_owner(root_pid, provider_claims, process_table)
+        owner_claim = lineage[0] if lineage else None
+        worker_claims = lineage[1] if lineage else []
+
+        lineage_subagents: list[dict[str, Any]] = []
+        for worker_kind, worker_pid, worker_uuid in worker_claims:
+            if worker_kind == "codex":
+                worker_threads, _ = codex_rows_for_pid(worker_pid)
+                worker_thread = worker_threads.get(worker_uuid, {})
+                worker_title = clean_text(
+                    worker_thread.get("session_index_name")
+                    or worker_thread.get("name")
+                    or worker_thread.get("title"),
+                    120,
+                ) or f"PID {worker_pid}"
+                worker_status = _codex_turn_state(
+                    codex_index.get(worker_pid, ()), worker_uuid
+                )
+                mapped_codex.add(worker_pid)
+            elif worker_kind == "claude-agent":
+                worker_agent = claude_by_pid[worker_pid]
+                worker_title = clean_text(
+                    worker_agent.get("agent_name") or worker_agent.get("title"),
+                    120,
+                ) or f"PID {worker_pid}"
+                worker_status = clean_text(worker_agent.get("status"), 60) or "unknown"
+                mapped_claude.add(worker_pid)
+            else:
+                worker_title = "Claude worker"
+                worker_status = "running"
+            lineage_subagents.append(
+                {
+                    "provider": (
+                        "codex" if worker_kind == "codex" else "claude"
+                    ),
+                    "uuid": worker_uuid,
+                    "pid": worker_pid,
+                    "title": worker_title,
+                    "status": worker_status,
+                }
+            )
+        lineage_subagents.sort(
+            key=lambda item: (
+                str(item["provider"]),
+                str(item["title"]).casefold(),
+                int(item["pid"]),
+            )
+        )
+
+        def include_lineage_subagents(
+            existing: Sequence[Any],
+        ) -> list[dict[str, Any]]:
+            combined = [
+                dict(item) for item in existing if isinstance(item, Mapping)
+            ]
+            for worker in lineage_subagents:
+                if any(
+                    item.get("pid") == worker["pid"]
+                    or (
+                        item.get("provider") == worker["provider"]
+                        and item.get("uuid") == worker["uuid"]
+                    )
+                    for item in combined
+                ):
+                    continue
+                combined.append(dict(worker))
+            return combined
+
+        claude_parent_ids: set[str] = set()
+        claude_parent_evidence = False
 
         pid: int | None
         uuid: str | None
@@ -492,12 +1107,8 @@ def build_inventory(
         provider_title_is_explicit = True
         provider_title_state = "ready"
         claude_color_evidence = ""
-        if (
-            len(claude_candidates) == 1
-            and not native_claude_candidates
-            and not codex_candidates
-        ):
-            pid = claude_candidates[0]
+        if owner_claim and owner_claim[0] == "claude-agent":
+            pid = owner_claim[1]
             agent = claude_by_pid[pid]
             uuid = agent["uuid"]
             native_title = agent["title"]
@@ -527,17 +1138,15 @@ def build_inventory(
                 provenance="claude agents --json",
                 confidence="exact",
             )
-            subagents = claude_subagents(uuid, process_table)
+            subagents = include_lineage_subagents(
+                claude_subagents(uuid, process_table)
+            )
             recovery = recovery_spec(provider, uuid, cwd or None)
             mapped_claude.add(pid)
             agent_status = agent["status"]
             needs_you = agent["needs_you"]
-        elif (
-            len(native_claude_candidates) == 1
-            and not claude_candidates
-            and not codex_candidates
-        ):
-            pid, uuid = native_claude_candidates[0]
+        elif owner_claim and owner_claim[0] == "claude-native":
+            _, pid, uuid = owner_claim
             provider = "claude"
             native_title = "Claude started"
             cwd = clean_text(process_table.get(pid, {}).get("cwd"), 4096)
@@ -549,18 +1158,16 @@ def build_inventory(
                 provenance="native Claude CLI session argument",
                 confidence="exact",
             )
-            subagents = claude_subagents(uuid, process_table)
+            subagents = include_lineage_subagents(
+                claude_subagents(uuid, process_table)
+            )
             recovery = recovery_spec(provider, uuid, cwd or None)
             mapped_claude.add(pid)
             agent_status = "running"
             needs_you = False
             provider_title_is_explicit = False
-        elif (
-            len(codex_candidates) == 1
-            and not claude_candidates
-            and not native_claude_candidates
-        ):
-            pid, uuid = codex_candidates[0]
+        elif owner_claim and owner_claim[0] == "codex":
+            _, pid, uuid = owner_claim
             profile_threads, profile_edges = codex_rows_for_pid(pid)
             thread = profile_threads.get(uuid, {})
             native_title = clean_text(
@@ -594,7 +1201,7 @@ def build_inventory(
                 provenance="native Codex PID open exact rollout",
                 confidence="exact",
             )
-            subagents = list(profile_edges.get(uuid, ()))
+            subagents = include_lineage_subagents(profile_edges.get(uuid, ()))
             recovery = recovery_spec(provider, uuid, cwd or None)
             mapped_codex.add(pid)
             turn_state = _codex_turn_state(codex_index.get(pid, ()), uuid)
@@ -661,7 +1268,9 @@ def build_inventory(
                             break
             else:
                 provider = "shell"
-                native_title, cwd, pid = _shell_title(tree, root_pid, process_table)
+                native_title, cwd, pid = _shell_title(
+                    tree, root_pid, process_table, own_processes
+                )
                 agent_status = "idle" if native_title == "Idle shell" else "running"
             uuid = None
             identity = _agent_identity(
@@ -675,6 +1284,44 @@ def build_inventory(
             subagents = []
             recovery = _empty_recovery()
             needs_you = False
+
+        exact_argv = process_table.get(pid or -1, {}).get("cmdline")
+        exact_argv = (
+            list(exact_argv)
+            if isinstance(exact_argv, Sequence)
+            and not isinstance(exact_argv, (str, bytes))
+            else []
+        )
+        for index, argument in enumerate(exact_argv):
+            if argument == "--parent-session-id":
+                claude_parent_evidence = True
+                raw_parent = (
+                    exact_argv[index + 1] if index + 1 < len(exact_argv) else ""
+                )
+            elif isinstance(argument, str) and argument.startswith(
+                "--parent-session-id="
+            ):
+                claude_parent_evidence = True
+                raw_parent = argument.partition("=")[2]
+            else:
+                continue
+            parent_uuid = valid_uuid(raw_parent)
+            if parent_uuid:
+                claude_parent_ids.add(parent_uuid)
+        headless_codex_machine = provider == "codex" and _codex_first_positional(
+            exact_argv
+        ) in CODEX_MACHINE_SUBCOMMANDS
+        codex_app_server_driver = (
+            _codex_app_server_driver(
+                pid,
+                exact_argv,
+                tree,
+                process_table,
+                _process_age(pid, process_table, current_time),
+            )
+            if provider == "codex"
+            else "unknown"
+        )
 
         title, title_source = provider_title_info(
             provider,
@@ -728,16 +1375,75 @@ def build_inventory(
                 ),
             )
         )
+        sessions[-1]["aged_children"] = _aged_shell_children(
+            root_pid,
+            tree,
+            process_table,
+            current_time,
+            own_processes,
+        )
         account_alias = _exact_account_alias(pid, identity, process_table)
         if account_alias:
             sessions[-1]["account_alias"] = account_alias
         sessions[-1]["account_switch_capable"] = _exact_account_capable(
             pid, identity, process_table
         )
+        codex_parents = codex_parent_by_child.get(uuid or "", set())
+        if claude_parent_evidence:
+            sessions[-1]["is_subagent"] = True
+            if len(claude_parent_ids) == 1:
+                sessions[-1]["parent_session"] = {
+                    "provider": "claude",
+                    "uuid": next(iter(claude_parent_ids)),
+                    "provenance": "Claude --parent-session-id",
+                }
+        elif len(codex_parents) == 1:
+            sessions[-1]["is_subagent"] = True
+            sessions[-1]["parent_session"] = {
+                "provider": "codex",
+                "uuid": next(iter(codex_parents)),
+                "provenance": "Codex thread_spawn_edges",
+            }
+        elif codex_parents:
+            sessions[-1]["is_subagent"] = True
+        elif headless_codex_machine:
+            # ``codex exec``, ``codex review``, and the server modes
+            # (``app-server``, ``mcp-server``) are machine-driven -- no person
+            # converses with them. Their cross-provider caller is only
+            # process-ancestry evidence; if no durable provider edge names the
+            # parent, projection treats it as an orphan child behind the
+            # machine count.
+            sessions[-1]["is_subagent"] = True
+        elif codex_app_server_driver == "program":
+            # X16: a program holds this conversation and no window does, so it
+            # is nobody's top-level row. It is marked machine rather than made
+            # a child: nothing in the process tree names the DRIVING session,
+            # and a child whose parent cannot be named is projected into the
+            # orphan class, which no list and no count shows. Machine keeps it
+            # counted, and one keystroke away.
+            sessions[-1]["machine_driven"] = True
+        if codex_app_server_driver == "person":
+            # The other positive verdict, published because something has to
+            # be able to say that a provider restart FINISHED. The shell that
+            # relaunches a provider blocks on it and can never report that,
+            # so the bounce marker it leaves behind is cleared here instead --
+            # by a sighting of the window, not by a timer.
+            sessions[-1]["app_server_window"] = True
         if claude_color_evidence:
             sessions[-1]["_claude_agent_color"] = claude_color_evidence
         if provider == "claude":
             sessions[-1]["provider_title_state"] = provider_title_state
+            sessions[-1]["blocking_question"] = bool(
+                agent.get("blocking_question")
+                if owner_claim and owner_claim[0] == "claude-agent"
+                else False
+            )
+        elif provider == "codex":
+            # The rollout proves Codex needs a reply, but the app-server
+            # protocol records the kit reads expose no separately proven
+            # currently-open picker/approval marker. False `question` is the
+            # dangerous direction, so Codex remains `needs you`.
+            sessions[-1]["blocking_question"] = False
         if provider == "unknown" and starting_provider:
             # Display only. `provider` stays "unknown", so identity, mutation
             # and recovery decisions are completely unaffected.
@@ -897,16 +1603,33 @@ def build_inventory(
         outside_agents[-1]["account_switch_capable"] = _exact_account_capable(
             pid, outside_agents[-1]["identity"], process_table
         )
-    sessions.sort(
-        key=lambda item: (
-            AVAILABILITY_ORDER.get(item["availability"], 9),
-            PROVIDER_ORDER.get(item["provider"], 9),
-            not bool(item.get("needs_you")),
-            item.get("recent_output_at_unix_ms") is None,
-            -(item.get("recent_output_at_unix_ms") or 0),
-            natural_name_key(item["shpool_id"]),
-        )
-    )
+    _attach_aged_workers(sessions + outside_agents, process_table, current_time)
+
+    # A spawn edge is history, not liveness. A sub-agent entry with no pid is
+    # only a recorded parent->child edge; once the child finished it kept
+    # rendering as an open sub-agent for days (operator finding X20,
+    # 2026-08-14: rows idle since the previous day, pid null). Completion
+    # means closure: a pid-less entry whose thread is not alive anywhere in
+    # this snapshot and whose observed turn state is "idle" -- the completed
+    # state -- is dropped. Everything else stays: a pid is a real process, a
+    # live session row is a worker process, "working" is a Codex child
+    # executing inside the parent process (no pid of its own), and the
+    # question states plus "state unavailable" err VISIBLE rather than hide
+    # a pending reply or an unreadable rollout (the X16/X17 lesson).
+    live_thread_uuids = {
+        (item.get("identity") or {}).get("uuid")
+        for item in sessions + outside_agents
+    }
+    live_thread_uuids.discard(None)
+    for item in sessions + outside_agents:
+        item["subagents"] = [
+            child
+            for child in item.get("subagents") or []
+            if child.get("pid") is not None
+            or (child.get("uuid") and child["uuid"] in live_thread_uuids)
+            or str(child.get("status") or "").casefold() != "idle"
+        ]
+    sessions.sort(key=canonical_session_order_key)
     for row, item in enumerate(sessions, start=1):
         item["row"] = row
     outside_agents.sort(
@@ -980,6 +1703,9 @@ def collect_live(
     ],
     recent_output_times: Callable[..., dict[str, int]],
     build_inventory: Callable[..., dict[str, Any]],
+    daemon_identity: Callable[
+        [Mapping[int, Mapping[str, Any]]], dict[str, int] | None
+    ],
     apply_provider_title_states: Callable[[dict[str, Any], Mapping[str, Any]], Any],
     apply_retained_setup_attributions: Callable[[dict[str, Any]], Any],
 ) -> dict[str, Any]:
@@ -987,6 +1713,9 @@ def collect_live(
     invoke = runner or default_runner
     timeout = float(config.get("command_timeout_seconds", 6.0))
     root = proc_root or gated_proc_root(environ)
+    max_proc_nodes = int(config.get("max_proc_nodes", default_max_proc_nodes))
+    before_table = platform_process_table(root, max_proc_nodes)
+    before_identity = daemon_identity(before_table)
     try:
         shpool_payload = command_json(
             fixture_env="SESSION_KIT_SHPOOL_JSON_FILE",
@@ -1002,10 +1731,14 @@ def collect_live(
         CollectionError,
     ) as exc:
         raise CollectionError(f"cannot collect shpool snapshot: {exc}") from exc
-    _parse_shpool_payload(shpool_payload)
-    process_table = platform_process_table(
-        root, int(config.get("max_proc_nodes", default_max_proc_nodes))
+    process_table = platform_process_table(root, max_proc_nodes)
+    after_identity = daemon_identity(process_table)
+    payload_binding = (
+        before_identity
+        if before_identity is not None and before_identity == after_identity
+        else None
     )
+    _parse_shpool_payload(shpool_payload)
     warnings: list[str] = []
     account_home = Path(environ.get("HOME") or Path.home())
     configured_claude_root = environ.get("CLAUDE_CONFIG_DIR", "")
@@ -1186,6 +1919,13 @@ def collect_live(
     recent_outputs = recent_output_times(
         item["name"] for item in _parse_shpool_payload(shpool_payload)
     )
+    publish_table = platform_process_table(root, max_proc_nodes)
+    publish_identity = daemon_identity(publish_table)
+    publish_binding = (
+        payload_binding
+        if payload_binding is not None and payload_binding == publish_identity
+        else None
+    )
     inventory = build_inventory(
         shpool_payload,
         claude_payload,
@@ -1194,6 +1934,7 @@ def collect_live(
         codex_rows,
         config,
         recent_output_by_shpool_id=recent_outputs,
+        daemon_binding=publish_binding,
     )
     apply_provider_title_states(inventory, config)
     apply_retained_setup_attributions(inventory)

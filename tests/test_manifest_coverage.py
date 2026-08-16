@@ -26,6 +26,14 @@ MANIFEST = REPO / "public-files.txt"
 # the exporter, not from the manifest, so it has no pattern to match.
 GENERATED_BY_THE_EXPORT = {"SOURCE.json"}
 
+# These were deliberately removed from the public source. Broad directory
+# patterns must not make a later accidental reintroduction silent.
+REMOVED_FROM_THE_PUBLIC_TREE = {
+    "docs/build-tracks-2026-08-12.md",
+    "LICENSES/MIT-maniple.txt",
+    "tools/reset-collection-order.py",
+}
+
 # Tracked files the public export deliberately leaves behind, each with the
 # reason it is held back. Keep this list exact: an entry that starts matching a
 # manifest pattern, or that stops being tracked, fails the staleness test.
@@ -34,10 +42,24 @@ PRIVATE_BY_DECISION = {
         "reference copy of a file install.sh generates; shipping it invites an "
         "edit the installer would silently overwrite"
     ),
-    "tests/test_picker_dashboard.py": "fixtures carry a private account alias",
+    "tests/test_picker_dashboard.py": (
+        "machine-specific test fixture; never exported"
+    ),
+    "tests/test_production_checkout_unreachable.py": (
+        "machine-specific deployment artifact; never exported. The same "
+        "guarantees are tested generically in tests/test_worktree_isolation.py"
+    ),
+    "phase1-patches/claude_headless_job.sh.patch": (
+        "machine-specific deployment artifact; never exported"
+    ),
+    "phase1-patches/scheduled_jobs_runner.sh.patch": (
+        "machine-specific deployment artifact; never exported"
+    ),
+    "phase1-patches/watcher.py.patch": (
+        "machine-specific deployment artifact; never exported"
+    ),
     "tools/publish-release": (
-        "maintainer-only tool that drives the private-to-public release "
-        "pipeline; deliberately not shipped (decided 2026-08-11)"
+        "maintainer-only release tooling; deliberately not shipped"
     ),
 }
 
@@ -128,6 +150,14 @@ class ManifestCoverageTests(unittest.TestCase):
             path for path, reason in PRIVATE_BY_DECISION.items() if not reason.strip()
         )
         self.assertEqual([], unexplained, "a held-back file needs its reason")
+
+    def test_removed_files_do_not_return(self) -> None:
+        returned = sorted(REMOVED_FROM_THE_PUBLIC_TREE.intersection(self.tracked))
+        self.assertEqual(
+            [],
+            returned,
+            f"removed public-tree paths returned: {returned}",
+        )
 
     def test_manifest_and_this_module_agree_on_the_matching_rule(self) -> None:
         """The guard is worthless if it matches differently from the exporter."""

@@ -13,6 +13,13 @@
 # Globals the entry script owns are assigned there, not here.
 # shellcheck disable=SC2154
 
+# One row, one layout, for every report the kit prints. `session-kit doctor`
+# and `session-kit check` are the two reports a person runs when something is
+# wrong, so they render the same way and name each check the same way.
+render_check_row() {
+  printf '%-5s %-18s %s\n' "${1^^}" "$2" "$3"
+}
+
 systemd_user_manager_transport() {
   if systemctl --user show-environment >/dev/null 2>&1; then
     printf '%s\n' direct
@@ -242,126 +249,105 @@ PY
 
 check_source() {
   local source=$1 failed=0 current_platform command required
+  local -a missing_commands=() missing_files=()
+  # Same renderer, same check names as `session-kit doctor`.
+  check_row() {
+    render_check_row "$1" "$2" "$3"
+    [[ $1 != fail ]] || failed=1
+  }
   current_platform=$(platform)
-  case "$current_platform" in
-    linux) printf 'OK    operating system: Linux\n' ;;
-    macos) printf 'OK    operating system: macOS\n' ;;
-    *)
-      printf 'FAIL  operating system: only Linux and macOS are supported\n'
-      failed=1
-      ;;
-  esac
+  if [[ $current_platform != unsupported ]]; then
+    check_row ok platform "$current_platform"
+  else
+    check_row fail platform "unsupported operating system; Session Kit needs Linux or macOS"
+  fi
   local -a required_commands=("${common_required_commands[@]}")
   if [[ $current_platform == linux ]]; then
-    required_commands+=(flock journalctl systemctl)
+    required_commands+=(flock journalctl sha256sum systemctl)
   elif [[ $current_platform == macos ]]; then
     required_commands+=(launchctl plutil sw_vers)
   fi
   for command in "${required_commands[@]}"; do
-    if command -v "$command" >/dev/null 2>&1; then
-      printf 'OK    command: %s\n' "$command"
-    else
-      printf 'FAIL  command missing: %s\n' "$command"
-      failed=1
-    fi
+    command -v "$command" >/dev/null 2>&1 || missing_commands+=("$command")
   done
-  if (( BASH_VERSINFO[0] < 4 )); then
-    printf 'FAIL  Bash 4 or newer is required\n'
-    failed=1
+  if ((${#missing_commands[@]} == 0)); then
+    check_row ok prerequisites "all required commands are available"
   else
-    printf 'OK    Bash: %s\n' "$BASH_VERSION"
+    check_row fail prerequisites "commands unavailable: ${missing_commands[*]}"
   fi
-  local python_floor=10
+  if (( BASH_VERSINFO[0] < 4 )); then
+    check_row fail bash "Bash 4 or newer is required"
+  else
+    check_row ok bash "$BASH_VERSION"
+  fi
+  local python_floor=10 python_version=
   [[ $current_platform != macos ]] || python_floor=11
-  if ! python3 -c "import sys; raise SystemExit(0 if sys.version_info >= (3, $python_floor) else 1)"; then
-    printf 'FAIL  Python 3.%s or newer is required on %s\n' "$python_floor" "$current_platform"
-    failed=1
+  python_version=$(python3 -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])' 2>/dev/null) ||
+    python_version=
+  if python3 -c "import sys; raise SystemExit(0 if sys.version_info >= (3, $python_floor) else 1)"; then
+    check_row ok python "${python_version:-available}"
+  else
+    check_row fail python "Python 3.$python_floor or newer is required on $current_platform"
   fi
   local shpool_status= shpool_detail=
   IFS=$'\t' read -r shpool_status shpool_detail < <(shpool_version_report)
-  case $shpool_status in
-    ok) printf 'OK    shpool: %s\n' "$shpool_detail" ;;
-    warn) printf 'WARN  shpool: %s\n' "$shpool_detail" ;;
-    *)
-      printf 'FAIL  shpool: %s\n' "$shpool_detail"
-      failed=1
-      ;;
-  esac
+  check_row "$shpool_status" shpool-version "$shpool_detail"
   if [[ $current_platform == linux ]]; then
     if [[ ! -d /proc && ${SESSION_KIT_TESTING:-0} != 1 ]]; then
-      printf 'FAIL  Linux /proc is required for process identity checks\n'
-      failed=1
+      check_row fail process "/proc is unavailable"
     else
-      printf 'OK    process adapter: Linux /proc\n'
+      check_row ok process "Linux /proc is available"
     fi
     local manager_transport=
     if [[ ${SESSION_KIT_TESTING:-0} == 1 ]]; then
-      printf 'OK    user service manager: systemd\n'
+      check_row ok services "systemd user manager is available"
     elif manager_transport=$(systemd_user_manager_transport); then
       if [[ $manager_transport == direct ]]; then
-        printf 'OK    user service manager: systemd\n'
+        check_row ok services "systemd user manager is available"
       else
-        printf 'WARN  user service manager: available through local-machine transport; direct user socket is unavailable\n'
+        check_row warn services "systemd user manager is available through local-machine transport; direct user socket is unavailable"
       fi
     else
-      printf 'FAIL  systemd user manager is unavailable\n'
-      failed=1
+      check_row fail services "systemd user manager is unavailable"
     fi
     # Lingering is a documented install step the installer cannot perform for
     # the operator, so preflight reports it without blocking the install. The
     # post-install doctor is the gate that fails on it.
     local linger_status= linger_detail=
     IFS=$'\t' read -r linger_status linger_detail < <(logind_linger_report)
-    case $linger_status in
-      ok) printf 'OK    logind lingering: %s\n' "$linger_detail" ;;
-      *) printf 'WARN  logind lingering: %s\n' "$linger_detail" ;;
-    esac
+    if [[ $linger_status == ok ]]; then
+      check_row ok linger "$linger_detail"
+    else
+      check_row warn linger "$linger_detail"
+    fi
   elif [[ $current_platform == macos ]]; then
     if [[ ${SESSION_KIT_TESTING:-0} != 1 ]]; then
       local mac_major mac_arch
       mac_major=$(sw_vers -productVersion | cut -d. -f1)
       mac_arch=$(uname -m)
-      [[ $mac_major =~ ^[0-9]+$ && $mac_major -ge 14 ]] || {
-        printf 'FAIL  macOS 14 or newer is required\n'
-        failed=1
-      }
-      [[ $mac_arch == arm64 || $mac_arch == x86_64 ]] || {
-        printf 'FAIL  unsupported Mac architecture: %s\n' "$mac_arch"
-        failed=1
-      }
+      if [[ $mac_major =~ ^[0-9]+$ && $mac_major -ge 14 ]]; then
+        check_row ok macos-version "macOS $mac_major"
+      else
+        check_row fail macos-version "macOS 14 or newer is required"
+      fi
+      if [[ $mac_arch == arm64 || $mac_arch == x86_64 ]]; then
+        check_row ok architecture "$mac_arch"
+      else
+        check_row fail architecture "unsupported Mac architecture: $mac_arch"
+      fi
     fi
     if [[ ${SESSION_KIT_TESTING:-0} == 1 ]] ||
         python3 "$source/lib/session_inventory.py" platform boot-id >/dev/null 2>&1; then
-      printf 'OK    process adapter: Darwin native APIs\n'
+      check_row ok process "Darwin native process adapter is available"
     else
-      printf 'FAIL  Darwin native process or boot APIs are unavailable\n'
-      failed=1
+      check_row fail process "Darwin native process adapter is unavailable"
     fi
-    printf 'OK    user service manager: launchd\n'
+    check_row ok services "launchd is available"
   fi
   if command -v claude >/dev/null 2>&1 || command -v codex >/dev/null 2>&1; then
-    printf 'OK    provider CLI: Claude Code or Codex\n'
+    check_row ok provider "Claude Code or Codex is available"
   else
-    printf 'FAIL  install Claude Code, Codex, or both\n'
-    failed=1
-  fi
-  # Activation writes one provenance-marked hook into each provider config, and
-  # it refuses a config directory other accounts could write. Reporting that
-  # here, from the same code that enforces it, keeps a directory the operator
-  # can repair in seconds from stopping an install partway through.
-  local hook_tool=$source/lib/sessionkit_supervisor/provider_hooks.py
-  local hook_status= hook_detail=
-  if [[ -f $hook_tool && ! -L $hook_tool ]]; then
-    while IFS=$'\t' read -r hook_status hook_detail; do
-      case $hook_status in
-        ok) printf 'OK    provider config: %s\n' "$hook_detail" ;;
-        *)
-          printf 'FAIL  provider config: %s\n' "$hook_detail"
-          failed=1
-          ;;
-      esac
-    done < <(python3 "$hook_tool" preflight \
-      --claude-settings "$claude_settings" --codex-hooks "$codex_hooks")
+    check_row fail provider "no provider is installed; install Claude Code, Codex, or both"
   fi
   # The theme layout applies its own stricter rule to the Codex home and runs
   # at the start of the install transaction. Reporting its refusal here, in its
@@ -369,45 +355,41 @@ check_source() {
   # installable.
   local codex_detail=
   if codex_detail=$(codex_theme_layout validate 2>&1); then
-    printf 'OK    Codex home: the theme layout is owner-controlled\n'
+    check_row ok codex-home "the theme layout is owner-controlled"
   else
-    printf 'FAIL  Codex home: %s\n' "${codex_detail#session-kit: }"
-    failed=1
+    check_row fail codex-home "${codex_detail#session-kit: }"
   fi
   for required in \
     bin/sp bin/shpool_login bin/shpool_status bin/shpool_reaper \
     bin/codex_resume_here bin/session_kit_common bin/session-kit \
     "${inventory_files[@]}" "${shell_modules[@]}" bashrc/shpool.bashrc \
     deploy/session-kit-launcher config/projects.example.tsv \
-    config/session-inventory.example.json config/shpool.example.toml \
-    config/codex/hooks.json lib/sessionkit_supervisor/provider_hooks.py; do
-    if [[ ! -f $source/$required ]]; then
-      printf 'FAIL  source file missing: %s\n' "$required"
-      failed=1
-    fi
+    config/session-inventory.example.json config/shpool.example.toml; do
+    [[ -f $source/$required ]] || missing_files+=("$required")
   done
+  if ((${#missing_files[@]} == 0)); then
+    check_row ok source-files "every required file is present"
+  else
+    for required in "${missing_files[@]}"; do
+      check_row fail source-files "missing from the source: $required"
+    done
+  fi
   if source_is_git_root "$source"; then
-    if ! command -v git >/dev/null 2>&1; then
-      printf 'FAIL  command missing: git (required for Git checkout installs)\n'
-      failed=1
-    fi
     if [[ ${SESSION_KIT_TESTING:-0} != 1 ]] &&
       [[ -n $(git -C "$source" status --porcelain --untracked-files=all) ]]; then
-      printf 'FAIL  source worktree has uncommitted or untracked files\n'
-      failed=1
+      check_row fail provenance "the source worktree has uncommitted or untracked files"
     else
-      printf 'OK    source provenance: clean Git root\n'
+      check_row ok provenance "clean Git root"
     fi
   elif source_record_commit "$source" >/dev/null 2>&1; then
-    printf 'OK    source provenance: release artifact\n'
+    check_row ok provenance "release artifact"
   else
-    printf 'FAIL  source has neither an exact Git root nor valid SOURCE.json\n'
-    failed=1
+    check_row fail provenance "the source has neither an exact Git root nor a valid SOURCE.json"
   fi
   (( failed == 0 )) || return 1
   validate_roots
   release_id_from_source "$source" >/dev/null
-  printf 'OK    source: installable\n'
+  check_row ok source "installable"
 }
 
 validate_purge_ownership() {

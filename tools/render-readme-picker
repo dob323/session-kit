@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+"""Render the public README picture from Session Kit's real picker."""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+import html
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO))
+
+# The picture is rendered by the real picker through the login test fixture,
+# so the repository has to be on the path before this import resolves.
+from tests.test_login import LoginFixture, inventory, row, run_pty  # noqa: E402
+
+
+DEFAULT_OUTPUT = REPO / "docs" / "assets" / "session-kit-picker.png"
+ANSI = re.compile(r"\x1b\[([0-9;]*)m")
+CLEAR = "\x1b[2J\x1b[H"
+COLORS = {
+    30: "#484f58",
+    31: "#f85149",
+    32: "#3fb950",
+    33: "#d29922",
+    34: "#58a6ff",
+    35: "#bc8cff",
+    36: "#39c5cf",
+    37: "#c9d1d9",
+}
+
+
+@dataclass
+class Style:
+    color: str = "#c9d1d9"
+    bold: bool = False
+
+
+def demo_row(
+    session_id: str,
+    number: int,
+    provider: str,
+    title: str,
+    *,
+    availability: str = "ready",
+    status: str = "idle",
+    needs_you: bool = False,
+    blocking_question: bool = False,
+    transcript_idle: bool = False,
+    color: str,
+    subagents: int = 0,
+) -> dict:
+    item = row(
+        session_id,
+        number=number,
+        provider=provider,
+        availability=availability,
+        needs_you=needs_you,
+    )
+    item.update(
+        {
+            "title": title,
+            "native_title": title,
+            "display_title": title,
+            "agent_status": status,
+            "blocking_question": blocking_question,
+            "transcript_idle": transcript_idle,
+            "display_color": color,
+            "subagents": [
+                {"provider": "codex", "status": "idle"}
+                for _ in range(subagents)
+            ],
+        }
+    )
+    return item
+
+
+def capture_picker() -> str:
+    rows = [
+        demo_row(
+            "demo53",
+            53,
+            "claude",
+            "Review Release Notes",
+            status="needs your reply",
+            needs_you=True,
+            blocking_question=True,
+            color="purple",
+        ),
+        demo_row(
+            "demo57",
+            57,
+            "claude",
+            "Fix Login Timeout",
+            needs_you=True,
+            color="cyan",
+        ),
+        demo_row(
+            "demo59",
+            59,
+            "claude",
+            "Plan Database Upgrade",
+            needs_you=True,
+            transcript_idle=True,
+            color="green",
+        ),
+        demo_row(
+            "demo60",
+            60,
+            "claude",
+            "Document Release Process",
+            status="working",
+            color="orange",
+        ),
+        demo_row(
+            "demo61",
+            61,
+            "codex",
+            "Improve Session Picker",
+            status="running",
+            color="pink",
+            subagents=2,
+        ),
+        demo_row(
+            "demo62",
+            62,
+            "codex",
+            "Draft API Guide",
+            availability="attached",
+            color="blue",
+        ),
+        demo_row(
+            "demo64",
+            64,
+            "codex",
+            "Update Installation Docs",
+            availability="attached",
+            status="working",
+            color="yellow",
+        ),
+    ]
+    document = inventory(*rows)
+    # Five neutral display-only roots keep the current More counter visible.
+    document["outside_agents"] = [{"provider": "codex"} for _ in range(5)]
+    fixture = LoginFixture(document)
+    try:
+        code, output = run_pty(
+            fixture,
+            b"q\n",
+            lines=30,
+            columns=110,
+            env_updates={"SESSION_KIT_NO_COLOR": None, "NO_COLOR": None},
+        )
+    finally:
+        fixture.close()
+    if code != 0 or CLEAR not in output:
+        raise RuntimeError("the real picker did not produce its expected terminal frame")
+    frames = [
+        part
+        for part in output.split(CLEAR)
+        if "sessions" in ANSI.sub("", part) and "↵" in ANSI.sub("", part)
+    ]
+    if not frames:
+        raise RuntimeError("the real picker did not produce a complete list frame")
+    lines = frames[-1].rstrip().splitlines()
+    if lines and "❯" in ANSI.sub("", lines[-1]):
+        lines.pop()
+    return "\n".join(lines)
+
+
+def styled_runs(line: str) -> list[tuple[str, Style]]:
+    style = Style()
+    runs: list[tuple[str, Style]] = []
+    cursor = 0
+    for match in ANSI.finditer(line):
+        if match.start() > cursor:
+            runs.append((line[cursor : match.start()], Style(style.color, style.bold)))
+        codes = [int(value) if value else 0 for value in match.group(1).split(";")]
+        index = 0
+        while index < len(codes):
+            code = codes[index]
+            if code == 0:
+                style = Style()
+            elif code == 1:
+                style.bold = True
+            elif code == 22:
+                style.bold = False
+            elif code in COLORS:
+                style.color = COLORS[code]
+            elif code == 38 and codes[index + 1 : index + 2] == [2]:
+                if index + 4 >= len(codes):
+                    raise RuntimeError("incomplete truecolor escape in picker output")
+                red, green, blue = codes[index + 2 : index + 5]
+                style.color = f"#{red:02x}{green:02x}{blue:02x}"
+                index += 4
+            index += 1
+        cursor = match.end()
+    if cursor < len(line):
+        runs.append((line[cursor:], Style(style.color, style.bold)))
+    return runs
+
+
+def svg_document(frame: str) -> str:
+    lines = frame.splitlines()
+    font_size = 15
+    line_height = 23
+    left = 30
+    top = 70
+    width = 1160
+    height = top + (len(lines) + 1) * line_height + 24
+    output = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        (
+            f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" '
+            f'height="{height}" viewBox="0 0 {width} {height}">'
+        ),
+        '<rect width="100%" height="100%" rx="14" fill="#0d1117"/>',
+        '<rect width="100%" height="48" rx="14" fill="#161b22"/>',
+        '<rect y="34" width="100%" height="14" fill="#161b22"/>',
+        '<circle cx="24" cy="24" r="6" fill="#ff5f56"/>',
+        '<circle cx="44" cy="24" r="6" fill="#ffbd2e"/>',
+        '<circle cx="64" cy="24" r="6" fill="#27c93f"/>',
+        (
+            '<text x="580" y="30" text-anchor="middle" '
+            'font-family="Nimbus Mono PS,DejaVu Sans Mono,monospace" '
+            'font-size="14" fill="#8b949e">session kit</text>'
+        ),
+    ]
+    for line_number, line in enumerate(lines):
+        x = left
+        y = top + line_number * line_height
+        output.append(
+            f'<text x="{x}" y="{y}" xml:space="preserve" '
+            'font-family="Nimbus Mono PS,DejaVu Sans Mono,monospace" '
+            f'font-size="{font_size}">'
+        )
+        for text, style in styled_runs(line):
+            weight = "700" if style.bold else "400"
+            output.append(
+                f'<tspan fill="{style.color}" font-weight="{weight}">'
+                f'{html.escape(text)}</tspan>'
+            )
+        output.append("</text>")
+    output.append("</svg>")
+    return "\n".join(output) + "\n"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("output", nargs="?", type=Path, default=DEFAULT_OUTPUT)
+    args = parser.parse_args()
+    converter = shutil.which("rsvg-convert")
+    if converter is None:
+        parser.error("rsvg-convert is required to produce the PNG")
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    frame = capture_picker()
+    with tempfile.TemporaryDirectory(prefix="session-kit-readme-") as raw:
+        svg = Path(raw) / "picker.svg"
+        svg.write_text(svg_document(frame), encoding="utf-8")
+        subprocess.run(
+            [converter, "--format=png", "--output", args.output, svg],
+            check=True,
+        )
+    print(args.output)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

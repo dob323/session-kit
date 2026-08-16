@@ -10,10 +10,31 @@ import tarfile
 import tempfile
 from typing import Iterable
 
+# Re-exported so a fixture never has to know where the guard lives. The guard
+# itself is armed from tests/__init__.py, before any of this runs; these are the
+# pieces a fixture reaches for when it wants to RECORD shpool calls and assert
+# on them, rather than only be stopped from making them.
+from tests.sandbox_guard import (  # noqa: F401
+    guarded_environment,
+    install_recording_shpool,
+    private_daemon_name,
+    recorded_shpool_calls,
+    unexpected_shpool_calls,
+    without_shpool,
+)
+
 
 REPO = Path(__file__).resolve().parents[1]
 RELEASE_TOOL = REPO / "deploy" / "session-kit-release"
-HELPERS = ("sp", "shpool_login", "shpool_status", "shpool_reaper", "codex_resume_here")
+HELPERS = (
+    "sp",
+    "shpool_login",
+    "shpool_login_tui",
+    "shpool_login_launcher",
+    "shpool_status",
+    "shpool_reaper",
+    "codex_resume_here",
+)
 # Both palettes: the eight names Claude Code's /color accepts and the six
 # Codex-only ones, in palette order. Mirrors bin/session-kit's
 # codex_theme_names, and tests/test_session_colors.py asserts it still equals
@@ -59,6 +80,18 @@ def run(
         cwd=cwd,
         env=merged,
         input=input_text,
+        # A child with no input of its own must not inherit the runner's
+        # stdin. Whether stdin is a terminal is a BRANCH in the shipped code:
+        # every `[[ ! -t 0 ]]` site takes a different path for a person than
+        # for a script, and sk_confirm_exact (session_kit_common, the person
+        # branch that announces and acts vs the scripted branch that requires
+        # an exact SESSION_KIT_CONFIRM_ID) is the one that bit. Inheriting
+        # made the launcher pick the branch the assertion measured -- green
+        # through a pipe, red from a terminal, with the test unchanged.
+        # DEVNULL is the same not-a-terminal a pipe already gave, chosen here
+        # instead of inherited. `stdin=None` when `input` is used keeps
+        # subprocess's own "stdin and input may not both be used" check happy.
+        stdin=subprocess.DEVNULL if input_text is None else None,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -129,12 +162,12 @@ def write_runtime(repo: Path, version: str) -> str:
         "config/projects.example.tsv": "# alias\tprovider\tcwd\n",
         "config/session-inventory.example.json": '{"schema_version":1}\n',
         "config/shpool.example.toml": (
-            "session_restore_mode = { lines = 500 }\n"
+            'session_restore_mode = "simple"\n'
             "output_spool_lines = 1000\n"
             "vt100_output_spool_width = 200\n"
         ),
         "shpool/config.toml": (
-            "session_restore_mode = { lines = 500 }\n"
+            'session_restore_mode = "simple"\n'
             "output_spool_lines = 1000\n"
             "vt100_output_spool_width = 200\n"
         ),
@@ -189,6 +222,8 @@ def make_backup_bundle(
     with tarfile.open(installed, mode="w") as archive:
         for name in (
             f"{home_prefix}/.local/bin/shpool_login",
+            f"{home_prefix}/.local/bin/shpool_login_tui",
+            f"{home_prefix}/.local/bin/shpool_login_launcher",
             f"{home_prefix}/.local/bin/shpool_reaper",
             f"{home_prefix}/.local/bin/shpool_status",
             f"{home_prefix}/.local/bin/sp",

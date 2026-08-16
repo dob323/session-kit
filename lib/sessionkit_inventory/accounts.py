@@ -8,9 +8,11 @@ import json
 import os
 from pathlib import Path
 import re
+import select
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 from typing import Any, Mapping
@@ -25,6 +27,19 @@ PROFILE_ALIAS_RE = re.compile(r"[a-z][a-z0-9_-]{0,11}")
 PROFILE_KEY_RE = re.compile(r"(claude|codex):([a-z][a-z0-9_-]{0,11})")
 DEFAULT_ADVICE_MAX_AGE_SECONDS = 600
 MAX_REGISTRY_BYTES = 1024 * 1024
+# Claude's own `.claude.json` is not a kit state file and does not obey a kit
+# size budget: the provider keeps one entry per project directory ever opened,
+# so it grows with the operator's history and never shrinks. Reading it under
+# the 1 MiB registry cap meant that crossing that line would silently stop the
+# first-run marker from being copied -- and the symptom of that is exactly the
+# bug this marker exists to fix, coming back years later with no explanation
+# (lane B F8). Measured 2026-08-15: the default profile is 90,786 bytes and the
+# two enrolled profiles 98,594 and 48,814, so this is headroom rather than a
+# fix for today. The cap still exists, because an unbounded read of a file this
+# code did not write is not acceptable either -- it is just set where a real
+# provider file will not reach it, and passing it is now reported, never
+# silent.
+MAX_CLAUDE_STATE_BYTES = 64 * 1024 * 1024
 MAX_TRANSACTION_BYTES = 256 * 1024
 MAX_FEED_CONFIG_BYTES = 16 * 1024
 MAX_ARTIFACT_BYTES = 512 * 1024 * 1024
@@ -231,7 +246,36 @@ def _registry_lock(config: Mapping[str, Any]) -> StateLock:
     return StateLock(root, root / "accounts.lock")
 
 
-def _atomic_private_json(path: Path, value: Any) -> None:
+class _FileChangedUnderUs(Exception):
+    """Someone else wrote the file between our read and our replace."""
+
+
+def _file_identity(path: Path) -> tuple[int, int, int, int] | None:
+    """(dev, inode, mtime_ns, size), or None when the file is not there.
+
+    Enough to detect either shape of foreign write: an in-place write moves
+    mtime_ns and usually size, and a write-to-temp-then-rename moves the inode.
+    """
+    try:
+        info = os.stat(path)
+    except OSError:
+        return None
+    return (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_size)
+
+
+_NO_GUARD: Any = object()
+
+
+def _atomic_private_json(path: Path, value: Any, *, expect: Any = _NO_GUARD) -> None:
+    """Durably replace one owner-only JSON file.
+
+    ``expect`` is a compare-and-swap guard: pass the file identity observed
+    BEFORE the content was read, and the replace is abandoned -- raising
+    ``_FileChangedUnderUs`` -- if the file has moved since. The default
+    sentinel means no guard, which is what every caller that owns its file
+    outright wants. Only the Claude profile, which the provider also writes,
+    passes one.
+    """
     ensure_private_directory(path.parent)
     payload = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
     descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -242,6 +286,11 @@ def _atomic_private_json(path: Path, value: Any) -> None:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
+        # As late as it can possibly be: the whole point is to shrink the gap
+        # between "the file is still the one I read" and the replace itself to
+        # two adjacent syscalls.
+        if expect is not _NO_GUARD and _file_identity(path) != expect:
+            raise _FileChangedUnderUs(str(path))
         os.replace(temporary, path)
         directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
         try:
@@ -388,36 +437,67 @@ def _run_codex_account_read(profile_dir: Path) -> dict[str, Any]:
         )
         + "\n"
     )
+    # Codex 0.145+ exits the app-server on stdin EOF before answering, so the
+    # probe must keep stdin open until the account/read reply has arrived.
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             ["codex", "app-server", "--listen", "stdio://"],
-            input=requests,
-            text=True,
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=15,
-            check=False,
+            stderr=subprocess.DEVNULL,
+            text=True,
             env=_provider_environment("codex", profile_dir),
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except OSError as exc:
         raise CollectionError("Codex account identity probe did not complete") from exc
-    for line in completed.stdout.splitlines():
+    reply: Mapping[str, Any] | None = None
+    timed_out = False
+    try:
         try:
-            value = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(value, Mapping) and value.get("id") == 1:
-            result = value.get("result")
-            account = result.get("account") if isinstance(result, Mapping) else None
-            if isinstance(account, Mapping) and account.get("type") == "chatgpt":
-                email = clean_text(account.get("email"), 254).casefold()
-                if "@" in email:
-                    return {
-                        "provider": "codex",
-                        "email": email,
-                        "plan": clean_text(account.get("planType"), 80),
-                    }
-            break
+            process.stdin.write(requests)
+            process.stdin.flush()
+        except OSError as exc:
+            raise CollectionError(
+                "Codex account identity probe did not complete"
+            ) from exc
+        deadline = time.monotonic() + 15
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            ready, _, _ = select.select([process.stdout], [], [], remaining)
+            if not ready:
+                timed_out = True
+                break
+            line = process.stdout.readline()
+            if not line:
+                break
+            try:
+                value = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(value, Mapping) and value.get("id") == 1:
+                reply = value
+                break
+    finally:
+        with contextlib.suppress(OSError):
+            process.kill()
+        with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+            process.wait(timeout=5)
+    if timed_out and reply is None:
+        raise CollectionError("Codex account identity probe did not complete")
+    if isinstance(reply, Mapping):
+        result = reply.get("result")
+        account = result.get("account") if isinstance(result, Mapping) else None
+        if isinstance(account, Mapping) and account.get("type") == "chatgpt":
+            email = clean_text(account.get("email"), 254).casefold()
+            if "@" in email:
+                return {
+                    "provider": "codex",
+                    "email": email,
+                    "plan": clean_text(account.get("planType"), 80),
+                }
     raise CollectionError("Codex did not report a signed-in ChatGPT account")
 
 
@@ -557,27 +637,116 @@ def sync_profile_configuration(provider: str, profile_dir: Path) -> None:
 
 
 def _load_owned_claude_state(path: Path) -> Mapping[str, Any] | None:
+    """Claude's own default state, or None with a stated reason.
+
+    Every None here means a first-run offer will NOT be marked seen, and the
+    operator meets the question again on their next fresh profile. That used to
+    happen in complete silence, so the one symptom they would ever see was the
+    bug returning (lane B F8). Now each refusal says which check failed.
+    """
     try:
         info = path.lstat()
-        if (
-            stat.S_ISLNK(info.st_mode)
-            or not stat.S_ISREG(info.st_mode)
-            or info.st_uid != os.geteuid()
-            or info.st_size > MAX_REGISTRY_BYTES
-        ):
+        if stat.S_ISLNK(info.st_mode):
+            reason = "it is a symlink"
+        elif not stat.S_ISREG(info.st_mode):
+            reason = "it is not a regular file"
+        elif info.st_uid != os.geteuid():
+            reason = "it is owned by another user"
+        elif info.st_size > MAX_CLAUDE_STATE_BYTES:
+            reason = f"it is {info.st_size} bytes, past the {MAX_CLAUDE_STATE_BYTES} cap"
+        else:
+            reason = ""
+        if reason:
+            _unmarked(path, reason)
             return None
         value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except FileNotFoundError:
+        # There is no default Claude profile on this machine. Nothing to copy
+        # from, and nothing has gone wrong -- printing "could not be read: No
+        # such file" would dress an ordinary state up as a fault, on every
+        # enrollment, forever. The states that MATTER all still speak.
         return None
-    return value if isinstance(value, Mapping) else None
+    except OSError as error:
+        _unmarked(path, f"it could not be read: {error}")
+        return None
+    except ValueError as error:
+        _unmarked(path, f"it is not valid JSON: {error}")
+        return None
+    if not isinstance(value, Mapping):
+        _unmarked(path, "it does not hold a JSON object")
+        return None
+    return value
+
+
+def _unmarked(path: Path, reason: str) -> None:
+    """Say why a first-run offer is going unanswered. Never silent."""
+    print(
+        f"session inventory: not marking Claude's first-run offers seen -- "
+        f"{path} could not be used because {reason}",
+        file=sys.stderr,
+    )
+
+
+# First-run offers this kit may answer on the operator's behalf, by marking
+# them SEEN. Two rules decide what may go here, and both must hold:
+#   1. marking it seen changes nothing about how the session behaves, and
+#   2. "you have already been shown this" is honestly true -- the operator has
+#      seen it, on the profile Claude runs by default.
+# So a flag is only ever copied FROM the default profile, and only when it is
+# already true there. Choosing a permission mode, a model, or an update policy
+# is not on this list and must never be: those are answers, not acknowledgments.
+#
+# hasSeenAutoDefaultNudge -- the "Make auto mode your default permission mode?"
+#   offer. Seen means it stops being offered; the permission mode is untouched,
+#   which is exactly the decision this must not make. A brand-new session on a
+#   kit profile opened onto this question and the operator could not answer it
+#   (2026-08-15), because a fresh profile has never been shown it.
+CLAUDE_FIRST_RUN_SEEN_FLAGS = ("hasSeenAutoDefaultNudge",)
+# Three shots at a file the provider may be writing. A real collision is one
+# save, so the second attempt wins; a third means the provider is writing
+# continuously and this courtesy write should stand aside.
+_CLAUDE_PROFILE_WRITE_ATTEMPTS = 3
+# Claude Code guards its own config writes with a proper-lockfile mkdir lock at
+# `<config>.lock`, refreshed every 5s and considered stale after 10s (read out
+# of the shipped 2.1.233 binary, 2026-08-15).
+#
+# This code deliberately does NOT take that lock. Claude acquires it with
+# `retries: 0`: a Claude process that finds the lock held does not wait, it
+# logs "Failed to save config with lock" and writes anyway down an UNLOCKED
+# path that skips its own re-read. Taking the lock would therefore not
+# serialise anything -- it would convert an ordinary collision into a
+# guaranteed unlocked overwrite. Its exit-time plugin-usage flush takes no lock
+# at all either.
+#
+# What the lock is good for is the other direction: its presence is a reliable
+# "Claude is writing right now" signal, so this pass stands aside instead of
+# starting a compare-and-swap that is certain to lose.
+_CLAUDE_LOCK_STALE_SECONDS = 10.0
+_CLAUDE_LOCK_WAIT_SECONDS = 0.2
+
+
+def _provider_is_writing(path: Path) -> bool:
+    """True while Claude's own config lock is held and fresh."""
+    try:
+        info = os.stat(path.with_name(path.name + ".lock"))
+    except OSError:
+        return False
+    return (time.time() - info.st_mtime) < _CLAUDE_LOCK_STALE_SECONDS
 
 
 def _complete_claude_profile_onboarding(profile_dir: Path) -> None:
-    """Keep an authenticated isolated profile out of Claude's first-run login wizard."""
+    """Keep an authenticated isolated profile out of Claude's first-run offers.
+
+    Compare-and-swap against the profile Claude itself writes, so a value the
+    provider set while this ran can never be clobbered: only missing keys are
+    filled, and the replace is abandoned rather than forced if the file moved
+    under us. See the write at the foot of this function for why refusing is
+    the right failure.
+    """
     path = profile_dir / ".claude.json"
     value = read_private_json(
         path,
-        max_bytes=MAX_REGISTRY_BYTES,
+        max_bytes=MAX_CLAUDE_STATE_BYTES,
         allow_missing=False,
     )
     if not isinstance(value, dict):
@@ -592,10 +761,16 @@ def _complete_claude_profile_onboarding(profile_dir: Path) -> None:
         else {}
     )
     projects = value.get("projects")
-    if not isinstance(projects, dict):
+    if projects is not None and not isinstance(projects, dict):
+        # Some other shape entirely: the provider owns this key and this
+        # function does not understand what it is looking at. Leave it exactly
+        # as found and copy no trust into it -- normalising it to {} destroyed
+        # a real provider value (Codex finding 7).
+        projects = None
+    elif projects is None:
         projects = {}
         value["projects"] = projects
-    if isinstance(default_projects, Mapping):
+    if isinstance(default_projects, Mapping) and projects is not None:
         for project_path, project_state in default_projects.items():
             if (
                 not isinstance(project_path, str)
@@ -610,8 +785,82 @@ def _complete_claude_profile_onboarding(profile_dir: Path) -> None:
             if current.get("hasTrustDialogAccepted") is not True:
                 current["hasTrustDialogAccepted"] = True
                 changed = True
-    if changed:
-        _atomic_private_json(path, value)
+    # Only what the operator has already been shown, and only where this
+    # profile has said nothing itself. An existing value -- true or false --
+    # is their answer and is left exactly as it is.
+    for flag in CLAUDE_FIRST_RUN_SEEN_FLAGS:
+        if flag in value:
+            continue
+        if isinstance(default_state, Mapping) and default_state.get(flag) is True:
+            value[flag] = True
+            changed = True
+    if not changed:
+        return
+    # THE WRITE. The provider owns this file too and takes no lock this code
+    # could share, so "re-read, then replace" cannot be made safe by reading
+    # later -- there is always a gap after the last read, and a provider save
+    # landing in it was simply lost (lane B F7, Codex 5).
+    #
+    # So the write is a compare-and-swap instead of a replace. The file's
+    # identity is captured BEFORE the content is read -- that ordering is what
+    # makes it sound: if the identity is unchanged at replace time then nothing
+    # touched the file across the whole read-decide-write span, so the content
+    # being written is current. If it did change, the attempt is thrown away
+    # and retried against the new content. And if it keeps changing, the write
+    # is ABANDONED, not forced: the cost of not writing is that a first-run
+    # offer is shown once, and the cost of forcing is losing whatever the
+    # provider just saved. Those are not close.
+    #
+    # The guard detects a provider save with certainty rather than by luck:
+    # Claude writes this file as `.tmp.<pid>.<hex>` beside the target followed
+    # by a rename, so every one of its saves changes the inode. (Read out of
+    # the shipped binary; the orphaned `.claude.json.tmp.*` files on this box
+    # are the same mechanism leaving litter.) And a merged write of ours is not
+    # ignored by a running Claude: it polls the file's mtime once a second and
+    # re-reads on any advance.
+    for _attempt in range(_CLAUDE_PROFILE_WRITE_ATTEMPTS):
+        if _provider_is_writing(path):
+            # Claude is mid-save. Starting a swap now just burns an attempt.
+            time.sleep(_CLAUDE_LOCK_WAIT_SECONDS)
+            if _provider_is_writing(path):
+                continue
+        before = _file_identity(path)
+        latest = read_private_json(
+            path, max_bytes=MAX_CLAUDE_STATE_BYTES, allow_missing=True
+        )
+        merged = value
+        if isinstance(latest, dict):
+            merged = dict(latest)
+            merged["hasCompletedOnboarding"] = True
+            latest_projects = merged.get("projects")
+            if latest_projects is not None and not isinstance(latest_projects, dict):
+                latest_projects = None          # not ours to reshape
+            elif latest_projects is None:
+                latest_projects = {}
+                merged["projects"] = latest_projects
+            for project_path, project_state in (projects or {}).items():
+                if latest_projects is None:
+                    break
+                current = latest_projects.get(project_path)
+                if not isinstance(current, dict):
+                    latest_projects[project_path] = dict(project_state)
+                elif project_state.get("hasTrustDialogAccepted") is True:
+                    current.setdefault("hasTrustDialogAccepted", True)
+            for flag in CLAUDE_FIRST_RUN_SEEN_FLAGS:
+                if flag not in merged and value.get(flag) is True:
+                    merged[flag] = True
+        try:
+            _atomic_private_json(path, merged, expect=before)
+            return
+        except _FileChangedUnderUs:
+            continue
+    print(
+        "session inventory: not marking Claude's first-run offers seen -- "
+        f"{path} is being written by Claude right now, and overwriting it "
+        f"would lose what Claude just saved (gave up after "
+        f"{_CLAUDE_PROFILE_WRITE_ATTEMPTS} attempts)",
+        file=sys.stderr,
+    )
 
 
 def _register_profile(
@@ -622,7 +871,31 @@ def _register_profile(
     profile_dir: Path,
     *,
     legacy: bool,
+    enable: bool = True,
 ) -> dict[str, Any]:
+    """Record one verified profile.
+
+    ``enable=True`` is enrolment: the operator is adding or adopting an
+    account, and enabling it is the point of the call. ``enable=False`` is
+    re-verification of an account that is already enrolled, and it may never
+    turn a disabled profile back on.
+
+    That distinction is not cosmetic. The identity probe below runs a provider
+    binary and can take seconds; the registry is shared, and the operator can
+    disable an account inside that window. Writing ``enabled: True``
+    unconditionally afterwards silently undid their decision, and any caller
+    that then used the profile spent money on an account they had switched off.
+    Re-verification therefore re-reads the row under the lock and refuses on
+    anything but a still-enabled profile at the same directory.
+    """
+    if enable:
+        before: Mapping[str, Any] | None = None
+    else:
+        registry_before = load_registry(config)
+        found = registry_before["profiles"].get(_profile_key(provider, alias))
+        before = dict(found) if isinstance(found, Mapping) else None
+        if before is None or before.get("enabled") is not True:
+            raise CollectionError("account profile is unavailable")
     identity = probe_identity(provider, profile_dir)
     email = clean_text(expected_email, 254).casefold()
     if identity["email"] != email:
@@ -632,6 +905,38 @@ def _register_profile(
     with _registry_lock(config):
         registry = load_registry(config)
         key = _profile_key(provider, alias)
+        current = registry["profiles"].get(key)
+        if not enable:
+            # Compare-and-set against what was read before the probe. An
+            # unrelated write elsewhere in the registry is fine; a change to
+            # THIS profile is not, and being switched off is the change that
+            # matters most.
+            if not isinstance(current, Mapping) or current.get("enabled") is not True:
+                raise CollectionError(
+                    "account %s was disabled while it was being verified; "
+                    "it was left disabled" % alias
+                )
+            # This is a real compare-and-set on the operator-controlled
+            # identity fields, not merely an enabled-bit check wearing that
+            # name.  Another verifier may refresh plan/timestamp while the
+            # probe runs, but an operator changing the email, directory,
+            # legacy status, or enabled state makes this probe stale and it
+            # may not overwrite that newer decision.
+            guarded_fields = (
+                "provider",
+                "alias",
+                "email",
+                "profile_dir",
+                "legacy",
+                "enabled",
+            )
+            if before is None or any(
+                current.get(field) != before.get(field) for field in guarded_fields
+            ):
+                raise CollectionError(
+                    "account %s changed while it was being verified; its newer "
+                    "settings were left unchanged" % alias
+                )
         for other_key, other in registry["profiles"].items():
             if other_key != key and other["provider"] == provider and other["email"] == email:
                 raise CollectionError("that provider account is already enrolled")
@@ -644,7 +949,9 @@ def _register_profile(
             "legacy": legacy,
             "plan": identity.get("plan", ""),
             "verified_at_unix_ms": _now_ms(),
-            "enabled": True,
+            # Never resurrected: re-verification carries the value it just
+            # proved was True, and enrolment is the only path that sets it.
+            "enabled": True if enable else current.get("enabled") is True,
         }
         registry["generation"] += 1
         write_registry(config, registry)
@@ -687,6 +994,7 @@ def enroll(
 
 
 def verify_profile(config: Mapping[str, Any], provider: str, alias: str) -> dict[str, Any]:
+    """Re-prove an already-enrolled profile. Never enables anything."""
     current = profile(config, provider, alias)
     return _register_profile(
         config,
@@ -695,6 +1003,7 @@ def verify_profile(config: Mapping[str, Any], provider: str, alias: str) -> dict
         current["email"],
         Path(current["profile_dir"]),
         legacy=current["legacy"],
+        enable=False,
     )
 
 
@@ -787,36 +1096,76 @@ def account_choices(config: Mapping[str, Any], provider: str) -> dict[str, Any]:
             advice_reason = clean_text(
                 use_now.get("why") or use_now.get("reason"), 240
             )
+    roster_state = (
+        "fresh" if roster_fresh else ("stale" if roster is not None else "absent")
+    )
     choices: list[dict[str, Any]] = []
     for item in list_profiles(config, provider):
         health = health_by_email.get(item["email"])
-        eligible = bool(
-            item["enabled"]
-            and health
-            and health.get("serving") is True
-            and str(health.get("health") or "").casefold() == "ok"
+        # `serving` is the CLIProxy cron-lane routing toggle. Interactive
+        # sessions authenticate with the profile's own login and never ride
+        # that lane, so a resting account with a healthy probe is selectable.
+        # `serving` stays in the payload as advisory display.
+        #
+        # A stale or absent roster proves nothing about any account. Failing
+        # closed there turns a dead feed process into a machine where no
+        # session can be started at all, so eligibility falls open to the
+        # profile registry and the row says its health is unverified.
+        if roster_fresh:
+            eligible = bool(
+                item["enabled"]
+                and health
+                and str(health.get("health") or "").casefold() == "ok"
+            )
+        else:
+            eligible = bool(item["enabled"])
+        health_word = (
+            clean_text(health.get("health"), 40)
+            if (health and roster_fresh)
+            else "unverified"
         )
+        if eligible:
+            state = "ready" if roster_fresh else "ready (feed %s)" % roster_state
+        elif not item["enabled"]:
+            state = "blocked: profile disabled"
+        elif not health:
+            state = "blocked: not in the account roster"
+        else:
+            state = "blocked: health %s" % (health_word or "unknown")
         choices.append(
             {
                 "alias": item["alias"],
                 "email": item["email"],
                 "plan": item["plan"],
                 "eligible": eligible,
-                "health": clean_text(health.get("health"), 40) if health else "unverified",
+                "state": state,
+                "health": health_word,
                 "serving": health.get("serving") is True if health else False,
-                "u5h": health.get("u5h") if health else None,
-                "u7d": health.get("u7d") if health else None,
+                "u5h": health.get("u5h") if (health and roster_fresh) else None,
+                "u7d": health.get("u7d") if (health and roster_fresh) else None,
                 "recommended": eligible and item["email"] == recommended_email,
             }
         )
     recommendation = next((row for row in choices if row["recommended"]), None)
+    # The reason travels only with a live recommendation. An advised account
+    # that is present but blocked is reported as exactly that, so a renderer
+    # can say "X is advised but not selectable because Y" instead of nothing.
+    blocked_advice = None
+    if recommendation is None and recommended_email:
+        advised = next(
+            (row for row in choices if row["email"] == recommended_email), None
+        )
+        if advised is not None:
+            blocked_advice = {"alias": advised["alias"], "state": advised["state"]}
     return {
         "schema_version": ACCOUNT_SCHEMA_VERSION,
         "provider": provider,
         "roster_fresh": roster_fresh,
+        "roster_state": roster_state,
         "advice_fresh": advice_fresh,
         "recommendation": recommendation["alias"] if recommendation else None,
-        "recommendation_reason": advice_reason,
+        "recommendation_reason": advice_reason if recommendation else "",
+        "recommendation_blocked": blocked_advice,
         "choices": choices,
     }
 
@@ -826,12 +1175,30 @@ def _require_eligible_profile(
 ) -> None:
     choices = account_choices(config, provider)["choices"]
     selected = next((row for row in choices if row["alias"] == alias), None)
-    if not selected or selected.get("eligible") is not True:
-        raise CollectionError("selected account is not healthy and serving")
+    if not selected:
+        raise CollectionError(f"account {alias} is not enrolled for {provider}")
+    if selected.get("eligible") is not True:
+        # Name the actual predicate that failed; "unavailable" refusals that
+        # guess at a login problem send the operator to re-enroll a working
+        # account.
+        raise CollectionError(
+            f"account {alias} is not selectable: {selected.get('state')}"
+        )
 
 
 def resume_profile(config: Mapping[str, Any], provider: str, alias: str) -> dict[str, Any]:
     item = verify_profile(config, provider, alias)
+    if provider == "claude":
+        # Every profile the kit can launch, not only the ones it creates from
+        # here on. A profile enrolled before this shipped has never been told
+        # the first-run offers were seen, and it is exactly such a profile the
+        # operator's blocked session was running on. This writes only when a
+        # marker is missing, so it costs one write per profile, once.
+        try:
+            _complete_claude_profile_onboarding(Path(str(item["profile_dir"])))
+        except (CollectionError, OSError):
+            # A launch must never fail because a courtesy write did not land.
+            pass
     return {
         "provider": provider,
         "alias": alias,

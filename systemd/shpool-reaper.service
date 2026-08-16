@@ -1,5 +1,5 @@
 [Unit]
-Description=Close exactly verified provider-exited Session Kit terminals
+Description=Session Kit — close verified provider-exited sessions
 
 [Service]
 Type=oneshot

@@ -44,6 +44,10 @@ from .manifest import MANIFEST_NAME, ManifestError
 # The bound also ends the walk on a cyclic mount rather than spinning.
 MAX_WALK_DEPTH = 64
 IGNORE_KIND = "ignore"
+# A live row's kind is the project's default provider, and "any" is the row
+# that has none: one directory is one project, and which provider opens it is
+# answered when a session starts.
+ANY_KIND = "any"
 GITDIR_RE = re.compile(r"\A\s*gitdir:\s*(?P<path>\S.*?)\s*\Z")
 MAX_GIT_POINTER_BYTES = 4096
 
@@ -203,7 +207,7 @@ def _shortcut_rows(
             warnings.append(f"project list line {number} is not three tab fields")
             continue
         alias, kind, raw_cwd = fields[0], fields[1], fields[2]
-        if kind not in ("claude", "codex", "shell", IGNORE_KIND):
+        if kind not in ("claude", "codex", "shell", ANY_KIND, IGNORE_KIND):
             warnings.append(f"project list line {number} has an unknown kind")
             continue
         if not raw_cwd.startswith("/"):
@@ -358,7 +362,14 @@ class Resolver:
         return self._project(row["cwd"], source=SOURCE_SHORTCUT)
 
     def resolve_alias(self, alias: str) -> Project | None:
-        """The project a shortcut alias names, manifest included."""
+        """The project a shortcut alias names, manifest included.
+
+        The row that matched is carried through. Looking the directory up again
+        would answer with the *first* row for it, so on a file that still lists
+        one directory twice — the shape this release folds — asking for the
+        second alias returned the first alias's provider and started the wrong
+        one.
+        """
         for row in self._rows:
             if row["alias"] != alias or row["kind"] == IGNORE_KIND:
                 continue
@@ -370,6 +381,7 @@ class Resolver:
                 values=values,
                 manifest_path=manifest_path,
                 error=error,
+                row=row,
             )
         return None
 
@@ -406,6 +418,13 @@ class Resolver:
 
     # ---- construction ----------------------------------------------------
 
+    def _live_rows_for_root(self, root: str) -> list[dict[str, str]]:
+        return [
+            item
+            for item in self._rows
+            if item["kind"] != IGNORE_KIND and item["cwd"] == root
+        ]
+
     def _project(
         self,
         root: str,
@@ -414,8 +433,10 @@ class Resolver:
         values: Mapping[str, Any] | None = None,
         manifest_path: str | None = None,
         error: str | None = None,
+        row: Mapping[str, str] | None = None,
     ) -> Project:
-        row = self._shortcut_for_root(root)
+        siblings = self._live_rows_for_root(root)
+        row = dict(row) if row is not None else self._shortcut_for_root(root)
         group_root = main_repository(root)
         warnings: list[str] = []
         manifest_values = values
@@ -439,6 +460,18 @@ class Resolver:
             )
         if error is not None:
             warnings.append(error)
+        shortcut_provider = row["kind"] if row is not None else None
+        if len({item["kind"] for item in siblings}) > 1:
+            # The directory is still listed more than once and the rows
+            # disagree about the provider. There is no default to be had from
+            # that, and picking either row's answer is how a directory worked
+            # on with both providers started the wrong one.
+            shortcut_provider = ANY_KIND
+            warnings.append(
+                f"{root} is listed more than once with different providers, so "
+                "it has no default; name one when you start a session, or run "
+                "`session-kit projects normalize`"
+            )
         return Project(
             root=root,
             name=str(name),
@@ -450,7 +483,7 @@ class Resolver:
             manifest=manifest_values,
             manifest_path=manifest_path,
             manifest_error=error,
-            shortcut_provider=row["kind"] if row is not None else None,
+            shortcut_provider=shortcut_provider,
             warnings=tuple(warnings),
         )
 

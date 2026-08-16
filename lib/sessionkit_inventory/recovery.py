@@ -74,6 +74,7 @@ def recovery_manifest(
     return {
         "schema_version": schema_version,
         "generated_at": inventory.get("generated_at"),
+        "collection_start": inventory.get("collection_start"),
         "boot_id": boot_id(),
         "daemon_generation": inventory.get("daemon_generation"),
         "sessions": sessions,
@@ -123,6 +124,38 @@ def _has_recovery_entries(
     )
 
 
+def _pending_conversation_keys(value: Any, *, schema_version: int) -> set[str]:
+    found: set[str] = set()
+    if not _valid_recovery_state(value, schema_version=schema_version):
+        return found
+    generations: list[Mapping[str, Any]] = [value]
+    generations.extend(
+        item
+        for item in value.get("queued_generations", ())
+        if isinstance(item, Mapping)
+    )
+    for generation in generations:
+        if _generation_key(
+            {
+                "boot_id": generation.get("source_boot_id"),
+                "daemon_generation": generation.get("source_daemon_generation"),
+            }
+        ) is None:
+            continue
+        for group in ("sessions", "outside_agents"):
+            entries = generation.get(group, {})
+            if not isinstance(entries, Mapping):
+                continue
+            for entry in entries.values():
+                if not isinstance(entry, Mapping):
+                    continue
+                provider = entry.get("provider")
+                uuid = valid_uuid(entry.get("uuid"))
+                if provider in PROVIDERS and uuid:
+                    found.add(f"{provider}:{uuid}")
+    return found
+
+
 def update_recovery_state(
     paths: Mapping[str, Path],
     inventory: Mapping[str, Any],
@@ -133,6 +166,8 @@ def update_recovery_state(
     has_recovery_entries: Callable[[Any], bool],
     generation_key: Callable[[Mapping[str, Any]], tuple[str, int, int] | None],
     atomic_write_json: Callable[[Path, Any], None],
+    collection_start: int | None = None,
+    write_collection_json: Callable[..., None] | None = None,
 ) -> None:
     """Preserve exact pre-generation recovery data until explicitly resolved.
 
@@ -142,6 +177,13 @@ def update_recovery_state(
     and partial post-reboot inventories therefore cannot erase the queue.
     """
     detected = recovery_manifest(inventory)
+    publish = (
+        (lambda path, payload: write_collection_json(
+            paths, path, payload, collection_start=collection_start
+        ))
+        if write_collection_json is not None
+        else atomic_write_json
+    )
     existing = read_state_json(paths["manifest"])
     pending = read_state_json(paths["pending"])
     existing_valid = has_recovery_entries(existing)
@@ -237,11 +279,264 @@ def update_recovery_state(
                     "daemon_generation"
                 )
         if has_recovery_entries(new_pending):
-            atomic_write_json(paths["pending"], new_pending)
+            publish(paths["pending"], new_pending)
+            expected = _pending_conversation_keys(
+                new_pending, schema_version=schema_version
+            )
+            try:
+                published_pending = read_state_json(paths["pending"])
+            except (OSError, ValueError) as exc:
+                expected_text = ", ".join(sorted(expected))
+                raise CollectionError(
+                    "pending recovery evidence changed before inventory/manifest "
+                    f"advance; expected {expected_text}; found unreadable "
+                    f"{paths['pending'].name}: {exc}"
+                ) from exc
+            prove_pending_losses(
+                published_pending,
+                tuple(expected),
+                schema_version=schema_version,
+            )
 
     # Never replace the latest nonempty exact manifest with an empty snapshot.
     if detected["sessions"] or detected["outside_agents"]:
-        atomic_write_json(paths["manifest"], detected)
+        publish(paths["manifest"], detected)
+
+
+def _lost_entry(
+    item: Mapping[str, Any],
+    *,
+    now_unix_ms: int,
+) -> tuple[str, str, dict[str, Any]] | None:
+    """One queue entry for a conversation whose session went away.
+
+    Two shapes qualify, and both mean "nobody said to end this":
+
+    * a row still carrying a LIVE provider with exact identity -- a window
+      killed mid-conversation, a daemon that took its session down, a machine
+      that went away;
+    * an idle shell whose provider had already exited, still carrying the
+      exact conversation it ran. That is what a crash left behind, and when
+      the reaper's proven-safe auto-close eventually takes the terminal, the
+      conversation inside it is lost rather than finished. An automatic reap
+      is not intent (operator ruling, 2026-08-11): only a person's explicit
+      verb is, and a person's verb leaves a tombstone.
+
+    The net invariant: a conversation leaves the visible world either because
+    somebody said so, or by entering this queue. Never silently.
+    """
+    session_id = item.get("shpool_id_raw") or item.get("shpool_id")
+    provider = item.get("provider")
+    identity = item.get("identity")
+    recovery = item.get("recovery")
+    if not isinstance(session_id, str) or not isinstance(recovery, Mapping):
+        return None
+    if provider in PROVIDERS:
+        exact = (
+            isinstance(identity, Mapping)
+            and identity.get("confidence") == "exact"
+        )
+    else:
+        # The idle shell an exited provider leaves behind. Its exact identity
+        # is the one the overlay put back on the row, from the committed
+        # conversation or the retained exact record -- never a guess.
+        provider = item.get("exited_provider")
+        exited_identity = item.get("exited_identity")
+        exact = (
+            provider in PROVIDERS
+            and isinstance(exited_identity, Mapping)
+            and exited_identity.get("confidence") == "historical-exact"
+        )
+        identity = exited_identity
+    if (
+        not exact
+        or provider not in PROVIDERS
+        or recovery.get("available") is not True
+        or recovery.get("provider") != provider
+    ):
+        return None
+    uuid = valid_uuid(recovery.get("uuid"))
+    if not uuid or (
+        isinstance(identity, Mapping)
+        and valid_uuid(identity.get("uuid"))
+        and valid_uuid(identity.get("uuid")) != uuid
+    ):
+        return None
+    number = item.get("terminal_number")
+    return (
+        session_id,
+        uuid,
+        {
+            "provider": provider,
+            "uuid": uuid,
+            "title": item.get("title", ""),
+            "started_at_unix_ms": item.get("started_at_unix_ms"),
+            "cwd": recovery.get("cwd"),
+            "argv": list(recovery.get("argv", ())),
+            "command": recovery.get("command"),
+            "account_alias": item.get("account_alias"),
+            "terminal_number": (
+                number
+                if isinstance(number, int) and not isinstance(number, bool)
+                else None
+            ),
+            "crashed_at_unix_ms": now_unix_ms,
+        },
+    )
+
+
+def _live_conversations(inventory: Mapping[str, Any]) -> set[str]:
+    live: set[str] = set()
+    for group in ("sessions", "outside_agents"):
+        for item in inventory.get(group, ()):
+            if not isinstance(item, Mapping):
+                continue
+            for source in (item.get("identity"), item.get("recovery")):
+                if isinstance(source, Mapping):
+                    uuid = valid_uuid(source.get("uuid"))
+                    provider = source.get("provider") or item.get("provider")
+                    if uuid and provider in PROVIDERS:
+                        live.add(f"{provider}:{uuid}")
+    return live
+
+
+def enqueue_lost_conversations(
+    inventory: Mapping[str, Any],
+    previous_inventory: Mapping[str, Any] | None,
+    *,
+    paths: Mapping[str, Path],
+    schema_version: int,
+    boot_id: str,
+    read_state_json: Callable[[Path], Any],
+    atomic_write_json: Callable[[Path, Any], None],
+    valid_recovery_state: Callable[[Any], bool],
+    closed_on_purpose: Callable[[Any, Any], bool],
+    now_unix_ms: int,
+    collection_start: int | None = None,
+    write_collection_json: Callable[..., None] | None = None,
+) -> list[str]:
+    """Queue conversations whose session vanished with the provider still in it.
+
+    The queue could only ever learn about a whole generation at once: when the
+    daemon restarted, everything the old manifest held became pending. One
+    session dying on its own -- the ordinary way a conversation is lost -- was
+    invisible to it until the next daemon restart, and by then the row it came
+    from had aged out of every screen.
+
+    Exact loss evidence is always retained. A tombstone may suppress its
+    public offer while the matching closed-sessions row remains findable, but
+    neither that row nor a newly restored live session is permanent. Keeping
+    the raw candidate is what lets the projection offer it again if the record
+    that justified suppression later vanishes.
+
+    Returns the conversation keys persisted, for the caller to report.
+    """
+    if not isinstance(previous_inventory, Mapping):
+        return []
+    generation = inventory.get("daemon_generation")
+    if not isinstance(generation, Mapping) or not boot_id:
+        # Without an exact generation the entry could not be acknowledged
+        # later, and an entry nobody can resolve is worse than no entry.
+        return []
+    current_ids = {
+        item.get("shpool_id_raw")
+        for item in inventory.get("sessions", ())
+        if isinstance(item, Mapping)
+    }
+    live = _live_conversations(inventory)
+    found: dict[str, dict[str, Any]] = {}
+    queued: list[str] = []
+    for item in previous_inventory.get("sessions", ()):
+        if not isinstance(item, Mapping):
+            continue
+        parsed = _lost_entry(item, now_unix_ms=now_unix_ms)
+        if parsed is None:
+            continue
+        session_id, uuid, entry = parsed
+        key = f"{entry['provider']}:{uuid}"
+        if session_id in current_ids or key in live:
+            continue
+        # Evaluate the agreement here as well as in the public projection so
+        # a missing-row inconsistency is diagnosed at the moment the loss is
+        # observed. Never discard the candidate: a later ledger replacement
+        # must be able to make the recovery offer heal itself.
+        closed_on_purpose(entry["provider"], uuid)
+        found[session_id] = entry
+        queued.append(key)
+    if not found:
+        return []
+    pending = read_state_json(paths["pending"])
+    if valid_recovery_state(pending):
+        document = json.loads(json.dumps(pending))
+        same_source = (
+            document.get("source_boot_id") == boot_id
+            and document.get("source_daemon_generation") == generation
+        )
+        if same_source:
+            # Never overwrite an entry already queued for this generation: the
+            # first record of a loss is the one that names when it happened.
+            document["sessions"] = {**found, **dict(document.get("sessions", {}))}
+        else:
+            bucket = None
+            for candidate in document.get("queued_generations", ()):
+                if (
+                    isinstance(candidate, Mapping)
+                    and candidate.get("source_boot_id") == boot_id
+                    and candidate.get("source_daemon_generation") == generation
+                    and isinstance(candidate.get("sessions"), Mapping)
+                ):
+                    bucket = candidate
+                    break
+            if bucket is None:
+                document.setdefault("queued_generations", []).append(
+                    {
+                        "source_boot_id": boot_id,
+                        "source_daemon_generation": generation,
+                        "sessions": found,
+                    }
+                )
+            else:
+                bucket["sessions"] = {**found, **dict(bucket["sessions"])}
+    else:
+        document = {
+            "schema_version": schema_version,
+            "generated_at": inventory.get("generated_at"),
+            "source_boot_id": boot_id,
+            "source_daemon_generation": generation,
+            "detected_boot_id": boot_id,
+            "detected_daemon_generation": generation,
+            "sessions": found,
+        }
+    document["updated_at"] = _utc_now()
+    if write_collection_json is not None:
+        write_collection_json(
+            paths,
+            paths["pending"],
+            document,
+            collection_start=collection_start,
+        )
+    else:
+        atomic_write_json(paths["pending"], document)
+    return queued
+
+
+def prove_pending_losses(
+    value: Any,
+    expected_conversation_keys: Sequence[str],
+    *,
+    schema_version: int,
+) -> None:
+    """Prove the pending pathname still contains this snapshot's exact losses."""
+    expected = set(expected_conversation_keys)
+    found = _pending_conversation_keys(value, schema_version=schema_version)
+    missing = expected - found
+    if missing:
+        expected_text = ", ".join(sorted(expected))
+        found_text = ", ".join(sorted(found)) if found else "none"
+        raise CollectionError(
+            "pending recovery evidence changed before inventory/manifest advance; "
+            f"expected {expected_text}; found {found_text}"
+        )
 
 
 def source_generation_key(
@@ -302,8 +597,16 @@ def flatten_pending(
     pending_preferred_entry: Callable[[Sequence[dict[str, Any]]], dict[str, Any]],
     pending_conflict_fields: Callable[[Sequence[Mapping[str, Any]]], list[str]],
     pending_evidence: Callable[[Mapping[str, Any]], dict[str, Any]],
+    closed_on_purpose: Callable[[Any, Any], bool] | None = None,
 ) -> dict[str, Any]:
-    """Return one safe recovery candidate per exact provider conversation."""
+    """Return one safe recovery candidate per exact provider conversation.
+
+    A conversation somebody closed on purpose is not recovery work. The
+    tombstone is honoured HERE, at the one place every consumer passes
+    through -- the picker's offers, the count in its header, and the ack --
+    so an entry queued before the close disappears from all three together
+    rather than being rewritten out of a file under its own lock.
+    """
     entries: list[dict[str, Any]] = []
     if not valid_recovery_state(value):
         return {
@@ -368,6 +671,13 @@ def flatten_pending(
                     continue
                 uuid = valid_uuid(raw_session.get("uuid"))
                 provider = raw_session.get("provider")
+                if (
+                    closed_on_purpose is not None
+                    and provider in PROVIDERS
+                    and uuid
+                    and closed_on_purpose(provider, uuid)
+                ):
+                    continue
                 started_at = raw_session.get("started_at_unix_ms")
                 entries.append(
                     {
@@ -459,35 +769,6 @@ def list_pending(
         return flatten_pending(read_state_json(paths["pending"]))
 
 
-def _remove_pending_entry(
-    pending: dict[str, Any],
-    *,
-    queue: str,
-    queue_index: int | None,
-    scope: str,
-    old_shpool_id: str,
-) -> None:
-    container = "outside_agents" if scope == "outside" else "sessions"
-    if queue == "primary":
-        sessions = pending.get(container)
-        if isinstance(sessions, dict):
-            sessions.pop(old_shpool_id, None)
-        return
-    queued = pending.get("queued_generations")
-    if not isinstance(queued, list) or not isinstance(queue_index, int):
-        raise CollectionError("pending queue changed during acknowledgment")
-    if queue_index < 0 or queue_index >= len(queued):
-        raise CollectionError("pending generation changed during acknowledgment")
-    generation = queued[queue_index]
-    if not isinstance(generation, dict) or not isinstance(
-        generation.get(container), dict
-    ):
-        raise CollectionError("pending generation is malformed")
-    generation[container].pop(old_shpool_id, None)
-    if not generation.get("sessions") and not generation.get("outside_agents"):
-        queued.pop(queue_index)
-
-
 def acknowledge_pending(
     config: Mapping[str, Any],
     generation_key: str,
@@ -503,10 +784,13 @@ def acknowledge_pending(
     flatten_pending: Callable[[Any], dict[str, Any]],
     collect_live: Callable[[Mapping[str, Any]], dict[str, Any]],
     strict_live_inventory: Callable[[Mapping[str, Any]], bool],
-    remove_pending_entry: Callable[..., None],
-    atomic_write_json: Callable[[Path, Any], None],
 ) -> dict[str, Any]:
-    """Compare-and-ack one restored entry under the inventory state lock."""
+    """Prove one pending entry is restored without deleting its evidence.
+
+    The live projection suppresses retained evidence while the exact provider
+    conversation is active. If that live record disappears after this check,
+    the next projection offers the still-persisted candidate again.
+    """
     exact_uuid = valid_uuid(uuid)
     if not generation_key or not old_shpool_id or not exact_uuid:
         raise CollectionError(
@@ -554,31 +838,11 @@ def acknowledge_pending(
         evidence = target.get("evidence")
         if not isinstance(evidence, list) or not evidence:
             raise CollectionError("pending recovery evidence is incomplete")
-        ordered_evidence = sorted(
-            evidence,
-            key=lambda item: (
-                item.get("queue") == "primary",
-                -(
-                    item.get("queue_index")
-                    if isinstance(item.get("queue_index"), int)
-                    else -1
-                ),
-            ),
-        )
-        for source in ordered_evidence:
-            if not isinstance(source, Mapping):
-                raise CollectionError("pending recovery evidence is malformed")
-            remove_pending_entry(
-                pending,
-                queue=str(source.get("queue") or ""),
-                queue_index=source.get("queue_index"),
-                scope=str(source.get("scope") or ""),
-                old_shpool_id=str(source.get("old_shpool_id") or ""),
-            )
-        pending["updated_at"] = _utc_now()
-        atomic_write_json(paths["pending"], pending)
+        if not all(isinstance(source, Mapping) for source in evidence):
+            raise CollectionError("pending recovery evidence is malformed")
         return {
             "schema_version": schema_version,
             "acknowledged": target,
+            "evidence_retained": True,
             "remaining": flatten_pending(pending),
         }

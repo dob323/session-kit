@@ -34,6 +34,29 @@ picker_clear_screen() {
   return 0
 }
 
+# Compute-first frames: a renderer runs with stdout captured (in the current
+# shell, so its state side effects survive), and the finished bytes reach the
+# terminal as ONE write. In `home` mode each replaced line erases its own
+# remainder and the frame ends by erasing below — nothing is blanked until
+# its replacement is in the same write, so a slow renderer can never expose
+# an empty screen, with or without DEC-2026 support. `append` mode emits the
+# captured block in one write at the cursor, which turns a progressively
+# painted menu into a single paint.
+picker_frame_emit_file() {
+  local mode=$2 content
+  content=$(cat -- "$1" && printf x) || return 0
+  content=${content%x}
+  if (( PICKER_SCREEN )) && [[ $mode == home ]]; then
+    content=${content//$'\n'/$'\033[K\n'}
+    printf '\033[?2026h\033[H%s\033[K\033[J\033[?2026l' "$content"
+  else
+    # Append mode: the capture already makes this one write; extra control
+    # sequences would change the screen contract for no gain.
+    printf '%s' "$content"
+  fi
+  return 0
+}
+
 terminal_height() {
   local height=${LINES:-}
   if [[ ! $height =~ ^[0-9]+$ ]]; then

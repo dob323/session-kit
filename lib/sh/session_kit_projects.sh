@@ -19,6 +19,31 @@ projects_tool() {
     --state-dir "$state_root" "$@"
 }
 
+# A project's manifest is a different store from the host's project list, and
+# a different program reads it. Both are `session-kit projects <verb>` to the
+# person typing, because a startup command a person cannot review or approve
+# is a startup command that can never run: the verbs existed and nothing
+# reached them.
+projects_manifest_tool() {
+  local release=${1:-$install_root/current}
+  shift || true
+  local tool=$release/lib/sessionkit_projects/cli.py
+  [[ -f $tool && ! -L $tool ]] || die "the project manifest tool is unavailable"
+  python3 "$tool" --projects-file "$config_root/projects.tsv" \
+    --state-dir "$state_root" "$@"
+}
+
+projects_command() {
+  case "${1:-}" in
+    launch-plan | approve-startup | check | resolve | context | group-sessions)
+      projects_manifest_tool "$install_root/current" "$@"
+      ;;
+    *)
+      projects_tool "$install_root/current" "$@"
+      ;;
+  esac
+}
+
 configure_initial_projects() {
   local choice=$1 noninteractive=$2 answer count discovery
   (( projects_created )) || return 0

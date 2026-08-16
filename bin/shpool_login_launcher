@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# The picker's front door, and its way back.
+#
+# The new screen runs only where someone turned it on: `SESSION_KIT_TUI=on`
+# in the environment, or a `tui-on` file in the state directory. Everywhere
+# else a login window gets the picker that shipped before it. Where the new
+# screen is on and ends any way other than a person deliberately leaving,
+# this records one line and hands the window to that same picker, so a screen
+# that cannot draw is a worse picker for one login rather than a login with
+# no picker at all.
+
+set -u
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+TUI=${SESSION_KIT_TUI_CMD:-"$SCRIPT_DIR/shpool_login_tui"}
+FALLBACK=${SESSION_KIT_PICKER_FALLBACK_CMD:-"$SCRIPT_DIR/shpool_login"}
+STATE_DIR=${SESSION_KIT_STATE_DIR:-${XDG_STATE_HOME:-"$HOME/.local/state"}/session-kit}
+LOG=${SESSION_KIT_TUI_FALLBACK_LOG:-"$STATE_DIR/tui-fallback.log"}
+
+tui_switch=${SESSION_KIT_TUI:-}
+if [[ -z $tui_switch && -e "$STATE_DIR/tui-on" ]]; then
+  tui_switch=on
+fi
+
+if [[ $tui_switch != on || ! -x $TUI ]]; then
+  exec "$FALLBACK" "$@"
+fi
+
+mkdir -p -- "$STATE_DIR" 2>/dev/null || true
+stderr_root=$(mktemp -d "$STATE_DIR/tui-stderr.XXXXXXXX" 2>/dev/null || true)
+stderr_capture=
+stderr_pipe=
+stderr_drain=
+if [[ -n $stderr_root ]]; then
+  chmod 700 "$stderr_root" 2>/dev/null || true
+  stderr_capture=$stderr_root/tail
+  stderr_pipe=$stderr_root/stream
+  if command mkfifo -- "$stderr_pipe" 2>/dev/null; then
+    # Forward stderr as it arrives and retain only its useful tail. This is a
+    # shell reader so a login PATH without python3 cannot strand the FIFO.
+    # The parent gives it a short bounded drain below; a picker descendant
+    # that inherited stderr therefore cannot hold the login window forever.
+    drain_stderr() {
+      local chunk= size=0 chunk_size=0 keep=0
+      local limit=$((4 * 1024 * 1024)) trim=$stderr_capture.trim
+      : > "$stderr_capture" || return
+      exec 3< "$stderr_pipe" || return
+      while IFS= read -r -N 65536 chunk <&3 || [[ -n $chunk ]]; do
+        printf '%s' "$chunk" >&2
+        size=$(stat -c %s "$stderr_capture" 2>/dev/null || echo 0)
+        chunk_size=$(printf '%s' "$chunk" | wc -c)
+        if (( size + chunk_size > limit )); then
+          keep=$((limit - chunk_size))
+          (( keep < 0 )) && keep=0
+          if command tail -c "$keep" -- "$stderr_capture" > "$trim" 2>/dev/null; then
+            command mv -f -- "$trim" "$stderr_capture" || : > "$stderr_capture"
+          else
+            : > "$stderr_capture"
+          fi
+        fi
+        printf '%s' "$chunk" >> "$stderr_capture" || return
+        chunk=
+      done
+      exec 3<&-
+      command rm -f -- "$trim"
+    }
+    drain_stderr &
+    stderr_drain=$!
+  else
+    command rmdir -- "$stderr_root" 2>/dev/null || true
+    stderr_root=
+  fi
+fi
+if [[ -n $stderr_drain ]]; then
+  "$TUI" "$@" 2> "$stderr_pipe"
+  status=$?
+  # Normally the FIFO reaches EOF immediately. Give pending bytes a bounded
+  # grace period, then stop the reader if a detached child still owns stderr.
+  for (( drain_poll = 0; drain_poll < 20; drain_poll++ )); do
+    kill -0 "$stderr_drain" 2>/dev/null || break
+    sleep 0.01
+  done
+  kill "$stderr_drain" 2>/dev/null || true
+  wait "$stderr_drain" 2>/dev/null || true
+else
+  "$TUI" "$@"
+  status=$?
+fi
+
+# Leaving on purpose is the one status that means the screen did its job.
+if (( status == 0 )); then
+  if [[ -n $stderr_root ]]; then
+    command rm -f -- "$stderr_capture" "$stderr_pipe"
+    command rmdir -- "$stderr_root" 2>/dev/null || true
+  fi
+  exit 0
+fi
+
+mkdir -p -- "$(dirname -- "$LOG")" 2>/dev/null || true
+stderr_text=-
+if [[ -n $stderr_capture ]]; then
+  # Preserve the useful end of a traceback without copying unbounded picker
+  # output into a shell variable or one fallback-log record.
+  stderr_text=$(command tail -c 4096 -- "$stderr_capture" 2>/dev/null)
+  stderr_text=${stderr_text//\\/\\\\}
+  stderr_text=${stderr_text//$'\t'/\\t}
+  stderr_text=${stderr_text//$'\r'/\\r}
+  stderr_text=${stderr_text//$'\n'/\\n}
+  [[ -n $stderr_text ]] || stderr_text=-
+  command rm -f -- "$stderr_capture" "$stderr_pipe"
+  command rmdir -- "$stderr_root" 2>/dev/null || true
+fi
+printf '%s\texit %s\t%s\tstderr=%s\n' \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$status" "$TUI" "$stderr_text" \
+  >> "$LOG" 2>/dev/null || true
+
+exec "$FALLBACK" "$@"

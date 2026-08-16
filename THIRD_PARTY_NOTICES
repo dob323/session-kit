@@ -11,6 +11,8 @@ shpool 0.11.0:
   shpool-patch/0002-restore-input-modes-on-reattach.patch
   shpool-patch/0003-kill-tolerates-an-already-dead-shell.patch
   shpool-patch/0004-detach-must-not-hold-the-shells-lock.patch
+  shpool-patch/0005-attach-must-not-discard-the-shells-exit-status.patch
+  shpool-patch/0006-coalesce-client-resize-bursts.patch
 
 Upstream: https://github.com/shell-pool/shpool
 Base revision: v0.11.0 == fe2d11595ff255810523b0868159dec051e303f1
@@ -26,28 +28,3 @@ Session Kit does not include the shpool source tree or a shpool binary.
 The Apache License text is included at:
 
   LICENSES/Apache-2.0.txt
-
-Maniple (maniple-mcp)
----------------------
-
-The supervisor's oversight primitives are adapted from Maniple:
-
-  lib/sessionkit_supervisor/vendor/**
-  lib/sessionkit_supervisor/server.py
-
-Upstream: https://github.com/Martian-Engineering/maniple
-Vendored commit: 0987ccf59552989600f6134e6602abe72a3214d0
-Upstream version: maniple-mcp 0.13.0
-
-Maniple is MIT licensed. The upstream repository declares MIT in its
-pyproject.toml and README and publishes no LICENSE file of its own, so the MIT
-text reproduced here names the copyright holder from the project's declared
-authors and maintainers. The upstream file mapping and the Session Kit
-modifications are recorded at:
-
-  lib/sessionkit_supervisor/vendor/NOTICE
-
-The MIT license text is included at:
-
-  lib/sessionkit_supervisor/vendor/LICENSE
-  LICENSES/MIT-maniple.txt

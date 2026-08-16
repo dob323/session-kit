@@ -68,6 +68,23 @@ def _missing_shell_generation_is_quarantined(
     )
 
 
+def _generation_is_quarantined(item: Mapping[str, Any]) -> bool:
+    """Either shape of "this one row could not be numbered".
+
+    The first is the inert daemon-listed husk with no shell at all. The second
+    is any other row whose generation could not be proven: numbering used to
+    raise for the WHOLE estate on one of those, which took every session on
+    the machine read-only — no close, no switch, and no launch, because arming
+    a launch needs a clean snapshot. One row is now unactionable and named
+    instead, and the other rows keep working.
+    """
+    return _missing_shell_generation_is_quarantined(item) or (
+        item.get("terminal_number") is None
+        and item.get("mutation_allowed") is False
+        and item.get("mutation_rejection_reason") == "unprovable-generation"
+    )
+
+
 def guard_live_inventory(
     inventory: Mapping[str, Any],
     *,
@@ -117,7 +134,7 @@ def guard_live_inventory(
         shell = item.get("shpool_shell")
         provider = item.get("provider")
         terminal_number = item.get("terminal_number")
-        if _missing_shell_generation_is_quarantined(item):
+        if _generation_is_quarantined(item):
             if (
                 isinstance(row, bool)
                 or not isinstance(row, int)
@@ -358,7 +375,7 @@ def load_inventory_input(
             or (
                 has_terminal_numbers
                 and terminal_number is None
-                and not _missing_shell_generation_is_quarantined(item)
+                and not _generation_is_quarantined(item)
             )
             or (
                 has_terminal_numbers

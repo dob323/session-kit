@@ -19,15 +19,56 @@ import os
 from pathlib import Path
 import re
 import stat as statmod
+import sys
 import tempfile
 import time
 from typing import Any, Callable, Mapping
 
 from .common import automatic_naming_enabled, valid_uuid
 from .providers_codex import _codex_state_databases
+from .transcripts import claude_roots
 
 
 MAX_CLAUDE_SESSION_RECORDS = 512
+
+
+def _claude_transcripts(home: Path, uuid: str) -> list[Path]:
+    """Every local transcript of one conversation, whichever profile holds it.
+
+    A session started on an enrolled account keeps its transcript under that
+    account's profile, not under ``~/.claude``. A push that knew only the
+    default root therefore wrote nothing for those sessions and reported no
+    error a person would ever see — measured 2026-08-12: six of seven live
+    sessions had no colour record at all, so every provider window picked its
+    own colour while the picker showed the kit's.
+    """
+    found: list[Path] = []
+    for root in claude_roots({"HOME": os.fspath(home)}):
+        try:
+            found.extend(sorted((root / "projects").glob(f"*/{uuid}.jsonl")))
+        except OSError:
+            continue
+    return found
+
+
+def _claude_transcripts_by_age(home: Path, uuid: str) -> list[Path]:
+    """`_claude_transcripts`, oldest first, unreadable entries dropped.
+
+    One conversation can exist in more than one profile — an account switch
+    copies it — and then "which file describes this session" has to be
+    answered by evidence, not by which profile name sorts last. Recency is
+    the same rule `transcripts._claude_transcript` already uses.
+    """
+    dated: list[tuple[float, str, Path]] = []
+    for path in _claude_transcripts(home, uuid):
+        try:
+            if path.is_symlink() or not path.is_file():
+                continue
+            dated.append((path.stat().st_mtime, os.fspath(path), path))
+        except OSError:
+            continue
+    dated.sort()
+    return [path for _, _, path in dated]
 
 
 def _push_claude_title(
@@ -69,11 +110,7 @@ def _push_claude_title(
     # The prompt bar's bottom-right name is a transcript agent-name record —
     # the exact store /rename persists, hydrated at session start/resume,
     # rendered beside the agent-color. Same append discipline as colors.
-    projects = home / ".claude" / "projects"
-    try:
-        transcripts = sorted(projects.glob(f"*/{uuid}.jsonl"))
-    except OSError:
-        transcripts = []
+    transcripts = _claude_transcripts(home, uuid)
     name_entry = json.dumps(
         {"type": "agent-name", "agentName": title, "sessionId": uuid},
         separators=(",", ":"),
@@ -81,14 +118,19 @@ def _push_claude_title(
     for transcript in transcripts[:4]:
         if transcript.is_symlink():
             continue
-        try:
-            with open(transcript, "a", encoding="utf-8") as handle:
-                handle.write(name_entry + "\n")
-                handle.flush()
-                os.fsync(handle.fileno())
+        # Same "already says the right thing, leave it alone" rule the colour
+        # got: this runs on every pass too, so an unguarded append grew one
+        # more identical name record every time.
+        if _claude_name_already_set(transcript, uuid, title):
+            pushed.append("claude-transcript-name-current")
+            continue
+        landed, note = _append_transcript_record(transcript, name_entry)
+        if note:
+            warnings.append(
+                f"Claude transcript name{'' if landed else ' not'} appended: {note}"
+            )
+        if landed:
             pushed.append("claude-transcript-name")
-        except OSError as exc:
-            warnings.append(f"Claude transcript name not appended: {exc}")
     # The per-PID session record names the thread in Claude's own session
     # picker. Records carry the exact sessionId, so match by content.
     try:
@@ -132,6 +174,7 @@ def codex_bounce_prepare(
     *,
     codex_home: Callable[..., Path],
     max_session_index_bytes: int,
+    mirror_index: bool = True,
 ) -> str:
     """Resolve the real name a bounced Codex process should boot under.
 
@@ -224,7 +267,7 @@ def codex_bounce_prepare(
         chosen = title
     else:
         return ""
-    if index_name != chosen:
+    if index_name != chosen and mirror_index:
         # A failed mirror would relaunch under the stale bar name and burn
         # the one-shot bounce on nothing, so it defers instead.
         if index.is_symlink():
@@ -263,22 +306,22 @@ def claude_bounce_prepare(
         return "", False
     if not title:
         return "", False
-    try:
-        transcripts = sorted(
-            (home / ".claude" / "projects").glob(f"*/{uuid}.jsonl"),
-            key=lambda path: path.stat().st_mtime,
-        )
-    except OSError:
-        transcripts = []
+    # Every profile, not just the default root. A session launched on an
+    # enrolled account keeps its transcript under that account's profile, so
+    # the default-root glob found nothing and returned "defer" forever: the
+    # untitled marker was never cleared and the one safe rename bounce was
+    # never requested, which is exactly "it didn't rename the session" for a
+    # window that got its name after boot and then sat idle.
+    transcripts = _claude_transcripts_by_age(home, uuid)
     if not transcripts:
         return "", False
     last_prompt = 0.0
     try:
-        with open(transcripts[-1], encoding="utf-8") as handle:
-            for line in handle:
+        with open(transcripts[-1], "rb") as handle:
+            for raw in handle:
                 try:
-                    record = json.loads(line)
-                except ValueError:
+                    record = json.loads(raw.decode("utf-8", "strict"))
+                except (UnicodeDecodeError, ValueError):
                     continue
                 if not isinstance(record, Mapping) or record.get("type") != "user":
                     continue
@@ -321,9 +364,14 @@ def codex_pending_auto_titles(
     load_config: Callable[[], dict[str, Any]],
     max_session_index_bytes: int,
     push_live_rename: Callable[[Path, str, str], tuple[list[str], list[str]]],
+    human_named: Callable[[Mapping[str, str]], frozenset[str]],
     name_owner: Callable[..., str],
     claim_name: Callable[..., str],
+    release_claim: Callable[..., bool],
+    record_pushed: Callable[..., None],
     adopt_native: Callable[..., str],
+    budget_seconds: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> list[dict[str, str]]:
     """Kit-side auto-titler for Codex threads nobody has named.
 
@@ -342,11 +390,22 @@ def codex_pending_auto_titles(
     no thread id and no first_user_message, so nothing here can see it. From
     the claim onward the thread is named, and no later pass renames it — and
     a thread a person has renamed is never a candidate in the first place.
+
+    Nothing here is capped by count or by age any more. The old shape looked
+    at the 200 most recent threads, skipped anything older than seven days,
+    and stopped after twenty names and twenty repairs per pass — so a thread
+    that fell past any of those edges was never named at all, while the
+    Claude side named everything. The bound is now TIME: this runs on the
+    path that builds a human-facing inventory, so a pass spends at most a
+    couple of seconds and the next pass continues where it left off. Progress
+    is durable (each name writes the index entry that excludes the thread from
+    later passes), so a backlog converges instead of being abandoned.
     """
     import sqlite3
 
     env = environ if environ is not None else os.environ
-    reconciled = reconcile_pending_titles(load_config(), "codex", env)
+    config = load_config()
+    reconciled = reconcile_pending_titles(config, "codex", env)
     if not automatic_naming_enabled(env):
         return reconciled
     if str(env.get("SESSION_KIT_CODEX_AUTOTITLE", "")).strip().casefold() in {
@@ -358,10 +417,51 @@ def codex_pending_auto_titles(
         return reconciled
     codex_root, database = codex_paths()
     if not database.is_file():
+        # No thread store at all is not a failure to report: Codex may simply
+        # not be installed here. Any earlier complaint is stale, though, and a
+        # doctor warning nobody can act on is its own kind of noise.
+        _clear_titler_failure(env)
+        return reconciled
+    if budget_seconds is None:
+        budget_seconds = _autotitle_budget_seconds(env)
+    deadline = monotonic() + budget_seconds
+    store_error = False
+
+    def _remaining() -> float:
+        return max(0.0, deadline - monotonic())
+
+    def _set_sqlite_deadline(connection: Any) -> bool:
+        remaining = _remaining()
+        if remaining <= 0:
+            return False
+        connection.execute(f"PRAGMA busy_timeout={max(0, int(remaining * 1000))}")
+        return True
+
+    def _report_unreadable(exc: Exception) -> None:
+        nonlocal store_error
+        store_error = True
+        # A thread store that cannot be read means no Codex session gets a
+        # name, which is exactly the failure nobody could see before.
+        print(
+            f"session inventory: Codex thread store unreadable; "
+            f"threads were not titled: {exc}",
+            file=sys.stderr,
+        )
+        _record_titler_failure(env, f"Codex thread store unreadable: {exc}")
+
+    remaining = _remaining()
+    if remaining <= 0:
+        # No budget, no work: not even the schema probe. A pass that is out of
+        # time before it starts is a pass that does nothing, which is what
+        # makes the bound something a caller can rely on.
         return reconciled
     try:
-        connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+        connection = sqlite3.connect(
+            f"file:{database}?mode=ro", uri=True, timeout=remaining
+        )
         try:
+            if not _set_sqlite_deadline(connection):
+                return reconciled
             columns = {
                 row[1] for row in connection.execute("PRAGMA table_info(threads)")
             }
@@ -379,18 +479,69 @@ def codex_pending_auto_titles(
                 root_filter = " AND (agent_path IS NULL OR agent_path = '')"
             if "source" in columns:
                 root_filter += " AND (source IS NULL OR source != 'exec')"
-            rows = connection.execute(
-                "SELECT id, title, first_user_message, updated_at"
-                " FROM threads"
-                " WHERE first_user_message IS NOT NULL"
-                " AND first_user_message != ''"
-                + root_filter
-                + " ORDER BY updated_at DESC LIMIT 200"
+        finally:
+            connection.close()
+    except sqlite3.Error as exc:
+        _report_unreadable(exc)
+        return reconciled
+
+    # Read a page at a time, newest first, and only while there is budget left.
+    # The old shape asked for every matching row and materialized the lot
+    # before the first deadline check, so on a large store the query and its
+    # result set were outside the bound the pass claims to have. Keyset paging
+    # (updated_at, id) keeps the order total -- a thread with no timestamp
+    # sorts last rather than vanishing -- and each page is a short read.
+    select = (
+        "SELECT id, title, first_user_message, updated_at"
+        " FROM threads"
+        " WHERE first_user_message IS NOT NULL"
+        " AND first_user_message != ''" + root_filter
+    )
+
+    def _page(after: tuple[float, str] | None) -> list:
+        remaining = _remaining()
+        if remaining <= 0:
+            return []
+        connection = sqlite3.connect(
+            f"file:{database}?mode=ro", uri=True, timeout=remaining
+        )
+        try:
+            if not _set_sqlite_deadline(connection):
+                return []
+            if after is None:
+                return connection.execute(
+                    select
+                    + " ORDER BY COALESCE(updated_at, 0) DESC, id DESC LIMIT ?",
+                    (AUTOTITLE_PAGE_ROWS,),
+                ).fetchall()
+            stamp, last_id = after
+            return connection.execute(
+                select
+                + " AND (COALESCE(updated_at, 0) < ?"
+                " OR (COALESCE(updated_at, 0) = ? AND id < ?))"
+                " ORDER BY COALESCE(updated_at, 0) DESC, id DESC LIMIT ?",
+                (stamp, stamp, last_id, AUTOTITLE_PAGE_ROWS),
             ).fetchall()
         finally:
             connection.close()
-    except sqlite3.Error:
-        return reconciled
+
+    def _rows():
+        after: tuple[float, str] | None = None
+        while True:
+            if monotonic() >= deadline:
+                return
+            try:
+                page = _page(after)
+            except sqlite3.Error as exc:
+                _report_unreadable(exc)
+                return
+            if not page:
+                return
+            last = page[-1]
+            after = (float(last[3] or 0), str(last[0]))
+            yield from page
+
+    rows = _rows()
     index = codex_root / "session_index.jsonl"
     # Latest entry per id wins — the file is append-ordered and renames are
     # appended, so later lines overwrite earlier ones here.
@@ -398,6 +549,14 @@ def codex_pending_auto_titles(
     if index.is_file() and not index.is_symlink():
         try:
             if index.stat().st_size > max_session_index_bytes:
+                # Silence here looks exactly like "nothing needed a name",
+                # and the effect is that no Codex session is ever named again.
+                detail = (
+                    "Codex session index is larger than the bounded size "
+                    f"({max_session_index_bytes} bytes); threads were not titled"
+                )
+                print(f"session inventory: {detail}", file=sys.stderr)
+                _record_titler_failure(env, detail)
                 return reconciled
             for line in index.read_text(encoding="utf-8").splitlines():
                 try:
@@ -408,14 +567,28 @@ def codex_pending_auto_titles(
                     indexed[str(entry["id"])] = str(
                         entry.get("thread_name") or ""
                     ).strip()
-        except OSError:
+        except OSError as exc:
             # Unable to prove which threads already carry deliberate names;
-            # titling anyway could overwrite one, so do nothing.
+            # titling anyway could overwrite one, so do nothing — but say so,
+            # because silence here looks exactly like "nothing needed a name".
+            detail = f"Codex session index unreadable; threads were not titled: {exc}"
+            print(f"session inventory: {detail}", file=sys.stderr)
+            _record_titler_failure(env, detail)
             return reconciled
-    cutoff = time.time() - 7 * 86400
     results: list[dict[str, str]] = [
         {"uuid": str(item["uuid"]), "title": str(item["title"])} for item in reconciled
     ]
+    # Read the recorded name state once for the whole pass. The settled-row
+    # fast path is hot when a large indexed head precedes unnamed work, so
+    # deciding it from these in-memory maps keeps the check bounded and
+    # socket-free.
+    human_owned = human_named(env)
+    raw_aliases = config.get("aliases")
+    aliases = raw_aliases if isinstance(raw_aliases, Mapping) else {}
+    raw_automatic = config.get("automatic_titles")
+    automatic_titles = raw_automatic if isinstance(raw_automatic, Mapping) else {}
+    raw_pushed = config.get("pushed_titles")
+    pushed_titles = dict(raw_pushed) if isinstance(raw_pushed, Mapping) else {}
     # Live app-server windows repaint from a socket rename; derive the
     # socket root from the caller's exact environment (no real-home
     # fallback) so sandboxed runs stay inert.
@@ -424,26 +597,82 @@ def codex_pending_auto_titles(
         live_home = env.get("HOME")
         if live_home:
             live_state_dir = _session_kit_state_dir(env, Path(live_home))
-    healed = 0
     for uuid, raw_title, first_message, updated_at in rows:
+        if monotonic() >= deadline:
+            # Out of budget for this pass. Everything already written stands,
+            # and the next pass resumes from the newest thread still unnamed.
+            break
         exact = valid_uuid(uuid)
         if not exact:
             continue
-        # The index name is the deliberate one when it exists — /rename
-        # writes it — and threads.title is the fallback evidence.
-        adopted = adopt_native(
-            "codex",
-            exact,
-            indexed.get(exact) or str(raw_title or ""),
-            environ=env,
+        # A settled row is safe to skip only while its native title still
+        # equals the last state the kit recorded for that ownership tier. For
+        # a human row that is its alias; for an automatic row it is the last
+        # provider push. Ownership alone is never enough: a second /rename
+        # keeps human ownership but changes the native title, and that news
+        # must reach adoption before restore can replay the older alias.
+        key = f"codex:{exact}"
+        settled = (
+            exact in indexed
+            and indexed[exact] == str(raw_title or "").strip()
         )
+        recorded_title = (
+            aliases.get(key) if key in human_owned else pushed_titles.get(key)
+        )
+        if settled and recorded_title and recorded_title == indexed[exact]:
+            continue
+        # Rows created before pushed-title bookkeeping can still prove their
+        # history without a provider write: the two native stores agree, no
+        # person owns the row, and that exact title is either the retained
+        # automatic title or the title this same heuristic derives today.
+        # Adopt that evidence once so old stores converge onto the fast path.
+        if (
+            settled
+            and key not in human_owned
+            and not pushed_titles.get(key)
+            and indexed[exact]
+            and (
+                automatic_titles.get(key) == indexed[exact]
+                or derive_title(str(first_message or "")) == indexed[exact]
+            )
+        ):
+            record_pushed("codex", exact, indexed[exact], environ=env)
+            pushed_titles[key] = indexed[exact]
+            continue
+        # The index name is the deliberate one when it exists — /rename
+        # writes it — and threads.title is the fallback evidence. Codex may
+        # re-stamp the raw first prompt and drop its index entry; that known
+        # seed is not a person renaming the thread away from the kit's push.
+        native_title = indexed.get(exact) or str(raw_title or "")
+        last_recorded_title = (
+            aliases.get(key)
+            if key in human_owned
+            else pushed_titles.get(key) or automatic_titles.get(key)
+        )
+        adopted = ""
+        if (
+            last_recorded_title
+            and native_title != last_recorded_title
+            and (
+                exact in indexed
+                or not _codex_title_echoes_prompt(
+                    native_title, str(first_message or "")
+                )
+            )
+        ):
+            adopted = adopt_native(
+                "codex",
+                exact,
+                native_title,
+                environ=env,
+            )
         if adopted:
             results.append({"uuid": exact, "title": adopted})
             continue
-        owner = name_owner("codex", exact, environ=env)
-        if owner == "human":
-            # A person renamed this thread. Neither the titler nor the healer
-            # touches it again, in this pass or any pass after any restart.
+        if key in human_owned:
+            # Human ownership is irreversible. If this snapshot already
+            # proves it and adoption found no newer native text, the later
+            # repair/name paths are forbidden without another config read.
             continue
         if exact in indexed:
             # Heal the database half of the dual write: the status bar reads
@@ -455,27 +684,43 @@ def codex_pending_auto_titles(
             title = str(raw_title or "").strip()
             first = str(first_message or "").strip()
             if (
-                healed < 20
-                and index_name
+                index_name
                 and index_name != title
                 and not _codex_title_echoes_prompt(index_name, first)
                 and (not title or _codex_title_echoes_prompt(title, first))
             ):
-                _push_codex_thread_title(codex_root, exact, index_name)
-                if live_state_dir is not None:
-                    push_live_rename(live_state_dir, exact, index_name)
-                healed += 1
+                # This is the only indexed-row path that can still write.
+                # Re-read ownership at that boundary; rows with nothing to
+                # heal need no per-row config read at all.
+                owner = name_owner("codex", exact, environ=env)
+                if owner == "human":
+                    continue
+                remaining = _remaining()
+                if remaining > 0:
+                    _push_codex_thread_title(
+                        codex_root,
+                        exact,
+                        index_name,
+                        timeout_seconds=remaining,
+                    )
+                remaining = _remaining()
+                if live_state_dir is not None and remaining > 0:
+                    push_live_rename(
+                        live_state_dir,
+                        exact,
+                        index_name,
+                        timeout_seconds=remaining,
+                    )
+            continue
+        owner = name_owner("codex", exact, environ=env)
+        if owner == "human":
+            # A person renamed this thread. Neither the titler nor the healer
+            # touches it again, in this pass or any pass after any restart.
             continue
         if exact == "00000000-0000-0000-0000-000000000000":
             continue
         if owner:
             # The first-turn pass already claimed this thread's name.
-            continue
-        if (
-            not isinstance(updated_at, (int, float))
-            or isinstance(updated_at, bool)
-            or float(updated_at) < cutoff
-        ):
             continue
         title = str(raw_title or "").strip()
         first = str(first_message or "").strip()
@@ -485,21 +730,135 @@ def codex_pending_auto_titles(
         derived = derive_title(first)
         if not derived:
             continue
-        # Both writes target the exact store tree the candidates were read
-        # from — pushing anywhere else would split reads and writes across
-        # different Codex homes.
+        # The claim is the race decision, so nothing is written before it.
+        # `/rename` or `sp name` landing between the ownership read above and
+        # this line takes the name; the claim refuses, and refusing has to mean
+        # writing nothing at all. Claiming after the index append (as this did)
+        # left the person owning the name locally while the provider surfaces
+        # carried the automatic one -- the two disagreeing about the same
+        # session is the whole defect class this file exists to close.
+        refusal = claim_name("codex", exact, environ=env)
+        if refusal:
+            continue
+        def still_automatic() -> bool:
+            return name_owner("codex", exact, environ=env) == "automatic"
+        # The index is append-only, so its only safe race boundary is the
+        # instant immediately before the append. A human claim that landed
+        # after our automatic claim therefore suppresses this write entirely.
+        if not still_automatic():
+            continue
         try:
             _append_codex_index_entry(index, exact, derived[:100])
         except OSError:
+            release_claim("codex", exact, environ=env)
             continue
-        claim_name("codex", exact, environ=env)
-        _push_codex_thread_title(codex_root, exact, derived)
-        if live_state_dir is not None:
-            push_live_rename(live_state_dir, exact, derived)
+        # The append is the titler's durable provider-side write. Remember
+        # its exact value so a later settled pass can distinguish the kit's
+        # own title from a native /rename without reopening this row forever.
+        record_pushed("codex", exact, derived, environ=env)
+        # Both writes target the exact store tree the candidates were read
+        # from — pushing anywhere else would split reads and writes across
+        # different Codex homes. Each is checked against the budget: one
+        # SQLite update plus eight socket attempts at a two-second timeout can
+        # outlast the whole pass on its own.
+        remaining = _remaining()
+        if remaining > 0:
+            _push_codex_thread_title(
+                codex_root,
+                exact,
+                derived,
+                timeout_seconds=remaining,
+                still_automatic=still_automatic,
+            )
+        remaining = _remaining()
+        if live_state_dir is not None and remaining > 0:
+            push_live_rename(
+                live_state_dir,
+                exact,
+                derived,
+                timeout_seconds=remaining,
+                still_automatic=still_automatic,
+            )
         results.append({"uuid": exact, "title": derived})
-        if len(results) >= 20:
-            break
+    if not store_error:
+        _clear_titler_failure(env)
     return results
+
+
+DEFAULT_AUTOTITLE_BUDGET_SECONDS = 2.0
+
+# One page is a short read even on a large store, and small enough that the
+# deadline is re-checked often.
+AUTOTITLE_PAGE_ROWS = 200
+
+
+def _record_titler_failure(env: Mapping[str, str], detail: str) -> None:
+    """Leave a failure where a person will actually meet it.
+
+    Printing to stderr is not enough on its own: every human-facing inventory
+    build calls this through `shpool_status`, which sends both streams to
+    /dev/null, so the one thing worth saying -- no Codex session can be named
+    right now -- reached nobody. `session-kit doctor` reads this file.
+    """
+    home = env.get("HOME")
+    if not home:
+        return
+    try:
+        state = _session_kit_state_dir(env, Path(home))
+        state.mkdir(parents=True, exist_ok=True)
+        path = state / "codex-autotitle-error.json"
+        if path.is_symlink():
+            return
+        payload = json.dumps(
+            {
+                "detail": str(detail)[:400],
+                "at": dt.datetime.now(dt.timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z"),
+            },
+            separators=(",", ":"),
+        )
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(payload + "\n")
+    except OSError:
+        return
+
+
+def _clear_titler_failure(env: Mapping[str, str]) -> None:
+    """A pass that read the store fine retires the last complaint."""
+    home = env.get("HOME")
+    if not home:
+        return
+    try:
+        path = (
+            _session_kit_state_dir(env, Path(home)) / "codex-autotitle-error.json"
+        )
+        if not path.is_symlink():
+            path.unlink()
+    except OSError:
+        return
+
+
+def _autotitle_budget_seconds(env: Mapping[str, str]) -> float:
+    """How long one titling pass may spend, in seconds.
+
+    This runs before a human-facing inventory build, so the pass has to end
+    while somebody is waiting for a list. Two seconds names a large backlog
+    over a handful of refreshes and is invisible on an ordinary one, where
+    every recent thread already carries an index entry and the loop does
+    nothing at all.
+    """
+    raw = str(env.get("SESSION_KIT_CODEX_AUTOTITLE_BUDGET_SECONDS", "")).strip()
+    if not raw:
+        return DEFAULT_AUTOTITLE_BUDGET_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_AUTOTITLE_BUDGET_SECONDS
+    if value <= 0 or value > 60:
+        return DEFAULT_AUTOTITLE_BUDGET_SECONDS
+    return value
 
 
 def _append_codex_index_entry(index: Path, uuid: str, title: str) -> None:
@@ -521,7 +880,12 @@ def _append_codex_index_entry(index: Path, uuid: str, title: str) -> None:
 
 
 def _push_codex_thread_title(
-    codex_root: Path, uuid: str, title: str
+    codex_root: Path,
+    uuid: str,
+    title: str,
+    *,
+    timeout_seconds: float = 1.0,
+    still_automatic: Callable[[], bool] | None = None,
 ) -> tuple[list[str], list[str]]:
     """Set threads.title in Codex's own state database.
 
@@ -538,11 +902,34 @@ def _push_codex_thread_title(
         return [], []
     database = candidates[-1]
     try:
-        connection = sqlite3.connect(database, timeout=1.0)
+        timeout_seconds = max(0.0, float(timeout_seconds))
+        deadline = time.monotonic() + timeout_seconds
+
+        def set_busy_deadline(connection: Any) -> bool:
+            remaining = max(0.0, deadline - time.monotonic())
+            if remaining <= 0:
+                return False
+            connection.execute(
+                f"PRAGMA busy_timeout={max(0, int(remaining * 1000))}"
+            )
+            return True
+
+        connection = sqlite3.connect(database, timeout=timeout_seconds)
         try:
+            if not set_busy_deadline(connection):
+                return [], []
             cursor = connection.execute(
                 "UPDATE threads SET title = ? WHERE id = ?", (title, uuid)
             )
+            # SQLite lets us hold the UPDATE uncommitted. Re-read ownership
+            # after the blocking write and finalize only while the claim is
+            # still automatic; a human rename that landed meanwhile wins.
+            if still_automatic is not None and not still_automatic():
+                connection.rollback()
+                return [], []
+            if not set_busy_deadline(connection):
+                connection.rollback()
+                return [], []
             connection.commit()
             if cursor.rowcount > 0:
                 return ["codex-thread-title"], []
@@ -575,7 +962,26 @@ def _session_kit_state_dir(env: Mapping[str, str], home: Path) -> Path:
     return home / ".local" / "state" / "session-kit"
 
 
-def _ws_send_frame(connection: Any, payload: bytes, opcode: int = 1) -> None:
+def _socket_time_left(deadline: float | None, cap: float = 2.0) -> float:
+    if deadline is None:
+        return cap
+    return min(cap, max(0.0, deadline - time.monotonic()))
+
+
+def _set_socket_deadline(connection: Any, deadline: float | None) -> None:
+    remaining = _socket_time_left(deadline)
+    if remaining <= 0:
+        raise TimeoutError("automatic-title deadline expired")
+    connection.settimeout(remaining)
+
+
+def _ws_send_frame(
+    connection: Any,
+    payload: bytes,
+    opcode: int = 1,
+    *,
+    deadline: float | None = None,
+) -> None:
     import struct
 
     header = bytes([0x80 | opcode])
@@ -588,15 +994,19 @@ def _ws_send_frame(connection: Any, payload: bytes, opcode: int = 1) -> None:
         header += bytes([127 | 0x80]) + struct.pack("!Q", length)
     mask = os.urandom(4)
     masked = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
+    _set_socket_deadline(connection, deadline)
     connection.sendall(header + mask + masked)
 
 
-def _ws_recv_frame(connection: Any, *, max_frame: int) -> tuple[int, bytes]:
+def _ws_recv_frame(
+    connection: Any, *, max_frame: int, deadline: float | None = None
+) -> tuple[int, bytes]:
     import struct
 
     def read_exact(count: int) -> bytes:
         data = b""
         while len(data) < count:
+            _set_socket_deadline(connection, deadline)
             chunk = connection.recv(count - len(data))
             if not chunk:
                 raise OSError("WebSocket closed mid-frame")
@@ -626,6 +1036,7 @@ def _ws_request(
     params: dict[str, Any],
     *,
     max_frame: int,
+    deadline: float | None = None,
 ) -> None:
     _ws_send_frame(
         connection,
@@ -633,13 +1044,16 @@ def _ws_request(
             {"method": method, "id": request_id, "params": params},
             separators=(",", ":"),
         ).encode(),
+        deadline=deadline,
     )
     while True:
-        opcode, payload = _ws_recv_frame(connection, max_frame=max_frame)
+        opcode, payload = _ws_recv_frame(
+            connection, max_frame=max_frame, deadline=deadline
+        )
         if opcode == 8:
             raise OSError("WebSocket closed by server")
         if opcode == 9:
-            _ws_send_frame(connection, payload, opcode=10)
+            _ws_send_frame(connection, payload, opcode=10, deadline=deadline)
             continue
         if opcode != 1:
             continue
@@ -661,6 +1075,8 @@ def _push_codex_live_rename(
     *,
     max_sockets: int,
     max_frame: int,
+    timeout_seconds: float | None = None,
+    still_automatic: Callable[[], bool] | None = None,
 ) -> tuple[list[str], list[str]]:
     """Repaint live app-server-backed Codex windows with the new name.
 
@@ -676,6 +1092,12 @@ def _push_codex_live_rename(
     """
     import base64
     import socket as socketmod
+
+    deadline = (
+        None
+        if timeout_seconds is None
+        else time.monotonic() + max(0.0, float(timeout_seconds))
+    )
 
     app_root = kit_state_dir / "app-server"
     try:
@@ -700,7 +1122,7 @@ def _push_codex_live_rename(
     delivered = False
     connected = 0
     for _, directory in ordered:
-        if connected >= max_sockets:
+        if connected >= max_sockets or _socket_time_left(deadline) <= 0:
             break
         socket_path = directory / "app.sock"
         try:
@@ -711,9 +1133,9 @@ def _push_codex_live_rename(
         except OSError:
             continue
         connection = socketmod.socket(socketmod.AF_UNIX, socketmod.SOCK_STREAM)
-        connection.settimeout(2.0)
         try:
             try:
+                _set_socket_deadline(connection, deadline)
                 connection.connect(os.fspath(socket_path))
             except OSError:
                 # An abandoned socket file refuses the connection at once;
@@ -721,6 +1143,7 @@ def _push_codex_live_rename(
                 continue
             connected += 1
             key = base64.b64encode(os.urandom(16)).decode()
+            _set_socket_deadline(connection, deadline)
             connection.sendall(
                 (
                     "GET / HTTP/1.1\r\nHost: localhost\r\n"
@@ -733,6 +1156,7 @@ def _push_codex_live_rename(
             while not response.endswith(b"\r\n\r\n"):
                 if len(response) > 65536:
                     raise OSError("oversized upgrade response")
+                _set_socket_deadline(connection, deadline)
                 byte = connection.recv(1)
                 if not byte:
                     raise OSError("app-server closed during upgrade")
@@ -751,6 +1175,7 @@ def _push_codex_live_rename(
                     }
                 },
                 max_frame=max_frame,
+                deadline=deadline,
             )
             _ws_send_frame(
                 connection,
@@ -758,13 +1183,19 @@ def _push_codex_live_rename(
                     {"method": "initialized", "params": {}},
                     separators=(",", ":"),
                 ).encode(),
+                deadline=deadline,
             )
+            # The protocol call below is irreversible. Check the canonical
+            # owner at its last safe boundary so a human claim suppresses it.
+            if still_automatic is not None and not still_automatic():
+                continue
             _ws_request(
                 connection,
                 2,
                 "thread/name/set",
                 {"threadId": uuid, "name": title},
                 max_frame=max_frame,
+                deadline=deadline,
             )
             delivered = True
         except (OSError, ValueError):
@@ -775,6 +1206,69 @@ def _push_codex_live_rename(
     if delivered:
         return ["codex-live-rename"], []
     return [], []
+
+
+CODEX_LIVE_CAPABILITY_FILE = "capabilities.json"
+
+
+def codex_live_capabilities(kit_state_dir: Path) -> dict[str, bool]:
+    """What a live Codex app-server in this installation can be asked to do.
+
+    The kit already renames a live window through ``thread/name/set``. A live
+    RECOLOUR has no equivalent in the installed build, and the honest handling
+    of that is to say so rather than to guess a method name: the caller then
+    tells the person their colour lands at the window's next start, which is
+    true today and stops being printed the moment the capability appears.
+
+    The file is written by the app-server client after it negotiates
+    ``initialize`` -- that client is WS-F's work. Until it exists, every
+    capability reads false, which is exactly the current truth.
+    """
+    path = kit_state_dir / "app-server" / CODEX_LIVE_CAPABILITY_FILE
+    try:
+        if path.is_symlink():
+            return {}
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, Mapping):
+        return {}
+    return {
+        str(key): bool(value)
+        for key, value in raw.items()
+        if isinstance(key, str) and isinstance(value, bool)
+    }
+
+
+def push_codex_live_color(
+    kit_state_dir: Path,
+    uuid: str,
+    color: str,
+    *,
+    capabilities: Callable[[Path], Mapping[str, bool]] = codex_live_capabilities,
+    send: Callable[[Path, str, str], tuple[list[str], list[str]]] | None = None,
+) -> tuple[list[str], list[str]]:
+    """Repaint a live Codex window in a new colour, when that becomes possible.
+
+    Codex takes its theme from the command line at launch, so today a recolour
+    reaches a window only through the one safe provider restart. The seam is
+    here so the recolour path has one place to ask, and one answer that is
+    never a false success: a warning naming the real reason, which the caller
+    turns into the line the person reads.
+    """
+    exact = valid_uuid(uuid)
+    if not exact or not color:
+        return [], ["invalid Codex live recolor request"]
+    if not capabilities(kit_state_dir).get("theme_set"):
+        return [], [
+            "Codex has no live theme control in this build; "
+            "the color applies when the window next starts"
+        ]
+    if send is None:
+        return [], [
+            "Codex live theme control is available but no app-server client is wired"
+        ]
+    return send(kit_state_dir, exact, color)
 
 
 def _push_codex_title(
@@ -809,21 +1303,178 @@ def _push_codex_title(
     )
 
 
+def _claude_last_record_value(
+    transcript: Path, uuid: str, kind: str, field: str
+) -> str | None:
+    """The value this transcript's LAST `kind` record carries for this uuid.
+
+    The last one is what counts: Claude replays the records in order, so a
+    later record overrides an earlier one. Any unreadable or malformed line
+    is skipped rather than treated as an answer, and a transcript that cannot
+    be read at all returns None -- every caller reads that as "no answer" and
+    falls through to the append, which is the behaviour that existed before
+    the guard.
+
+    The file is read as BYTES and each candidate line is decoded on its own.
+    Text mode raises UnicodeDecodeError -- a ValueError, not an OSError --
+    from the iteration itself, so one half-written multi-byte character at
+    the end of a transcript a live provider is writing (the normal shape of a
+    killed writer) escaped this function, its caller, and the hydration loop
+    that walks every session, and silently stopped colour and name for every
+    session in the pass. Decoding per line keeps one torn line from costing
+    the other forty thousand.
+    """
+    current: str | None = None
+    marker = f'"{kind}"'.encode()
+    try:
+        with open(transcript, "rb") as handle:
+            for raw in handle:
+                if marker not in raw:
+                    continue
+                try:
+                    item = json.loads(raw.decode("utf-8", "strict"))
+                except (UnicodeDecodeError, ValueError):
+                    continue
+                if (
+                    isinstance(item, Mapping)
+                    and item.get("type") == kind
+                    and item.get("sessionId") == uuid
+                ):
+                    value = item.get(field)
+                    current = value if isinstance(value, str) else None
+    except OSError:
+        return None
+    return current
+
+
+def _claude_color_already_set(transcript: Path, uuid: str, color: str) -> bool:
+    """Whether this transcript's LAST color record already says `color`."""
+    return (
+        _claude_last_record_value(transcript, uuid, "agent-color", "agentColor")
+        == color
+    )
+
+
+def _claude_name_already_set(transcript: Path, uuid: str, name: str) -> bool:
+    """Whether this transcript's LAST name record already says `name`."""
+    return (
+        _claude_last_record_value(transcript, uuid, "agent-name", "agentName") == name
+    )
+
+
+# How long a transcript must sit untouched before an unterminated last line
+# counts as wreckage left by a killed writer rather than a record being
+# written this instant.
+TRANSCRIPT_QUIET_SECONDS = 30.0
+
+
+def _write_whole_line(descriptor: int, payload: bytes) -> bool:
+    """One O_APPEND write. True when the record ended up on its own line.
+
+    O_APPEND makes the kernel place the whole buffer contiguously at the end
+    of the file, so this record can never be cut in half by another writer.
+    Where it landed is read back from the file offset, which O_APPEND leaves
+    at the end of OUR bytes -- so it stays true even if the provider appends
+    again immediately afterwards.
+
+    A payload that already begins with a newline starts a line whatever
+    precedes it, so it is standalone by construction; anything else has to be
+    proven by the byte in front of it.
+    """
+    written = os.write(descriptor, payload)
+    if written != len(payload):
+        raise OSError(f"short write ({written} of {len(payload)} bytes)")
+    start = os.lseek(descriptor, 0, os.SEEK_CUR) - written
+    if os.pread(descriptor, written, start) != payload:
+        raise OSError("the record did not read back as it was written")
+    if payload.startswith(b"\n") or start == 0:
+        return True
+    return os.pread(descriptor, 1, start - 1) == b"\n"
+
+
+def _append_transcript_record(transcript: Path, entry: str) -> tuple[bool, str]:
+    """Append one whole JSONL record. Returns (it landed, what to say).
+
+    Appending is the only safe edit to a transcript a live provider owns, and
+    the danger is not the write being torn -- O_APPEND cannot tear it -- but
+    WHERE it lands. A provider writes a record; if it does that in more than
+    one write, there is an instant when the file ends part-way through its
+    record, and a record appended in that instant lands INSIDE the provider's,
+    making one invalid line out of two records. The old code checked the tail
+    and then wrote, and a provider that began a record between those two steps
+    got its record destroyed while the caller was told the colour had landed.
+
+    Nothing closes that window from this side: the provider does not
+    coordinate, and there is no check-and-append syscall. What is guaranteed
+    instead:
+
+    * a record already visibly in flight is never written onto at all;
+    * where the write lands is VERIFIED, not assumed;
+    * if it landed inside another record anyway, the colour is written again
+      behind a leading newline, which starts a line whatever precedes it, so
+      OUR record always ends up whole and readable;
+    * success is reported only for a record read back from the file;
+    * and damage to the provider's record is said out loud instead of being
+      swallowed.
+    """
+    payload = (entry + "\n").encode("utf-8")
+    try:
+        descriptor = os.open(transcript, os.O_RDWR | os.O_APPEND)
+    except OSError as exc:
+        return False, str(exc)
+    try:
+        status = os.fstat(descriptor)
+        if not statmod.S_ISREG(status.st_mode):
+            return False, "not a regular file"
+        if status.st_size and os.pread(descriptor, 1, status.st_size - 1) != b"\n":
+            if time.time() - status.st_mtime < TRANSCRIPT_QUIET_SECONDS:
+                # A record is visibly in flight. Refuse: the next pass tries
+                # again, and a colour that arrives a few seconds later beats
+                # one that costs the provider an event.
+                return False, "a record is being written to this transcript right now"
+            # Untouched long enough that the half-line is wreckage from a
+            # killed writer, not work in progress. The leading newline closes
+            # it, so the file is never left worse than it was found.
+            payload = b"\n" + payload
+        if not _write_whole_line(descriptor, payload):
+            # The provider began a record between the check above and the
+            # write, and this one landed inside it. Both records are now one
+            # invalid line. Write the colour again behind a leading newline --
+            # that starts a line no matter what precedes it, so this copy is
+            # whole and is the one every reader will find.
+            _write_whole_line(descriptor, b"\n" + payload)
+            os.fsync(descriptor)
+            return True, (
+                "a Claude record was being written at the same instant and was "
+                "damaged; the record was written again on its own line"
+            )
+        os.fsync(descriptor)
+    except OSError as exc:
+        return False, str(exc)
+    finally:
+        os.close(descriptor)
+    return True, ""
+
+
 def _push_claude_color(
     home: Path, uuid: str, color: str
 ) -> tuple[list[str], list[str]]:
-    """Append the exact agent-color record /color itself writes.
+    """Write the exact agent-color record /color itself writes, once.
 
     Claude Code reads it at session start/resume; nothing is ever typed into
     a live terminal. Missing transcripts fail open.
+
+    Written once per conversation, not once per pass. This runs on every
+    attach (`sk_push_session_color`), and it used to append unconditionally,
+    so a session a person opened eight times carried eight identical color
+    records and grew one more on every reattach. Claude honours the last
+    record either way, so the repeats never changed what was shown -- they
+    only grew a file the kit does not own and cannot compact. A record that
+    already says the right thing is left alone; a DIFFERENT color still
+    appends, because that is a real change and appending is the only safe
+    edit to a transcript a live provider is writing to.
     """
-    projects = home / ".claude" / "projects"
-    if not projects.is_dir():
-        return [], ["Claude projects directory unavailable; color not pushed"]
-    try:
-        transcripts = sorted(projects.glob(f"*/{uuid}.jsonl"))
-    except OSError as exc:
-        return [], [f"Claude transcripts unreadable: {exc}"]
+    transcripts = _claude_transcripts(home, uuid)
     if not transcripts:
         return [], ["no Claude transcript for this conversation; color not pushed"]
     entry = json.dumps(
@@ -836,12 +1487,14 @@ def _push_claude_color(
         if transcript.is_symlink():
             warnings.append(f"refusing symlinked transcript: {transcript.name}")
             continue
-        try:
-            with open(transcript, "a", encoding="utf-8") as handle:
-                handle.write(entry + "\n")
-                handle.flush()
-                os.fsync(handle.fileno())
+        if _claude_color_already_set(transcript, uuid, color):
+            pushed.append("claude-transcript-color-current")
+            continue
+        landed, note = _append_transcript_record(transcript, entry)
+        if note:
+            warnings.append(
+                f"Claude transcript{'' if landed else ' not'} appended: {note}"
+            )
+        if landed:
             pushed.append("claude-transcript-color")
-        except OSError as exc:
-            warnings.append(f"Claude transcript not appended: {exc}")
     return pushed, warnings

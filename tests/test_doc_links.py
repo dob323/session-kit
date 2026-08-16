@@ -11,6 +11,20 @@ CHECKER = REPO / "tools" / "check-doc-links"
 
 
 class DocumentationLinkTests(unittest.TestCase):
+    def test_claude_statusline_preservation_and_ledgers_are_documented(self) -> None:
+        changelog = (REPO / "CHANGELOG.md").read_text(encoding="utf-8")
+        updates = (REPO / "docs/update-and-rollback.md").read_text(encoding="utf-8")
+        uninstall = (REPO / "docs/uninstall.md").read_text(encoding="utf-8")
+
+        for text in (changelog, updates):
+            self.assertIn("--force", text)
+            self.assertIn("claude-statusline-backups.json", text)
+            self.assertIn("claude-integration.json", text)
+        self.assertIn("claude-statusline-backups.json", uninstall)
+        self.assertIn("claude-integration.json", uninstall)
+        self.assertIn("restores", uninstall)
+        self.assertIn("session-kit-quota", uninstall)
+
     def test_repository_local_links_resolve(self) -> None:
         result = subprocess.run(
             [str(CHECKER), str(REPO)],

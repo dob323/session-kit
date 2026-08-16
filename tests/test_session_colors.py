@@ -10,9 +10,11 @@ import json
 import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -158,6 +160,83 @@ class SessionColorTests(unittest.TestCase):
                         transcript.read_text(encoding="utf-8").splitlines()[-1]
                     )["agentColor"],
                 )
+
+    def color_records(self, transcript: Path, uuid: str) -> list[str]:
+        """Every agent-color value in a transcript, in order."""
+        values: list[str] = []
+        for line in transcript.read_text(encoding="utf-8").splitlines():
+            try:
+                item = json.loads(line)
+            except ValueError:
+                continue
+            if item.get("type") == "agent-color" and item.get("sessionId") == uuid:
+                values.append(item["agentColor"])
+        return values
+
+    def transcript_fixture(self, base: str, number: int) -> tuple[Path, str, dict]:
+        home = Path(base) / "home"
+        project_dir = home / ".claude" / "projects" / "-srv-project"
+        project_dir.mkdir(parents=True, mode=0o700)
+        exact = uuid_for(number)
+        transcript = project_dir / f"{exact}.jsonl"
+        transcript.write_text(
+            '{"type":"user","sessionId":"%s"}\n' % exact, encoding="utf-8"
+        )
+        return transcript, exact, {"HOME": os.fspath(home)}
+
+    def test_the_color_is_written_once_not_once_per_attach(self) -> None:
+        """One record per conversation, not one per pass.
+
+        The push runs on every attach (`sk_push_session_color`), so a session
+        a person opened eight times carried eight identical records and grew
+        one more on every reattach. Claude honours the last record either way,
+        so the repeats never changed what was shown -- they only grew a file
+        the kit does not own and cannot compact.
+        """
+        with tempfile.TemporaryDirectory(prefix=".colors-", dir=REPO) as raw:
+            transcript, exact, environ = self.transcript_fixture(raw, 81)
+
+            for _ in range(8):
+                result = inventory_core.propagate_provider_color(
+                    "claude", exact, "blue", environ=environ
+                )
+
+            self.assertEqual(["blue"], self.color_records(transcript, exact))
+            self.assertEqual(
+                ["claude-transcript-color-current"],
+                result["provider_color_pushes"],
+            )
+
+    def test_a_real_color_change_is_still_written(self) -> None:
+        """Idempotence must not freeze the colour: a change is a change."""
+        with tempfile.TemporaryDirectory(prefix=".colors-", dir=REPO) as raw:
+            transcript, exact, environ = self.transcript_fixture(raw, 82)
+
+            for color in ("blue", "pink", "pink"):
+                inventory_core.propagate_provider_color(
+                    "claude", exact, color, environ=environ
+                )
+
+            # The change appends; the repeat of the new colour does not. The
+            # earlier record stays -- appending is the only safe edit to a
+            # transcript a live provider is also writing to.
+            self.assertEqual(["blue", "pink"], self.color_records(transcript, exact))
+
+    def test_another_conversations_record_never_counts_as_this_ones(self) -> None:
+        """Records carry a sessionId, so the match has to use it."""
+        with tempfile.TemporaryDirectory(prefix=".colors-", dir=REPO) as raw:
+            transcript, exact, environ = self.transcript_fixture(raw, 83)
+            with open(transcript, "a", encoding="utf-8") as handle:
+                handle.write(
+                    '{"type":"agent-color","agentColor":"blue","sessionId":"%s"}\n'
+                    % uuid_for(84)
+                )
+
+            inventory_core.propagate_provider_color(
+                "claude", exact, "blue", environ=environ
+            )
+
+            self.assertEqual(["blue"], self.color_records(transcript, exact))
 
     def test_codex_color_push_is_a_clean_no_op(self) -> None:
         result = inventory_core.propagate_provider_color(
@@ -374,6 +453,15 @@ class SessionColorTests(unittest.TestCase):
                 )
                 self.assertEqual("sand", kept[f"codex:{exact}"])
                 self.assertFalse(marker.exists())
+
+                # A newer explicit choice published after the collector read
+                # its empty override map also wins at the lock boundary.
+                inventory_core.mutate_canonical_color(
+                    config, "codex", exact, "lime"
+                )
+                inventory_core.record_launch_color(config, shpool_id)
+                raced = inventory_core._adopt_launch_colors(config, sessions, {})
+                self.assertEqual("lime", raced[f"codex:{exact}"])
 
 
 class PaletteSplitTests(unittest.TestCase):
@@ -704,6 +792,25 @@ class ReconcileTests(unittest.TestCase):
         self.assertEqual(settled, self.effective("claude", uuids))
         self.assertEqual(written, self.config_file.read_bytes())
 
+    def test_it_recollects_rows_after_taking_the_publishing_lock(self) -> None:
+        _, uuids = colliding_uuids("claude", 2)
+        stale_rows = self.rows("claude", uuids)
+        calls: list[str] = []
+
+        def current_rows() -> list[dict[str, object]]:
+            calls.append("under-lock")
+            return self.rows("claude", [uuids[0]])
+
+        result = inventory_core.reconcile_session_colors(
+            self.config,
+            stale_rows,
+            revalidate_sessions=current_rows,
+        )
+
+        self.assertEqual(["under-lock"], calls)
+        self.assertEqual({}, result["moved"])
+        self.assertEqual({}, result["colors"])
+
     def test_a_reversed_arrival_order_settles_the_same_way(self) -> None:
         # Settle order is the identity, not the order the snapshot happened to
         # list rows in, or a second pass over a reordered inventory would move
@@ -877,9 +984,7 @@ def quoted_names(text: str) -> tuple[str, ...]:
 
 
 class PaletteSurfaceTests(unittest.TestCase):
-    """A palette that is fourteen in Python and eight in Bash still passes
-    every unit test above and still looks wrong on screen. Each check here
-    parses one non-Python surface and compares it to the palette itself."""
+    """Every visual surface uses the canonical palette."""
 
     def section(self, relative: str, pattern: str) -> str:
         text = (REPO / relative).read_text(encoding="utf-8")
@@ -889,14 +994,17 @@ class PaletteSurfaceTests(unittest.TestCase):
         return match.group(1)
 
     def test_picker_renderer_tints_every_color(self) -> None:
-        body = self.section(
-            "lib/sh/shpool_login_render.sh", r"SESSION_PALETTE = \{(.*?)\n\}"
+        source = (REPO / "lib/sh/shpool_login_render.sh").read_text(
+            encoding="utf-8"
         )
-        self.assertEqual(inventory_core.SESSION_COLORS, quoted_names(body))
+        self.assertIn(
+            "from sessionkit_inventory.render import render_picker_page", source
+        )
+        self.assertNotIn("SESSION_PALETTE =", source)
 
     def test_dashboard_renderer_tints_every_color(self) -> None:
         body = self.section(
-            "lib/sessionkit_inventory/render.py", r"session_palette = \(\s*\{(.*?)\n        \}"
+            "lib/sessionkit_inventory/render.py", r"SESSION_PALETTE = \{(.*?)\n\}"
         )
         self.assertEqual(inventory_core.SESSION_COLORS, quoted_names(body))
 
@@ -908,6 +1016,18 @@ class PaletteSurfaceTests(unittest.TestCase):
         # tests/test_install.py checks lifecycle theme targets against this
         # list, so it has to stay the palette rather than drift beside it.
         self.assertEqual(inventory_core.SESSION_COLORS, THEME_COLORS)
+
+    def test_codex_launch_accepts_every_codex_color_and_no_claude_color(self) -> None:
+        body = self.section(
+            "bashrc/shpool.bashrc",
+            r'case "\$__sk_theme_color" in\s*(.*?)\)\s*'
+            r'__sk_codex_home=',
+        )
+        accepted = tuple(body.split("|"))
+        self.assertEqual(inventory_core.CODEX_SESSION_COLORS, accepted)
+        self.assertEqual(
+            set(), set(inventory_core.CLAUDE_SESSION_COLORS) & set(accepted)
+        )
 
     def test_doctor_checks_a_theme_for_every_color(self) -> None:
         body = self.section("lib/sh/session_kit_doctor.sh", r"theme_names = \((.*?)\)")
@@ -946,6 +1066,579 @@ class PaletteSurfaceTests(unittest.TestCase):
         self.assertEqual(inventory_core.CLAUDE_SESSION_COLORS, named)
         for color in inventory_core.CODEX_SESSION_COLORS:
             self.assertNotIn(f"    {color})", text)
+
+    def test_claude_status_line_hashes_cache_keys_with_sha256sum(self) -> None:
+        text = (REPO / "config" / "claude" / "statusline.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("sha256sum", text)
+        self.assertIn("shasum -a 256", text)
+        self.assertNotRegex(text, r"python3\s+-c")
+
+    def test_claude_status_line_uses_unique_quota_cache_tempfiles(self) -> None:
+        text = (REPO / "config" / "claude" / "statusline.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertRegex(text, r'mktemp\s+"\$QDIR/quota_headers\.tmp\.[X]+"')
+        self.assertNotIn('"$QCACHE.tmp"', text)
+
+    def test_shipped_quota_refresher_example_states_the_status_line_contract(
+        self,
+    ) -> None:
+        example = REPO / "extras/statusline-quota-refresh.example"
+        text = example.read_text(encoding="utf-8")
+        self.assertTrue(example.stat().st_mode & 0o111)
+        self.assertIn("TODO: Call the quota endpoint", text)
+        for field in (
+            "x-probe-account",
+            "anthropic-ratelimit-unified-5h-utilization",
+            "anthropic-ratelimit-unified-5h-reset",
+            "anthropic-ratelimit-unified-7d-utilization",
+            "anthropic-ratelimit-unified-7d-reset",
+        ):
+            self.assertIn(field, text)
+        self.assertIn("$HOME/.claude/cache/quota_headers", text)
+        self.assertNotRegex(text, r"https?://")
+
+        documentation = (REPO / "config/claude/README.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("extension point", documentation)
+        self.assertRegex(documentation, r"at most once every 180\s+seconds")
+        self.assertIn("`HOME` set to an isolated probe directory", documentation)
+
+    def test_claude_status_line_reports_the_session_profile_account(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="session-kit-statusline.") as raw:
+            home = Path(raw)
+            profile = home / "profile"
+            profile.mkdir()
+            (home / ".claude.json").write_text(
+                json.dumps({"oauthAccount": {"emailAddress": "ambient@example.test"}}),
+                encoding="utf-8",
+            )
+            (profile / ".claude.json").write_text(
+                json.dumps({"oauthAccount": {"emailAddress": "profile@example.test"}}),
+                encoding="utf-8",
+            )
+            payload = {
+                "model": {"display_name": "fixture"},
+                "workspace": {"current_dir": "/tmp/project"},
+                "context_window": {"used_percentage": 12},
+                "session_id": "",
+            }
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "HOME": str(home),
+                    "CLAUDE_CONFIG_DIR": str(profile),
+                    "USER": "fixture",
+                }
+            )
+            result = subprocess.run(
+                [str(REPO / "config/claude/statusline.sh")],
+                input=json.dumps(payload),
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertIn("profile@example.test", result.stdout)
+            self.assertNotIn("ambient@example.test", result.stdout)
+
+    def run_status_line(self, home: Path, sid: str) -> str:
+        payload = {
+            "model": {"display_name": "fixture"},
+            "workspace": {"current_dir": "/tmp/project"},
+            "context_window": {"used_percentage": 12},
+            "session_id": sid,
+        }
+        environment = os.environ.copy()
+        environment.update({"HOME": str(home), "USER": "fixture"})
+        environment.pop("CLAUDE_CONFIG_DIR", None)
+        result = subprocess.run(
+            [str(REPO / "config/claude/statusline.sh")],
+            input=json.dumps(payload),
+            env=environment,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        return result.stdout
+
+    def test_a_pushed_title_reaches_the_status_bar_with_no_restart(self) -> None:
+        """End to end, on the surface the person actually watches.
+
+        The status line re-runs every two seconds and reads the name straight
+        from the intent file, so a title written to a LIVE session shows up on
+        the next refresh -- no restart, no reattach. Before the push the slot
+        is empty, which is exactly what a person sees today.
+        """
+        with tempfile.TemporaryDirectory(prefix="session-kit-statusline.") as raw:
+            home = Path(raw)
+            (home / ".claude" / "sessions").mkdir(parents=True, mode=0o700)
+            project = home / ".claude" / "projects" / "-srv-app"
+            project.mkdir(parents=True, mode=0o700)
+            (home / ".claude.json").write_text(
+                json.dumps({"oauthAccount": {"emailAddress": "fixture@example.test"}}),
+                encoding="utf-8",
+            )
+            exact = uuid_for(92)
+            (project / f"{exact}.jsonl").write_text(
+                '{"type":"user","sessionId":"%s"}\n' % exact, encoding="utf-8"
+            )
+            state = home / ".local/state/session-kit"
+            state.mkdir(parents=True, mode=0o700)
+            (state / "inventory.json").write_text(
+                json.dumps(
+                    {
+                        "sessions": [
+                            {
+                                "identity": {"uuid": exact},
+                                "display_color": "blue",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            before = self.run_status_line(home, exact)
+            self.assertNotIn("Count the great lakes", before)
+
+            inventory_core.propagate_provider_title(
+                "claude",
+                exact,
+                "Count the great lakes",
+                environ={"HOME": os.fspath(home)},
+            )
+            after = self.run_status_line(home, exact)
+
+            # The name leads the line, tinted with the session's own colour --
+            # blue is 97;166;240 in the kit's calibrated palette.
+            self.assertIn("Count the great lakes", after)
+            self.assertIn("\033[38;2;97;166;240m", after)
+            self.assertTrue(
+                after.startswith("\033[38;2;97;166;240mCount the great lakes"),
+                after[:80],
+            )
+
+    def test_an_account_sessions_derived_title_reaches_the_status_bar(self) -> None:
+        """The whole chain for the session the operator was looking at.
+
+        Their session ran on an enrolled profile and had a title the PROVIDER
+        derived. The kit read the provider's evidence from the default root
+        only, found nothing, and therefore pushed nothing -- so the status bar
+        name slot stayed empty while `sp detail` happily printed the title.
+        Reading the profile is what turns the rest of the chain on.
+        """
+        with tempfile.TemporaryDirectory(prefix="session-kit-statusline.") as raw:
+            home = Path(raw)
+            (home / ".claude" / "sessions").mkdir(parents=True, mode=0o700)
+            (home / ".claude" / "projects").mkdir(parents=True, mode=0o700)
+            (home / ".claude.json").write_text(
+                json.dumps({"oauthAccount": {"emailAddress": "fixture@example.test"}}),
+                encoding="utf-8",
+            )
+            profile = home / ".local/share/session-kit/accounts/claude/primary"
+            project = profile / "projects" / "-srv-app"
+            project.mkdir(parents=True, mode=0o700)
+            exact = uuid_for(93)
+            (project / f"{exact}.jsonl").write_text(
+                json.dumps(
+                    {
+                        "type": "ai-title",
+                        "aiTitle": "Count the great lakes",
+                        "sessionId": exact,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            state = home / ".local/state/session-kit"
+            state.mkdir(parents=True, mode=0o700)
+            (state / "inventory.json").write_text(
+                json.dumps(
+                    {
+                        "sessions": [
+                            {"identity": {"uuid": exact}, "display_color": "blue"}
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            environ = {"HOME": os.fspath(home)}
+
+            # What the kit can see of the provider's own title...
+            signals = inventory_core.read_claude_transcript_signals(exact, home)
+            # ...is what it pushes, and the push is what the bar reads.
+            if signals["ai_title"]:
+                inventory_core.propagate_provider_title(
+                    "claude", exact, signals["ai_title"], environ=environ
+                )
+
+            self.assertEqual("Count the great lakes", signals["ai_title"])
+            self.assertIn(
+                "Count the great lakes", self.run_status_line(home, exact)
+            )
+
+    def test_claude_quota_caches_are_isolated_by_profile_and_alias(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="session-kit-quota.") as raw:
+            home = Path(raw)
+            claude_home = home / ".claude"
+            claude_home.mkdir()
+            refresh_log = home / "refresh.log"
+            refresher = claude_home / "statusline-quota-refresh.sh"
+            refresher.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -eu\n"
+                "mkdir -p \"$HOME/.claude/cache\"\n"
+                "email=$(jq -r '.oauthAccount.emailAddress' \"$HOME/.claude.json\")\n"
+                "printf '%s|%s\\n' \"$email\" \"${CLAUDE_CONFIG_DIR:-default}\" >> \"$REFRESH_LOG\"\n"
+                "printf 'x-probe-account: %s\\nanthropic-ratelimit-unified-5h-utilization: 0.25\\nanthropic-ratelimit-unified-5h-reset: 4102444800\\n' \"$email\" > \"$HOME/.claude/cache/quota_headers\"\n",
+                encoding="utf-8",
+            )
+            refresher.chmod(0o700)
+            profiles = []
+            aliases = ("a" * 32 + "-one", "a" * 32 + "-two")
+            for alias in aliases:
+                profile = home / alias
+                profile.mkdir()
+                (profile / ".claude.json").write_text(
+                    json.dumps(
+                        {"oauthAccount": {"emailAddress": f"{alias}@example.test"}}
+                    ),
+                    encoding="utf-8",
+                )
+                profiles.append((alias, profile))
+            payload = {
+                "model": {"display_name": "fixture"},
+                "workspace": {"current_dir": "/tmp/project"},
+                "context_window": {"used_percentage": 12},
+                "session_id": "",
+            }
+
+            def render(alias: str, profile: Path) -> subprocess.CompletedProcess[str]:
+                environment = os.environ.copy()
+                environment.update(
+                    {
+                        "HOME": str(home),
+                        "CLAUDE_CONFIG_DIR": str(profile),
+                        "SESSION_KIT_ACCOUNT_ALIAS": alias,
+                        "REFRESH_LOG": str(refresh_log),
+                        "USER": "fixture",
+                    }
+                )
+                return subprocess.run(
+                    [str(REPO / "config/claude/statusline.sh")],
+                    input=json.dumps(payload),
+                    env=environment,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+
+            for alias, profile in profiles:
+                result = render(alias, profile)
+                self.assertEqual(0, result.returncode, result.stderr)
+            cache_root = claude_home / "cache/session-kit-quota"
+            for _ in range(100):
+                caches = list(cache_root.glob("*/quota_headers"))
+                if len(caches) == 2:
+                    break
+                time.sleep(0.02)
+            self.assertEqual(2, len(caches))
+            cache_keys = {path.parent.name for path in caches}
+            for alias in aliases:
+                self.assertTrue(
+                    any(
+                        re.fullmatch(re.escape(alias) + r"-[0-9a-f]{64}", key)
+                        for key in cache_keys
+                    ),
+                    cache_keys,
+                )
+            self.assertEqual(
+                {f"{alias}@example.test" for alias in aliases},
+                {
+                    re.search(r"x-probe-account: (.+)", path.read_text()).group(1)
+                    for path in caches
+                },
+            )
+            first_refreshes = refresh_log.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(2, len(first_refreshes))
+
+            for alias, profile in profiles:
+                result = render(alias, profile)
+                self.assertEqual(0, result.returncode, result.stderr)
+                self.assertIn(f"{alias}@example.test", result.stdout)
+                self.assertIn("5h", result.stdout)
+            time.sleep(0.05)
+            self.assertEqual(
+                first_refreshes,
+                refresh_log.read_text(encoding="utf-8").splitlines(),
+            )
+
+
+class TranscriptWritesSurviveTornFilesTests(unittest.TestCase):
+    """Colour and name writes against transcripts a live provider owns.
+
+    Two failures live here and both are silent, which is what makes them
+    expensive: one unreadable byte used to end the naming pass for EVERY
+    session, and an append onto a half-written record used to destroy that
+    record, lose the colour, and still report success.
+    """
+
+    def fixture(self, base: str, number: int) -> tuple[Path, str, dict]:
+        home = Path(base) / "home"
+        project = home / ".claude" / "projects" / "-srv-project"
+        project.mkdir(parents=True, mode=0o700)
+        exact = uuid_for(number)
+        transcript = project / f"{exact}.jsonl"
+        transcript.write_bytes(b'{"type":"user","sessionId":"%s"}\n' % exact.encode())
+        return transcript, exact, {"HOME": os.fspath(home)}
+
+    def records(self, transcript: Path, uuid: str, kind: str, field: str) -> list:
+        """Every value of one record kind, read the way a torn file allows."""
+        values = []
+        for raw in transcript.read_bytes().split(b"\n"):
+            try:
+                item = json.loads(raw.decode("utf-8", "strict"))
+            except (UnicodeDecodeError, ValueError):
+                continue
+            if item.get("type") == kind and item.get("sessionId") == uuid:
+                values.append(item[field])
+        return values
+
+    def age(self, transcript: Path, seconds: float) -> None:
+        stamp = time.time() - seconds
+        os.utime(transcript, (stamp, stamp))
+
+    def test_one_unreadable_byte_does_not_stop_the_colour(self) -> None:
+        """A killed writer leaves half a character; that is not an answer.
+
+        Text mode raises UnicodeDecodeError from the iteration itself, and a
+        UnicodeDecodeError is a ValueError, not an OSError -- so it escaped
+        the guard, its caller, and the hydration loop that walks every
+        session, and from there on nobody got a colour or a name.
+        """
+        with tempfile.TemporaryDirectory(prefix=".colors-", dir=REPO) as raw:
+            transcript, exact, environ = self.fixture(raw, 91)
+            with open(transcript, "ab") as handle:
+                handle.write(b'{"type":"user","text":"caf\xc3')
+            self.age(transcript, 600)
+
+            result = inventory_core.propagate_provider_color(
+                "claude", exact, "blue", environ=environ
+            )
+
+            self.assertEqual(
+                ["blue"], self.records(transcript, exact, "agent-color", "agentColor")
+            )
+            self.assertIn("claude-transcript-color", result["provider_color_pushes"])
+
+    def test_one_unreadable_byte_does_not_stop_the_other_sessions(self) -> None:
+        """The blast radius: one torn file, every other session still named.
+
+        `bin/shpool_status` runs this pass with its output and its errors
+        discarded, so anything raised here is invisible -- the symptom is
+        that sessions quietly stop getting names, which is the same silence
+        the operator already complained about.
+        """
+        names = sys.modules["sessionkit_inventory.names"]
+        with tempfile.TemporaryDirectory(prefix=".colors-", dir=REPO) as raw:
+            torn, exact_torn, environ = self.fixture(raw, 92)
+            healthy_uuid = uuid_for(93)
+            healthy = torn.parent / f"{healthy_uuid}.jsonl"
+            healthy.write_bytes(
+                b'{"type":"user","sessionId":"%s"}\n' % healthy_uuid.encode()
+            )
+            with open(torn, "ab") as handle:
+                handle.write(b'{"type":"user","text":"caf\xc3')
+            self.age(torn, 600)
+            live = {
+                "sessions": [
+                    {"provider": "claude", "identity": {"uuid": exact_torn}},
+                    {"provider": "claude", "identity": {"uuid": healthy_uuid}},
+                ]
+            }
+
+            hydrated = names.claude_pending_native_hydrations(
+                None,
+                environ,
+                canonical_colors=lambda settings: list(THEME_COLORS),
+                guard_inventory=lambda *a, **k: True,
+                load_config=lambda *a, **k: {},
+                transcript_signals=inventory_core.read_claude_transcript_signals,
+                session_color=lambda provider, uuid, colors: "blue",
+                snapshot_inventory=lambda *a, **k: live,
+                propagate_color=inventory_core.propagate_provider_color,
+                propagate_title=inventory_core.propagate_provider_title,
+                reconcile_pending_titles=lambda *a, **k: [],
+                human_named=lambda env: frozenset(),
+                adopt_native=lambda *a, **k: "",
+            )
+
+            self.assertEqual(
+                ["blue"],
+                self.records(healthy, healthy_uuid, "agent-color", "agentColor"),
+            )
+            self.assertEqual(
+                ["blue"], self.records(torn, exact_torn, "agent-color", "agentColor")
+            )
+            self.assertTrue(hydrated)
+
+    def test_a_record_being_written_right_now_is_never_written_onto(self) -> None:
+        """A file that does not end in a newline has a writer mid-record.
+
+        Concatenating there makes one invalid line out of two records: the
+        provider's own event is destroyed AND the colour is lost, and the old
+        code called that a successful push, so the window kept its old colour
+        while the kit said it had changed it.
+        """
+        with tempfile.TemporaryDirectory(prefix=".colors-", dir=REPO) as raw:
+            transcript, exact, environ = self.fixture(raw, 94)
+            with open(transcript, "ab") as handle:
+                handle.write(
+                    b'{"type":"agent-color","agentColor":"pink","sessionId":"%s"}\n'
+                    % exact.encode()
+                )
+                handle.write(b'{"type":"assistant","message":{"content":"half a rec')
+
+            result = inventory_core.propagate_provider_color(
+                "claude", exact, "blue", environ=environ
+            )
+
+            tail = transcript.read_bytes().split(b"\n")[-1]
+            self.assertNotIn(b"agent-color", tail)
+            self.assertNotIn(
+                "claude-transcript-color", result["provider_color_pushes"]
+            )
+            self.assertTrue(result["provider_color_warnings"])
+            self.assertEqual(
+                ["pink"], self.records(transcript, exact, "agent-color", "agentColor")
+            )
+
+    def test_a_provider_that_starts_a_record_mid_write_never_costs_the_colour(
+        self,
+    ) -> None:
+        """The window that matters: the instant between the check and the write.
+
+        Checking that the file ends in a newline and then appending is two
+        steps, and a live provider can begin a record between them. Then the
+        colour lands INSIDE the provider's record, one invalid line is made
+        out of two records, and the old code reported a successful push --
+        the worst outcome available here, because it damages a transcript a
+        live session is writing and then says everything is fine.
+
+        A fixture that finishes the partial write BEFORE calling the code
+        cannot catch this; it never races that window. This one holds the
+        writer open across it by starting the provider's record from inside
+        the tail check itself, which is exactly where the real one can land.
+        """
+        with tempfile.TemporaryDirectory(prefix=".colors-", dir=REPO) as raw:
+            transcript, exact, environ = self.fixture(raw, 98)
+            with open(transcript, "ab") as handle:
+                handle.write(
+                    b'{"type":"agent-color","agentColor":"pink","sessionId":"%s"}\n'
+                    % exact.encode()
+                )
+            real_pread = os.pread
+            started = []
+
+            def racing_pread(fd, length, offset):
+                answer = real_pread(fd, length, offset)
+                if not started:
+                    # The check has just seen a newline. The provider begins
+                    # its record NOW, before the append happens.
+                    started.append(True)
+                    with open(transcript, "ab") as writer:
+                        writer.write(b'{"type":"assistant","message":"split')
+                return answer
+
+            with mock.patch.object(os, "pread", racing_pread):
+                result = inventory_core.propagate_provider_color(
+                    "claude", exact, "blue", environ=environ
+                )
+            # ...and finishes it after the append, the way a real one would.
+            with open(transcript, "ab") as writer:
+                writer.write(b' provider record"}\n')
+
+            self.assertTrue(started, "the race was never entered")
+            # The colour is a whole, readable record -- not bytes buried in
+            # the middle of an invalid line.
+            self.assertEqual(
+                ["pink", "blue"],
+                self.records(transcript, exact, "agent-color", "agentColor"),
+            )
+            # And what was reported matches what is in the file.
+            self.assertIn("claude-transcript-color", result["provider_color_pushes"])
+            # The damage that could not be prevented is said out loud.
+            self.assertTrue(result["provider_color_warnings"])
+
+    def test_wreckage_nobody_is_writing_is_closed_and_the_colour_lands(self) -> None:
+        """Refusing forever would mean a killed session never gets a colour.
+
+        A transcript nothing has touched for a long time is not being written
+        to: the half-line is wreckage from a kill, so one write closes it and
+        adds the record, and the file is never left worse than it was found.
+        """
+        with tempfile.TemporaryDirectory(prefix=".colors-", dir=REPO) as raw:
+            transcript, exact, environ = self.fixture(raw, 95)
+            with open(transcript, "ab") as handle:
+                handle.write(b'{"type":"assistant","message":{"content":"half a rec')
+            self.age(transcript, 600)
+
+            inventory_core.propagate_provider_color(
+                "claude", exact, "blue", environ=environ
+            )
+
+            lines = [line for line in transcript.read_bytes().split(b"\n") if line]
+            self.assertEqual(
+                ["blue"], self.records(transcript, exact, "agent-color", "agentColor")
+            )
+            # The wreckage is still its own line; our record did not join it.
+            self.assertTrue(lines[-1].startswith(b'{"type":"agent-color"'))
+
+    def test_the_name_is_written_once_not_once_per_pass(self) -> None:
+        """The colour got the "already right, leave it alone" rule and the
+        name did not. This runs on every pass too, so an unguarded append
+        grew one more identical record every time."""
+        with tempfile.TemporaryDirectory(prefix=".colors-", dir=REPO) as raw:
+            transcript, exact, environ = self.fixture(raw, 96)
+            (Path(environ["HOME"]) / ".claude" / "sessions").mkdir(parents=True)
+
+            for _ in range(8):
+                result = inventory_core.propagate_provider_title(
+                    "claude", exact, "Steady Name", environ=environ
+                )
+
+            self.assertEqual(
+                ["Steady Name"],
+                self.records(transcript, exact, "agent-name", "agentName"),
+            )
+            self.assertIn(
+                "claude-transcript-name-current", result["provider_title_pushes"]
+            )
+
+    def test_a_real_name_change_is_still_written(self) -> None:
+        """Idempotence must not freeze the name: a change is a change."""
+        with tempfile.TemporaryDirectory(prefix=".colors-", dir=REPO) as raw:
+            transcript, exact, environ = self.fixture(raw, 97)
+            (Path(environ["HOME"]) / ".claude" / "sessions").mkdir(parents=True)
+
+            for title in ("First", "Second", "Second"):
+                inventory_core.propagate_provider_title(
+                    "claude", exact, title, environ=environ
+                )
+
+            self.assertEqual(
+                ["First", "Second"],
+                self.records(transcript, exact, "agent-name", "agentName"),
+            )
 
 
 if __name__ == "__main__":

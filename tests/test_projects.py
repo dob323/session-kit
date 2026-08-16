@@ -374,6 +374,59 @@ class ProjectDiscoveryTests(unittest.TestCase):
         self.assertEqual(repeated["removed"], [])
         self.assertIsNone(repeated["backup"])
 
+    def test_unignore_puts_a_dropped_directory_back_in_reach(self) -> None:
+        """Dropping was a one-way door with no verb anywhere to reverse it."""
+        target = self.directory("work/dropped")
+        self.private_json(
+            self.home / ".claude.json",
+            {"projects": {str(target): {}}},
+        )
+        projects_file = self.root / "projects.tsv"
+        projects_file.write_text("# keep this comment\n", encoding="utf-8")
+        projects_file.chmod(0o600)
+        state = self.root / "state"
+        projects.ignore_project(projects_file, state, str(target))
+        self.assertEqual(
+            [str(target)],
+            projects.project_candidates(projects_file)["ignored"],
+        )
+
+        restored = projects.unignore_project(projects_file, state, str(target))
+
+        self.assertEqual([], restored["added"])
+        self.assertEqual(
+            [{"alias": "dropped", "provider": "ignore", "cwd": str(target)}],
+            restored["removed"],
+        )
+        after = projects.project_candidates(projects_file)
+        self.assertEqual([], after["ignored"])
+        # No decision at all, so the directory is offered again.
+        self.assertEqual(
+            [str(target)],
+            [row["cwd"] for row in after["candidates"]],
+        )
+        self.assertIn("# keep this comment", projects_file.read_text(encoding="utf-8"))
+        self.assertEqual(projects_file.stat().st_mode & 0o777, 0o600)
+
+    def test_unignore_of_a_directory_that_was_never_dropped_changes_nothing(
+        self,
+    ) -> None:
+        target = self.directory("work/listed")
+        projects_file = self.root / "projects.tsv"
+        projects_file.write_text(f"listed\tclaude\t{target}\n", encoding="utf-8")
+        projects_file.chmod(0o600)
+
+        result = projects.unignore_project(
+            projects_file, self.root / "state", str(target)
+        )
+
+        self.assertEqual([], result["added"])
+        self.assertEqual([], result["removed"])
+        self.assertEqual(
+            [{"alias": "listed", "provider": "claude", "cwd": str(target)}],
+            projects._parse_projects(projects_file.read_bytes()),
+        )
+
     def test_ignore_names_a_directory_that_had_no_shortcut(self) -> None:
         target = self.directory("work/unlisted")
         projects_file = self.root / "projects.tsv"
@@ -388,6 +441,56 @@ class ProjectDiscoveryTests(unittest.TestCase):
             result["added"],
             [{"alias": "unlisted", "provider": "ignore", "cwd": str(target)}],
         )
+
+    def test_unignore_withdraws_the_decision_and_leaves_the_file_alone(self) -> None:
+        target = self.directory("work/hidden")
+        kept = self.directory("work/kept")
+        projects_file = self.root / "projects.tsv"
+        projects_file.write_text(
+            f"# keep this comment\nsl\tclaude\t{kept}\n", encoding="utf-8"
+        )
+        projects_file.chmod(0o600)
+        state = self.root / "state"
+        projects.ignore_project(projects_file, state, str(target))
+
+        result = projects.unignore_project(projects_file, state, str(target))
+
+        self.assertEqual(result["added"], [])
+        self.assertEqual([row["cwd"] for row in result["removed"]], [str(target)])
+        self.assertEqual(
+            projects._parse_projects(projects_file.read_bytes()),
+            [{"alias": "sl", "provider": "claude", "cwd": str(kept)}],
+        )
+        self.assertIn("# keep this comment", projects_file.read_text(encoding="utf-8"))
+        self.assertEqual(projects_file.stat().st_mode & 0o777, 0o600)
+
+        repeated = projects.unignore_project(projects_file, state, str(target))
+        self.assertEqual(repeated["removed"], [])
+        self.assertIsNone(repeated["backup"])
+
+    def test_unignore_reaches_a_directory_that_no_longer_exists(self) -> None:
+        target = self.directory("work/gone")
+        projects_file = self.root / "projects.tsv"
+        projects_file.write_text("", encoding="utf-8")
+        projects_file.chmod(0o600)
+        state = self.root / "state"
+        projects.ignore_project(projects_file, state, str(target))
+        target.rmdir()
+
+        # The row is a decision, not a shortcut: it outlives its directory and
+        # must still be withdrawable, or the picker's restore key would refuse
+        # exactly the rows a person most wants gone from the file.
+        result = projects.unignore_project(projects_file, state, str(target))
+
+        self.assertEqual([row["cwd"] for row in result["removed"]], [str(target)])
+        self.assertEqual(projects._parse_projects(projects_file.read_bytes()), [])
+
+    def test_unignore_refuses_a_path_that_is_not_absolute(self) -> None:
+        projects_file = self.root / "projects.tsv"
+        projects_file.write_text("", encoding="utf-8")
+        projects_file.chmod(0o600)
+        with self.assertRaises(projects.ProjectError):
+            projects.unignore_project(projects_file, self.root / "state", "work/gone")
 
     def test_add_validates_alias_and_never_replaces_an_existing_alias(self) -> None:
         cwd = self.directory("work/project")

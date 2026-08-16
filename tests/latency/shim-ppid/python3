@@ -1,0 +1,6 @@
+#!/bin/bash
+# Logs who started each interpreter: a call from the picker's own shell is
+# foreground work between a keystroke and its echo; a call from one of its
+# children is the background collector, where that work belongs.
+printf '%s\t%s\t%s\n' "$EPOCHREALTIME" "$PPID" "$*" >> "$SK_SHIM_PPID_LOG"
+exec /usr/bin/python3 "$@"

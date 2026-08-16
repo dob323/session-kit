@@ -10,32 +10,73 @@ source "$SCRIPT_DIR/session_kit_common"
 STATUS_CMD=${SESSION_KIT_STATUS_CMD:-"$SCRIPT_DIR/shpool_status"}
 SP_CMD=${SESSION_KIT_SP_CMD:-"$SCRIPT_DIR/sp"}
 PROJECTS_TOOL=${SESSION_KIT_PROJECTS_TOOL:-"$SCRIPT_DIR/../lib/sessionkit_inventory/projects.py"}
-PEEK_TOOL=${SESSION_KIT_PEEK_TOOL:-"$SCRIPT_DIR/../lib/sessionkit_events/peek.py"}
 
+# Leaving the picker on purpose is 0; every way it cannot run is 1, with the
+# reason on stderr (`sp help exit-codes`). 2 belongs to arguments and
+# selectors, which this program has none of.
 if [[ ! -t 0 || ! -t 1 || ${SESSION_KIT_NONINTERACTIVE:-0} == 1 ]]; then
   # Still a picker exit: without a logged reason, a window that lands in a
   # bare shell is undiagnosable from the action log.
   sk_prepare_state >/dev/null 2>&1 && sk_log_action picker_exit noninteractive 2>/dev/null
-  exit 2
+  echo "session-kit: the picker needs a terminal." >&2
+  exit 1
 fi
-[[ -x $STATUS_CMD && -x $SP_CMD ]] || exit 1
+# The third descriptor was never checked here, and it is the one that decides
+# whether a session opened from this window can be typed into at all. shpool's
+# client leaves the terminal in line-typing mode unless stdin, stdout AND
+# stderr are all a terminal, and it does that silently, so a stray redirect on
+# fd 2 -- inherited from a parent, or left behind by a picker that upgraded
+# itself -- reaches a person as "my keyboard is dead", with nothing anywhere
+# saying why. Put it back on the screen and say so, rather than drawing a
+# picker whose every session will be unusable.
+if [[ ! -t 2 ]]; then
+  # Try the reopen in a subshell first: a failed redirection on a bare `exec`
+  # ends a non-interactive shell, and no picker should die because a window
+  # has no controlling terminal to reopen.
+  if ( exec 2>/dev/tty ) 2>/dev/null; then
+    exec 2>/dev/tty
+  fi
+  if [[ -t 2 ]]; then
+    sk_prepare_state >/dev/null 2>&1 && sk_log_action picker_stderr rebound 2>/dev/null
+    echo "session-kit: this window's error output was not the screen, which would have left every session opened here unable to receive typing. It is back on the screen now." >&2
+  else
+    sk_prepare_state >/dev/null 2>&1 && sk_log_action picker_stderr unrepairable 2>/dev/null
+    echo "session-kit: this window's error output is not the screen and could not be put back, so a session opened here may not receive typing. Open a fresh window, or repair it with: exec 2>/dev/tty" >&2
+  fi
+fi
+[[ -x $STATUS_CMD && -x $SP_CMD ]] || {
+  echo "session-kit: the picker's helpers are missing from this release." >&2
+  exit 1
+}
 sk_require_shpool || exit 1
-sk_prepare_state || exit 1
+sk_prepare_state || {
+  echo "session-kit: the picker's state directory could not be prepared." >&2
+  exit 1
+}
 
 SNAPSHOT=""
 VIEW=""
 RECOVERY=""
+# Set when the Closed screen could not write down what it printed beside each
+# row. The screen still draws; it says the check `sp restore` makes against it
+# is missing rather than letting it look as though one was made.
+RECOVERY_UNRECORDED=""
 QUERY=""
 PAGE=1
-# The map from an r-key on the screen to the message its reply belongs to.
-# Rebuilt on every redraw, so a row that moved cannot open the wrong report.
-MSG_REPLY_INDEX=""
-# The q-number to durable quarantine-key map is rebuilt on every redraw. The
-# machine key is never rendered or accepted directly from a person.
-PROMPT_QUARANTINE_INDEX=""
 # The d-number to watchdog repair array index, built only inside Needs you.
 REPAIR_INDEX=""
 PAGE_SIZE=1
+# How many rows the last page sizing counted, for the page arithmetic that
+# follows it. Empty means "not counted yet", which costs one read of the view.
+VIEW_ITEM_COUNT=
+# The numbers the last paint put on the screen, in display order, and whether
+# a repaint has changed that set since the prompt appeared. `k all` closes the
+# drawn set and only while it is still the drawn set: the background collector
+# re-sorts the list every few seconds (the sort follows recent output and
+# needs-you), so the page a person read and the page that exists when they
+# press Enter are not always the same page.
+PAGE_RENDERED_NUMBERS=""
+PAGE_RENDER_CHANGED=0
 # How the list is grouped, whether rows are drawn compact, and which row the
 # jump key last landed on. All three are view-only: they change what the
 # screen shows, never which sessions exist or what a number does. The two
@@ -48,7 +89,12 @@ case "$PICKER_GROUP_MODE" in
 esac
 PICKER_COMPACT=${SESSION_KIT_PICKER_COMPACT:-0}
 [[ $PICKER_COMPACT == 1 ]] || PICKER_COMPACT=0
+PICKER_MACHINE_EXPANDED=${SESSION_KIT_PICKER_MACHINE_EXPANDED:-0}
+[[ $PICKER_MACHINE_EXPANDED == 1 ]] || PICKER_MACHINE_EXPANDED=0
 PICKER_JUMP_NUMBER=""
+# Set only between `g` choosing a row and the next paint. Page size belongs to
+# the new view, so render_main positions the row after recomputing that size.
+PICKER_JUMP_PENDING=0
 PICKER_REFUSED_STATUS=74
 PICKER_ATTACH_FAILED_STATUS=75
 TEMP_FILES=()
@@ -98,12 +144,20 @@ trap cleanup EXIT
 # redraw the menu instead of killing the picker. Hangup and terminate still
 # end it, with the reason recorded for later diagnosis.
 PICKER_INTERRUPTED=0
-# Set after any confirmed destructive action: the next EMPTY menu choice is
-# forgiven once (re-prompt) instead of exiting to a terminal, because it is
-# far more likely a late Enter from the y-confirm than a deliberate exit.
-CONFIRM_FORGIVE=0
 trap 'PICKER_INTERRUPTED=1' INT
-trap 'sk_log_action picker_exit hangup || true; exit 2' HUP TERM
+# A resize changes how many rows fit and how wide every row is drawn, and the
+# repaint fingerprint deliberately hashes only session content -- so on a quiet
+# estate nothing ever repainted and the list kept the old geometry until a key
+# was pressed. On a quiet estate that is forever.
+PICKER_RESIZED=0
+trap 'PICKER_RESIZED=1' WINCH
+# What an unknown key on the home menu is answered with: every key the
+# dispatcher below actually takes, and nothing else. Kept next to that
+# dispatcher so a new key is added in one place; `?` has the whole table.
+PICKER_MAIN_KEYS="Enter, a session number, n, a, g, x, m, p, r, c, o, u, \
+h number, k numbers, name number, name reset number, fork number, group, \
+next, prev, model number, /text, ?, b, and q"
+trap 'sk_log_action picker_exit hangup || true; exit 1' HUP TERM
 
 # ---- live menu ---------------------------------------------------------
 # The list used to be a photograph: whatever was true when the window opened,
@@ -112,13 +166,15 @@ trap 'sk_log_action picker_exit hangup || true; exit 2' HUP TERM
 LIVE_PID=
 LIVE_FILE=
 LIVE_DONE=
+LIVE_PENDING=
 LIVE_FINGERPRINT=
 LIVE_WARNING=
 
 # The main prompt, kept live. Identical to picker_read from the keyboard's
 # point of view: a read that times out consumes nothing, and a line that is
 # still being typed stays queued in the terminal untouched.
-# Returns 3 when the estate changed and the caller should repaint.
+# Returns 0 with a line to act on, or non-zero when the read was interrupted
+# and the caller should draw the menu again without acting.
 PICKER_LIVE_STATUS=0
 # Repair failures are read into the explicit Needs-you view. Merely drawing a
 # menu never acknowledges or changes them.
@@ -136,7 +192,7 @@ PENDING_CACHE=0
 # failure — a planned restart takes a few seconds.
 picker_clear_screen
 if ! refresh_snapshot; then
-  echo "  The session manager is not responding — retrying for up to a minute (close the window for a plain terminal)."
+  echo "  The session manager is not responding. Retrying for a minute."
   SK_BOOT_OK=0
   # Short per-try bound: five 10s-capped refreshes keep the whole retry
   # window near one minute even against a fully jammed manager.
@@ -148,43 +204,85 @@ if ! refresh_snapshot; then
     fi
   done
   if (( SK_BOOT_OK == 0 )); then
-    echo "  Live sessions could not be loaded. Returning to a regular terminal."
+    echo "session-kit: the session manager did not answer; the picker could not start." >&2
     picker_exit startup_refresh_failed
   fi
 fi
+# Only ever set by this picker's own self-upgrade, and consumed here so the
+# window comes back to the list it was showing.
+picker_resume_view
+
+# Compute-first frames: renders are captured here and emitted as one write
+# (picker_frame_emit_file), so a slow render never paints progressively.
+PICKER_FRAME_FILE=""
+if new_temp login-frame; then PICKER_FRAME_FILE=$NEW_TEMP; fi
 
 while true; do
   picker_self_upgrade
-  render_main
+  if [[ -n $PICKER_FRAME_FILE && -f $PICKER_FRAME_FILE ]]; then
+    # Same width pinning as picker_redraw_home: stdout is a file during the
+    # capture, so probes that ioctl stdout would lay rows out for a 100-col
+    # fallback terminal. tput reads the real size from stderr.
+    __sk_cols=$(tput cols 2>/dev/null) && [[ $__sk_cols =~ ^[0-9]+$ ]] || __sk_cols=
+    __sk_rows=$(tput lines 2>/dev/null) && [[ $__sk_rows =~ ^[0-9]+$ ]] || __sk_rows=
+    COLUMNS=${__sk_cols:-${COLUMNS:-}} LINES=${__sk_rows:-${LINES:-}} \
+      render_main > "$PICKER_FRAME_FILE"
+    picker_frame_emit_file "$PICKER_FRAME_FILE" append
+  else
+    render_main
+  fi
   choice=""
   picker_read_live choice "  $(picker_green '❯') "
   live_status=$?
   (( live_status == 0 )) || continue
-  FORGIVE_EMPTY=$CONFIRM_FORGIVE
-  CONFIRM_FORGIVE=0
+  # One frame per keystroke. The menu used to be appended below whatever was
+  # already on the screen, so a working session ended up as a column of stale
+  # menus -- while the background repaint replaced the screen in place, making
+  # the same key leave a different screen depending on when it was pressed.
+  # Clearing here, after the key is read and before it is acted on, gives
+  # every keystroke the same shape: what the action says, then the menu.
+  picker_clear_screen
   case "$choice" in
     "")
-      if (( FORGIVE_EMPTY )); then
-        echo "  (Enter again for a regular terminal)"
-        continue
+      # Enter takes the most likely option on every screen (operator ruling,
+      # 2026-08-16). Here that is the top row of the list as drawn -- the
+      # session sorted most in need -- and on an empty list, a new session.
+      # The footer names the number it will open, from the same page slice.
+      if number=$(first_number_on_page); then
+        choose_number "$number"
+      else
+        guided_new
       fi
-      picker_exit terminal_requested
       ;;
-    q|Q|p|P) picker_exit quit ;;
+    # The words people type when a key does not come to mind. `exit` and
+    # `quit` meant nothing here, which is a strange thing for a menu whose
+    # whole job is leaving. `p` is not among them: it opens Projects below,
+    # one meaning per key.
+    # `b` is Back on every screen in the picker. This is the top screen, so
+    # back from here is out -- the same door q already opens, not a new one.
+    q|Q|quit|QUIT|Quit|exit|EXIT|Exit|b|B|back|BACK|Back) picker_exit quit ;;
     r|R)
       refresh_snapshot || {
         sk_log_action picker_refresh failed || true
-        echo "  Live sessions could not be refreshed; showing the previous view."
+        echo "  Live refresh failed. Showing the last confirmed list."
       }
       ;;
     m|M)
       show_more_menu
+      ;;
+    p|P)
+      # p used to be a second way to leave, one keystroke away from the More
+      # menu where p means Projects. One meaning per key: q leaves.
+      show_projects_menu
       ;;
     a|A)
       show_attention_menu
       ;;
     g|G)
       jump_next_attention
+      ;;
+    x|X)
+      toggle_machine_sessions
       ;;
     c|C|compact|COMPACT|Compact)
       toggle_compact
@@ -195,17 +293,21 @@ while true; do
     group\ *|GROUP\ *|Group\ *)
       cycle_grouping "${choice#* }"
       ;;
-    i|I)
-      echo "  Use i followed by a session number, such as i3. Nothing changed."
+    h|H)
+      echo "  That needs a session number, such as h 19. Numbers shown here work."
       ;;
-    i[0-9]*|I[0-9]*)
-      peek_row "${choice#[iI]}"
+    h[0-9]*|H[0-9]*)
+      # History straight from the list: playback of the recording when one
+      # exists, the conversation transcript when it does not.
+      history_number "${choice#[hH]}"
       ;;
-    i\ *|I\ *)
-      peek_row "${choice#* }"
+    h\ *|H\ *)
+      history_number "${choice#* }"
       ;;
-    v|V)
-      open_supervisor
+    k[0-9]*|K[0-9]*)
+      # A row key takes its number with or without the space: k5 and k 5 are
+      # the same close.
+      direct_close "${choice#[kK]}"
       ;;
     \?)
       show_help
@@ -218,9 +320,6 @@ while true; do
       ;;
     n|N)
       guided_new
-      ;;
-    s|S)
-      compose_message
       ;;
     next|\>)
       pages=$(page_count)
@@ -237,28 +336,23 @@ while true; do
         echo "  Already on the first page."
       fi
       ;;
-    r[0-9]*|R[0-9]*)
-      open_reply_row "${choice#[rR]}"
-      ;;
-    q[0-9]*|Q[0-9]*)
-      choose_prompt_quarantine "${choice#[qQ]}"
-      ;;
-    qp|QP|q\ prune|Q\ PRUNE)
-      prompt_quarantine_prune
+    name\ reset[0-9]*|NAME\ RESET[0-9]*|Name\ reset[0-9]*)
+      number=${choice##*[rR][eE][sS][eE][tT]}
+      reset_name_number "$number"
       ;;
     /*)
       QUERY=${choice#/}
       PAGE=1
       build_view || {
-        echo "  Search failed. Returning to the unfiltered list."
+        echo "  The search failed. Showing the whole list."
         QUERY=""
         build_view || {
           sk_log_action picker_refresh failed || true
-          echo "  The list could not be rebuilt; showing the previous view."
+          echo "  Live refresh failed. Showing the last confirmed list."
         }
       }
       ;;
-    k\ *|K\ *|x\ *|X\ *)
+    k\ *|K\ *)
       direct_close "${choice#* }"
       ;;
     name\ reset\ *|NAME\ RESET\ *|Name\ reset\ *)
@@ -266,34 +360,45 @@ while true; do
       if [[ $number =~ ^[0-9]+$ ]]; then
         reset_name_number "$number"
       else
-        echo "  Use name reset followed by a visible number. Nothing changed."
+        echo "  That needs a session number, such as name reset 19. Numbers shown here work."
       fi
       ;;
-    name\ *|NAME\ *|Name\ *)
+    name\ *|NAME\ *|Name\ *|name[0-9]*|NAME[0-9]*|Name[0-9]*)
       number=${choice#* }
+      number=${number#[nN][aA][mM][eE]}
       if [[ $number =~ ^[0-9]+$ ]]; then
         rename_number "$number"
       else
-        echo "  Use name followed by a visible number. Nothing changed."
+        echo "  That needs a session number, such as name 19. Numbers shown here work."
       fi
       ;;
-    fork\ *|FORK\ *|Fork\ *)
+    fork\ *|FORK\ *|Fork\ *|fork[0-9]*|FORK[0-9]*|Fork[0-9]*)
       number=${choice#* }
+      number=${number#[fF][oO][rR][kK]}
       if [[ $number =~ ^[0-9]+$ ]]; then
         fork_number "$number"
       else
-        echo "  Use fork followed by a visible number. Nothing changed."
+        echo "  That needs a session number, such as fork 19. Numbers shown here work."
+      fi
+      ;;
+    model\ *|MODEL\ *|Model\ *|model[0-9]*|MODEL[0-9]*|Model[0-9]*)
+      number=${choice#* }
+      number=${number#[mM][oO][dD][eE][lL]}
+      if [[ $number =~ ^[0-9]+$ ]]; then
+        change_model_number "$number"
+      else
+        echo "  That needs a session number, such as model 19. Numbers shown here work."
       fi
       ;;
     [0-9]*)
       if [[ $choice =~ ^[0-9]+$ ]]; then
         choose_number "$choice"
       else
-        echo "  Unknown choice. Nothing changed."
+        picker_unknown_choice "$PICKER_MAIN_KEYS"
       fi
       ;;
     *)
-      echo "  Unknown choice. Nothing changed."
+      picker_unknown_choice "$PICKER_MAIN_KEYS"
       ;;
   esac
 done

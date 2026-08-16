@@ -1,0 +1,3 @@
+#!/bin/bash
+printf '%s\tstty\t%s\n' "$EPOCHREALTIME" "$*" >> "$SK_SHIM_LOG"
+exec /usr/bin/stty "$@"

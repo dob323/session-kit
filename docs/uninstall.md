@@ -40,15 +40,16 @@ generated, or that it matches the digest recorded in the private LaunchAgent
 receipt. An edited or unowned plist is refused rather than deleted.
 
 `services disable` on macOS holds the Session Kit creation lock, proves shpool
-reports zero sessions, unloads the watchdog and the reaper, proves the session
-list is still empty, and only then unloads shpool. Any of those steps can refuse
+reports zero sessions, unloads the watchdog and the reaper, proves none
+appeared, and only then unloads shpool. Any of those steps can refuse
 and leave shpool running. The two proofs bracket the window in which a session
 could appear between them, because unloading the shpool job stops the daemon and
-takes the managed terminals it holds with it.
+takes the sessions it holds with it.
 
 On Linux, `services disable` runs `systemctl --user disable --now
-shpool-reaper.timer shpool.socket`, which disables and stops the socket and the
-cleanup timer. It makes no empty-session proof and never signals shpool
+shpool-reaper.timer session-kit-subagent-sweep.timer shpool.socket`, which
+disables and stops the socket, the hourly cleanup timer, and the five-minute
+sub-agent sweep. It makes no empty-session proof and never signals shpool
 directly. What happens to a running daemon depends on how that daemon was
 started: the shipped `shpool.service` declares `Requires=shpool.socket`, so a
 systemd-started daemon is stopped along with the socket, while a daemon started
@@ -80,17 +81,23 @@ The default uninstall removes:
 - the private integration marker;
 - `kit`, `sp`, `shpool_login`, `shpool_status`, `shpool_reaper`,
   `codex_resume_here`, and `session-kit` from `$HOME/.local/bin`;
+- on Linux, the copied systemd user units in `~/.config/systemd/user/`;
 - the install receipt, once the managed files above are verified and gone.
 
 It does not close sessions, delete provider conversations, remove shpool, remove
 the installed release code, remove configuration, or delete private state. It
 starts, stops, restarts, and signals nothing.
 
-On Linux the copied systemd user units stay in `~/.config/systemd/user/` after
-uninstall. They are left for explicit review and removal once the services are
-disabled, because deleting a unit file does not deactivate the unit, and a
-removed file with a live enablement behind it is worse than a file left in
-place.
+On Linux the unit files go with the uninstall, and the enablement is checked
+first. A unit systemd still holds a link to -- `enabled`, `enabled-runtime`,
+`linked`, or `linked-runtime` -- stops the uninstall with the command that
+clears it, because deleting a unit file does not deactivate the unit and a
+removed file behind a live enablement is worse than a file left in place. A unit
+that is merely *running* does not stop it: that daemon is holding live sessions,
+removing its file does not stop the process, and the way out of an installation
+must not go through killing every session in it. Uninstall names any unit it
+leaves running. A unit path that is a symlink is refused, not followed, and
+nothing is removed until every path has passed.
 
 ## Remove the code and configuration
 
@@ -145,15 +152,22 @@ history, logs, and terminal content.
 [Security and local data](security-and-data.md) describes what each class
 contains.
 
-Some files the installer wrote sit outside all of those roots, and no uninstall
-path touches them. `~/.config/shpool/config.toml` is created only when it is
-absent, and it is the account's own file from that moment on. The kit's Codex
+Some files the installer wrote sit outside all of those roots.
+`~/.config/shpool/config.toml` is created only when it is absent, and it is the
+account's own file from that moment on. The kit's Codex
 theme files, `${CODEX_HOME:-$HOME/.codex}/themes/sk-*.tmTheme`, are installed
 into the Codex home so Codex can read them; remove them by hand if you want them
-gone. Separately, the Claude Code title hook and status line at
-`~/.claude/hooks/nameintent_title.sh` and `~/.claude/statusline.sh` are
-hand-deployed rather than installed, so no uninstall step considers them either.
-See [the Claude Code integration notes](../config/claude/README.md).
+gone. The Claude Code title hook and status line at
+`~/.claude/hooks/nameintent_title.sh` and `~/.claude/statusline.sh` are owned by
+the kit. `claude-integration.json` records their installed digests. Uninstall
+removes them only while their content still matches that record, keeps both an
+edited file and its ledger entry, and removes only the kit's exact settings
+registrations. `claude-statusline-backups.json` records the operator's prior
+`statusLine`; uninstall restores its current recorded value instead of deleting
+it. Edited files and unrelated hooks stay in place. The generated per-account
+quota probes and caches beneath `~/.claude/cache/session-kit-quota/` are removed
+with the integration; provider credentials and conversation storage are not. See
+[the Claude Code integration notes](../config/claude/README.md).
 
 ## Removing retained data
 

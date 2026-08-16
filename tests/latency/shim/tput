@@ -1,0 +1,3 @@
+#!/bin/bash
+printf '%s\ttput\t%s\n' "$EPOCHREALTIME" "$*" >> "$SK_SHIM_LOG"
+exec /usr/bin/tput "$@"

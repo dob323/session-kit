@@ -8,9 +8,7 @@ if [[ $(uname -s 2>/dev/null) == Darwin && ${BASH_VERSINFO[0]} -lt 4 ]]; then
       exec "$modern_bash" "$0" "$@"
     fi
   done
-  printf '%s\n' 'Session Kit needs Homebrew Bash and Python on macOS.' >&2
-  printf '%s\n' 'Run: brew install bash python rust' >&2
-  printf '%s\n' 'Then: cargo install shpool --version 0.11.0 --locked' >&2
+  printf '%s\n' 'session-kit: macOS needs Homebrew Bash 4 or newer. Install it with: brew install bash python rust' >&2
   exit 69
 fi
 

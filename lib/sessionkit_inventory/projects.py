@@ -41,7 +41,14 @@ PROVIDERS = ("claude", "codex")
 # never launchable and never listed, and because import gives each directory
 # at most one row, discovery can never add a shortcut for it again.
 IGNORE_KIND = "ignore"
-ROW_KINDS = (*PROVIDERS, "shell", IGNORE_KIND)
+# A directory is one project, whatever it is worked on with. The kind column
+# on a live row is that project's DEFAULT provider, never a lock: the provider
+# is chosen when a session starts, and naming one there overrides the default.
+# "any" is a project with no default at all — the row a plain `projects add`
+# writes, because adding a directory is not the moment to decide that.
+ANY_KIND = "any"
+LAUNCH_KINDS = (*PROVIDERS, "shell")
+ROW_KINDS = (*LAUNCH_KINDS, ANY_KIND, IGNORE_KIND)
 MAX_PROVIDER_CONFIG_BYTES = 32 * 1024 * 1024
 MAX_CLAUDE_HISTORY_BYTES = 64 * 1024 * 1024
 MAX_PROJECTS_FILE_BYTES = 4 * 1024 * 1024
@@ -473,6 +480,7 @@ def _mutate_projects(
     state_dir: Path,
     mutate: Any,
     drop: Any = None,
+    replace: Any = None,
 ) -> dict[str, Any]:
     state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     lock_path = state_dir / "projects.lock"
@@ -493,6 +501,34 @@ def _mutate_projects(
         added = mutate(existing)
         payload = original
         removed: list[dict[str, str]] = []
+        changed: list[dict[str, str]] = []
+        if replace is not None:
+            # A row edited in place keeps its line, and therefore its number in
+            # the picker. Withdrawing it and appending the new one would
+            # renumber every project below it for a change to one of them.
+            lines: list[str] = []
+            for line in original.decode("utf-8", "strict").splitlines(keepends=True):
+                row = _row(line.rstrip("\n"))
+                replacement = replace(row) if row is not None else None
+                if replacement is None:
+                    lines.append(line)
+                    continue
+                changed.append(replacement)
+                lines.append(
+                    f"{replacement['alias']}\t{replacement['provider']}"
+                    f"\t{replacement['cwd']}\n"
+                )
+            payload = "".join(lines).encode("utf-8")
+            if not changed:
+                return {"added": [], "removed": [], "changed": [], "backup": None}
+            backup = _backup(original, state_dir) if projects_file.exists() else None
+            _atomic_write(projects_file, payload)
+            return {
+                "added": [],
+                "removed": [],
+                "changed": changed,
+                "backup": backup,
+            }
         if drop is not None:
             # Rewrite only the withdrawn rows so comments, blank lines, and
             # every unrelated line survive byte for byte.
@@ -542,6 +578,39 @@ def select_rows(rows: Sequence[Mapping[str, str]], answer: str) -> list[dict[str
     return [dict(rows[number - 1]) for number in picked]
 
 
+def collapse_rows(
+    rows: Sequence[Mapping[str, str]],
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """One entry per directory, and the duplicates that were folded into it.
+
+    A directory listed twice — the shape the old add flow forced on anyone who
+    worked in it with both providers — is one project, so the first row keeps
+    its alias and the later rows contribute only their default. Two rows that
+    disagree about the provider cancel to no default: a directory worked on
+    with both is exactly the case where guessing one is wrong.
+
+    Nothing is dropped silently; the second return value names every folded
+    row so a caller can say which alias it retired.
+    """
+    kept: list[dict[str, str]] = []
+    index: dict[str, dict[str, str]] = {}
+    folded: list[dict[str, str]] = []
+    for row in rows:
+        if row["provider"] == IGNORE_KIND:
+            kept.append(dict(row))
+            continue
+        first = index.get(row["cwd"])
+        if first is None:
+            entry = dict(row)
+            index[row["cwd"]] = entry
+            kept.append(entry)
+            continue
+        if first["provider"] != row["provider"]:
+            first["provider"] = ANY_KIND
+        folded.append({**dict(row), "kept_alias": first["alias"]})
+    return kept, folded
+
+
 def project_candidates(projects_file: Path) -> dict[str, Any]:
     """Directories a provider has used that have no row yet, each with the
     alias and provider import would give it. Nothing is written."""
@@ -556,12 +625,47 @@ def project_candidates(projects_file: Path) -> dict[str, Any]:
         {"alias": row["alias"], "provider": row["provider"], "cwd": row["cwd"]}
         for row in _new_rows(discovery["projects"], existing)
     ]
+    collapsed, duplicates = collapse_rows(existing)
     return {
         "candidates": candidates,
-        "configured": [row for row in existing if row["provider"] != IGNORE_KIND],
+        "configured": [row for row in collapsed if row["provider"] != IGNORE_KIND],
+        "duplicates": duplicates,
         "ignored": [row["cwd"] for row in existing if row["provider"] == IGNORE_KIND],
         "warnings": discovery["warnings"],
     }
+
+
+def normalize_projects(projects_file: Path, state_dir: Path) -> dict[str, Any]:
+    """Rewrite the file to one row per directory, keeping the first alias.
+
+    Only directories that carry more than one row are touched; every other
+    line, comment included, survives byte for byte.
+    """
+    payload = _read_owner_file(
+        projects_file,
+        label="Session Kit projects file",
+        max_bytes=MAX_PROJECTS_FILE_BYTES,
+    )
+    _, duplicates = collapse_rows(_parse_projects(payload or b""))
+    if not duplicates:
+        return {"added": [], "removed": [], "backup": None, "duplicates": []}
+    directories = {row["cwd"] for row in duplicates}
+
+    def merge(existing: Sequence[Mapping[str, str]]) -> list[dict[str, str]]:
+        collapsed, _ = collapse_rows(existing)
+        return [
+            {"alias": row["alias"], "provider": row["provider"], "cwd": row["cwd"]}
+            for row in collapsed
+            if row["cwd"] in directories and row["provider"] != IGNORE_KIND
+        ]
+
+    result = _mutate_projects(
+        projects_file,
+        state_dir,
+        merge,
+        drop=lambda row: row["provider"] != IGNORE_KIND and row["cwd"] in directories,
+    )
+    return {**result, "duplicates": duplicates}
 
 
 def import_projects(
@@ -586,15 +690,25 @@ def add_project(
     projects_file: Path,
     state_dir: Path,
     alias: str | None,
-    provider: str,
-    cwd: str,
+    provider: str | None = None,
+    cwd: str = "",
 ) -> dict[str, Any]:
-    """Add a shortcut. An omitted alias is derived from the directory, and an
-    ignore on that directory is withdrawn so adding always reverses ignoring."""
+    """Add a project. An omitted alias is derived from the directory, and an
+    ignore on that directory is withdrawn so adding always reverses ignoring.
+
+    ``provider`` is a *default* for that project and may be omitted, which is
+    what the add flow does: which provider opens a directory is answered when
+    a session starts, not once and for all when the directory is listed. A
+    directory already on the list is refused by name rather than given a
+    second entry — that second entry is what used to be needed to work in one
+    directory with both providers.
+    """
     if alias is not None and not ALIAS_RE.fullmatch(alias):
         raise ProjectError("alias must use lowercase letters, numbers, _ or -")
+    if provider is None:
+        provider = ANY_KIND
     if provider not in ROW_KINDS:
-        raise ProjectError("provider must be claude, codex, shell, or ignore")
+        raise ProjectError("provider must be claude, codex, shell, any, or ignore")
     directory = _directory(cwd)
     if directory is None:
         raise ProjectError("project directory must be an existing absolute directory")
@@ -607,9 +721,15 @@ def add_project(
         ]
         chosen = alias if alias is not None else suggest_alias(directory, live)
         for row in live:
-            if row["alias"] == chosen:
-                if row["provider"] == provider and row["cwd"] == directory:
+            if row["cwd"] == directory:
+                if row["alias"] == chosen and row["provider"] == provider:
                     return []
+                raise ProjectError(
+                    f"{directory} is already on the list as {row['alias']}; "
+                    "one directory is one project, and which provider opens it "
+                    "is chosen when a session starts"
+                )
+            if row["alias"] == chosen:
                 raise ProjectError(f"project alias already exists: {chosen}")
         return [{"alias": chosen, "provider": provider, "cwd": directory}]
 
@@ -619,6 +739,47 @@ def add_project(
         add,
         drop=lambda row: row["provider"] == IGNORE_KIND and row["cwd"] == directory,
     )
+
+
+def set_default_provider(
+    projects_file: Path, state_dir: Path, target: str, provider: str
+) -> dict[str, Any]:
+    """Set (or with ``any``, clear) the provider a project opens with by default.
+
+    The default exists so `sp new sl` need not repeat what is nearly always
+    true. It is changed here rather than by removing and re-adding the project,
+    and it never prevents `sp new codex sl` from opening the same directory
+    with the other provider.
+    """
+    if provider not in (*LAUNCH_KINDS, ANY_KIND):
+        raise ProjectError("a default provider is claude, codex, shell, or any")
+    directory = _directory(target) if target.startswith("/") else None
+    matched: dict[str, str] | None = None
+
+    def find(existing: Sequence[Mapping[str, str]]) -> list[dict[str, str]]:
+        nonlocal matched
+        for row in existing:
+            if row["provider"] == IGNORE_KIND:
+                continue
+            if row["alias"] == target or (
+                directory is not None and row["cwd"] == directory
+            ):
+                matched = dict(row)
+                break
+        if matched is None:
+            raise ProjectError(f"no project on the list is called {target}")
+        return []
+
+    def rewrite(row: Mapping[str, str]) -> dict[str, str] | None:
+        if matched is None or row["provider"] == IGNORE_KIND:
+            return None
+        if row["cwd"] != matched["cwd"] or row["provider"] == provider:
+            return None
+        return {"alias": row["alias"], "provider": provider, "cwd": row["cwd"]}
+
+    result = _mutate_projects(projects_file, state_dir, find, replace=rewrite)
+    # The caller prints from `added`; an in-place edit reports the same shape.
+    return {**result, "added": result.get("changed", [])}
 
 
 def ignore_project(projects_file: Path, state_dir: Path, cwd: str) -> dict[str, Any]:
@@ -652,6 +813,75 @@ def ignore_project(projects_file: Path, state_dir: Path, cwd: str) -> dict[str, 
         state_dir,
         ignore,
         drop=lambda row: not unchanged and row["cwd"] == directory,
+    )
+
+
+def unignore_project(projects_file: Path, state_dir: Path, cwd: str) -> dict[str, Any]:
+    """Withdraw an ignore so the directory can be offered again.
+
+    An ignore is a decision, not a shortcut, and it outlives the directory it
+    names: a row for a directory that has since been deleted or moved must
+    still be withdrawable, so this does not require the path to resolve."""
+    if (
+        not isinstance(cwd, str)
+        or not cwd.startswith("/")
+        or len(cwd) > 4096
+        or any(ord(character) < 32 or ord(character) == 127 for character in cwd)
+    ):
+        raise ProjectError("project directory must be an absolute path")
+    wanted = {cwd.rstrip("/") or "/"}
+    resolved = _directory(cwd)
+    if resolved is not None:
+        wanted.add(resolved)
+    return _mutate_projects(
+        projects_file,
+        state_dir,
+        lambda existing: [],
+        drop=lambda row: row["provider"] == IGNORE_KIND and row["cwd"] in wanted,
+    )
+
+
+def _add_words(
+    words: Sequence[str], default_provider: str | None
+) -> tuple[str | None, str | None, str]:
+    """Read ``add``'s positional words as (alias, default provider, directory).
+
+    The directory is the last word and is always absolute; a provider, when
+    one is typed at all, is the recognised word before it. Anything else in
+    front is the alias. Refusing an ambiguous form beats adding a project
+    under the alias "codex".
+    """
+    words = list(words)
+    if len(words) > 3:
+        raise ProjectError("add takes at most an alias, a provider, and a directory")
+    cwd = words[-1]
+    if not cwd.startswith("/"):
+        raise ProjectError("the last word must be the project's absolute directory")
+    rest = words[:-1]
+    provider = default_provider
+    if rest and rest[-1] in ROW_KINDS:
+        if provider is not None and provider != rest[-1]:
+            raise ProjectError("the provider was given twice and does not agree")
+        provider = rest.pop()
+    if len(rest) > 1:
+        raise ProjectError("add takes at most an alias, a provider, and a directory")
+    if provider is not None and provider not in (*LAUNCH_KINDS, ANY_KIND):
+        raise ProjectError("a default provider is claude, codex, shell, or any")
+    return (rest[0] if rest else None), provider, cwd
+
+
+def _rollback_note(alias: str) -> None:
+    """Say out loud what a row with no default costs on a rollback.
+
+    A release built before this one skips a kind it does not know, so a project
+    written as `any` is not listed at all by an older kit. `session-kit
+    rollback` is a verb this operator uses; a project quietly vanishing from
+    the picker after one is not something to leave in a report footnote.
+    """
+    print(
+        f"Note: a kit older than this release does not understand a project "
+        f"with no default, so {alias} would not be listed if you roll back. "
+        f"`session-kit projects default {alias} claude` gives it one."
     )
 
 
@@ -693,16 +923,32 @@ def _parser() -> argparse.ArgumentParser:
         help='import the candidates named by "1,3-4" or "a"',
     )
     add = subparsers.add_parser("add")
-    add.add_argument("alias")
-    add.add_argument("provider")
-    add.add_argument("cwd")
+    # One directory, one project. The provider used to be a required third
+    # word here and a third question in the picker; it is now an optional
+    # default, so `add /srv/app` and `add app /srv/app` are the whole form.
+    # `add ALIAS claude /srv/app` still parses: it is what every existing
+    # script, document, and habit types.
+    add.add_argument("words", nargs="+", metavar="[ALIAS] [PROVIDER] CWD")
+    add.add_argument(
+        "--default",
+        dest="default_provider",
+        help="the provider this project opens with unless another is named",
+    )
     here = subparsers.add_parser("here")
     here.add_argument("alias", nargs="?")
-    here.add_argument("--provider", default="claude")
+    here.add_argument("--provider", default=None)
+    default = subparsers.add_parser("default")
+    default.add_argument("target", help="project alias or absolute directory")
+    default.add_argument(
+        "provider", help="claude, codex, shell, or any to clear the default"
+    )
+    subparsers.add_parser("normalize")
     suggest = subparsers.add_parser("suggest")
     suggest.add_argument("cwd")
     ignore = subparsers.add_parser("ignore")
     ignore.add_argument("cwd")
+    unignore = subparsers.add_parser("unignore")
+    unignore.add_argument("cwd")
     subparsers.add_parser("list")
     return parser
 
@@ -748,13 +994,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                     raise ProjectError("nothing was selected")
             value = import_projects(projects_file, state_dir, only=only or None)
         elif args.action == "add":
-            value = add_project(
-                projects_file, state_dir, args.alias, args.provider, args.cwd
-            )
+            alias, provider, cwd = _add_words(args.words, args.default_provider)
+            value = add_project(projects_file, state_dir, alias, provider, cwd)
         elif args.action == "here":
             value = add_project(
                 projects_file, state_dir, args.alias, args.provider, os.getcwd()
             )
+        elif args.action == "default":
+            value = set_default_provider(
+                projects_file, state_dir, args.target, args.provider
+            )
+        elif args.action == "normalize":
+            value = normalize_projects(projects_file, state_dir)
         elif args.action == "suggest":
             directory = _directory(args.cwd)
             if directory is None:
@@ -772,6 +1023,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             }
         elif args.action == "ignore":
             value = ignore_project(projects_file, state_dir, args.cwd)
+        elif args.action == "unignore":
+            value = unignore_project(projects_file, state_dir, args.cwd)
         else:
             payload = _read_owner_file(
                 projects_file,
@@ -808,9 +1061,51 @@ def main(argv: Sequence[str] | None = None) -> int:
                 row = value["added"][0]
                 if value["removed"]:
                     print(f"No longer ignoring {row['cwd']}.")
-                print(f"Added {row['alias']}: {row['provider']} in {row['cwd']}")
+                if row["provider"] == ANY_KIND:
+                    print(f"Added {row['alias']}: {row['cwd']}")
+                    print(
+                        "Claude, Codex, or a shell is chosen when you start a "
+                        "session in it."
+                    )
+                    _rollback_note(row["alias"])
+                else:
+                    print(
+                        f"Added {row['alias']}: {row['cwd']} "
+                        f"(opens with {row['provider']} unless you name another)"
+                    )
             else:
-                print("That project shortcut is already configured.")
+                print("That project is already on the list.")
+        elif args.action == "default":
+            if value["added"]:
+                row = value["added"][0]
+                if row["provider"] == ANY_KIND:
+                    print(
+                        f"{row['alias']} has no default provider now; name one "
+                        "when you start a session."
+                    )
+                    _rollback_note(row["alias"])
+                else:
+                    print(f"{row['alias']} opens with {row['provider']} by default.")
+            else:
+                print("That project already opens that way. Nothing changed.")
+        elif args.action == "normalize":
+            if not value["duplicates"]:
+                print("Every directory already has exactly one entry.")
+            else:
+                for row in value["duplicates"]:
+                    print(
+                        f"{row['cwd']} was listed twice; kept {row['kept_alias']} "
+                        f"and retired {row['alias']}."
+                    )
+                for row in value["added"]:
+                    if row["provider"] == ANY_KIND:
+                        print(
+                            f"{row['alias']} has no default provider: it is worked "
+                            "on with more than one."
+                        )
+                        _rollback_note(row["alias"])
+                if value.get("backup"):
+                    print(f"Previous projects file backed up to {value['backup']}")
         elif args.action == "ignore":
             if value["added"]:
                 row = value["added"][0]
@@ -824,6 +1119,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"Ignoring {row['cwd']}. It stays out of the project list.")
             else:
                 print("That directory is already ignored.")
+        elif args.action == "unignore":
+            if value["removed"]:
+                print(
+                    f"No longer ignoring {value['removed'][0]['cwd']}."
+                    " It can be listed and added again."
+                )
+            else:
+                print("That directory was not ignored. Nothing changed.")
         else:
             for row in value["projects"]:
                 print(f"{row['alias']}\t{row['provider']}\t{row['cwd']}")

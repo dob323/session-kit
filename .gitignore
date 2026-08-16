@@ -20,3 +20,15 @@ venv/
 # commits a mocked home. Ignore the whole class rather than chase prefixes.
 /.*/
 !/.github/
+# Overhaul work-order paperwork and its evidence: kept beside the branch for
+# the lead to read, deliberately not tracked so the export manifest stays a
+# statement about what the kit ships.
+WORKORDER-REPORT.md
+/WORKORDER-REPORT.md
+/wsd-evidence/
+/WORKORDER-FLEET-SOCKET.diff
+
+# Per-branch review notes are working papers kept beside the worktree, not
+# release or public-tree content.
+/BUILD-REPORT.md
+BUILD-REPORT.md

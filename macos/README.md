@@ -28,10 +28,11 @@ refused rather than silently replaced.
 
 ## LaunchAgents
 
-Installation generates three inactive LaunchAgent templates in
-`~/.config/session-kit/launchd/` and stops there. It does not copy, load, start,
-stop, or restart any service. Activate the jobs explicitly, while logged into
-the Mac desktop:
+Installation generates three LaunchAgent templates in
+`~/.config/session-kit/launchd/`. A first install does not load them; activate
+the jobs explicitly while logged into the Mac desktop. On an update or
+rollback, an already-loaded watchdog is kickstarted onto the selected release.
+The shpool and reaper jobs are not restarted automatically.
 
 ```bash
 session-kit services enable
@@ -66,9 +67,10 @@ window where a new session could appear. Before it removes any active plist it
 verifies that file against the generated template or the digest in its private
 receipt, and refuses a modified or unowned one.
 
-Update and rollback regenerate the inactive templates but never reload a loaded
-LaunchAgent. To adopt a changed definition, reach a point with no managed
-sessions and cycle `services disable` then `services enable` deliberately. See
+Update and rollback regenerate the templates and kickstart an already-loaded
+watchdog. They do not unload or reload shpool or the reaper. To adopt changed
+definitions for those jobs, reach a point with no managed sessions and cycle
+`services disable` then `services enable` deliberately. See
 [Update and roll back](../docs/update-and-rollback.md) and
 [Troubleshooting](../docs/troubleshooting.md#macos-services-are-not-running).
 

@@ -24,13 +24,11 @@ from tests.support import REPO, run
 sys.path.insert(0, os.fspath(REPO / "lib"))
 
 from sessionkit_inventory import common as inventory_common  # noqa: E402
-from sessionkit_messages import claude_send  # noqa: E402
 
 
 COMMON = REPO / "bin" / "session_kit_common"
 LIFECYCLE = REPO / "lib" / "sh" / "session_kit_lifecycle.sh"
-BASHRC = REPO / "bashrc" / "shpool.bashrc"
-PROVIDER_HOOKS = REPO / "lib" / "sessionkit_supervisor" / "provider_hooks.py"
+COMMANDS = REPO / "lib" / "sh" / "sp_commands.sh"
 
 # A PID that exists (this process) paired with start ticks that cannot be its
 # own, so the real evidence path always answers "not present". Only the
@@ -184,32 +182,6 @@ class LifecycleFailpointGateTests(unittest.TestCase):
         self.assertNotIn("SESSION_KIT_TEST_FAILPOINT", source)
 
 
-class CodexHandoffFailpointGateTests(unittest.TestCase):
-    def test_the_handoff_failpoint_reads_the_testing_gate(self) -> None:
-        source = BASHRC.read_text(encoding="utf-8")
-
-        self.assertIn('os.environ.get("SESSION_KIT_TESTING") == "1"', source)
-        self.assertEqual(
-            2, source.count('failpoint_armed("prompt-after-quarantine-move")')
-        )
-        # No caller may read the raw variable and skip the gate.
-        self.assertEqual(
-            1, source.count('os.environ.get("SESSION_KIT_TEST_FAILPOINT")')
-        )
-
-
-class ProviderHooksFailpointGateTests(unittest.TestCase):
-    def test_both_provider_hook_failpoints_read_the_testing_gate(self) -> None:
-        source = PROVIDER_HOOKS.read_text(encoding="utf-8")
-
-        self.assertEqual(
-            2, source.count('os.environ.get("SESSION_KIT_TEST_FAILPOINT")')
-        )
-        self.assertEqual(
-            2, source.count('os.environ.get("SESSION_KIT_TESTING") == "1"')
-        )
-
-
 class ProviderSnapshotFixtureGateTests(unittest.TestCase):
     """The fixture hooks replace the provider's own answer about what exists."""
 
@@ -264,35 +236,6 @@ class ProviderSnapshotFixtureGateTests(unittest.TestCase):
         self.assertEqual({"fixture": str(self.fixture)}, payload)
         self.assertEqual([], called)
 
-    def test_registry_fixture_is_ignored_without_the_testing_gate(self) -> None:
-        """Without the gate the real `claude` command decides, not the file."""
-        missing = Path(self.temporary.name) / "no-such-binary"
-
-        entries = claude_send.registry_entries(
-            {
-                "SESSION_KIT_CLAUDE_JSON_FILE": str(self.fixture),
-                "SESSION_KIT_CLAUDE_CMD": str(missing),
-            }
-        )
-
-        self.assertEqual([], entries)
-
-    def test_registry_fixture_is_honoured_under_the_testing_gate(self) -> None:
-        missing = Path(self.temporary.name) / "no-such-binary"
-
-        entries = claude_send.registry_entries(
-            {
-                "SESSION_KIT_TESTING": "1",
-                "SESSION_KIT_CLAUDE_JSON_FILE": str(self.fixture),
-                "SESSION_KIT_CLAUDE_CMD": str(missing),
-            }
-        )
-
-        self.assertEqual(
-            ["00000000-0000-4000-8000-000000000001"],
-            [entry["sessionId"] for entry in entries],
-        )
-
 
 class ProcRootGateTests(unittest.TestCase):
     """`/proc` is where every identity proof in the kit gets its answer."""
@@ -333,7 +276,7 @@ class ProcRootGateTests(unittest.TestCase):
             [
                 "bash",
                 "-c",
-                'set -a; source /dev/stdin <<<"$(sed -n "1,30p" "$1")"; '
+                'set -a; source /dev/stdin <<<"$(awk "/^sweep_subagents/{exit} {print}" "$1")"; '
                 'printf "%s\\n" "$PROC_ROOT"',
                 "reaper-proc-root-test",
                 REPO / "bin" / "shpool_reaper",
@@ -349,7 +292,7 @@ class ProcRootGateTests(unittest.TestCase):
             [
                 "bash",
                 "-c",
-                'set -a; source /dev/stdin <<<"$(sed -n "1,30p" "$1")"; '
+                'set -a; source /dev/stdin <<<"$(awk "/^sweep_subagents/{exit} {print}" "$1")"; '
                 'printf "%s\\n" "$PROC_ROOT"',
                 "reaper-proc-root-test",
                 REPO / "bin" / "shpool_reaper",
@@ -364,6 +307,48 @@ class ProcRootGateTests(unittest.TestCase):
         self.assertEqual(os.fspath(self.fake_proc), result.stdout.strip(), result.stderr)
 
 
+class HistoryExecutableOverrideGateTests(unittest.TestCase):
+    """History tool substitutions are isolated-test hooks, never production input."""
+
+    OVERRIDES = (
+        "SESSION_KIT_JOURNAL_RENDER_TOOL",
+        "SESSION_KIT_TRANSCRIPT_TEXT_TOOL",
+        "SESSION_KIT_HISTORY_SEARCH_TOOL",
+    )
+
+    def selected_path(
+        self, name: str, **extra: str
+    ) -> subprocess.CompletedProcess[str]:
+        return run(
+            [
+                "bash",
+                "-c",
+                'source "$1"; source "$2"; sk_history_tool_path "$3" /trusted/tool',
+                "history-tool-gate-test",
+                COMMON,
+                COMMANDS,
+                name,
+            ],
+            env=sandbox_env(**{name: "/untrusted/tool"}, **extra),
+            check=False,
+        )
+
+    def test_overrides_are_ignored_without_the_testing_gate(self) -> None:
+        for name in self.OVERRIDES:
+            with self.subTest(name=name):
+                result = self.selected_path(name)
+                self.assertEqual("/trusted/tool", result.stdout.strip())
+                self.assertIn(f"ignoring {name}", result.stderr)
+                self.assertIn("reserved for isolated tests", result.stderr)
+
+    def test_overrides_are_honoured_under_the_testing_gate(self) -> None:
+        for name in self.OVERRIDES:
+            with self.subTest(name=name):
+                result = self.selected_path(name, SESSION_KIT_TESTING="1")
+                self.assertEqual("/untrusted/tool", result.stdout.strip())
+                self.assertEqual("", result.stderr)
+
+
 class NoUngatedTestHookRemainsTests(unittest.TestCase):
     """A regression net: a new ungated hook fails here, not in production."""
 
@@ -376,6 +361,9 @@ class NoUngatedTestHookRemainsTests(unittest.TestCase):
         "SESSION_KIT_PROC_ROOT",
         "SESSION_KIT_SHPOOL_JSON_FILE",
         "SESSION_KIT_CLAUDE_JSON_FILE",
+        "SESSION_KIT_JOURNAL_RENDER_TOOL",
+        "SESSION_KIT_TRANSCRIPT_TEXT_TOOL",
+        "SESSION_KIT_HISTORY_SEARCH_TOOL",
     )
     # The files that own a gate. Every other reader has to sit beside one.
     GATEKEEPERS = {
@@ -426,6 +414,7 @@ class NoUngatedTestHookRemainsTests(unittest.TestCase):
                     marker in line
                     for marker in (
                         "sk_test_hook",
+                        "sk_history_tool_path",
                         "failpoint_armed",
                         "proc_root(",
                         # Names the variable for `_command_json`, which is

@@ -19,6 +19,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -29,7 +30,15 @@ import uuid
 
 SCHEMA_VERSION = 1
 CURRENT_RELEASE_SCHEMA_VERSION = 5
-HELPERS = ("sp", "shpool_login", "shpool_status", "shpool_reaper", "codex_resume_here")
+HELPERS = (
+    "sp",
+    "shpool_login",
+    "shpool_login_tui",
+    "shpool_login_launcher",
+    "shpool_status",
+    "shpool_reaper",
+    "codex_resume_here",
+)
 LEGACY_REQUIRED_RELEASE_PAYLOAD = (
     "bin/session_kit_common",
     "lib/session_inventory.py",
@@ -92,6 +101,8 @@ REQUIRED_BACKUP_PAYLOAD = {
 }
 INSTALLED_TARGET_SUFFIXES = {
     ".local/bin/shpool_login",
+    ".local/bin/shpool_login_tui",
+    ".local/bin/shpool_login_launcher",
     ".local/bin/shpool_reaper",
     ".local/bin/shpool_status",
     ".local/bin/sp",
@@ -109,6 +120,20 @@ SHPOOL_ID_RE = re.compile(
     r"^(?:main(?:[1-9][0-9]*)?|s[0-9]{8}-[0-9]{6}-[1-9][0-9]*(?:-[1-9][0-9]*)?)$"
 )
 LAUNCH_RECORD_MAX_BYTES = 8192
+COLLECTION_DOCUMENT_NAMES = (
+    "inventory.json",
+    "terminal-numbers.json",
+    "terminal-numbers-retired.json",
+    "terminal-numbers.initialized.json",
+    "recovery-manifest.json",
+    "recovery-pending.json",
+)
+COLLECTION_SEQUENCE_NAME = "collection-sequence.json"
+COLLECTION_FLOOR_NAME = "collection-sequence-floor.json"
+COLLECTION_MARKERS_NAME = "collection-markers"
+LEGACY_INVENTORY_LOCK_NAME = "inventory.lock"
+VERSIONED_INVENTORY_LOCK_NAME = "inventory-v2.lock"
+LEGACY_INVENTORY_FENCE = b"session-kit publishing lock generation 2\n"
 
 
 class ReleaseError(RuntimeError):
@@ -175,6 +200,266 @@ def atomic_json(path: Path, payload: dict, mode: int = 0o600) -> None:
     finally:
         with contextlib.suppress(FileNotFoundError):
             tmp.unlink()
+
+
+def create_json_once(path: Path, payload: dict, mode: int = 0o600) -> bool:
+    """Durably publish JSON only if no entry already occupies its pathname."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    content = (json.dumps(payload, sort_keys=True, indent=2) + "\n").encode()
+    try:
+        with tmp.open("xb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, mode)
+        try:
+            os.link(tmp, path, follow_symlinks=False)
+        except FileExistsError:
+            return False
+        fsync_dir(path.parent)
+        return True
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            tmp.unlink()
+        if path.exists() or path.is_symlink():
+            fsync_dir(path.parent)
+
+
+def collection_floor_remedy(state_root: Path, remedy_tool: Path) -> str:
+    command = shlex.join(
+        [
+            "env",
+            f"SESSION_KIT_STATE_DIR={state_root}",
+            "python3",
+            os.fspath(remedy_tool),
+        ]
+    )
+    return (
+        "collection allocation floor cannot be derived from existing state; "
+        "restart the machine and, before starting a picker, sp, shpool_status, "
+        "or any Session Kit user service, run exactly:\n  "
+        f"{command}"
+    )
+
+
+def _private_sequence(path: Path) -> int | None:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ReleaseError(f"unsafe collection allocation counter: {path}: {exc}") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        try:
+            pathname = path.lstat()
+        except OSError as exc:
+            raise ReleaseError(
+                f"cannot inspect collection allocation counter: {path}"
+            ) from exc
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or metadata.st_size > 8192
+            or (metadata.st_dev, metadata.st_ino)
+            != (pathname.st_dev, pathname.st_ino)
+        ):
+            raise ReleaseError(f"unsafe collection allocation counter: {path}")
+        payload = os.read(descriptor, 8193)
+        if len(payload) > 8192 or os.read(descriptor, 1):
+            return None
+    finally:
+        os.close(descriptor)
+    try:
+        value = json.loads(payload.decode("utf-8", "strict"))
+    except (UnicodeError, ValueError):
+        return None
+    sequence = value.get("last_collection_start") if isinstance(value, dict) else None
+    if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence <= 0:
+        return None
+    return sequence
+
+
+def _collection_estate_is_empty(state_root: Path) -> bool:
+    counter = state_root / COLLECTION_SEQUENCE_NAME
+    if os.path.lexists(counter):
+        return False
+    if any(os.path.lexists(state_root / name) for name in COLLECTION_DOCUMENT_NAMES):
+        return False
+    markers = state_root / COLLECTION_MARKERS_NAME
+    try:
+        metadata = markers.lstat()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        return False
+    try:
+        next(markers.iterdir())
+    except StopIteration:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _locked_regular(path: Path, flags: int, mode: int) -> int | None:
+    keep_open = False
+    try:
+        descriptor = os.open(path, flags, mode)
+    except OSError:
+        return None
+    try:
+        opened = os.fstat(descriptor)
+        pathname = path.lstat()
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or stat.S_IMODE(opened.st_mode) != mode
+            or opened.st_uid != os.geteuid()
+            or opened.st_nlink != 1
+            or (opened.st_dev, opened.st_ino) != (pathname.st_dev, pathname.st_ino)
+        ):
+            return None
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        pathname = path.lstat()
+        if (opened.st_dev, opened.st_ino) != (pathname.st_dev, pathname.st_ino):
+            return None
+        keep_open = True
+        return descriptor
+    except OSError:
+        return None
+    finally:
+        if not keep_open:
+            with contextlib.suppress(OSError):
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
+
+def _exact_inventory_fence(path: Path) -> bool:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        return False
+    try:
+        opened = os.fstat(descriptor)
+        pathname = path.lstat()
+        content = os.read(descriptor, len(LEGACY_INVENTORY_FENCE) + 1)
+        return (
+            stat.S_ISREG(opened.st_mode)
+            and stat.S_IMODE(opened.st_mode) == 0o400
+            and opened.st_uid == os.geteuid()
+            and opened.st_nlink == 1
+            and (opened.st_dev, opened.st_ino) == (pathname.st_dev, pathname.st_ino)
+            and content == LEGACY_INVENTORY_FENCE
+        )
+    except OSError:
+        return False
+    finally:
+        os.close(descriptor)
+
+
+@contextlib.contextmanager
+def collection_seed_lock(state_root: Path):
+    """Serialize with either publisher generation without changing its fence."""
+    legacy = state_root / LEGACY_INVENTORY_LOCK_NAME
+    versioned = state_root / VERSIONED_INVENTORY_LOCK_NAME
+    open_flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        open_flags |= os.O_NOFOLLOW
+    while True:
+        if _exact_inventory_fence(legacy):
+            descriptor = _locked_regular(versioned, open_flags, 0o600)
+            if descriptor is None:
+                raise ReleaseError(f"unsafe collection publication lock: {versioned}")
+            if not _exact_inventory_fence(legacy):
+                os.close(descriptor)
+                continue
+            break
+        if os.path.lexists(legacy):
+            try:
+                info = legacy.lstat()
+            except OSError as exc:
+                raise ReleaseError(
+                    f"cannot inspect collection publication lock: {legacy}"
+                ) from exc
+            if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
+                raise ReleaseError(f"unsafe collection publication lock: {legacy}")
+        descriptor = _locked_regular(legacy, open_flags, 0o600)
+        if descriptor is not None:
+            break
+        if _exact_inventory_fence(legacy):
+            continue
+        raise ReleaseError(f"unsafe collection publication lock: {legacy}")
+    try:
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def seed_collection_floor(
+    state_root: Path, remedy_tool: Path, *, dry_run: bool = False
+) -> dict:
+    """Seed an absent allocation floor without consuming an allocation."""
+    floor = state_root / COLLECTION_FLOOR_NAME
+    if os.path.lexists(floor):
+        return {"status": "preserved", "path": str(floor)}
+    if dry_run and not state_root.exists():
+        return {"status": "would-seed", "path": str(floor), "value": 1}
+    if not dry_run:
+        state_root.mkdir(parents=True, mode=0o700, exist_ok=True)
+    try:
+        root_info = state_root.lstat()
+    except OSError as exc:
+        raise ReleaseError(f"cannot inspect collection state directory: {state_root}") from exc
+    if (
+        not stat.S_ISDIR(root_info.st_mode)
+        or stat.S_ISLNK(root_info.st_mode)
+        or stat.S_IMODE(root_info.st_mode) != 0o700
+        or root_info.st_uid != os.geteuid()
+    ):
+        raise ReleaseError(
+            f"collection state directory must be current-owner mode-0700: {state_root}"
+        )
+
+    @contextlib.contextmanager
+    def maybe_lock():
+        if dry_run:
+            yield
+        else:
+            with collection_seed_lock(state_root):
+                yield
+
+    with maybe_lock():
+        if os.path.lexists(floor):
+            return {"status": "preserved", "path": str(floor)}
+        sequence = _private_sequence(state_root / COLLECTION_SEQUENCE_NAME)
+        if sequence is None:
+            if not _collection_estate_is_empty(state_root):
+                raise ReleaseError(collection_floor_remedy(state_root, remedy_tool))
+            sequence = 1
+        if dry_run:
+            status = "would-seed"
+        else:
+            status = (
+                "seeded"
+                if create_json_once(
+                    floor,
+                    {"schema_version": 1, "last_collection_start": sequence},
+                )
+                else "preserved"
+            )
+        result = {"status": status, "path": str(floor)}
+        if status != "preserved":
+            result["value"] = sequence
+        return result
 
 
 def fsync_dir(path: Path) -> None:
@@ -1270,8 +1555,72 @@ def _read_private_launch_record(path: Path, expected_uid: int) -> bytes:
     return payload
 
 
-def validate_rollback_launch_records(home: Path) -> int:
-    """Require rollback-compatible, exact legacy launch pairs only."""
+def _launch_record_metadata_safe(path: Path, expected_uid: int) -> None:
+    """The fstat half of the launch-record safety proof, without a grammar.
+
+    Current-family records include a free-text prompt handoff, so a payload
+    grammar cannot apply to every file the way it does to the legacy pair.
+    What always applies: a private regular file, owned by us, mode 0600, one
+    link, non-empty, bounded, reached without following a symlink.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise ReleaseError(f"unsafe retained launch record: {path}: {exc}") from exc
+    try:
+        info = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != expected_uid
+        or stat.S_IMODE(info.st_mode) != 0o600
+        or info.st_nlink != 1
+        or info.st_size <= 0
+        or info.st_size > LAUNCH_RECORD_MAX_BYTES
+    ):
+        raise ReleaseError(
+            f"unsafe retained launch record type, owner, mode, link count, or size: {path}"
+        )
+
+
+def _target_reads_current_launch_records(target_release: Path | None) -> bool:
+    """Whether the rollback target understands the current record family.
+
+    The `.account`/`.launch`/`.prompt` records and the widened start pair
+    entered with the daemon-identity release; every release that reads them
+    names the `.launch` suffix in its `bin/session_kit_common`. A missing or
+    unreadable target answers False, which keeps the refusal conservative.
+    """
+    if target_release is None:
+        return False
+    common = target_release / "bin" / "session_kit_common"
+    try:
+        return b".launch" in common.read_bytes()
+    except OSError:
+        return False
+
+
+CURRENT_LAUNCH_SUFFIXES = (".account", ".launch", ".prompt")
+
+
+def validate_rollback_launch_records(
+    home: Path, target_release: Path | None = None
+) -> int:
+    """Refuse rollback only when retained records would poison the target.
+
+    The 15 August version required exact LEGACY pairs and nothing else, so
+    the first live estate whose kit wrote a `.launch` record could never roll
+    back at all -- the safety net was dead precisely when it was needed, and
+    on 16 August it had to be bypassed by hand-quarantining records. The rule
+    now: every record must still prove the same private-file safety, but
+    current-family records block a rollback only when the TARGET release
+    cannot read them. With no target supplied the old conservative refusal
+    stands.
+    """
     root = home / ".local/state/shpool-start"
     if root.is_symlink():
         raise ReleaseError(f"unsafe retained launch directory symlink: {root}")
@@ -1303,8 +1652,13 @@ def validate_rollback_launch_records(home: Path) -> int:
         if path.is_symlink():
             raise ReleaseError(f"unsafe retained launch record symlink: {path}")
         name = path.name
-        kind = "expected" if name.endswith(".expected") else "start"
-        shpool_id = name.removesuffix(".expected") if kind == "expected" else name
+        kind = "start"
+        shpool_id = name
+        for suffix in (".expected", *CURRENT_LAUNCH_SUFFIXES):
+            if name.endswith(suffix):
+                kind = suffix[1:]
+                shpool_id = name.removesuffix(suffix)
+                break
         if not SHPOOL_ID_RE.fullmatch(shpool_id):
             raise ReleaseError(f"unsafe retained launch record name: {path}")
         if not path.is_file():
@@ -1314,8 +1668,32 @@ def validate_rollback_launch_records(home: Path) -> int:
             raise ReleaseError(f"duplicate retained launch record for {shpool_id}")
         pair[kind] = path
 
-    legacy_pairs = 0
+    target_compatible = _target_reads_current_launch_records(target_release)
+    validated = 0
     for shpool_id, pair in sorted(records.items()):
+        current_family = any(
+            suffix[1:] in pair for suffix in CURRENT_LAUNCH_SUFFIXES
+        )
+        if current_family:
+            # The current release owns the shape of its own record set (a
+            # `.launch` request legitimately exists alone before creation),
+            # so no pair mandate applies -- but every file must prove the
+            # private-file safety, and the prompt handoff is free text so it
+            # gets the metadata proof without a payload grammar.
+            for kind, path in sorted(pair.items()):
+                if kind == "prompt":
+                    _launch_record_metadata_safe(path, expected_uid)
+                else:
+                    _read_private_launch_record(path, expected_uid)
+            if not target_compatible:
+                raise ReleaseError(
+                    "new-format retained launch pair blocks older-release "
+                    f"rollback: {shpool_id}: the target release cannot read "
+                    "current-family launch records; close that session or "
+                    "move its records into the failed/ quarantine first"
+                )
+            validated += 1
+            continue
         if set(pair) != {"start", "expected"}:
             raise ReleaseError(
                 f"mismatched retained launch pair blocks rollback: {shpool_id}"
@@ -1344,9 +1722,25 @@ def validate_rollback_launch_records(home: Path) -> int:
                 f"mismatched retained launch fields block rollback: {shpool_id}"
             )
         if len(start) == 4:
-            raise ReleaseError(
-                f"new-format retained launch pair blocks older-release rollback: {shpool_id}"
-            )
+            # The widened pair is the current family too: same target gate,
+            # same control-byte proof, no legacy 3-field grammar to apply.
+            if not target_compatible:
+                raise ReleaseError(
+                    "new-format retained launch pair blocks older-release "
+                    f"rollback: {shpool_id}: the target release cannot read "
+                    "current-family launch records; close that session or "
+                    "move its records into the failed/ quarantine first"
+                )
+            if any(
+                byte < 0x20 or byte == 0x7F
+                for field in start + expected
+                for byte in field
+            ):
+                raise ReleaseError(
+                    f"unsafe legacy retained launch fields block rollback: {shpool_id}"
+                )
+            validated += 1
+            continue
         uuid_pattern = re.compile(
             rb"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
             rb"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
@@ -1376,13 +1770,13 @@ def validate_rollback_launch_records(home: Path) -> int:
             raise ReleaseError(
                 f"unsafe legacy retained launch fields block rollback: {shpool_id}"
             )
-        legacy_pairs += 1
+        validated += 1
 
     after = root.lstat()
     stable = ("st_dev", "st_ino", "st_mode", "st_uid", "st_mtime_ns", "st_ctime_ns")
     if any(getattr(metadata, field) != getattr(after, field) for field in stable):
         raise ReleaseError(f"retained launch directory changed while reading: {root}")
-    return legacy_pairs
+    return validated
 
 
 def validate_rollback_creation_state(home: Path) -> tuple[Path, os.stat_result | None]:
@@ -1498,6 +1892,19 @@ def activation_checkpoint(label: str) -> None:
 def integration_marker_path(args: argparse.Namespace) -> Path:
     configured = getattr(args, "integration_marker", None)
     return configured or args.state_dir.parent / "integration-ready-v1"
+
+
+def collection_state_root(args: argparse.Namespace) -> Path:
+    configured = getattr(args, "collection_state_dir", None)
+    return configured or args.state_dir.parent
+
+
+def target_floor_seed(args: argparse.Namespace, release: Path) -> dict:
+    return seed_collection_floor(
+        collection_state_root(args),
+        release / "bin/reset-collection-order.py",
+        dry_run=args.dry_run,
+    )
 
 
 def activation_transaction_paths(args: argparse.Namespace) -> list[Path]:
@@ -1784,9 +2191,10 @@ def activate(args: argparse.Namespace, *, action: str = "activate") -> dict:
             dry_run=True,
         )
         validated_integration_proof(args, evidence["release"]["commit"])
+        floor_seed = target_floor_seed(args, release) if action == "activate" else None
         if action == "rollback":
             validate_rollback_creation_state(home)
-            validate_rollback_launch_records(home)
+            validate_rollback_launch_records(home, target_release=release)
         previous = release_commit_from_current(root)
         plan = {
             "action": action,
@@ -1800,6 +2208,8 @@ def activate(args: argparse.Namespace, *, action: str = "activate") -> dict:
             "dry_run": True,
             "service_restart": False,
         }
+        if floor_seed is not None:
+            plan["collection_floor"] = floor_seed
         return plan
     with deploy_lock(args.state_dir), contextlib.ExitStack() as rollback_stack:
         ensure_no_pending_bootstrap(args.state_dir)
@@ -1807,11 +2217,11 @@ def activate(args: argparse.Namespace, *, action: str = "activate") -> dict:
             # Inspect before creating/acquiring the serialization lock so an
             # unsafe rollback refusal remains read-only.
             validate_rollback_creation_state(home)
-            validate_rollback_launch_records(home)
+            validate_rollback_launch_records(home, target_release=release)
             rollback_stack.enter_context(rollback_launch_creation_lock(home))
             # Recheck under the same create lock used by sp launch writers and
             # hold it until the pointer transaction is complete.
-            validate_rollback_launch_records(home)
+            validate_rollback_launch_records(home, target_release=release)
         recovered = recover_activation_transaction(args)
         # Revalidate under the lock to close the check/switch race.
         evidence, missing = activation_preconditions(
@@ -1826,8 +2236,9 @@ def activate(args: argparse.Namespace, *, action: str = "activate") -> dict:
         marker_content = validated_integration_proof(
             args, evidence["release"]["commit"]
         )
+        floor_seed = target_floor_seed(args, release) if action == "activate" else None
         if action == "rollback":
-            validate_rollback_launch_records(home)
+            validate_rollback_launch_records(home, target_release=release)
         marker_path = integration_marker_path(args)
         previous = release_commit_from_current(root)
         receipt = {
@@ -1917,6 +2328,8 @@ def activate(args: argparse.Namespace, *, action: str = "activate") -> dict:
             "service_restart": False,
             "recovered_transaction": recovered,
         }
+        if floor_seed is not None:
+            plan["collection_floor"] = floor_seed
     plan["previous_commit"] = previous
     plan["result"] = "current-switched"
     return plan
@@ -1940,6 +2353,7 @@ def bootstrap(args: argparse.Namespace) -> dict:
         source_launcher = release / "deploy" / "session-kit-launcher"
         if not source_launcher.is_file():
             raise ReleaseError(f"verified release is missing launcher source: {source_launcher}")
+        floor_seed = target_floor_seed(args, release)
         plan = {
             "action": "bootstrap",
             "commit": evidence["release"]["commit"],
@@ -1948,6 +2362,7 @@ def bootstrap(args: argparse.Namespace) -> dict:
             "missing_sentinels": missing,
             "dry_run": True,
             "service_restart": False,
+            "collection_floor": floor_seed,
         }
         return plan
     with deploy_lock(args.state_dir):
@@ -1965,6 +2380,7 @@ def bootstrap(args: argparse.Namespace) -> dict:
         source_launcher = release / "deploy" / "session-kit-launcher"
         if not source_launcher.is_file():
             raise ReleaseError(f"verified release is missing launcher source: {source_launcher}")
+        floor_seed = target_floor_seed(args, release)
         plan = {
             "action": "bootstrap",
             "commit": evidence["release"]["commit"],
@@ -1973,6 +2389,7 @@ def bootstrap(args: argparse.Namespace) -> dict:
             "missing_sentinels": missing,
             "dry_run": False,
             "service_restart": False,
+            "collection_floor": floor_seed,
         }
         args.root.mkdir(parents=True, exist_ok=True, mode=0o755)
         args.bin_dir.mkdir(parents=True, exist_ok=True, mode=0o755)
@@ -2110,6 +2527,11 @@ def common_activation(parser: argparse.ArgumentParser) -> None:
             os.environ.get("SESSION_KIT_DEPLOY_STATE", "~/.local/state/session-kit/deploy")
         ),
     )
+    parser.add_argument(
+        "--collection-state-dir",
+        type=path_arg,
+        help="inventory state root (defaults to the deploy state directory's parent)",
+    )
     parser.add_argument("--dry-run", action="store_true")
 
 
@@ -2129,6 +2551,11 @@ def parser() -> argparse.ArgumentParser:
 
     backup = commands.add_parser("verify-backup", help="verify the required pre-deploy backup")
     backup.add_argument("bundle", type=path_arg)
+
+    floor = commands.add_parser("seed-floor", help=argparse.SUPPRESS)
+    floor.add_argument("--state-root", required=True, type=path_arg)
+    floor.add_argument("--remedy-tool", required=True, type=path_arg)
+    floor.add_argument("--dry-run", action="store_true")
 
     boot = commands.add_parser("bootstrap", help="install stable launchers once and activate")
     common_activation(boot)
@@ -2167,6 +2594,10 @@ def main() -> int:
                 "canonical_head": marker["canonical_head"],
                 "ok": True,
             }
+        elif args.command == "seed-floor":
+            result = seed_collection_floor(
+                args.state_root, args.remedy_tool, dry_run=args.dry_run
+            )
         elif args.command == "bootstrap":
             result = bootstrap(args)
         elif args.command == "activate":

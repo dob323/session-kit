@@ -36,8 +36,48 @@ Run 'sp help' for every command with a one-line description, or
 EOF
 }
 
+# Every refusal carries the one prefix and says what was wrong before it shows
+# the synopsis: "usage:" on its own names the shape of the command but never
+# the mistake, and a person reading only the first line learned nothing.
+sp_refuse() {
+  printf 'session-kit: %s\n' "$*" >&2
+  usage >&2
+  exit 2
+}
+
+# `sp account` and `sp worktree` hand their remaining words to python. Left
+# unchecked, a typo reached argparse, which answered in its own voice: a sixth
+# error prefix, the file name of an internal module, and the full list of
+# machine subcommands `sp help` withholds on purpose. The verb is checked here
+# instead, and the refusal names only the commands a person is meant to type.
+#
+# The machine subcommands stay callable -- the picker runs `sp account choices`
+# -- they are simply never printed.
+sp_require_subcommand() {
+  local group=$1 candidate=$2 known= human=
+  case "$group" in
+    account)
+      known="list adopt-default enroll verify configure-feeds choices binding
+        source bind launch-profile resume-profile sync-ui switch-prepare
+        switch-apply switch-commit switch-rollback switch-status"
+      human="list adopt-default enroll verify configure-feeds"
+      ;;
+    worktree)
+      known="list materialize teardown sweep release bind lookup"
+      human="list materialize teardown sweep"
+      ;;
+  esac
+  local word
+  for word in $known; do
+    [[ $word == "$candidate" ]] && return 0
+  done
+  printf 'session-kit: no %s command named %s\n' "$group" "$candidate" >&2
+  printf 'commands: %s\n' "$human" >&2
+  exit 2
+}
+
 # The complete human command reference, grouped by the job being done. The
-# machine verbs -- picker-*, restore-exact -- are deliberately absent: the
+# machine verbs — picker-*, restore-exact — are deliberately absent: the
 # picker and the managed shell call them with proof arguments a person does
 # not hold, so listing them here would only invite someone to run one by hand.
 # `sp help machine` names them for anyone reading the source.
@@ -51,14 +91,26 @@ usage: sp <command> [arguments]
 Sessions
   sp list                            every managed session with its live state
   sp new [claude|codex|shell] [project-alias] [--account ALIAS] [--model ID] [--launch-key KEY]
+      [--origin human|machine] a machine session stays out of the default picker view
       [--worktree BRANCH] runs the session in that branch's own git worktree
+      [--no-worktree] a delegated session shares the checkout instead of getting its own
+      a machine session in a git repository gets its own working copy by
+      default, and gives it back when it closes
       Codex also accepts [--prompt-file OWNER-PRIVATE-FILE]
   sp go <session>                    open a ready session in this terminal
   sp takeover <session>              move an attached session here, after a check
-  sp close <session>                 end one managed terminal
+  sp close <session>                 close one session
+  sp change-model <session> <model> [--model-anyway]
+                                     move an idle conversation to another model;
+                                     a model this machine would answer with a
+                                     different one is refused, never substituted
+  sp account-auto-switch <session> [--apply]
+                                     say whether an idle conversation would be
+                                     carried off a subscription account that
+                                     has run dry; --apply actually moves it
   sp detail <session>                everything known about one session
   sp health                          manager, daemon, and resource state
-  sp prune                           review terminals eligible for cleanup
+  sp prune                           close sessions that are idle and empty
   sp repair <session>                rebuild after a proven shpool handoff failure
   sp verify-start <session>          re-prove a provider start left pending
 
@@ -72,23 +124,12 @@ Names and colors
   sp color reset <session>           return to the derived color
   sp color reconcile                 give every live session its own color
 
-Messages
-  sp msg <all|idle|3|1,3,5|2-4|shpool-id> "text" [--fyi] [--yes]
-  sp msg report [msg-id]             read a message with its replies
-  sp msg reply <msg-id> "text"       answer a message from this session
-  sp msg list                        the message ledger
-
 Delegated work
   sp teardown <session> [--merged-into REF] [--force]
                                      close a worker and prune its worktree
   sp worktree list                   worktrees materialized for delegated work
   sp worktree materialize --repo DIR --branch BRANCH
   sp worktree teardown --branch BRANCH [--merged-into REF] [--force]
-  sp receipt cap --msg-id ID [--max-usd N] [--max-tokens N] [--max-iterations N]
-                                     the cost cap a plan is approved with
-  sp receipt show [--receipt ID | --msg-id ID]
-                                     what a run cost, verified, changed, and why it stopped
-  sp receipt spend|verifier|files|close|list|gate ...
 
 Accounts
   sp account list [claude|codex]     enrolled accounts and last verification
@@ -98,26 +139,26 @@ Accounts
   sp account configure-feeds <roster-json> <advice-json>
 
 History and recovery
-  sp find <text>                     search journals for text
-  sp history <session>               replay one session's journal
-  sp recover                         exact recovery records for closed work
-  sp prompt-quarantine list          prompts held back from delivery
-  sp prompt-quarantine ingest|discard <key>
-  sp prompt-quarantine resume <key> <absolute-project-directory>
-  sp prompt-quarantine prune         drop held prompts that expired
+  sp find <text>                     search history for text
+  sp history <session>               show one session's history
+  sp recover                         closed conversations you can restore
+  sp recover --allow-large-ledger    deliberately stream a pathological ledger
+  sp restore number|selector         bring one back, by what sp recover shows beside it
+  sp restore --allow-large-ledger number|selector
+                                     restore from the deliberate large stream
 
 Topics
   sp help sessions      start, open, move, and close sessions
   sp help names         titles and colors
-  sp help messages      sp msg, replies, and the message centre
   sp help accounts      provider profiles and account switching
-  sp help history       journals, search, recovery, and quarantine
+  sp help history       history, search, and restore
   sp help selectors     what <session> accepts
+  sp help unavailable   session records with no shell, and how they clear
   sp help exit-codes    what every status a Session Kit command returns means
   sp help completion    turn on tab completion
   sp help machine       the verbs the picker and the managed shell call
 
-<session> is a terminal number or an exact shpool ID. Both -h and --help print
+<session> is a session number or an exact shpool ID. Both -h and --help print
 this reference, with or without shpool installed.
 EOF
 }
@@ -130,23 +171,47 @@ Sessions
 
   sp list                            every managed session with its live state
   sp new [claude|codex|shell] [project-alias] [--account ALIAS] [--model ID]
+                                     [--origin human|machine]
+                                     [--worktree BRANCH] [--no-worktree]
+                                     [--model-anyway]
   sp go <session>                    open a ready session in this terminal
   sp takeover <session>              move an attached session here, after a check
-  sp close <session>                 end one managed terminal
+  sp close <session>                 close one session
+  sp change-model <session> <model> [--model-anyway]
+                                     move an idle conversation to another model;
+                                     a model this machine would answer with a
+                                     different one is refused, never substituted
+  sp account-auto-switch <session> [--apply]
+                                     say whether an idle conversation would be
+                                     carried off a subscription account that
+                                     has run dry; --apply actually moves it
   sp detail <session>                everything known about one session
   sp health                          manager, daemon, and resource state
-  sp prune                           review terminals eligible for cleanup
+  sp prune                           close sessions that are idle and empty
   sp repair <session>                rebuild after a proven shpool handoff failure
   sp verify-start <session>          re-prove a provider start left pending
 
+`sp change-model` restarts the provider on the model named and resumes the same
+conversation. It runs only on an idle session: a restart in the middle of a
+turn would lose that turn.
+
+`sp account-auto-switch` says whether one idle conversation would be moved to
+another enrolled account because its own is spent, and changes nothing until
+`--apply` is given. It refuses unless the usage feed is fresh, refuses any
+account already past the reserve, refuses a conversation whose live account
+disagrees with its record or that is running a model asked for by name, and
+moves a conversation at most once -- a session that spends a second account
+stops and says so. It never switches an account back on.
+`$XDG_STATE_HOME/session-kit/account-switching-off` turns it off, and the same
+file turns the manual switch and enrolment off with it.
+
 `sp new <project-alias>` alone uses the provider stored for that alias. A
-terminal number stays with its session for the current host boot; terminal 1 is
-reserved for Fleet Supervisor, so ordinary sessions start at 2.
+session number stays with its session for the current host boot.
 
 `sp go` opens a detached session. `sp takeover` moves an attached one after a
 fresh identity check, and the window that had it returns to its picker; the
-conversation is never duplicated. Closing ends the managed terminal only, and
-keeps provider history and any journal.
+conversation is never duplicated. Closing ends the session only, and keeps the
+conversation and its history.
 
 `sp repair` is for direct evidence of an unrecoverable shpool handoff failure.
 Silence alone does not qualify, and if every session is unreachable at once,
@@ -169,10 +234,10 @@ Names and colors
   sp color reset <session>           return to the derived color
   sp color reconcile                 give every live session its own color
 
-Claude sessions take red, blue, green, yellow, purple, orange, pink, and cyan --
+Claude sessions take red, blue, green, yellow, purple, orange, pink, and cyan —
 the eight names Claude Code itself accepts. Codex sessions take lime, magenta,
-silver, sand, sky, and sea. The two palettes never overlap, so a Claude row and
-a Codex row cannot look alike.
+silver, sand, sky, and sea. The two palettes never overlap, so a Claude session
+and a Codex session cannot look alike.
 
 Title priority: a local manual name, then an explicit provider rename, then a
 retained automatic title, then a provider-and-project description, then a
@@ -182,30 +247,6 @@ local name; it does not hand the session back to automatic naming.
 A color is derived from the conversation identity, so it is the same every time
 you return. `sp color reconcile` settles every live session at once, moves only
 the ones that have to move, and changes nothing on a second run.
-EOF
-      ;;
-    messages | msg)
-      cat <<'EOF'
-Messages
-
-  sp msg                             open the message centre on a terminal
-  sp msg <all|idle|3|1,3,5|2-4|shpool-id> "text" [--fyi] [--yes]
-  sp msg report [msg-id]             read a message with its replies
-  sp msg reply <msg-id> "text"       answer a message from this session
-  sp msg list                        the message ledger
-
-Targets are the same selectors the rest of sp takes, plus `all` and `idle`, and
-they combine: `sp msg 1,3,5 "..."`, `sp msg 2-4 "..."`. A mass send asks for one
-confirmation; --yes answers it in advance, and --fyi marks a message as needing
-no reply.
-
-With no arguments and a terminal to draw on, `sp msg` is the message centre:
-write, watch replies land on the same screen, and answer from there. Without a
-terminal -- a pipe, a cron, SESSION_KIT_NONINTERACTIVE=1, TERM=dumb, or
-SESSION_KIT_MSG_CONSOLE=0 -- the same verbs print and exit.
-
-The picker opens the centre with `s` and lists new replies as rows. A reply
-outlives its session: one from a room that has since closed still opens.
 EOF
       ;;
     accounts | account)
@@ -228,53 +269,125 @@ separate CODEX_HOME roots. Enroll, complete the provider's own sign-in, then
 verify. Session Kit never asks for, copies, or prints a provider token.
 
 Changing the account of an existing conversation is a picker action, not a
-command: select the session and choose `Change account`. Every switch is
-confirmed on its own and proceeds only when fresh evidence proves the exact
-conversation has no active turn, tool, hook, or subagent work.
+command: select the session and choose `Change account`. A switch proceeds only
+when fresh evidence proves the exact conversation has no active turn, tool,
+hook, or subagent work. Nothing is asked first; if the evidence is not there,
+the switch is refused.
+
+Which accounts can be selected
+
+An account is selectable when its profile is enabled and the account roster
+reports its health as `ok`. The roster's `serving` flag is a routing toggle
+for scheduled proxy work: it is displayed, and it never decides an interactive
+session, which signs in with that profile's own login and no proxy.
+
+Health comes from the two feeds `sp account configure-feeds` points at — a
+roster of accounts and a rotation advice file — and each carries its own
+timestamp. Past SESSION_KIT_ACCOUNT_ADVICE_MAX_AGE_SECONDS (600 by default),
+or with no feed configured at all, nothing is known about any account's
+health. Every enabled account then stays selectable, its row reads `ready
+(feed stale)` or `ready (feed absent)`, and the picker names the feed's state
+above its footer. Stale advice recommends nothing; it never blocks a choice.
+A machine with no feeds configured behaves this way from the first session.
+
+Refusals name the account, not a guess about the login:
+
+  Account work is not selectable: its health check expired.
+  There is no account 4 on this screen. Numbers shown here work.
+
+The same rule answers `sp new --account <alias>`, which refuses with `account
+work is not selectable: its health check expired`. The other states an account
+can carry are `its profile is disabled` and `it is not in the account roster`.
+`sp account verify` refreshes a profile's own record; the roster health itself
+comes from whatever writes the feed.
 EOF
       ;;
-    history | recovery | recover | quarantine)
+    history | recovery | recover)
       cat <<'EOF'
 History and recovery
 
-  sp find <text>                     search journals for text
-  sp history <session>               replay one session's journal
-  sp recover                         exact recovery records for closed work
-  sp prompt-quarantine list          prompts held back from delivery
-  sp prompt-quarantine ingest|discard <key>
-  sp prompt-quarantine resume <key> <absolute-project-directory>
-  sp prompt-quarantine prune         drop held prompts that expired
+  sp find <text>                     search history for text
+  sp history <session>               show one session's history
+  sp recover                         closed conversations you can restore
+  sp recover --allow-large-ledger    deliberately stream a pathological ledger
+  sp restore number|selector         bring one back, by what sp recover shows beside it
+  sp restore --allow-large-ledger number|selector
+                                     restore from the deliberate large stream
 
-History exists only for sessions whose journals were explicitly enabled;
-journals hold raw terminal output, so they are off unless you opted in.
+A recording captures everything on the screen, so it is off unless you asked
+for it. A session with no recording falls back to its conversation transcript,
+for Claude and for Codex. Both histories include readable tool calls and tool
+output. `sp find` groups matching lines under session names and reports counts.
 
-Recovery uses an exact Claude Code or Codex UUID and never falls back to
-recency, directory, or "latest". An active UUID cannot be resumed into a second
-writable terminal: open the terminal that has it, or fork it deliberately.
+`sp recover` lists what you closed on purpose next to what a crash took,
+newest first. A conversation stays on that list until it is restored. One
+whose transcript this machine can no longer read stays as well, as history
+only, and the row says so; a plain shell has no conversation to reopen, so its
+row offers history only too. A row keeps the session number it has on every
+other screen; a conversation whose number was retired goes by the name shown
+beside it, or -- when two rows answer to one name, or another row already
+answers to that name -- by the time of its own event, printed where its number
+would be. A name and an event time belong to the list rather than to the
+conversation, so each screen writes down what it printed beside each row: if
+the word you type has come to mean a different conversation since you read it,
+`sp restore` says so and restores nothing.
 
-A quarantined prompt is one the kit refused to deliver blindly. `list` shows
-what is held, `ingest` accepts one, `discard` drops it, and `resume` restarts it
-in an absolute project directory you name.
+Normal refreshes refuse a ledger above the pathological-file ceiling. The
+error names its exact size and tells you to use `sp recover
+--allow-large-ledger`; that deliberate form validates and streams the complete
+file with bounded memory instead of hiding its rows. Its footer gives the
+matching `sp restore --allow-large-ledger number` command.
+
+Restoring uses an exact Claude Code or Codex UUID and never falls back to
+recency, directory, or "latest". An open conversation cannot be restored into a
+second writable session: open the session that has it, or fork it
+deliberately.
 EOF
       ;;
     selectors | selector | session | targets)
       cat <<'EOF'
 Selectors
 
-<session> is either the terminal number shown in the picker and in `sp list`, or
+<session> is either the session number shown in the picker and in `sp list`, or
 the exact shpool ID. Every command that takes one accepts both.
 
-Terminal numbers are display conveniences. They are stable for the current host
+Session numbers are display conveniences. They are stable for the current host
 boot and never change meaning under a repaint, but they describe what is on
 screen, not which conversation you mean. Never automate a move, close, repair,
-or cleanup by number -- pass the exact shpool ID.
-
-`sp msg` accepts more: `all`, `idle`, a list (1,3,5), and a range (2-4).
+or cleanup by number — pass the exact shpool ID.
 
 No Session Kit screen prints a shpool ID or a provider UUID, and no flag reveals
 one. Identifiers live in the 0600 state files, in the JSON modes
 (`shpool_status --json`, `--lookup`), and in proofs. Commands still accept an ID
 wherever they accept a number, so a script that already holds one keeps working.
+EOF
+      ;;
+    unavailable | quarantined | phantom)
+      cat <<'EOF'
+Unavailable session records
+
+The session manager can keep listing a session whose shell process no longer
+exists: a kill that hit an already-dead process aborts its own bookkeeping, and
+the entry stays in the list with nothing behind it.
+
+Session Kit quarantines those entries. They have no session number, they are
+not drawn in the picker, and every `sp` verb refuses them — there is no shell
+to attach to, take over, close, or repair, and a number that resolved to one
+would be a number that cannot act. The picker's More screen counts them so the
+state is never silent.
+
+They clear on their own:
+
+  * the next cleanup pass removes a record whose shell and every process from
+    its session have been proved absent, and
+  * restarting the session manager clears every stale entry at once, which also
+    ends every live session, so it is not a routine step.
+
+Cleanup re-proves the exact manager generation and session start time, then
+uses the manager's supported attach-and-exit path with a hard timeout and
+checks that the entry is gone. A changed manager, a reused name, an unreadable
+process census, or any surviving session process leaves the record quarantined
+here instead of guessing.
 EOF
       ;;
     exit-codes | exit | status | codes)
@@ -294,6 +407,8 @@ Every Session Kit command uses the same statuses.
        missing from the pinned release, or Bash 4 or newer on macOS
   74   the picker refused the action it was asked to take
   75   the picker's attach failed after the action was allowed
+  76   a provider-exit reopen ran and the reopened provider exited non-zero;
+       the managed shell stops at the recovery menu again rather than closing
   78   the launcher found a release or manager link outside the install root
   127  codex_resume_here could not find the codex command
   143  sp was terminated (SIGTERM or SIGHUP)
@@ -323,7 +438,7 @@ demand. Without it, source one copy from your own shell startup file:
 It completes verbs, help topics, flags, provider names, color names, and the
 project aliases in your projects file. It never runs a session command and
 never asks the manager for state, so a Tab press cannot change anything or
-block on a snapshot -- which is also why it does not complete terminal numbers.
+block on a snapshot — which is also why it does not complete session numbers.
 
 Set SESSION_KIT_COMPLETION_DIR to install the copies somewhere else, or to
 "none" to skip them. Uninstall removes only files that still carry the kit's
@@ -349,11 +464,15 @@ refused.
   sp picker-title-refresh <session>
   sp picker-fork <session>
   sp picker-account-switch <session> <alias>
-  sp restore-exact <provider> <uuid> <cwd> [launch-key]
+  sp picker-change-model <session> <model>
+  sp account-auto-switch <session> [--dry-run]
+  sp restore-exact <provider> <uuid> <cwd> [account-alias]
+  sp worktree bind --path DIR --shpool-id ID
+  sp worktree lookup --path DIR
 
 A picker verb answers with 74 when it refuses the action and 75 when the attach
 itself failed after the action was allowed, so the picker can tell the two
-apart. Use the human verbs -- `sp go`, `sp close`, `sp name`, `sp recover` --
+apart. Use the human verbs — `sp go`, `sp close`, `sp name`, `sp recover` —
 for anything you type yourself.
 EOF
       ;;
@@ -369,6 +488,7 @@ EOF
 sp_help() {
   local topic=${1:-}
   if (($# > 1)); then
+    printf 'session-kit: sp help takes one topic\n' >&2
     usage >&2
     return 2
   fi
@@ -377,8 +497,8 @@ sp_help() {
     return 0
   fi
   sp_help_topic "$topic" && return 0
-  printf 'sp: no help topic named %s\n' "$topic" >&2
-  printf 'topics: sessions names messages accounts history selectors exit-codes completion machine\n' >&2
+  printf 'session-kit: there is no help topic named %s\n' "$topic" >&2
+  printf 'topics: sessions names accounts history selectors unavailable exit-codes completion machine\n' >&2
   return 2
 }
 
@@ -400,15 +520,25 @@ source "$MODULE_DIR/sp_provider_bounce.sh"
 source "$MODULE_DIR/sp_sessions.sh"
 # shellcheck source=lib/sh/sp_commands.sh
 source "$MODULE_DIR/sp_commands.sh"
-# shellcheck source=lib/sh/sp_msg.sh
-source "$MODULE_DIR/sp_msg.sh"
 
-trap cleanup_snapshot EXIT
+# Two cleanups, both required, neither an alternative to the other. This is a
+# merge of two branches that each added one to the same three traps.
+# `sk_handoff_guard_abandon` puts stderr back where the caller had it, so an
+# interrupted `sp` cannot leave the launcher's capture bypassed. It
+# deliberately does NOT touch the terminal: a trap can fire while an attach
+# client is still running, and nothing may fight a live client for the line
+# discipline. The terminal repair happens only on the normal return from
+# picker_attach_id, where the client has exited and been waited on.
+# `sk_prebake_abort` ends what `sp` itself started: the first-frame colour step
+# runs a real hidden provider, and the reap at the end of that function never
+# runs when the shell is being torn down -- exactly the path that left a
+# four-day-old provider pair alive on this machine.
+trap 'sk_handoff_guard_abandon; sk_prebake_abort; cleanup_snapshot' EXIT
 # Ctrl-C must actually stop sp. A trap that only cleaned up let bash resume
 # the script mid-flow with the snapshot deleted from under it, so no sp
 # operation could ever be interrupted. Held locks release with the process.
-trap 'cleanup_snapshot; trap - INT; kill -INT "$$"' INT
-trap 'cleanup_snapshot; exit 143' TERM HUP
+trap 'sk_handoff_guard_abandon; sk_prebake_abort; cleanup_snapshot; trap - INT; kill -INT "$$"' INT
+trap 'sk_handoff_guard_abandon; sk_prebake_abort; cleanup_snapshot; exit 143' TERM HUP
 
 command=${1:-list}
 # Help is answered before shpool is required. `sp --help` on a machine where
@@ -420,6 +550,9 @@ case "$command" in
     shift
     sp_help "$@"
     exit $?
+    ;;
+  list)
+    [[ $# -le 1 ]] || sp_refuse "sp list takes nothing else"
     ;;
 esac
 sk_require_shpool || exit 1
@@ -433,145 +566,166 @@ case "$command" in
     ;;
   name)
     if [[ ${2:-} == reset ]]; then
-      [[ $# -eq 3 ]] || { usage >&2; exit 2; }
+      [[ $# -eq 3 ]] || sp_refuse "sp name reset takes one session"
       name_target "$3" delete
     else
-      [[ $# -eq 3 ]] || { usage >&2; exit 2; }
+      [[ $# -eq 3 ]] || sp_refuse "sp name takes one session and one title"
       name_target "$2" set "$3"
     fi
     ;;
   self-name)
-    [[ $# -eq 2 ]] || { usage >&2; exit 2; }
+    [[ $# -eq 2 ]] || sp_refuse "sp self-name takes one title"
     exec python3 "$INVENTORY_CORE" automatic-title self-name "$2"
     ;;
   color)
     if [[ ${2:-} == reconcile ]]; then
-      [[ $# -eq 2 ]] || { usage >&2; exit 2; }
+      [[ $# -eq 2 ]] || sp_refuse "sp color reconcile takes nothing else"
       color_reconcile
     elif [[ ${2:-} == reset ]]; then
-      [[ $# -eq 3 ]] || { usage >&2; exit 2; }
+      [[ $# -eq 3 ]] || sp_refuse "sp color reset takes one session"
       color_target "$3" delete
     else
-      [[ $# -eq 3 ]] || { usage >&2; exit 2; }
+      [[ $# -eq 3 ]] || sp_refuse "sp color takes one session and one color"
       color_target "$2" set "$3"
     fi
     ;;
   go|resume|attach)
-    [[ $# -eq 2 ]] || { usage >&2; exit 2; }
+    [[ $# -eq 2 ]] || sp_refuse "sp go takes one session"
     go_target "$2"
     ;;
   takeover)
-    [[ $# -eq 2 ]] || { usage >&2; exit 2; }
+    [[ $# -eq 2 ]] || sp_refuse "sp takeover takes one session"
     takeover_target "$2"
     ;;
   close|kill)
-    [[ $# -eq 2 ]] || { usage >&2; exit 2; }
+    [[ $# -eq 2 ]] || sp_refuse "sp close takes one session"
     close_target "$2"
+    ;;
+  change-model)
+    [[ $# -eq 3 || ($# -eq 4 && $4 == --model-anyway) ]] ||
+      sp_refuse "sp change-model takes one session and one model"
+    change_model_target "$2" "$3" "${4:-}"
     ;;
   teardown)
     shift
-    [[ $# -gt 0 ]] || { usage >&2; exit 2; }
+    [[ $# -gt 0 ]] || sp_refuse "sp teardown takes one session"
     teardown_target "$@"
     ;;
   worktree)
     shift
-    [[ $# -gt 0 ]] || { usage >&2; exit 2; }
+    [[ $# -gt 0 ]] || sp_refuse "sp worktree takes a command"
+    sp_require_subcommand worktree "$1"
     exec python3 "$INVENTORY_CORE" worktree "$@"
     ;;
-  receipt)
-    shift
-    [[ $# -gt 0 ]] || { usage >&2; exit 2; }
-    exec python3 "$INVENTORY_CORE" receipt "$@"
-    ;;
   prune)
-    [[ $# -eq 1 ]] || { usage >&2; exit 2; }
+    [[ $# -eq 1 ]] || sp_refuse "sp prune takes nothing else"
     show_prune
     ;;
   detail)
-    [[ $# -eq 2 ]] || { usage >&2; exit 2; }
+    [[ $# -eq 2 ]] || sp_refuse "sp detail takes one session"
     exec "$SCRIPT_DIR/shpool_status" --detail "$2"
     ;;
   account)
     shift
+    [[ $# -gt 0 ]] || sp_refuse "sp account takes a command"
+    sp_require_subcommand account "$1"
     exec python3 "$INVENTORY_CORE" account "$@"
     ;;
   history|log)
-    [[ $# -eq 2 ]] || { usage >&2; exit 2; }
+    [[ $# -eq 2 ]] || sp_refuse "sp history takes one session"
     show_history "$2"
     ;;
   find|grep)
     shift
-    [[ $# -gt 0 ]] || { usage >&2; exit 2; }
+    [[ $# -gt 0 ]] || sp_refuse "sp find takes text to search for"
     find_history "$*"
-    ;;
-  msg)
-    shift
-    msg_command "$@"
     ;;
   health|resources)
     show_health
     ;;
   recover)
-    show_recovery
+    if [[ $# -eq 1 ]]; then
+      show_recovery no
+    elif [[ $# -eq 2 && $2 == --allow-large-ledger ]]; then
+      show_recovery yes
+    else
+      sp_refuse "sp recover takes only --allow-large-ledger"
+    fi
+    ;;
+  restore)
+    # A name can be several words, and quoting one is not something a person
+    # should have to know, so everything after the verb is the selector.
+    shift
+    allow_large=no
+    if [[ ${1:-} == --allow-large-ledger ]]; then
+      allow_large=yes
+      shift
+    fi
+    [[ $# -ge 1 ]] || sp_refuse "sp restore takes one number from sp recover, or the selector beside a session that has none"
+    restore_listed "$*" "$allow_large"
     ;;
   verify-start)
-    [[ $# -eq 2 ]] || { usage >&2; exit 2; }
+    [[ $# -eq 2 ]] || sp_refuse "sp verify-start takes one session"
     verify_start_target "$2"
     ;;
-  prompt-quarantine)
-    shift
-    exec python3 "$SCRIPT_DIR/../lib/sessionkit_supervisor/prompt_quarantine.py" "$@"
-    ;;
   picker-open)
-    [[ $# -eq 2 ]] || { usage >&2; exit 2; }
+    [[ $# -eq 2 ]] || sp_refuse "$command takes different arguments"
     picker_open "$2"
     ;;
   picker-takeover)
-    [[ $# -eq 2 ]] || { usage >&2; exit 2; }
+    [[ $# -eq 2 ]] || sp_refuse "$command takes different arguments"
     picker_takeover "$2"
     ;;
   picker-close)
-    [[ $# -eq 2 ]] || { usage >&2; exit 2; }
+    [[ $# -eq 2 ]] || sp_refuse "$command takes different arguments"
     picker_close "$2"
     ;;
   picker-recover)
-    [[ $# -eq 2 ]] || { usage >&2; exit 2; }
+    [[ $# -eq 2 ]] || sp_refuse "$command takes different arguments"
     picker_recover "$2"
     ;;
   repair)
-    [[ $# -eq 2 ]] || { usage >&2; exit 2; }
+    [[ $# -eq 2 ]] || sp_refuse "sp repair takes one session"
     repair_target "$2"
     ;;
   picker-history)
-    [[ $# -eq 2 ]] || { usage >&2; exit 2; }
+    [[ $# -eq 2 ]] || sp_refuse "$command takes different arguments"
     picker_history "$2"
     ;;
   picker-name)
-    [[ $# -eq 3 ]] || { usage >&2; exit 2; }
+    [[ $# -eq 3 ]] || sp_refuse "$command takes different arguments"
     picker_alias "$2" set "$3"
     ;;
   picker-name-reset)
-    [[ $# -eq 2 ]] || { usage >&2; exit 2; }
+    [[ $# -eq 2 ]] || sp_refuse "$command takes different arguments"
     picker_alias "$2" delete
     ;;
   picker-title-refresh)
-    [[ $# -eq 2 ]] || { usage >&2; exit 2; }
+    [[ $# -eq 2 ]] || sp_refuse "$command takes different arguments"
     picker_refresh_title "$2"
     ;;
   picker-fork)
-    [[ $# -eq 2 ]] || { usage >&2; exit 2; }
+    [[ $# -eq 2 ]] || sp_refuse "$command takes different arguments"
     picker_fork "$2"
     ;;
   picker-account-switch)
-    [[ $# -eq 3 ]] || { usage >&2; exit 2; }
+    [[ $# -eq 3 ]] || sp_refuse "$command takes different arguments"
     picker_account_switch "$2" "$3"
     ;;
+  picker-change-model)
+    [[ $# -eq 3 ]] || sp_refuse "$command takes different arguments"
+    picker_change_model "$2" "$3"
+    ;;
+  account-auto-switch)
+    [[ $# -eq 2 || ($# -eq 3 && ($3 == --apply || $3 == --dry-run)) ]] ||
+      sp_refuse "sp account-auto-switch takes one session and an optional --apply"
+    account_auto_switch_target "$2" "${3:-}"
+    ;;
   restore-exact)
-    [[ $# -eq 4 || $# -eq 5 ]] || { usage >&2; exit 2; }
-    restore_exact "$2" "$3" "$4" "${5:-}"
+    [[ $# -ge 4 && $# -le 6 ]] || sp_refuse "$command takes different arguments"
+    restore_exact "$2" "$3" "$4" "${5:-}" "${6:-}"
     ;;
   *)
-    usage >&2
-    exit 2
+    sp_refuse "there is no command named $command"
     ;;
 esac

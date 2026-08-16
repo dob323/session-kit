@@ -68,6 +68,28 @@ CODEX_SESSION_COLORS = (
 # rejects at the moment it matters and leaves the window with no colour.
 SESSION_COLORS = CLAUDE_SESSION_COLORS + CODEX_SESSION_COLORS
 
+# What a colour name IS on a terminal, as SGR parameters. The picker, `sp`, the
+# Claude status line and the in-session prompt all draw the same session, so
+# they all draw it from this one table rather than four copies that drift. The
+# values are the measured render of each theme accent (see the renderer's note
+# on how they were captured).
+SESSION_SGR = {
+    "red": "38;2;237;93;93",
+    "blue": "38;2;97;166;240",
+    "green": "38;2;63;221;115",
+    "yellow": "38;2;249;215;108",
+    "purple": "38;2;173;115;239",
+    "orange": "38;2;242;144;81",
+    "pink": "38;2;240;113;177",
+    "cyan": "38;2;64;216;209",
+    "lime": "38;2;170;230;70",
+    "magenta": "38;2;255;95;255",
+    "silver": "38;2;205;210;220",
+    "sand": "38;2;214;178;130",
+    "sky": "38;2;150;205;255",
+    "sea": "38;2;95;235;170",
+}
+
 
 def palette_for_provider(
     provider: str,
@@ -323,6 +345,7 @@ def reconcile_conversation_colors(
     color_for_session: Callable[..., str | None],
     free_color: Callable[..., str],
     palette_for: Callable[[str], Sequence[str]],
+    revalidate_sessions: Callable[[], Sequence[Mapping[str, Any]]] | None = None,
 ) -> dict[str, Any]:
     """Separate the live sessions that already share a colour, in one pass.
 
@@ -345,27 +368,35 @@ def reconcile_conversation_colors(
     Nothing is ever deleted here except entries that name a colour outside the
     palette now in force, which are already ignored on read.
     """
-    ordered: list[tuple[str, str]] = []
-    seen: set[tuple[str, str]] = set()
-    for item in sessions:
-        if not isinstance(item, Mapping):
-            continue
-        provider = str(item.get("provider") or "")
-        if provider not in PROVIDERS or not palette_for(provider):
-            continue
-        identity = item.get("identity")
-        raw = identity.get("uuid") if isinstance(identity, Mapping) else None
-        exact = valid_uuid(str(raw or ""))
-        if not exact or (provider, exact) in seen:
-            continue
-        seen.add((provider, exact))
-        ordered.append((provider, exact))
-    ordered.sort()
+    def ordered_from(
+        source: Sequence[Mapping[str, Any]],
+    ) -> list[tuple[str, str]]:
+        ordered: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for item in source:
+            if not isinstance(item, Mapping):
+                continue
+            provider = str(item.get("provider") or "")
+            if provider not in PROVIDERS or not palette_for(provider):
+                continue
+            identity = item.get("identity")
+            raw = identity.get("uuid") if isinstance(identity, Mapping) else None
+            exact = valid_uuid(str(raw or ""))
+            if not exact or (provider, exact) in seen:
+                continue
+            seen.add((provider, exact))
+            ordered.append((provider, exact))
+        ordered.sort()
+        return ordered
+
+    ordered = ordered_from(sessions)
 
     path = config_path()
     paths = state_paths(config)
     with state_lock(paths["root"], paths["config_lock"]):
         with state_lock(paths["root"], paths["lock"]):
+            if revalidate_sessions is not None:
+                ordered = ordered_from(revalidate_sessions())
             private_alias_parent(path)
             document = private_alias_document(path, allow_missing=True)
             raw_colors = document.get("colors")
@@ -500,7 +531,13 @@ def _adopt_launch_colors(
                 continue
             key = f"codex:{uuid}"
             if key not in current:
-                current = mutate_color(config, "codex", uuid, color)
+                # The session rows and marker were read before this helper's
+                # publishing lock. Re-read-and-add is safe; overwriting a key
+                # that appeared meanwhile would let that older reading replace
+                # a newer explicit choice.
+                current = mutate_color(
+                    config, "codex", uuid, color, only_if_absent=True
+                )
             marker.unlink(missing_ok=True)
         except (OSError, ValueError, CollectionError):
             continue
@@ -521,6 +558,7 @@ def mutate_canonical_color(
     valid_colors: Callable[[Any], dict[str, str]],
     atomic_write_json: Callable[[Path, Any], None],
     palette: Sequence[str],
+    only_if_absent: bool = False,
 ) -> dict[str, str]:
     exact_uuid = valid_uuid(uuid)
     if provider not in PROVIDERS or not exact_uuid:
@@ -535,6 +573,8 @@ def mutate_canonical_color(
             document = private_alias_document(path, allow_missing=True)
             colors = valid_colors(document.get("colors"))
             key = f"{provider}:{exact_uuid}"
+            if only_if_absent and key in colors:
+                return dict(colors)
             if color is None:
                 colors.pop(key, None)
             else:

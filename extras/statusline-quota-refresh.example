@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# Example quota refresher for config/claude/statusline.sh.
+#
+# The status line starts this script in the background. For an enrolled profile,
+# HOME is an isolated probe directory whose .claude.json and credentials file
+# point at that profile; for the ambient account, HOME is the normal home.
+# This script must write $HOME/.claude/cache/quota_headers and nothing to the
+# status line itself.
+
+set -euo pipefail
+
+cache_dir=$HOME/.claude/cache
+account_file=$HOME/.claude.json
+output=$cache_dir/quota_headers
+
+account=$(jq -r '.oauthAccount.emailAddress // empty' "$account_file" 2>/dev/null)
+if [[ -z $account || $account == *$'\n'* || $account == *$'\r'* ]]; then
+  printf 'statusline-quota-refresh: account email is unavailable\n' >&2
+  exit 1
+fi
+
+fetch_quota_headers() {
+  # TODO: Call the quota endpoint used by your account and print its response
+  # headers as `key: value` lines. Read credentials from this invocation's
+  # $HOME/.claude/.credentials.json; do not copy them into the output. No
+  # endpoint is supplied here because it is not a documented Session Kit API.
+  printf 'statusline-quota-refresh: TODO: configure a quota endpoint and transport\n' >&2
+  return 64
+}
+
+mkdir -p "$cache_dir"
+chmod 700 "$cache_dir"
+raw=$(mktemp "$cache_dir/quota_headers.response.XXXXXXXX")
+tmp=$(mktemp "$cache_dir/quota_headers.write.XXXXXXXX")
+trap 'rm -f -- "$raw" "$tmp"' EXIT
+chmod 600 "$raw" "$tmp"
+
+fetch_quota_headers > "$raw"
+
+header_value() {
+  awk -F':' -v wanted="$1" '
+    tolower($1) == tolower(wanted) {
+      sub(/^[^:]*:[[:space:]]*/, "")
+      sub(/\r$/, "")
+      print
+      exit
+    }
+  ' "$raw"
+}
+
+u5=$(header_value anthropic-ratelimit-unified-5h-utilization)
+r5=$(header_value anthropic-ratelimit-unified-5h-reset)
+u7=$(header_value anthropic-ratelimit-unified-7d-utilization)
+r7=$(header_value anthropic-ratelimit-unified-7d-reset)
+
+fraction() {
+  awk -v value="$1" 'BEGIN {
+    exit !(value ~ /^[0-9]+([.][0-9]+)?$/ && value >= 0 && value <= 1)
+  }'
+}
+
+epoch() {
+  [[ $1 =~ ^[0-9]+$ && $1 -gt 0 ]]
+}
+
+if ! fraction "$u5" || ! epoch "$r5"; then
+  printf 'statusline-quota-refresh: endpoint omitted the valid 5h quota headers\n' >&2
+  exit 1
+fi
+if [[ -n $u7 || -n $r7 ]] && { ! fraction "$u7" || ! epoch "$r7"; }; then
+  printf 'statusline-quota-refresh: endpoint returned an incomplete 7d quota pair\n' >&2
+  exit 1
+fi
+
+{
+  printf 'x-probe-account: %s\n' "$account"
+  printf 'anthropic-ratelimit-unified-5h-utilization: %s\n' "$u5"
+  printf 'anthropic-ratelimit-unified-5h-reset: %s\n' "$r5"
+  if [[ -n $u7 ]]; then
+    printf 'anthropic-ratelimit-unified-7d-utilization: %s\n' "$u7"
+    printf 'anthropic-ratelimit-unified-7d-reset: %s\n' "$r7"
+  fi
+} > "$tmp"
+chmod 600 "$tmp"
+mv -f -- "$tmp" "$output"

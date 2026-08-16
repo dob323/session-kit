@@ -15,7 +15,6 @@ Exit codes
 from __future__ import annotations
 
 import argparse
-import importlib
 import json
 import os
 from pathlib import Path
@@ -115,39 +114,6 @@ def _read_snapshot(path: str | None) -> tuple[list[dict[str, Any]], list[str]]:
     if not isinstance(rows, list):
         return [], ["the session inventory returned no session list"]
     return [row for row in rows if isinstance(row, dict)], []
-
-
-def _intake_module() -> Any:
-    """The supervisor's intake module, however this file was started.
-
-    The package is imported as ``lib.sessionkit_projects`` by the tests and as
-    a bare top-level package when the shell runs this file as a script; the
-    supervisor sits beside it either way.
-    """
-    for name in ("lib.sessionkit_supervisor.intake", "sessionkit_supervisor.intake"):
-        try:
-            return importlib.import_module(name)
-        except ImportError:
-            continue
-    return None
-
-
-def _read_intakes(state_dir: Path) -> tuple[list[dict[str, Any]], list[str]]:
-    """Open intakes from the supervisor spool, if there is one.
-
-    The supervisor is optional; a kit without one still has projects. A spool
-    that exists but cannot be read is reported rather than treated as empty.
-    """
-    intake_module = _intake_module()
-    if intake_module is None:
-        return [], ["the supervisor is not installed, so delegated work is not listed"]
-    spool = intake_module.Spool(state_dir)
-    if not spool.root.is_dir():
-        return [], []
-    try:
-        return spool.open_entries(), []
-    except (OSError, ValueError) as error:
-        return [], [f"the intake spool is unreadable: {error}"]
 
 
 # ---- verbs --------------------------------------------------------------
@@ -264,16 +230,13 @@ def _context(args: argparse.Namespace, environ: Mapping[str, str]) -> int:
     if project is None:
         print("no project covers that directory", file=sys.stderr)
         return EXIT_NO_PROJECT
-    state_dir = _state_dir(args, environ)
     sessions, session_notes = _read_snapshot(args.snapshot)
-    intakes, intake_notes = ([], []) if args.no_intakes else _read_intakes(state_dir)
     _print(
         context_module.project_context(
             project,
             sessions=sessions,
-            intakes=intakes,
             group=resolver.projects(),
-            unavailable=[*session_notes, *intake_notes],
+            unavailable=list(session_notes),
         )
     )
     return EXIT_OK
@@ -358,7 +321,6 @@ def _parser() -> argparse.ArgumentParser:
     context = subparsers.add_parser("context", help="what is going on in a project")
     context.add_argument("target", nargs="?")
     context.add_argument("--snapshot", help="read sessions from this snapshot file")
-    context.add_argument("--no-intakes", action="store_true")
     context.set_defaults(handler=_context)
 
     grouped = subparsers.add_parser(

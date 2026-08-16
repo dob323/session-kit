@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Example AWAY transport for SESSION_KIT_NOTICE_AWAY_CMD.
+#
+# extras/notify-desktop reaches a desktop popup, which is exactly the wrong
+# place for a notice about being away. This one hands the notice to a chat bot
+# that can reach a phone, without this script knowing anything about that bot:
+# it shells out to whatever SESSION_KIT_NOTICE_CARD_CMD names.
+#
+#   export SESSION_KIT_NOTICE_CARD_CMD="/path/to/your/bot post-card"
+#   export SESSION_KIT_NOTICE_AWAY_CMD="$HOME/.local/bin/notify-chat-card"
+#
+# The card command is called as:  <card cmd> [extra flags] <one text argument>
+#
+# Two rules this script exists to keep:
+#
+#   * The text is ONE argument, never a shell string. Session titles and alert
+#     bodies are written by other processes; interpolating them into a command
+#     line is how a title becomes a command.
+#   * The exit status is the truth. Non-zero means nothing was reached, and the
+#     router relies on that: a transport that always returned success is how a
+#     dropped alert came to be recorded as delivered.
+#
+# Unknown flags are ignored rather than refused, so the notifier contract can
+# grow without silencing every alert.
+
+set -u
+
+title="Session Kit"
+body=""
+notice_class=""
+
+for argument in "$@"; do
+  case "$argument" in
+    --title=*) title=${argument#--title=} ;;
+    --body=*) body=${argument#--body=} ;;
+    --class=*) notice_class=${argument#--class=} ;;
+    *) ;;
+  esac
+done
+
+card_cmd=${SESSION_KIT_NOTICE_CARD_CMD:-}
+if [[ -z $card_cmd ]]; then
+  printf 'notify-chat-card: SESSION_KIT_NOTICE_CARD_CMD is not set, so nothing was sent\n' >&2
+  exit 1
+fi
+
+# Word-split deliberately: the variable holds a command plus its own flags.
+# shellcheck disable=SC2206
+argv=($card_cmd)
+
+text="**${title}**"
+[[ -z $body ]] || text+=$'\n'"$body"
+[[ -z $notice_class ]] || text+=$'\n'"(${notice_class})"
+
+exec "${argv[@]}" "$text"

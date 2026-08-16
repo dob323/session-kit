@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -338,7 +340,7 @@ class AccountProfileTests(unittest.TestCase):
                 "plan": "max",
             },
         ):
-            with self.assertRaisesRegex(CollectionError, "not healthy"):
+            with self.assertRaisesRegex(CollectionError, "not selectable"):
                 accounts.launch_profile(self.config, "claude", "primary")
 
     def test_register_isolated_claude_profile_completes_onboarding(self) -> None:
@@ -389,6 +391,301 @@ class AccountProfileTests(unittest.TestCase):
         )
         self.assertNotIn("/srv/untrusted", stored["projects"])
         self.assertEqual(0o600, state_path.stat().st_mode & 0o777)
+
+    def provision(self, alias: str = "primary") -> Path:
+        """Enroll one isolated Claude profile and return its state file."""
+        profile_dir = self.profile_dir("claude", alias)
+        state_path = profile_dir / ".claude.json"
+        if not state_path.exists():
+            state_path.write_text(
+                json.dumps(
+                    {"oauthAccount": {"emailAddress": f"{alias}@invalid.example"}}
+                ),
+                encoding="utf-8",
+            )
+            state_path.chmod(0o600)
+        with mock.patch.object(
+            accounts,
+            "probe_identity",
+            return_value={
+                "provider": "claude",
+                "email": f"{alias}@invalid.example",
+                "plan": "max",
+            },
+        ):
+            accounts._register_profile(
+                self.config,
+                "claude",
+                alias,
+                f"{alias}@invalid.example",
+                profile_dir,
+                legacy=False,
+            )
+        return state_path
+
+    def write_default_state(self, **extra: object) -> None:
+        default_state = self.home / ".claude.json"
+        default_state.write_text(json.dumps(dict(extra)), encoding="utf-8")
+        default_state.chmod(0o644)
+
+    def test_a_fresh_profile_does_not_open_onto_a_first_run_offer(self) -> None:
+        """A brand-new session came up on "Make auto mode your default
+        permission mode?" and the operator could not answer it. A fresh kit
+        profile had never been shown that offer; the default profile had."""
+        self.write_default_state(hasSeenAutoDefaultNudge=True)
+
+        stored = json.loads(self.provision().read_text(encoding="utf-8"))
+
+        self.assertIs(True, stored["hasSeenAutoDefaultNudge"])
+        # Seen, not answered: the permission mode is not chosen here.
+        self.assertNotIn("defaultMode", stored)
+        self.assertNotIn("permissions", stored)
+
+    def test_an_offer_the_operator_never_saw_is_not_marked_seen(self) -> None:
+        """Only what they have already been shown, on their own default profile."""
+        self.write_default_state()
+
+        stored = json.loads(self.provision().read_text(encoding="utf-8"))
+
+        self.assertNotIn("hasSeenAutoDefaultNudge", stored)
+
+    def test_a_value_the_profile_already_holds_is_never_overwritten(self) -> None:
+        """An existing value is their answer, in either direction."""
+        self.write_default_state(hasSeenAutoDefaultNudge=True)
+        profile_dir = self.profile_dir("claude", "primary")
+        state_path = profile_dir / ".claude.json"
+        state_path.write_text(
+            json.dumps(
+                {
+                    "oauthAccount": {"emailAddress": "primary@invalid.example"},
+                    "hasSeenAutoDefaultNudge": False,
+                }
+            ),
+            encoding="utf-8",
+        )
+        state_path.chmod(0o600)
+
+        stored = json.loads(self.provision().read_text(encoding="utf-8"))
+
+        self.assertIs(False, stored["hasSeenAutoDefaultNudge"])
+
+    def test_a_concurrent_provider_write_is_not_lost(self) -> None:
+        """Claude owns this file too. A key it adds mid-provision survives.
+
+        The provider writes between this function's read and its write; the
+        re-read before the atomic replace is what keeps that key.
+        """
+        self.write_default_state(hasSeenAutoDefaultNudge=True)
+        profile_dir = self.profile_dir("claude", "primary")
+        state_path = profile_dir / ".claude.json"
+        state_path.write_text(
+            json.dumps({"oauthAccount": {"emailAddress": "primary@invalid.example"}}),
+            encoding="utf-8",
+        )
+        state_path.chmod(0o600)
+
+        real_load = accounts._load_owned_claude_state
+
+        def provider_writes_midway(path):
+            """Stand in for Claude Code saving the file while this runs."""
+            result = real_load(path)
+            current = json.loads(state_path.read_text(encoding="utf-8"))
+            current["lastReleaseNotesSeen"] = "2.1.233"
+            state_path.write_text(json.dumps(current), encoding="utf-8")
+            return result
+
+        with mock.patch.object(
+            accounts, "_load_owned_claude_state", side_effect=provider_writes_midway
+        ):
+            self.provision()
+
+        stored = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual("2.1.233", stored["lastReleaseNotesSeen"])  # not clobbered
+        self.assertIs(True, stored["hasSeenAutoDefaultNudge"])  # and ours landed
+        self.assertTrue(stored["hasCompletedOnboarding"])
+        self.assertEqual(0o600, state_path.stat().st_mode & 0o777)
+
+    def test_a_profile_enrolled_before_this_shipped_still_gets_the_marker(
+        self,
+    ) -> None:
+        """The operator hit this on an ALREADY enrolled account.
+
+        A fix that only covers profiles created from now on has not fixed it
+        for them, so the marker is applied when a profile is resumed too.
+        """
+        self.write_default_state(hasSeenAutoDefaultNudge=True)
+        profile_dir = self.profile_dir("claude", "primary")
+        state_path = profile_dir / ".claude.json"
+        # An old profile: onboarded long ago, no first-run marker.
+        state_path.write_text(
+            json.dumps(
+                {
+                    "oauthAccount": {"emailAddress": "primary@invalid.example"},
+                    "hasCompletedOnboarding": True,
+                }
+            ),
+            encoding="utf-8",
+        )
+        state_path.chmod(0o600)
+        self.seed_profiles(("claude", "primary", "primary@invalid.example"))
+
+        with mock.patch.object(
+            accounts,
+            "probe_identity",
+            return_value={
+                "provider": "claude",
+                "email": "primary@invalid.example",
+                "plan": "max",
+            },
+        ):
+            accounts.resume_profile(self.config, "claude", "primary")
+
+        stored = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertIs(True, stored["hasSeenAutoDefaultNudge"])
+
+    def test_a_provider_value_this_code_does_not_understand_survives(self) -> None:
+        """`projects` is the provider's. An unexpected shape is not ours to
+        normalise away while adding an unrelated marker (Codex finding 7)."""
+        self.write_default_state(
+            hasSeenAutoDefaultNudge=True,
+            projects={"/srv/trusted": {"hasTrustDialogAccepted": True}},
+        )
+        profile_dir = self.profile_dir("claude", "primary")
+        state_path = profile_dir / ".claude.json"
+        state_path.write_text(
+            json.dumps(
+                {
+                    "oauthAccount": {"emailAddress": "primary@invalid.example"},
+                    "projects": "provider-owned-value",
+                }
+            ),
+            encoding="utf-8",
+        )
+        state_path.chmod(0o600)
+
+        stored = json.loads(self.provision().read_text(encoding="utf-8"))
+
+        self.assertEqual("provider-owned-value", stored["projects"])
+        self.assertIs(True, stored["hasSeenAutoDefaultNudge"])
+
+    def test_a_provider_save_that_lands_after_the_final_read_is_not_lost(
+        self,
+    ) -> None:
+        """The half of the race the re-read never covered (lane B F7, Codex 5).
+
+        Re-reading before the replace narrows the window; it cannot close it,
+        because there is always a gap after the LAST read. Claude saves this
+        file as `.tmp.<pid>.<hex>` followed by a rename, so its save changes
+        the inode -- which is what the compare-and-swap catches. The write is
+        thrown away and retried against the new content rather than replacing
+        it.
+        """
+        self.write_default_state(hasSeenAutoDefaultNudge=True)
+        profile_dir = self.profile_dir("claude", "primary")
+        state_path = profile_dir / ".claude.json"
+        state_path.write_text(
+            json.dumps({"oauthAccount": {"emailAddress": "primary@invalid.example"}}),
+            encoding="utf-8",
+        )
+        state_path.chmod(0o600)
+
+        real_read = accounts.read_private_json
+        reads = {"of_the_profile": 0}
+
+        def claude_saves_after_the_read(path, **keywords):
+            result = real_read(path, **keywords)
+            if Path(path) != state_path:
+                return result
+            reads["of_the_profile"] += 1
+            # Read 1 is the function's opening read; read 2 is the one inside
+            # the write attempt, and the provider lands immediately after it --
+            # in the gap a re-read can never cover.
+            if reads["of_the_profile"] == 2:
+                current = json.loads(state_path.read_text(encoding="utf-8"))
+                current["lastReleaseNotesSeen"] = "2.1.233"
+                scratch = state_path.parent / (state_path.name + ".tmp.9999.abc")
+                scratch.write_text(json.dumps(current), encoding="utf-8")
+                scratch.chmod(0o600)
+                os.replace(scratch, state_path)   # exactly how Claude saves it
+            return result
+
+        with mock.patch.object(
+            accounts, "read_private_json", side_effect=claude_saves_after_the_read
+        ):
+            self.provision()
+
+        # If the injection never fired, or the swap never retried, this test
+        # proves nothing at EITHER revision -- the false-differential trap the
+        # round-1 lanes were caught by. Exactly three reads of the profile is
+        # the signature of the swap working: the opening read, the attempt the
+        # provider beat, and the retry that merged its key and won. Two would
+        # mean the collision was never detected.
+        self.assertEqual(3, reads["of_the_profile"])
+        stored = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual("2.1.233", stored["lastReleaseNotesSeen"])  # never lost
+        self.assertIs(True, stored["hasSeenAutoDefaultNudge"])       # ours retried in
+        self.assertTrue(stored["hasCompletedOnboarding"])
+        self.assertEqual(0o600, state_path.stat().st_mode & 0o777)
+
+    def test_nothing_is_written_while_claude_holds_its_own_config_lock(self) -> None:
+        """Claude takes a mkdir lock at `<config>.lock` while it saves.
+
+        This code does not TAKE that lock: Claude acquires it with retries 0, so
+        a held lock does not make Claude wait, it makes Claude fall back to an
+        unlocked write that skips its own re-read. Holding it would turn an
+        ordinary collision into a guaranteed overwrite. Its value is as a
+        signal, and the answer to the signal is to stand aside.
+        """
+        self.write_default_state(hasSeenAutoDefaultNudge=True)
+        profile_dir = self.profile_dir("claude", "primary")
+        state_path = profile_dir / ".claude.json"
+        original = json.dumps(
+            {"oauthAccount": {"emailAddress": "primary@invalid.example"}}
+        )
+        state_path.write_text(original, encoding="utf-8")
+        state_path.chmod(0o600)
+        (profile_dir / (state_path.name + ".lock")).mkdir()
+
+        noise = io.StringIO()
+        with contextlib.redirect_stderr(noise):
+            self.provision()
+
+        self.assertEqual(original, state_path.read_text(encoding="utf-8"))
+        # The exact refusal, not any message this module happens to print.
+        self.assertIn("is being written by Claude right now", noise.getvalue())
+        self.assertNotIn("hasSeenAutoDefaultNudge", state_path.read_text("utf-8"))
+
+    def test_a_default_state_past_the_old_one_MiB_cap_still_marks_the_offer(
+        self,
+    ) -> None:
+        """Lane B F8. `~/.claude.json` grows with project history and never
+        shrinks, and crossing the kit's registry cap used to stop the marker
+        silently -- so the only symptom would be this bug coming back with no
+        explanation. A real registry has been measured at 90,786 bytes."""
+        self.write_default_state(
+            hasSeenAutoDefaultNudge=True, filler="x" * (1024 * 1024 + 4096)
+        )
+        self.assertGreater(
+            (self.home / ".claude.json").stat().st_size, accounts.MAX_REGISTRY_BYTES
+        )
+
+        stored = json.loads(self.provision().read_text(encoding="utf-8"))
+
+        self.assertIs(True, stored["hasSeenAutoDefaultNudge"])
+
+    def test_a_default_state_it_cannot_use_says_why(self) -> None:
+        """Every unmarked offer now has a stated reason. None of them was
+        audible before, and silence is how F8 would have reached them."""
+        (self.home / ".claude.json").write_text("{not json", encoding="utf-8")
+        (self.home / ".claude.json").chmod(0o644)
+
+        noise = io.StringIO()
+        with contextlib.redirect_stderr(noise):
+            stored = json.loads(self.provision().read_text(encoding="utf-8"))
+
+        self.assertNotIn("hasSeenAutoDefaultNudge", stored)
+        self.assertIn("not marking", noise.getvalue())
+        self.assertIn("not valid JSON", noise.getvalue())
 
     def test_kill_switch_blocks_enroll_launch_and_switch_prepare(self) -> None:
         self.seed_profiles(

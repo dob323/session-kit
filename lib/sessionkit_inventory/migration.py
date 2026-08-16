@@ -937,6 +937,12 @@ def apply_legacy_recovery_manifest(
                 )
             if receipt.get("phase") != "applied":
                 atomic_write_json(receipt_path, migration_receipt_fn(plan, "applied"))
+            mutation_sequence, _diagnostic = _state_io.allocate_collection_start(paths)
+            _state_io.stamp_collection_document(
+                paths,
+                paths["manifest"],
+                collection_start=mutation_sequence,
+            )
             return {
                 "schema_version": schema_version,
                 "result": "already-applied",
@@ -959,7 +965,13 @@ def apply_legacy_recovery_manifest(
             raise CollectionError(
                 "legacy manifest changed before migration publication"
             )
+        mutation_sequence, _diagnostic = _state_io.allocate_collection_start(paths)
         atomic_write_json(paths["manifest"], plan["target_manifest"])
+        _state_io.stamp_collection_document(
+            paths,
+            paths["manifest"],
+            collection_start=mutation_sequence,
+        )
         if sha256(read_private_regular_bytes(paths["manifest"])) != target_hash:
             raise CollectionError("target recovery manifest verification failed")
         atomic_write_json(receipt_path, migration_receipt_fn(plan, "applied"))
@@ -1024,13 +1036,25 @@ def rollback_legacy_recovery_manifest(
                 atomic_write_json(
                     receipt_path, migration_receipt_fn(plan, "rolled-back")
                 )
+            mutation_sequence, _diagnostic = _state_io.allocate_collection_start(paths)
+            _state_io.stamp_collection_document(
+                paths,
+                paths["manifest"],
+                collection_start=mutation_sequence,
+            )
             return {
                 "schema_version": schema_version,
                 "result": "already-rolled-back",
                 "plan_token": plan["plan_token"],
                 "receipt": str(receipt_path),
             }
+        mutation_sequence, _diagnostic = _state_io.allocate_collection_start(paths)
         atomic_write_private_bytes(paths["manifest"], legacy_bytes)
+        _state_io.stamp_collection_document(
+            paths,
+            paths["manifest"],
+            collection_start=mutation_sequence,
+        )
         if sha256(read_private_regular_bytes(paths["manifest"])) != source_hash:
             raise CollectionError("exact legacy rollback verification failed")
         atomic_write_json(receipt_path, migration_receipt_fn(plan, "rolled-back"))

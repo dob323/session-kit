@@ -1,0 +1,3 @@
+#!/bin/bash
+printf '%s\tpython3\t%s\n' "$EPOCHREALTIME" "$*" >> "$SK_SHIM_LOG"
+exec /usr/bin/python3 "$@"

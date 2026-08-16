@@ -4,44 +4,34 @@ Session Kit uses official shpool 0.11.0 by default. This directory contains
 optional source patches: `0001` for a heartbeat failure, `0002` for
 input-mode loss on reattach, `0003` for sessions that become unkillable once
 their shell dies on its own, `0004` for a daemon-wide deadlock in the detach
-handler, and `0005` for an attach client that reports the wrong exit status.
-Apply them in numeric order; `0002`, `0003`, `0004` and `0005` each touch an
-independent region and apply cleanly to pristine `v0.11.0` on their own.
+handler, `0005` for an attach client that reports the wrong exit status, and
+`0006` for resize bursts that cause repeated stale-frame repaints. Apply any
+set you choose in numeric order; `0002` through `0006` touch independent
+regions and apply cleanly to pristine `v0.11.0` on their own.
 
-**Start with `0004`.** It is the only patch here backed by a reproduced
-production outage, and it is the only one whose failure mode is daemon-wide
-rather than confined to a single session. See
+**Evaluate `0004` first.** It is the only patch here whose reproduced failure
+mode is daemon-wide rather than confined to a single session. If you then carry
+more than one patch, still apply the chosen set in numeric order. See
 [Detach deadlock patch (0004)](#detach-deadlock-patch-0004).
 
 The patches are not installed, built, selected, or activated by Session Kit.
 
 ## Heartbeat ack patch (0001)
 
-> **Field correction, 2026-08-06.** A daemon-wide freeze that looked like this
-> patch's territory — sessions listed but unopenable, `attaching new client
-> stream to shell->client thread` in the log — was **not** caused by the
-> heartbeat path. The `waiting for heartbeat ack` / `timed out waiting on
-> receive operation` lines below never appeared in that daemon's log at all;
-> the only heartbeat error on record was a benign `sending heartbeat ack` on a
-> disconnected channel during a normal kill teardown. The real cause was the
-> unbounded detach handshake described in
-> [Detach deadlock patch (0004)](#detach-deadlock-patch-0004).
->
-> The "do not apply without the matching acknowledgement evidence" rule below
-> held up: applying `0001` on the strength of the attach-failure line alone
-> would have shipped a change that fixed nothing. Check for the ack lines
-> specifically, and rule out `0004` first.
+> **Evidence rule.** A generic attach failure does not establish a heartbeat
+> fault. Require the matching acknowledgement wait and receive-timeout chain
+> below, and rule out the bounded-detach failure addressed by `0004` first.
+> Applying `0001` without that chain changes the wrong path.
 
 In shpool 0.11.0, the heartbeat sender treats a send timeout as a busy handler
 and continues. The acknowledgement receiver can treat the same timeout as
 fatal. That error can unwind the handler scope, leaving a listed session unable
 to accept another client.
 
-This exact chain was captured in production on 2026-08-09. The daemon logged
-`joining heartbeat_h`, `waiting for heartbeat ack`, and the receive timeout;
-later attempts to open the named listed session timed out after 300ms while
-attaching a new client stream. This is the evidence required for `0001`, not a
-generic attach error by itself.
+The required chain is a daemon log containing `joining heartbeat_h`, `waiting
+for heartbeat ack`, and the receive timeout, followed by attempts to open the
+listed session timing out while attaching a new client stream. That sequence,
+not a generic attach error by itself, is the evidence for `0001`.
 
 Typical evidence is:
 
@@ -100,33 +90,38 @@ git clone --branch v0.11.0 --depth 1 \
   https://github.com/shell-pool/shpool.git shpool-0.11.0
 cd shpool-0.11.0
 test "$(git rev-parse HEAD)" = fe2d11595ff255810523b0868159dec051e303f1
-git apply --check /path/to/session-kit/shpool-patch/0001-heartbeat-ack-timeout-is-not-fatal.patch
-git apply /path/to/session-kit/shpool-patch/0001-heartbeat-ack-timeout-is-not-fatal.patch
+git apply --check ~/.local/lib/session-kit/current/shpool-patch/0001-heartbeat-ack-timeout-is-not-fatal.patch
+git apply ~/.local/lib/session-kit/current/shpool-patch/0001-heartbeat-ack-timeout-is-not-fatal.patch
 cargo build --locked --release --bin shpool
 sha256sum target/release/shpool
 ```
 
 `patched-binary.sha256` is the reference checksum from the reviewed build with
-all five patches applied in numeric order. A different Rust toolchain, target,
+all six patches applied in numeric order. A different Rust toolchain, target,
 or build environment can produce different bytes, so the checksum is worthless
 without the environment that produced it. The recorded value came from:
 
 | | |
 |---|---|
 | upstream tag | `v0.11.0` == `fe2d11595ff255810523b0868159dec051e303f1` |
-| patches | `0001`–`0005`, applied in numeric order |
+| patches | `0001`–`0006`, applied in numeric order |
 | rustc | 1.97.1 (8bab26f4f 2026-07-14) |
 | cargo | 1.97.1 (c980f4866 2026-06-30) |
 | target triple | `x86_64-unknown-linux-gnu` |
-| build image | `docker.io/library/rust:bookworm` |
+| build host | AlmaLinux 10.2, glibc 2.39, rustup `stable-x86_64-unknown-linux-gnu` |
 | build command | `cargo build --locked --release --bin shpool` |
-| sha256 | `ca8d28aa52da0b9ee45f7d7ef24aac41bccaa316a2a959ed6804db3b8a5b1e45` |
+| sha256 | `937ed524412b2810c45661c266cfbb495aa534b0da399ef6509aa04914556ade` |
+
+The `0001`–`0005` checksum recorded before `0006` was
+`ca8d28aa52da0b9ee45f7d7ef24aac41bccaa316a2a959ed6804db3b8a5b1e45`, built in
+`docker.io/library/rust:bookworm` on the same toolchain versions. The two are
+not comparable byte for byte: the patch set and the build host both differ.
 
 Record the same set for your own artifact. A checksum recorded without its
 build environment cannot later be reproduced or refuted, which is the same as
 not having recorded it.
 
-The CI patch job applies all five patches to the pinned upstream tag, runs the
+The CI patch job applies all six patches to the pinned upstream tag, runs the
 workspace tests, and builds the release binary.
 
 ## Activation and rollback
@@ -151,7 +146,7 @@ on purpose. Treat this as part of the replacement, not as optional cleanup:
 
 ```bash
 install -m 600 /dev/null "${XDG_STATE_HOME:-$HOME/.local/state}/session-kit/shpool-binary.sha256"
-sha256sum ~/.cargo/bin/shpool | cut -d' ' -f1 \
+sha256sum "$(command -v shpool)" | cut -d' ' -f1 \
   > "${XDG_STATE_HOME:-$HOME/.local/state}/session-kit/shpool-binary.sha256"
 ```
 
@@ -215,8 +210,7 @@ SIGHUP and SIGKILL-escalation sites are guarded.
 
 ## Detach deadlock patch (0004)
 
-This is the one patch here with a confirmed production outage behind it
-(2026-08-06: ten sessions unreachable for nineteen minutes).
+This is the one patch here whose failure mode can block the whole daemon.
 
 `handle_detach` in `libshpool/src/daemon/server.rs` holds the **global session
 table lock** across an unbounded control-channel handshake:
@@ -295,7 +289,8 @@ should be able to take the daemon down regardless of its cause.
 Build, activation and rollback are the same as for `0001`, including the
 daemon-restart requirement. Because a restart ends every managed terminal
 process, capture exact provider recovery identities first — after the restart
-they are recoverable only through the login chooser's recovery review.
+they come back through the one recovery list, which the login chooser's Closed
+sessions screen and `sp recover` both read.
 
 ## Exit-status patch (0005)
 
@@ -322,25 +317,9 @@ the shell's status. But `sock->stdout` checks that slot at the top of its loop,
 so it returns without ever reading the `ExitStatus` frame, and the client
 reports 1.
 
-Captured from an attach client log at the moment of failure:
-
-```text
-stdin->sock: read 8 bytes
-stdin->sock: close time.busy=34.4µs     <- stdin EOF, thread returns
-sock->stdout: chunk='prompt> ' kind=Data len=8
-sock->stdout: close                      <- bails, slot already poisoned
-pipe_bytes: close                        <- process::exit(1)
-```
-
-and on the daemon side, the status arriving with nobody left to send it to:
-
-```text
-shell->client: client_stream write err, assuming hangup: BrokenPipe
-shell->client: pty master hung up, exiting shell->client thread
-child_watcher: child exited with status 19
-```
-
-Note the ordering on the daemon side: the broken pipe sets the connection to
+The observable ordering is sufficient: stdin reaches EOF, the shared slot is
+set to the fallback, the socket reader exits before consuming `ExitStatus`, and
+the daemon then has no client for the real status. The broken pipe sets the connection to
 `Disconnect`, so the hangup path's `if let ClientConnectionMsg::New(conn)`
 no longer matches and the exit chunk is never written at all.
 
@@ -353,20 +332,10 @@ case costs one predicate call rather than the whole window.
 
 ### Evidence
 
-Upstream's own `exits_with_same_status_as_shell` is the reproducer. Measured
-over 50 full `-p shpool --test attach` runs per tree, in a container matched to
-the CI runner (`rust:bookworm` plus `zsh less bsdextrautils`, 4 CPUs — without
-`less` and `hexdump` the suite runs three times slower and the load profile
-this race depends on no longer matches):
-
-| tree | failures |
-|---|---|
-| pristine `v0.11.0`, no patches | 4 / 50 |
-| `0001`–`0004` | 10 / 50 and 3 / 50 across two identical containers |
-| pristine + `0005` alone | **0 / 50** |
-| `0001`–`0005` | **0 / 50** |
-
-The full workspace suite is green on the patched tree, including
+Upstream's own `exits_with_same_status_as_shell` is the reproducer. Repeat it
+under load on both pristine and patched trees; the pristine tree must expose
+the mismatched status and the patched tree must preserve the shell status.
+The full workspace suite must remain green, including
 `detaches_on_null_stdin` and `client_eof_does_not_spin`, the two tests that
 depend on the current early-exit behaviour.
 
@@ -379,6 +348,22 @@ the client is still listening when it arrives.
 
 This is an upstream defect, not a Session Kit one, and belongs upstream. Prefer
 an accepted upstream fix over carrying this patch.
+
+## Resize coalescing patch (0006)
+
+A fullscreen application can emit a burst of `SIGWINCH` events while a terminal
+is being resized. Stock shpool forwards every event immediately, so the attached
+application repaints once per intermediate size and stale frames can accumulate
+in scrollback.
+
+`0006-coalesce-client-resize-bursts.patch` waits 120 ms for the reported size
+and pending signal queue to settle, then forwards one resize carrying the final
+row and column count. It also remembers the last forwarded size and skips an
+unchanged duplicate. The wait runs only after a resize signal and is bounded by
+continued size movement; ordinary input and output are unchanged.
+
+Build, activation, rollback, and fingerprint recording are the same as for
+`0001`. When carrying it with other patches, apply it last.
 
 ## License and upstream
 

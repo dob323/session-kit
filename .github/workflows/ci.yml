@@ -150,10 +150,11 @@ jobs:
           ruff check --output-format github \
             tools/build-public-tree tools/build-release-artifact \
             tools/check-doc-links tools/check-embedded-scripts \
-            tools/public-scan tools/render-readme-dashboard \
+            tools/public-scan tools/render-readme-picker \
             deploy/session-kit-release
           ruff format --check lib/sessionkit_inventory/__init__.py \
             lib/sessionkit_inventory/collector.py \
+            lib/sessionkit_inventory/closed_sessions.py \
             lib/sessionkit_inventory/colors.py \
             lib/sessionkit_inventory/common.py \
             lib/sessionkit_inventory/lifecycle.py \
@@ -161,6 +162,8 @@ jobs:
             lib/sessionkit_inventory/model.py \
             lib/sessionkit_inventory/names.py \
             lib/sessionkit_inventory/names_push.py \
+            lib/sessionkit_inventory/origins.py \
+            lib/sessionkit_inventory/private_store.py \
             lib/sessionkit_inventory/processes.py \
             lib/sessionkit_inventory/projects.py \
             lib/sessionkit_inventory/providers.py \
@@ -172,7 +175,10 @@ jobs:
             lib/sessionkit_inventory/self_name.py \
             lib/sessionkit_inventory/snapshot.py \
             lib/sessionkit_inventory/terminal.py \
+            lib/sessionkit_inventory/transcripts.py \
             lib/sessionkit_inventory/validation.py \
+            lib/sessionkit_inventory/worker_model.py \
+            lib/sessionkit_inventory/worktrees.py \
             lib/sessionkit_projects/__init__.py \
             lib/sessionkit_projects/cli.py \
             lib/sessionkit_projects/context.py \
@@ -192,17 +198,16 @@ jobs:
           python -m py_compile tools/build-public-tree \
             tools/build-release-artifact tools/check-doc-links \
             tools/check-embedded-scripts tools/public-scan \
-            tools/render-readme-dashboard deploy/session-kit-release
+            tools/render-readme-picker deploy/session-kit-release
       - name: Check types
         env:
           MYPY_CACHE_DIR: ${{ runner.temp }}/mypy-cache
         run: |
           mypy --ignore-missing-imports \
             lib/session_inventory.py lib/sessionkit_inventory \
-            lib/sessionkit_supervisor lib/sessionkit_messages \
-            lib/sessionkit_events lib/sessionkit_projects extras/hooks
+            lib/sessionkit_projects extras/hooks
           # Extensionless scripts have no module name to infer, so they need
-          # --scripts-are-modules. tools/render-readme-dashboard is excluded:
+          # --scripts-are-modules. tools/render-readme-picker is excluded:
           # it imports the login test fixture, which pulls the whole test tree
           # into the type check.
           mypy --ignore-missing-imports --scripts-are-modules \
@@ -279,7 +284,8 @@ jobs:
             0002-restore-input-modes-on-reattach.patch \
             0003-kill-tolerates-an-already-dead-shell.patch \
             0004-detach-must-not-hold-the-shells-lock.patch \
-            0005-attach-must-not-discard-the-shells-exit-status.patch; do
+            0005-attach-must-not-discard-the-shells-exit-status.patch \
+            0006-coalesce-client-resize-bursts.patch; do
             git -C "$RUNNER_TEMP/shpool" apply --check \
               "$GITHUB_WORKSPACE/shpool-patch/$patch"
             git -C "$RUNNER_TEMP/shpool" apply \

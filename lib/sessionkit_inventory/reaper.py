@@ -55,9 +55,19 @@ def scan_shell_facts(
     proc_root: Path,
     daemon_pid: int,
     *,
+    daemon_start_ticks: int | None = None,
     max_nodes: int = 16384,
 ) -> dict[str, dict[str, Any]]:
     """Return exact daemon-child shell generations and empty-tree proof."""
+    daemon_before = _proc_stat(proc_root / str(daemon_pid) / "stat")
+    if (
+        daemon_start_ticks is not None
+        and (
+            daemon_before is None
+            or daemon_before[1] != daemon_start_ticks
+        )
+    ):
+        raise CollectionError("bound shpool daemon generation changed")
     try:
         entries = [entry for entry in proc_root.iterdir() if entry.name.isdigit()]
     except OSError as exc:
@@ -71,6 +81,7 @@ def scan_shell_facts(
         before = _proc_stat(entry / "stat")
         if before is None:
             continue
+        environ: list[bytes] = []
         try:
             comm = (entry / "comm").read_text(encoding="utf-8").strip()
             cmdline = (
@@ -79,17 +90,34 @@ def scan_shell_facts(
                 .replace(b"\0", b" ")
                 .decode("utf-8", "replace")
             )
-            # Only the daemon's direct children are ever asked for a session name
-            # (see the facts loop below), and /proc/<pid>/environ is readable only
-            # by the process owner. Reading it for every pid meant a denied open
-            # per foreign process for a result that was then discarded. `before[0]`
-            # is the ppid, so this is exactly children[daemon_pid].
-            if before[0] == daemon_pid:
-                environ = (entry / "environ").read_bytes().split(b"\0")
-            else:
-                environ = []
         except OSError:
             continue
+        # A shell-less manager record can still have a provider that escaped
+        # reaping and was adopted elsewhere. Every process started inside a
+        # managed shell inherits SHPOOL_SESSION_NAME, so read the environment
+        # of every process owned by this account, not only daemon children.
+        # Foreign processes cannot belong to this user's shpool and are never
+        # opened. An unreadable own-uid environment makes absence unprovable.
+        try:
+            owned_by_us = entry.stat(follow_symlinks=False).st_uid == os.geteuid()
+        except OSError:
+            owned_by_us = False
+        if before[0] == daemon_pid or owned_by_us:
+            try:
+                environ = (entry / "environ").read_bytes().split(b"\0")
+            except OSError as exc:
+                # A child that exited mid-scan is an ordinary race: it is gone
+                # from the table below too. A child that is still there and
+                # will not say its session name is not — it leaves a listed
+                # session unaccounted for, and an unaccounted session is
+                # exactly what the phantom rule closes. Refuse the whole run,
+                # as the Darwin adapter already does on the same ambiguity.
+                if _proc_stat(entry / "stat") is None:
+                    continue
+                raise CollectionError(
+                    "an own-uid process has an unreadable environment; "
+                    "cleanup refused"
+                ) from exc
         after = _proc_stat(entry / "stat")
         if before != after:
             continue
@@ -122,7 +150,7 @@ def scan_shell_facts(
         return not children.get(inner[0], [])
 
     facts: dict[str, dict[str, Any]] = {}
-    duplicates: set[str] = set()
+    direct_by_name: dict[str, list[int]] = {}
     for pid in children.get(daemon_pid, []):
         process = processes.get(pid)
         if process is None:
@@ -134,17 +162,75 @@ def scan_shell_facts(
                 break
         if not session_id:
             continue
-        if session_id in facts:
-            duplicates.add(session_id)
+        direct_by_name.setdefault(session_id, []).append(pid)
+    for session_id, pids in direct_by_name.items():
+        if len(pids) != 1:
+            facts[session_id] = {"ambiguous_shell_generations": len(pids)}
             continue
+        pid = pids[0]
         facts[session_id] = {
             "shell_pid": pid,
-            "shell_start_ticks": process["start_ticks"],
+            "shell_start_ticks": processes[pid]["start_ticks"],
             "empty": empty_shell(pid),
         }
-    for session_id in duplicates:
-        facts.pop(session_id, None)
+
+    named_processes: dict[str, list[int]] = {}
+    for pid, process in processes.items():
+        for item in process.get("environ", ()):
+            if item.startswith(b"SHPOOL_SESSION_NAME="):
+                session_id = item.split(b"=", 1)[1].decode("utf-8", "replace")
+                if session_id:
+                    named_processes.setdefault(session_id, []).append(pid)
+                break
+
+    def subtree(root: int) -> set[int]:
+        found, pending = {root}, [root]
+        while pending:
+            for child in children.get(pending.pop(), ()):
+                if child not in found:
+                    found.add(child)
+                    pending.append(child)
+        return found
+
+    for session_id, named_pids in named_processes.items():
+        fact = facts.get(session_id)
+        shell_pid = fact.get("shell_pid") if isinstance(fact, Mapping) else None
+        if isinstance(shell_pid, int):
+            outside = sorted(set(named_pids) - subtree(shell_pid))
+            if outside:
+                fact["empty"] = False
+                fact["unbound_session_processes"] = outside
+        elif fact is None:
+            # Positive evidence of a surviving process without a daemon child.
+            # Neither candidate predicate accepts this non-shell fact.
+            facts[session_id] = {
+                "unbound_session_processes": sorted(set(named_pids))
+            }
+    if daemon_start_ticks is not None and _proc_stat(
+        proc_root / str(daemon_pid) / "stat"
+    ) != daemon_before:
+        raise CollectionError("bound shpool daemon generation changed")
     return facts
+
+
+def _bound_daemon_generation(inventory: Mapping[str, Any]) -> tuple[int, int]:
+    """Return the exact socket-bound generation carried by a guard document."""
+    daemon = inventory.get("daemon_generation")
+    pid = daemon.get("pid") if isinstance(daemon, Mapping) else None
+    start = (
+        daemon.get("process_start_ticks")
+        if isinstance(daemon, Mapping)
+        else None
+    )
+    if (
+        not _positive_int(pid)
+        or not isinstance(start, int)
+        or isinstance(start, bool)
+        or start < 0
+    ):
+        raise CollectionError("guard-live daemon identity is unavailable")
+    assert isinstance(pid, int) and isinstance(start, int)
+    return pid, start
 
 
 def _inventory_by_id(inventory: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
@@ -174,6 +260,19 @@ def _safe_candidate(
     *,
     now_monotonic_ns: int,
 ) -> tuple[Any, ...] | None:
+    """A provider-exited terminal this pass may close, or None.
+
+    A BACKSTOP since 2026-08-15: the managed shell closes itself the moment
+    its provider is gone for good, so a row that reaches the full window
+    means the shell could not — an older release still running, or a close
+    that failed. bin/shpool_reaper's header lists the cases.
+
+    Two husk classes sit deliberately outside this predicate. Without
+    `agent_status == "provider exited"` there is no proof a provider ever
+    exited; without a uuid there is no conversation to promise back. Both
+    stay visible until a person closes them from the picker, because a row
+    whose state cannot be proven is never swept up quietly.
+    """
     session_id = row.get("name")
     shell = item.get("shpool_shell") if isinstance(item, Mapping) else None
     recovery = item.get("recovery") if isinstance(item, Mapping) else None
@@ -244,8 +343,8 @@ def _phantom_candidate(
     The daemon keeps advertising it (an ESRCH during a kill aborts removal on
     stock shpool), the kit quarantines it, and no picker action can touch it —
     it lies in the list until a daemon restart. There is nothing to preserve:
-    no shell, no provider, no identity. Nominated only after the full
-    observation window proves the state durable.
+    no shell, no provider, no identity. Nominated on the first complete pass:
+    exact absence is already the proof, and waiting cannot make it safer.
     """
     session_id = row.get("name")
     if (
@@ -270,6 +369,13 @@ def _phantom_candidate(
     if not isinstance(diagnostics, list) or not any(
         isinstance(entry, str) and "found 0" in entry for entry in diagnostics
     ):
+        return None
+    if any(
+        isinstance(entry, str) and "unreadable environment" in entry
+        for entry in diagnostics
+    ):
+        # The shell may be alive and merely unable to name itself. Nothing to
+        # preserve is a proof, not a default.
         return None
     return (
         "phantom",
@@ -339,8 +445,6 @@ def plan_auto_close(
             "first_verified_monotonic_ns": first,
         }
         if phantom is not None:
-            if now_monotonic_ns - first < minimum_age_ns:
-                continue
             candidates.append(
                 {
                     "class": "shell-less-phantom",
@@ -375,7 +479,7 @@ def plan_auto_close(
     candidate_doc = {
         "schema_version": AUTO_CLOSE_SCHEMA_VERSION,
         "generated_at_monotonic_ns": now_monotonic_ns,
-        "policy": "provider-exited-exact-72h",
+        "policy": "provider-exited-exact-window+shell-less-immediate",
         "candidates": candidates,
     }
     return observation_doc, candidate_doc
@@ -516,7 +620,6 @@ def plan_from_environment(
         inventory = json.loads(os.environ["SK_REAPER_INVENTORY_JSON"])
         state_dir = Path(os.environ["SK_REAPER_STATE_DIR"])
         proc_root = Path(os.environ["SK_REAPER_PROC_ROOT"])
-        daemon_pid = int(os.environ["SK_REAPER_DAEMON_PID"])
         hours = int(
             os.environ.get(
                 "SK_REAPER_AUTO_CLOSE_HOURS",
@@ -527,6 +630,7 @@ def plan_from_environment(
         raise CollectionError("auto-close environment is invalid") from exc
     if not 1 <= hours <= MAX_AUTO_CLOSE_HOURS:
         raise CollectionError("auto-close age is invalid")
+    daemon_pid, daemon_start = _bound_daemon_generation(inventory)
     now_monotonic_ns = time.monotonic_ns()
     if os.environ.get("SESSION_KIT_TESTING") == "1":
         raw_test_clock = os.environ.get("SESSION_KIT_TEST_MONOTONIC_NS")
@@ -546,7 +650,11 @@ def plan_from_environment(
     observation, candidates = plan_auto_close(
         shpool_payload,
         inventory,
-        scan_shell_facts(proc_root, daemon_pid),
+        scan_shell_facts(
+            proc_root,
+            daemon_pid,
+            daemon_start_ticks=daemon_start,
+        ),
         previous,
         now_monotonic_ns=now_monotonic_ns,
         minimum_age_ns=hours * 3600 * 1_000_000_000,

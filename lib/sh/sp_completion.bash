@@ -61,8 +61,8 @@ _sp() {
   # called by the picker and the managed shell with proof arguments; they are
   # left out here for the same reason `sp help` leaves them out.
   local verbs="list new go takeover close teardown detail health prune repair
-    verify-start name self-name color msg account worktree receipt find history
-    recover prompt-quarantine help"
+    verify-start name self-name color account worktree find history
+    recover help"
 
   if [ "$COMP_CWORD" -eq 1 ]; then
     _session_kit_words "$verbs" "$current"
@@ -72,21 +72,20 @@ _sp() {
   case "$verb" in
     help)
       [ "$COMP_CWORD" -eq 2 ] || return 0
-      _session_kit_words "sessions names messages accounts history selectors
-        exit-codes completion machine" "$current"
+      _session_kit_words "sessions names accounts history selectors
+        unavailable exit-codes completion machine" "$current"
       ;;
     worktree)
       [ "$COMP_CWORD" -eq 2 ] || return 0
       _session_kit_words "list materialize bind lookup teardown" "$current"
       ;;
-    receipt)
-      [ "$COMP_CWORD" -eq 2 ] || return 0
-      _session_kit_words "cap gate open spend verifier files close show list" \
-        "$current"
-      ;;
     new)
       case "$previous" in
         --account | --model | --launch-key)
+          return 0
+          ;;
+        --origin)
+          _session_kit_words "human machine" "$current"
           return 0
           ;;
         --prompt-file)
@@ -95,7 +94,7 @@ _sp() {
       esac
       case "$current" in
         -*)
-          _session_kit_words "--account --model --launch-key --prompt-file" \
+          _session_kit_words "--account --model --launch-key --origin --prompt-file --worktree" \
             "$current"
           return 0
           ;;
@@ -106,7 +105,7 @@ _sp() {
       elif [ "$COMP_CWORD" -eq 3 ]; then
         _session_kit_words "$(_session_kit_project_aliases)" "$current"
       else
-        _session_kit_words "--account --model --launch-key --prompt-file" \
+        _session_kit_words "--account --model --launch-key --origin --prompt-file --worktree" \
           "$current"
       fi
       ;;
@@ -124,15 +123,6 @@ _sp() {
           lime magenta silver sand sky sea" "$current"
       fi
       ;;
-    msg)
-      if [ "$COMP_CWORD" -eq 2 ]; then
-        _session_kit_words "all idle report reply list" "$current"
-      elif [ "$verb" = msg ]; then
-        case "$current" in
-          -*) _session_kit_words "--fyi --yes" "$current" ;;
-        esac
-      fi
-      ;;
     account)
       if [ "$COMP_CWORD" -eq 2 ]; then
         _session_kit_words "list adopt-default enroll verify configure-feeds" \
@@ -144,10 +134,6 @@ _sp() {
             ;;
         esac
       fi
-      ;;
-    prompt-quarantine)
-      [ "$COMP_CWORD" -eq 2 ] || return 0
-      _session_kit_words "list ingest discard resume prune" "$current"
       ;;
   esac
   return 0
@@ -172,7 +158,7 @@ _session_kit() {
       ;;
     projects)
       [ "$COMP_CWORD" -eq 2 ] || return 0
-      _session_kit_words "discover import list add ignore" "$current"
+      _session_kit_words "discover import list add ignore unignore" "$current"
       ;;
     services)
       [ "$COMP_CWORD" -eq 2 ] || return 0

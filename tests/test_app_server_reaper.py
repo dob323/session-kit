@@ -372,6 +372,27 @@ class ReaperWiringTests(unittest.TestCase):
             encoding="utf-8",
         )
         self.shpool.chmod(0o755)
+        daemon = self.proc / "10"
+        daemon.mkdir()
+        fields = ["S", "1", *(["0"] * 17), "1000"]
+        (daemon / "stat").write_text(
+            f"10 (shpool) {' '.join(fields)}\n",
+            encoding="utf-8",
+        )
+        (daemon / "comm").write_text("shpool\n", encoding="utf-8")
+        (daemon / "cmdline").write_bytes(b"shpool\0daemon\0")
+        (daemon / "environ").write_bytes(b"")
+        self.status = self.bin / "status"
+        self.status.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json,sys\n"
+            "if sys.argv[1:] != ['--guard-json']: raise SystemExit(2)\n"
+            "print(json.dumps({'source':'live','stale':False,'warnings':[],"
+            "'daemon_generation':{'pid':10,'process_start_ticks':1000},"
+            "'sessions':[]}))\n",
+            encoding="utf-8",
+        )
+        self.status.chmod(0o755)
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -392,13 +413,22 @@ class ReaperWiringTests(unittest.TestCase):
         environment = os.environ.copy()
         environment.update(
             HOME=os.fspath(self.home),
+            XDG_STATE_HOME=os.fspath(self.base / "xdg-state"),
+            XDG_DATA_HOME=os.fspath(self.base / "xdg-data"),
+            XDG_CONFIG_HOME=os.fspath(self.base / "xdg-config"),
+            XDG_CACHE_HOME=os.fspath(self.base / "xdg-cache"),
+            XDG_RUNTIME_DIR=os.fspath(self.base / "xdg-runtime"),
             SESSION_KIT_STATE_DIR=os.fspath(self.state),
+            SESSION_KIT_CONFIG=os.fspath(self.base / "xdg-config/session-kit.json"),
             SESSION_KIT_SHPOOL_CMD=os.fspath(self.shpool),
+            SESSION_KIT_STATUS_CMD=os.fspath(self.status),
             SESSION_KIT_PROC_ROOT=os.fspath(self.proc),
             SESSION_KIT_DAEMON_PID="10",
             SESSION_KIT_REAPER_SENTINEL=os.fspath(self.base / "absent"),
             SESSION_KIT_TESTING="1",
+            SESSION_KIT_TEST_PLATFORM="Linux",
             PYTHONDONTWRITEBYTECODE="1",
+            PATH=os.fspath(self.bin) + ":/usr/bin:/bin",
         )
         completed = subprocess.run(
             [os.fspath(REPO / "bin" / "shpool_reaper"), "--candidates"],

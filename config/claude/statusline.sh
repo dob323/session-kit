@@ -2,8 +2,9 @@
 # Claude Code status line (Linux)
 # Format: line 1: [MODEL] user@host:/CWD-BASENAME | PCT% context
 #         line 2: 5h PCT% (left) · 7d PCT% (left) · account email (~/.claude.json oauthAccount)
-# Quota segment reads ~/.claude/cache/quota_headers (refreshed in background
-# by statusline-quota-refresh.sh, TTL 180s); time-left counts down to window reset.
+# Quota segment reads a cache keyed by the active Claude profile (refreshed in
+# background by statusline-quota-refresh.sh, TTL 180s); time-left counts down
+# to window reset.
 # Session name leads line 1 (maintainer decision, 2026-08-04): the tab title
 # and top-right chip only update at session start or the next prompt, so
 # this is the one surface that shows a mid-turn name change while the human
@@ -12,7 +13,9 @@
 
 input=$(cat)
 
-IFS=$'\t' read -r model cwd used_pct sid < <(
+# Tab is IFS whitespace, so a run of tabs around an EMPTY field collapses and
+# every later field shifts left (the husk bug). Translate to \034 first.
+__sl_line=$(
   printf '%s' "$input" | jq -r '[
     .model.display_name,
     .workspace.current_dir,
@@ -20,6 +23,8 @@ IFS=$'\t' read -r model cwd used_pct sid < <(
     (.session_id // "")
   ] | @tsv'
 )
+__sl_line=${__sl_line//$'\t'/$'\034'}
+IFS=$'\034' read -r model cwd used_pct sid <<<"$__sl_line"
 
 session_name=""
 if [ -n "$sid" ]; then
@@ -68,14 +73,62 @@ else
 fi
 
 # --- Plan quota segment (5h + 7d unified windows) ---
-QCACHE="$HOME/.claude/cache/quota_headers"
 QTTL=180
 now=$(date +%s)
-acct=$(jq -r '.oauthAccount.emailAddress // empty' "$HOME/.claude.json" 2>/dev/null)
+# The session's own profile first: a kit-launched session sets
+# CLAUDE_CONFIG_DIR to its account profile, and that profile's .claude.json
+# names the account this session actually bills. The ambient file is only
+# right for sessions with no profile.
+if [ -n "${CLAUDE_CONFIG_DIR:-}" ] && [ -f "$CLAUDE_CONFIG_DIR/.claude.json" ]; then
+  acct=$(jq -r '.oauthAccount.emailAddress // empty' "$CLAUDE_CONFIG_DIR/.claude.json" 2>/dev/null)
+  qprofile=$CLAUDE_CONFIG_DIR
+else
+  acct=$(jq -r '.oauthAccount.emailAddress // empty' "$HOME/.claude.json" 2>/dev/null)
+  qprofile=
+fi
+qalias=${SESSION_KIT_ACCOUNT_ALIAS:-${qprofile##*/}}
+qalias=$(printf '%s' "${qalias:-default}" | tr -cd 'A-Za-z0-9._-')
+[ -n "$qalias" ] || qalias=default
+qidentity=${qprofile:-$HOME/.claude}
+qsum=$(printf '%s' "$qidentity" | sha256sum 2>/dev/null || printf '%s' "$qidentity" | shasum -a 256 2>/dev/null)
+qsum=${qsum%% *}
+QDIR="$HOME/.claude/cache/session-kit-quota/${qalias}-${qsum:-0}"
+QCACHE="$QDIR/quota_headers"
+QSTAMP="$QDIR/refresh-requested"
+QREFRESH="$HOME/.claude/statusline-quota-refresh.sh"
+mkdir -p "$QDIR" 2>/dev/null && chmod 700 "$QDIR" 2>/dev/null || true
 qacct=$(awk -F': ' '$1=="x-probe-account"{print $2}' "$QCACHE" 2>/dev/null)
 qmtime=$(stat -c %Y "$QCACHE" 2>/dev/null || echo 0)
 if [ $((now - qmtime)) -ge $QTTL ] || [ "$qacct" != "$acct" ]; then
-  ( "$HOME/.claude/statusline-quota-refresh.sh" >/dev/null 2>&1 & )
+  qstamp=$(stat -c %Y "$QSTAMP" 2>/dev/null || echo 0)
+  if [ $((now - qstamp)) -ge $QTTL ] && [ -x "$QREFRESH" ]; then
+    : > "$QSTAMP" 2>/dev/null || true
+    (
+      candidate=
+      if [ -n "$qprofile" ] && [ -d "$qprofile" ] && [ ! -L "$qprofile" ]; then
+        qhome="$QDIR/probe-home"
+        mkdir -p "$qhome/.claude/cache" 2>/dev/null || exit 0
+        chmod 700 "$qhome" "$qhome/.claude" "$qhome/.claude/cache" 2>/dev/null || exit 0
+        ln -sfn "$qprofile/.claude.json" "$qhome/.claude.json" 2>/dev/null || exit 0
+        ln -sfn "$qprofile/.credentials.json" "$qhome/.claude/.credentials.json" 2>/dev/null || exit 0
+        HOME="$qhome" CLAUDE_CONFIG_DIR="$qprofile" "$QREFRESH" >/dev/null 2>&1
+        candidate="$qhome/.claude/cache/quota_headers"
+      else
+        "$QREFRESH" >/dev/null 2>&1
+        candidate="$HOME/.claude/cache/quota_headers"
+      fi
+      candidate_acct=$(awk -F': ' '$1=="x-probe-account"{print $2}' "$candidate" 2>/dev/null)
+      if [ -f "$candidate" ] && [ "$candidate_acct" = "$acct" ]; then
+        qtmp=$(mktemp "$QDIR/quota_headers.tmp.XXXXXXXX" 2>/dev/null) || exit 0
+        if cp "$candidate" "$qtmp" 2>/dev/null &&
+          chmod 600 "$qtmp" 2>/dev/null && mv "$qtmp" "$QCACHE"; then
+          :
+        else
+          rm -f -- "$qtmp"
+        fi
+      fi
+    ) &
+  fi
 fi
 
 quota_color() {

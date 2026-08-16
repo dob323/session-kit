@@ -110,6 +110,86 @@ class ProviderAdviceTests(unittest.TestCase):
         with mock.patch.object(accounts.time, "time", return_value=NOW):
             return accounts.account_choices(self.config, provider)
 
+    def test_a_resting_account_with_a_healthy_probe_is_selectable(self) -> None:
+        """`serving` is the cron-lane toggle, never an interactive gate."""
+        self.write(
+            self.roster,
+            {
+                "ts": NOW,
+                "accounts": [
+                    {"health": "ok", "serving": False, "email": "one@invalid.example",
+                     "u5h": 0.34, "u7d": 0.36},
+                    {"health": "ok", "serving": True, "email": "two@invalid.example"},
+                ],
+                "codex_accounts": [],
+            },
+        )
+        rows = {row["alias"]: row for row in self.choices("claude")["choices"]}
+        self.assertTrue(rows["one"]["eligible"])
+        self.assertEqual("ready", rows["one"]["state"])
+        self.assertFalse(rows["one"]["serving"])
+        self.assertTrue(rows["two"]["eligible"])
+
+    def test_a_failed_probe_still_blocks_and_names_itself(self) -> None:
+        self.write(
+            self.roster,
+            {
+                "ts": NOW,
+                "accounts": [
+                    {"health": "expired", "serving": True, "email": "one@invalid.example"},
+                ],
+                "codex_accounts": [],
+            },
+        )
+        rows = {row["alias"]: row for row in self.choices("claude")["choices"]}
+        self.assertFalse(rows["one"]["eligible"])
+        self.assertEqual("blocked: health expired", rows["one"]["state"])
+        self.assertEqual(
+            "blocked: not in the account roster", rows["two"]["state"]
+        )
+
+    def test_a_stale_or_absent_roster_fails_open_to_the_registry(self) -> None:
+        """A dead feed process must never brick session creation."""
+        self.write(
+            self.roster,
+            {"ts": NOW - 3600, "accounts": [], "codex_accounts": []},
+        )
+        payload = self.choices("claude")
+        self.assertFalse(payload["roster_fresh"])
+        self.assertEqual("stale", payload["roster_state"])
+        for row in payload["choices"]:
+            self.assertTrue(row["eligible"])
+            self.assertEqual("ready (feed stale)", row["state"])
+            self.assertEqual("unverified", row["health"])
+        self.roster.unlink()
+        payload = self.choices("claude")
+        self.assertEqual("absent", payload["roster_state"])
+        self.assertTrue(all(row["eligible"] for row in payload["choices"]))
+
+    def test_a_blocked_advised_account_is_reported_not_silently_dropped(self) -> None:
+        self.write(
+            self.roster,
+            {
+                "ts": NOW,
+                "accounts": [
+                    {"health": "error", "serving": True, "email": "one@invalid.example"},
+                    {"health": "ok", "serving": True, "email": "two@invalid.example"},
+                ],
+                "codex_accounts": [],
+            },
+        )
+        self.write(
+            self.advice,
+            {"ts": NOW, "use_now": {"account": "one@invalid.example", "why": "soonest reset"}},
+        )
+        payload = self.choices("claude")
+        self.assertIsNone(payload["recommendation"])
+        self.assertEqual("", payload["recommendation_reason"])
+        self.assertEqual(
+            {"alias": "one", "state": "blocked: health error"},
+            payload["recommendation_blocked"],
+        )
+
     def test_a_provider_keyed_recommendation_reaches_codex(self) -> None:
         self.write(
             self.advice,

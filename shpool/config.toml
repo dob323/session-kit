@@ -2,12 +2,14 @@
 # Docs: https://github.com/shell-pool/shpool/blob/master/CONFIG.md
 # The daemon hot-reloads this file — no restart, no session loss.
 
-# On reattach, restore up to 500 recent rendered terminal rows. Complete raw
-# journals remain explicit through `sp history`; reconnect never streams them.
-session_restore_mode = { lines = 500 }
+# "simple": on reattach emit NOTHING from the spool; SIGWINCH makes the live
+# program redraw its own screen. Replaying spooled frames of a cell-diffing
+# TUI (Claude Code, Codex) interleaves cells from different frames — braided
+# corruption no width or line count fixes. Clean reading is `sp history`.
+session_restore_mode = "simple"
 
-# The spool is what the daemon RETAINS while detached; restore can never replay
-# more than this. Keep it at least as large as session_restore_mode.lines.
+# The spool is retained while detached; with "simple" restore it is never
+# replayed into a terminal, so these only bound daemon memory.
 output_spool_lines = 1000
 vt100_output_spool_width = 200
 

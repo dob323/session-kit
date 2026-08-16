@@ -8,7 +8,7 @@
 #      The session can never be attached again, nothing drains its terminal,
 #      and whatever runs inside it blocks on its next write, forever.
 #   2. A session stays wired to an SSH window that no longer exists. The
-#      terminal fills, the program blocks, and the session list still says
+#      terminal fills, the program blocks, and the picker still says
 #      "running".
 #
 # Both can look identical from outside: a session that claims to be running and
@@ -32,6 +32,9 @@ LOG_FILE=${SESSION_KIT_WATCHDOG_LOG:-"$STATE_ROOT/session-kit/watchdog.log"}
 REPAIR_FILE=${SESSION_KIT_WATCHDOG_REPAIRS:-"$STATE_ROOT/session-kit/watchdog-repairs.json"}
 SENTINEL=${SESSION_KIT_WATCHDOG_SENTINEL:-"$HOME/.no_shpool_watchdog"}
 NOTIFY_CMD=${SESSION_KIT_WATCHDOG_NOTIFY:-}
+# Where a notice goes when it is not a picker row: the terminal the operator is
+# sitting in, or the away transport when they are not. See bin/session_kit_notice.
+NOTICE_CMD=${SESSION_KIT_NOTICE_CMD:-"$SCRIPT_DIR/session_kit_notice"}
 ALERT_TYPE=${SESSION_KIT_WATCHDOG_ALERT_TYPE:-session-kit.watchdog}
 WATCHDOG_MODE=${SESSION_KIT_WATCHDOG_MODE:-report}
 JOURNAL_UNIT=${SESSION_KIT_WATCHDOG_UNIT:-shpool}
@@ -44,27 +47,37 @@ DEAD_QUIET_SECONDS=${SESSION_KIT_WATCHDOG_DEAD_SECONDS:-2700}
 # How long a quiet-but-unproven session stays reported before being mentioned
 # again.
 QUIET_REPORT_COOLDOWN_SECONDS=${SESSION_KIT_WATCHDOG_QUIET_REPORT_COOLDOWN:-21600}
+# How long a record about a session that no longer exists stays readable before
+# it retires itself. Two days: long enough that a person who was away for a day
+# still sees what happened, short enough that the review list is about the
+# estate as it is now. 0, or SESSION_KIT_WATCHDOG_RETIRE=off, disables it.
+RETIRE_DAYS=${SESSION_KIT_WATCHDOG_RETIRE_DAYS:-2}
+# How long a condition stays quiet after an alert that was NOT delivered. Short
+# enough that a notifier down for a minute costs one retry, long enough that a
+# notifier nobody has configured cannot fill the log.
+QUIET_RETRY_SECONDS=${SESSION_KIT_WATCHDOG_QUIET_RETRY:-900}
 # Seconds allowed for the read-only "is the manager alive" question.
 MANAGER_PROBE_TIMEOUT=${SESSION_KIT_WATCHDOG_MANAGER_TIMEOUT:-20}
 # sha256 of the session-manager binary this machine is supposed to run. Absent
 # means the check is skipped, so nothing breaks if it was never recorded.
 BINARY_FINGERPRINT=${SESSION_KIT_WATCHDOG_BINARY_FINGERPRINT:-"$STATE_ROOT/session-kit/shpool-binary.sha256"}
 REPORT_STATE=${SESSION_KIT_WATCHDOG_REPORT_STATE:-"$STATE_ROOT/session-kit/watchdog-reported.json"}
-# Attention notifications: OFF unless asked for. The picker's Needs You screen
-# is the guaranteed record and always has been; this only carries the same
-# facts to a desktop for someone who is not looking at a picker. It reuses the
-# notifier this watchdog already has, so there is one place to configure and
-# one place that can be muted.
-ATTENTION_NOTIFY=${SESSION_KIT_ATTENTION_NOTIFY:-0}
-[[ $ATTENTION_NOTIFY == 1 ]] || ATTENTION_NOTIFY=0
-ATTENTION_ALERT_TYPE=${SESSION_KIT_ATTENTION_ALERT_TYPE:-session-kit.attention}
-# Long enough that a session which asks and is answered in the same minute is
-# never announced at all.
-ATTENTION_AFTER_SECONDS=${SESSION_KIT_ATTENTION_NOTIFY_AFTER_SECONDS:-600}
-[[ $ATTENTION_AFTER_SECONDS =~ ^[0-9]+$ ]] || ATTENTION_AFTER_SECONDS=600
-ATTENTION_COOLDOWN_SECONDS=${SESSION_KIT_ATTENTION_NOTIFY_COOLDOWN_SECONDS:-3600}
-[[ $ATTENTION_COOLDOWN_SECONDS =~ ^[0-9]+$ ]] || ATTENTION_COOLDOWN_SECONDS=3600
-ATTENTION_STATE=${SESSION_KIT_ATTENTION_NOTIFY_STATE:-"$STATE_ROOT/session-kit/attention-notified.json"}
+# The account handoff rule's own kill switch, shared with the manual switch and
+# with enrolment. Its presence stops every automatic move; nothing here creates
+# it, because it also disables the operator's own manual switch and taking that
+# away automatically would remove their escape hatch at the worst moment.
+# Both of these live beside the account state itself, so they resolve to the
+# same directory the rest of the kit uses. Deriving them from $STATE_ROOT
+# instead was wrong: SESSION_KIT_STATE_DIR moves the account registry, the
+# ledger and this sentinel together, and a kill switch that resolves somewhere
+# else is a kill switch that silently does nothing.
+ACCOUNT_SWITCH_OFF=${SESSION_KIT_ACCOUNT_SWITCH_OFF:-"$SK_STATE_DIR/account-switching-off"}
+# Accounts move over hours, not seconds. Checking every minute would re-read
+# the usage feed sixty times for every window that can possibly have changed.
+ACCOUNT_GUARD_SECONDS=${SESSION_KIT_ACCOUNT_GUARD_SECONDS:-300}
+ACCOUNT_GUARD_LAST=0
+ACCOUNT_GUARD_LOCK=${SESSION_KIT_ACCOUNT_GUARD_LOCK:-"$SK_STATE_DIR/account-guard.lock"}
+ACCOUNT_GUARD_FD=
 ONCE=0
 
 watchdog_usage() {
@@ -115,13 +128,17 @@ log() {
 # Records every repair so the picker can tell the human what happened even if
 # all notification paths are down.
 record_repair() {
-  python3 - "$REPAIR_FILE" "$1" "$2" "$3" "$4" "$5" "$6" <<'PY'
+  python3 - "$REPAIR_FILE" "$1" "$2" "$3" "$4" "$5" "$6" "${7:-}" <<'PY'
 import json
 import os
 import sys
 import time
 
 path, old_id, new_id, title, provider, outcome, reason = sys.argv[1:8]
+# What the sweep KNEW when it wrote this, not just what it said. The latch
+# compares evidence, so a record that cannot name its own evidence must never
+# be read as having had the strong kind.
+evidence = sys.argv[8] if len(sys.argv) > 8 else ""
 try:
     with open(path, encoding="utf-8") as handle:
         data = json.load(handle)
@@ -139,6 +156,7 @@ entries.append(
         "provider": provider,
         "outcome": outcome,
         "reason": reason,
+        "evidence": evidence,
         "acknowledged": False,
     }
 )
@@ -153,6 +171,217 @@ os.replace(tmp, path)
 PY
 }
 
+# Retire records whose session no longer exists.
+#
+# Nothing ever removed a record: acknowledging one only flipped a flag, and the
+# only bound was a 50-slot cap that dropped the OLDEST -- so the list the picker
+# offered filled up with sessions that had not existed for a day, and the
+# operator was asked to clear them one at a time with `d<number>`. Thirty-eight
+# of their fifty named ids that were already gone.
+#
+# A record retires when BOTH hold: its session is absent from a snapshot that
+# proved itself live, and it is older than the retention window. Both, because
+# either alone is unsafe -- a snapshot that momentarily cannot see a session
+# would erase a live warning, and age alone would erase a warning about a
+# session still sitting there broken. A repaired session's record names the OLD
+# id, which is gone by definition, so age is what keeps it readable afterwards.
+#
+# Never touched: a record whose session is still live, a record inside the
+# window, and anything at all when the snapshot is not live. Own-uid,
+# regular-file, no symlink followed. SESSION_KIT_WATCHDOG_RETIRE=off, or
+# SESSION_KIT_WATCHDOG_RETIRE_DAYS=0, disables it; a dry run reports and writes
+# nothing.
+retire_repairs() {
+  local snapshot=$1 dry=${2:-0}
+  [[ ${SESSION_KIT_WATCHDOG_RETIRE:-on} != off ]] || return 0
+  python3 - "$REPAIR_FILE" "$snapshot" "$RETIRE_DAYS" "$dry" \
+    "${SESSION_KIT_STATE_DIR:-$STATE_ROOT/session-kit}/inventory.json" <<'PY'
+import json
+import os
+import stat
+import sys
+import time
+
+path, snapshot_path, days_raw, dry_raw = sys.argv[1:5]
+published_path = sys.argv[5] if len(sys.argv) > 5 else ""
+dry = dry_raw == "1"
+try:
+    days = float(days_raw)
+except ValueError:
+    days = 2.0
+if days <= 0:
+    sys.exit(0)
+
+# No live snapshot, no retirement. A sweep that cannot see the estate must
+# never be the thing that erases what the estate was warned about.
+try:
+    with open(snapshot_path, encoding="utf-8") as handle:
+        inventory = json.load(handle)
+except (OSError, ValueError):
+    sys.exit(0)
+if inventory.get("source") != "live" or inventory.get("stale") is not False:
+    sys.exit(0)
+def names(document):
+    rows = document.get("sessions") if isinstance(document, dict) else None
+    return {
+        str(row.get("shpool_id"))
+        for row in (rows or [])
+        if isinstance(row, dict) and row.get("shpool_id")
+    }
+
+
+live = names(inventory)
+# A snapshot proves what existed when it was captured; it cannot prove that no
+# restore finished afterwards. The published inventory is what a restore
+# updates, so read it too and treat the union as live -- a record retired
+# against a stale view is a warning erased about a session that came back
+# (found in review, 2026-08-15).
+if published_path:
+    try:
+        with open(published_path, encoding="utf-8") as handle:
+            live |= names(json.load(handle))
+    except (OSError, ValueError):
+        pass
+
+flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+try:
+    descriptor = os.open(path, flags)
+except OSError:
+    sys.exit(0)
+try:
+    info = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or info.st_size > 1024 * 1024
+    ):
+        sys.exit(0)
+    with os.fdopen(descriptor, encoding="utf-8") as handle:
+        data = json.load(handle)
+except (OSError, ValueError):
+    sys.exit(0)
+entries = data.get("repairs") if isinstance(data, dict) else None
+if not isinstance(entries, list):
+    sys.exit(0)
+
+cutoff_ms = (time.time() - days * 86400) * 1000
+kept = []
+retired = []
+for item in entries:
+    if not isinstance(item, dict):
+        continue
+    stamp = item.get("at_unix_ms")
+    old = str(item.get("old_shpool_id") or "")
+    # A repaired record names its REPLACEMENT, and that replacement is the
+    # session still carrying the conversation. Retiring on the old id alone
+    # deleted records whose live successor was right there in the snapshot.
+    replacement = str(item.get("new_shpool_id") or "")
+    aged = isinstance(stamp, (int, float)) and not isinstance(stamp, bool) and stamp < cutoff_ms
+    if old and old not in live and replacement not in live and aged:
+        retired.append(old)
+        continue
+    kept.append(item)
+if not retired:
+    sys.exit(0)
+print(f"retired {len(retired)} record(s) for sessions that no longer exist", end="")
+print("" if not dry else " (dry run, nothing written)")
+if dry:
+    sys.exit(0)
+tmp = f"{path}.tmp.{os.getpid()}"
+descriptor = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+    json.dump({"schema_version": 1, "repairs": kept[-50:]}, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+os.replace(tmp, path)
+PY
+}
+
+# One record per session per incident.
+#
+# The 6-hour cooldown was a rate limit, not a latch: a session that stayed
+# quiet earned a FRESH record every six hours, which is how twenty-one distinct
+# sessions became fifty records, one of them listed five times. A second record
+# for a session already on the list tells a person nothing new; it only
+# inflates a count (operator ruling, 2026-08-15).
+#
+# Same incident, or recovered and broke again? The session's own output answers
+# it. A record was written at time T. If the session has produced output SINCE
+# T, it recovered -- whatever went quiet afterwards is a new incident and earns
+# its own record. If its last output still predates T, this is the same
+# unbroken silence and the record already on the list is the whole story.
+# `recent_output_age_seconds` is the same field the detection uses, so the
+# latch can never disagree with what put the session on the list.
+#
+# Unknown output age suppresses: a duplicate is worse than a late record, and
+# an unacknowledged record is already saying this session needs looking at.
+# Acknowledged and repaired records never latch -- a person who cleared the row
+# has said they are done with it, so the next incident is allowed to speak.
+already_recorded_incident() {
+  local wanted=$1 age=$2 evidence=${3:-}
+  python3 - "$REPAIR_FILE" "$wanted" "$age" "$evidence" <<'INNERPY'
+import json
+import sys
+import time
+
+path, wanted, age_raw = sys.argv[1:4]
+incoming = sys.argv[4] if len(sys.argv) > 4 else ""
+
+# One record per incident AND per statement. Time alone cannot tell "same
+# silence, same story" from "same silence, and we have since learned why": once
+# a session had any unacknowledged `reported` row, the DAEMON-MARKER verdict --
+# the strongest per-session evidence the watchdog has, and the whole reason it
+# exists -- was suppressed for that session. A wedged terminal never stops
+# being quiet and retirement only clears records whose session is GONE, so that
+# was in practice forever, and the operator's list said "reported quiet, no
+# repair attempted" about a terminal the daemon had already proven dead (found
+# in review, 2026-08-15).
+#
+# Strength, not novelty: a repeat of the SAME statement is still one record,
+# but anything stronger is a new thing to say and gets its own row.
+#
+# A record written before this field existed reads as SILENCE-ONLY, not as
+# nothing. Reading it as nothing would let an ordinary silence report escalate
+# past it, and every one of the fifty rows already on the operator's disk would
+# duplicate itself on the next sweep -- the exact defect the latch was added to
+# stop. Unknown means "the weak kind", which is what those rows all were.
+STRENGTH = {"silence-only": 1, "daemon-marker": 2}
+incoming_strength = STRENGTH.get(incoming, 1)
+try:
+    with open(path, encoding="utf-8") as handle:
+        entries = json.load(handle)["repairs"]
+    if not isinstance(entries, list):
+        raise ValueError
+except (OSError, ValueError, KeyError, TypeError):
+    raise SystemExit(1)
+
+try:
+    age = float(age_raw)
+except ValueError:
+    age = -1.0
+last_output_ms = None if age < 0 else (time.time() - age) * 1000
+
+for item in entries:
+    if not isinstance(item, dict):
+        continue
+    if item.get("old_shpool_id") != wanted or item.get("acknowledged"):
+        continue
+    if item.get("outcome") == "repaired":
+        continue
+    stamp = item.get("at_unix_ms")
+    if not isinstance(stamp, (int, float)) or isinstance(stamp, bool):
+        continue
+    if STRENGTH.get(str(item.get("evidence") or ""), 1) < incoming_strength:
+        # We have learned something stronger about this session than anything
+        # already on the list. Say it.
+        continue
+    if last_output_ms is None or last_output_ms <= stamp:
+        raise SystemExit(0)
+raise SystemExit(1)
+INNERPY
+}
+
 # Always "warning": an automatic repair, successful or not, must never fire a
 # critical and wake a phone. The picker banner is the guaranteed record.
 notify() {
@@ -163,228 +392,26 @@ notify() {
   # detected a daemon-wide freeze and the alert went nowhere, because
   # SESSION_KIT_WATCHDOG_NOTIFY had never been set. Name the two cases apart so
   # the log says which one it is.
+  # Non-zero means nothing was reached. Callers that record a condition as
+  # reported depend on this: a notifier that always returned success is how a
+  # dropped alert came to be stamped as delivered and suppressed for six hours
+  # (it happened on 2026-08-06, and the state file said the operator was told).
   if [[ -z $NOTIFY_CMD ]]; then
     log "notify skipped: SESSION_KIT_WATCHDOG_NOTIFY is not set, so no alert is delivered anywhere"
-    return 0
+    return 1
   fi
   if [[ ! -x $NOTIFY_CMD ]]; then
     log "notify skipped: $NOTIFY_CMD is not executable"
-    return 0
+    return 1
   fi
-  "$NOTIFY_CMD" \
+  if ! "$NOTIFY_CMD" \
     "--type=$alert_type" \
     "--severity=warning" \
     "--title=$subject" \
-    "--body=$body" >/dev/null 2>&1 ||
+    "--body=$body" >/dev/null 2>&1; then
     log "notify not delivered for $alert_type (hub down or non-critical drop)"
-}
-
-# ---- attention notifications (opt-in) ----------------------------------
-# Which sessions have been waiting long enough to be worth saying out loud,
-# and have not already been said. Takes the path to a collected inventory and
-# answers with:
-#
-#   line 1  subject
-#   line 2  body
-#   line 3+ one thread key and the wait it belongs to, per announced session
-#
-# Nothing is recorded here: a notifier that fails must not consume the
-# announcement, so the keys are written back only after delivery.
-attention_pending() {
-  python3 - "$ATTENTION_STATE" "$ATTENTION_AFTER_SECONDS" \
-    "$ATTENTION_COOLDOWN_SECONDS" "$SK_STATE_DIR" "$SCRIPT_DIR/../lib" "$1" <<'PY'
-import json
-from pathlib import Path
-import sys
-import time
-import unicodedata
-
-state_path, after_text, cooldown_text, state_dir, library_dir, snapshot_path = (
-    sys.argv[1:7]
-)
-after_ms = int(after_text) * 1000
-cooldown_ms = int(cooldown_text) * 1000
-try:
-    with open(snapshot_path, encoding="utf-8") as handle:
-        inventory = json.load(handle)
-except (OSError, ValueError):
-    raise SystemExit(0)
-if not isinstance(inventory, dict):
-    raise SystemExit(0)
-# A cached list cannot prove anybody is waiting now.
-if inventory.get("stale") or inventory.get("source") != "live":
-    raise SystemExit(0)
-
-sys.path.insert(0, library_dir)
-try:
-    from sessionkit_events.queue import build_attention_queue
-except ImportError:
-    raise SystemExit(0)
-
-now_ms = int(time.time() * 1000)
-try:
-    # Read-only: a notification must never be what synthesizes an event.
-    queue = build_attention_queue(
-        inventory, Path(state_dir), now_ms=now_ms, mutate=False
-    )
-except Exception:
-    raise SystemExit(0)
-
-try:
-    with open(state_path, encoding="utf-8") as handle:
-        seen = json.load(handle)["announced"]
-    if not isinstance(seen, dict):
-        seen = {}
-except (OSError, ValueError, KeyError, TypeError):
-    seen = {}
-
-
-def clean(value, limit=60):
-    text = "".join(
-        " " if unicodedata.category(character).startswith("C") else character
-        for character in str(value or "")
-    )
-    return " ".join(text.split())[:limit]
-
-
-def duration(milliseconds):
-    minutes = max(0, milliseconds // 60000)
-    if minutes < 60:
-        return f"{minutes} min"
-    hours, minutes = divmod(minutes, 60)
-    if hours < 24:
-        return f"{hours} hr"
-    return f"{hours // 24} day{'s' if hours // 24 != 1 else ''}"
-
-
-fresh = []
-for item in queue.get("items", []):
-    if not isinstance(item, dict) or item.get("bucket") != "needs_you":
-        continue
-    key = item.get("thread_key")
-    waiting = item.get("waiting_ms")
-    if not isinstance(key, str) or not key:
-        continue
-    if isinstance(waiting, bool) or not isinstance(waiting, int):
-        continue
-    if waiting < after_ms:
-        continue
-    record = seen.get(key)
-    if isinstance(record, dict):
-        # One announcement per wait. The same session waiting on a NEW
-        # question is a new wait and is announced again; the cooldown only
-        # bounds how often one unbroken wait can repeat.
-        since = record.get("waiting_since_unix_ms")
-        announced = record.get("at_unix_ms")
-        same_wait = since == item.get("waiting_since_unix_ms")
-        recent = (
-            isinstance(announced, (int, float))
-            and now_ms - announced < cooldown_ms
-        )
-        if same_wait and recent:
-            continue
-    fresh.append(item)
-
-if not fresh:
-    raise SystemExit(0)
-
-count = len(fresh)
-subject = f"{count} session{'s' if count != 1 else ''} " + (
-    "need" if count != 1 else "needs"
-) + " you"
-parts = []
-for item in fresh[:3]:
-    provider = clean(item.get("provider"), 12).title() or "Session"
-    title = clean(item.get("title"), 60) or "a session"
-    parts.append(f"{provider} {title} waiting {duration(item.get('waiting_ms') or 0)}")
-if count > 3:
-    parts.append(f"and {count - 3} more")
-print(subject)
-print(" · ".join(parts))
-for item in fresh:
-    # key<TAB>the wait this announcement is for, so the next run can tell
-    # a continuing wait from a new question by the same session.
-    print(f"{item['thread_key']}\t{item.get('waiting_since_unix_ms') or 0}")
-PY
-}
-
-# Record what was actually delivered, keyed by the wait it belongs to. Called
-# only after the notifier ran, so a failed delivery is announced again rather
-# than silently swallowed.
-attention_remember() {
-  python3 - "$ATTENTION_STATE" "$@" <<'REMEMBER'
-import json
-import os
-import sys
-import time
-
-state_path = sys.argv[1]
-pairs = []
-for argument in sys.argv[2:]:
-    key, _, since = argument.partition("\t")
-    if key:
-        pairs.append((key, int(since) if since.isdigit() else 0))
-if not pairs:
-    raise SystemExit(0)
-now_ms = int(time.time() * 1000)
-try:
-    with open(state_path, encoding="utf-8") as handle:
-        entries = json.load(handle)["announced"]
-    if not isinstance(entries, dict):
-        entries = {}
-except (OSError, ValueError, KeyError, TypeError):
-    entries = {}
-for key, since in pairs:
-    entries[key] = {"at_unix_ms": now_ms, "waiting_since_unix_ms": since}
-# A key that can never match a live session again costs nothing to forget.
-if len(entries) > 200:
-    entries = dict(
-        sorted(
-            entries.items(),
-            key=lambda item: (item[1] or {}).get("at_unix_ms", 0),
-        )[-200:]
-    )
-tmp = f"{state_path}.tmp.{os.getpid()}"
-descriptor = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-    json.dump({"schema_version": 1, "announced": entries}, handle, sort_keys=True)
-    handle.write("\n")
-    handle.flush()
-    os.fsync(handle.fileno())
-os.replace(tmp, state_path)
-REMEMBER
-}
-
-attention_check() {
-  (( ATTENTION_NOTIFY == 1 )) || return 0
-  [[ -e $SENTINEL ]] && return 0
-  if [[ -z $NOTIFY_CMD || ! -x $NOTIFY_CMD ]]; then
-    log "attention notify skipped: SESSION_KIT_ATTENTION_NOTIFY is on but no usable SESSION_KIT_WATCHDOG_NOTIFY is set"
-    return 0
+    return 1
   fi
-  local snapshot answer subject body
-  local -a keys=()
-  # The collected list goes to an owner-private file rather than a pipe: the
-  # helper's own program arrives on standard input, so an inventory sent that
-  # way would be read as part of the program and silently ignored.
-  snapshot=$(mktemp "$SK_STATE_DIR/attention-snapshot.XXXXXX") || return 0
-  chmod 600 "$snapshot" 2>/dev/null || true
-  if ! sk_timeout "$MANAGER_PROBE_TIMEOUT" "$STATUS_CMD" --json \
-       >"$snapshot" 2>/dev/null; then
-    command rm -f -- "$snapshot"
-    return 0
-  fi
-  answer=$(attention_pending "$snapshot") || answer=""
-  command rm -f -- "$snapshot"
-  [[ -n $answer ]] || return 0
-  mapfile -t keys <<<"$answer"
-  (( ${#keys[@]} >= 3 )) || return 0
-  subject=${keys[0]}
-  body=${keys[1]}
-  keys=("${keys[@]:2}")
-  log "attention: ${#keys[@]} session(s) waiting past ${ATTENTION_AFTER_SECONDS}s"
-  notify "$subject" "$body" "$ATTENTION_ALERT_TYPE"
-  attention_remember "${keys[@]}" || true
 }
 
 # Timestamped attach outcomes from the current journal window. The daemon's
@@ -446,6 +473,18 @@ dead_sessions() {
     command rm -f -- "$snapshot"
     return 3
   fi
+  # Retirement runs FIRST, before a single verdict leaves this function.
+  # It was at the end, after the verdict stream had already started: the
+  # caller reads that stream through a process substitution and calls
+  # record_repair as verdicts arrive, so two read-modify-replace writers were
+  # live on the same file at once and either could clobber the other (found in
+  # review, 2026-08-15). Running it here serializes them with no lock: nothing
+  # can be recorded until retirement has finished. Best-effort either way --
+  # retiring stale bookkeeping must never fail the sweep that finds real
+  # faults.
+  local retired
+  retired=$(retire_repairs "$snapshot" "${SESSION_KIT_WATCHDOG_RETIRE_DRY_RUN:-0}" 2>/dev/null) || retired=""
+  [[ -z $retired ]] || log "$retired"
   python3 - "$snapshot" "$events" \
     "$FLAGGED_QUIET_SECONDS" "$DEAD_QUIET_SECONDS" <<'PY'
 import json
@@ -456,6 +495,22 @@ import time
 snapshot_path, events_raw, flagged_quiet_raw, dead_quiet_raw = sys.argv[1:5]
 flagged_quiet = int(flagged_quiet_raw)
 dead_quiet = int(dead_quiet_raw)
+
+# The provider's own words for "the turn's computation is finished and only a
+# person advances it". Deliberately the SAME three the provider bounce already
+# trusts for this exact judgement (lib/sh/sp_provider_bounce.sh), so the estate
+# has one definition of a waiting session rather than two that can drift.
+WAITING_STATES = frozenset({"idle", "needs your reply", "reply optional"})
+# `needs_you` is NOT purely a turn-state field. The snapshot publisher folds
+# fleet stall flags into it (lib/session_inventory.py publish_view_fields, and
+# SNAPSHOT.md "Fleet stalls fold into needs_you"): a session another observer
+# believes is stuck comes back with needs_you true and its reason listed. Those
+# reasons are FAULTS, not a person's turn, so a genuinely wedged session was
+# being excluded from detection precisely because something else had already
+# noticed it was stuck (found in review, 2026-08-15). A live fault also beats a
+# provider status word, which can be frozen at whatever the conversation last
+# said before the terminal died.
+FLEET_FAULT_REASONS = frozenset({"unsurfaced", "unanswered", "silent"})
 
 try:
     with open(snapshot_path, encoding="utf-8") as handle:
@@ -573,10 +628,43 @@ for row in sessions:
     age_known = isinstance(age, int) and not isinstance(age, bool)
     # A sufficiently aged failure from this exact daemon generation is direct
     # evidence. Unknown output age is safe to report but not safe to repair.
+    # Quiet because it is WAITING, not because it is wedged. The snapshot this
+    # sweep already fetched carries the provider's own answer to that question,
+    # and the watchdog was not reading it: `needs_you` is set from the
+    # conversation's turn state (the collector sets it when the turn state is
+    # "needs your reply"), and `agent_status` is the provider's own state word.
+    # A session parked at its prompt for a person is in its NORMAL resting
+    # state -- a research session can sit there for days -- and 45 minutes of
+    # journal silence is exactly what that looks like from the outside.
+    #
+    # Reporting it was not a harmless extra. Fifty records, every one
+    # outcome=reported, twelve of them written about sessions that were alive
+    # minutes earlier and merely waiting, is what the operator's picker was
+    # counting as "50 repair failures" (2026-08-15). Silence plus "it is your
+    # turn" is not evidence of a fault, so it is not a candidate at all.
+    #
+    # SILENCE-ONLY PATH ONLY. The daemon-marker branch rests on the daemon's
+    # own handoff-failure line for this exact session and this exact
+    # generation; a genuinely wedged terminal is still caught there whatever
+    # the conversation's turn state says, which is why this test sits after it.
+    raw_reasons = row.get("needs_you_reasons")
+    fleet_fault = bool(
+        FLEET_FAULT_REASONS
+        & {
+            str(reason).strip().casefold()
+            for reason in (raw_reasons if isinstance(raw_reasons, list) else ())
+        }
+    )
+    waiting_for_a_human = not fleet_fault and (
+        row.get("needs_you") is True
+        or str(row.get("agent_status") or "").strip().casefold() in WAITING_STATES
+    )
     if was_flagged:
         evidence = "daemon-marker"
         reason = "the daemon logged a terminal handoff failure for this session"
         repair_allowed = age_known and age >= flagged_quiet
+    elif waiting_for_a_human:
+        continue
     elif age_known and age >= dead_quiet:
         evidence = "silence-only"
         reason = "no output for far longer than any normal pause"
@@ -639,38 +727,70 @@ passive_evidence_only=1
 
 repair_session() {
   local verdict=$1 id title provider reason new_id
+  local diagnosis status=0 retry_line recovery_hint
   id=$(json_field "$verdict" shpool_id)
   title=$(json_field "$verdict" title)
   provider=$(json_field "$verdict" provider)
   reason=$(json_field "$verdict" reason)
   [[ -n $id ]] || return 0
   log "repairing $id ($provider: $title): $reason -- $verdict"
-  new_id=$("$SP_CMD" repair "$id" 2>&1 | tail -n 1)
+  # `sp repair` says whether it worked with its exit status; the new session ID
+  # is what it prints on success. Reading success off the shape of the last
+  # line called a restored session failed whenever `sp` printed a closing note
+  # after the ID, and would have called a failure a success if any diagnostic
+  # happened to start the same way. Keep the streams apart: stdout is the
+  # answer, stderr is the diagnosis.
+  local diagnosis_file
+  diagnosis_file=$(mktemp "$SK_STATE_DIR/watchdog-repair.XXXXXX") || return 0
+  # Repair preserves the original session's ownership. A watchdog may start a
+  # new drill of its own as a machine session, but fixing a person's session
+  # must never hide the replacement from the list that person opens.
+  new_id=$("$SP_CMD" repair "$id" 2>"$diagnosis_file") || status=$?
+  diagnosis=$(tr '\n' ' ' < "$diagnosis_file")
+  command rm -f -- "$diagnosis_file"
+  new_id=${new_id##*$'\n'}
   # A loaded daemon can miss the inventory timeout, and the mutation guard then
   # correctly refuses to act on stale data. That is a blind spot, not a failed
   # repair: say so in the log and try again next sweep rather than recording a
   # failure and announcing one.
-  case "$new_id" in
+  case "$diagnosis$new_id" in
     *"snapshot unavailable"*|*"stale"*|*"guard live inventory unavailable"*)
-      log "repair deferred for $id: live inventory unavailable ($new_id)"
+      log "repair deferred for $id: live inventory unavailable ($diagnosis$new_id)"
       return 0
       ;;
   esac
-  if [[ $new_id == s2* ]]; then
+  if (( status == 0 )) && [[ $new_id == s2* ]]; then
     log "repaired $id -> $new_id"
-    record_repair "$id" "$new_id" "$title" "$provider" repaired "$reason" || true
-    notify "Session recovered: ${title:-$id}" \
-      "The terminal for \"${title:-$id}\" stopped working, so the session could not be opened and its work had stopped ($reason). The conversation was moved to a new session and is running again. Nothing else changed."
+    record_repair "$id" "$new_id" "$title" "$provider" repaired "$reason" daemon-marker ||
+      log "repair record could not be written for $id -> $new_id"
+    notify "Session restored: ${title:-$id}" \
+      "\"${title:-$id}\" stopped working, so it could not be opened and its work had stopped ($reason). The conversation moved to a new session and is running again." ||
+      true
   else
-    log "repair FAILED for $id: $new_id"
-    record_repair "$id" "" "$title" "$provider" failed "$reason" || true
-    notify "Session could not be recovered: ${title:-$id}" \
-      "The terminal for \"${title:-$id}\" stopped working and the automatic repair did not succeed. The conversation is still saved -- open the session list to recover it by hand."
+    log "repair FAILED for $id (status $status): ${diagnosis:-$new_id}"
+    record_repair "$id" "" "$title" "$provider" failed "$reason" daemon-marker ||
+      log "repair record could not be written for the failed repair of $id"
+    # The original session is closed by the time most repairs fail, so "open
+    # the picker" is not a route back. When `sp` printed the exact restore
+    # command, carry it: it is the one thing that does work.
+    recovery_hint="The conversation is saved. Open the picker to restore it."
+    retry_line=$(grep -o 'sp restore-exact [^ ]* [^ ]* [^ ]*' <<<"$diagnosis" | head -n 1)
+    if [[ -n $retry_line ]]; then
+      recovery_hint="The session is already closed, so the picker has nothing to open. The conversation is saved. Restore it with: $retry_line"
+    fi
+    notify "Session could not be restored: ${title:-$id}" \
+      "\"${title:-$id}\" stopped working and the automatic repair did not succeed. $recovery_hint" ||
+      true
   fi
 }
 
-# Remembers which sessions have already been reported as quiet, so a session
-# parked for days produces one report rather than one a minute.
+# The time-based cooldown, now used ONLY by the manager-level `health:` alerts
+# in report_once. Per-session records latch on the incident instead (see
+# already_recorded_incident above): a rate limit was the wrong shape for them,
+# because it let one unbroken silence write a fresh record every six hours. It
+# remains the right shape here -- these are notifier alerts about a condition
+# with no session to ask about recovery, so elapsed time is the only thing that
+# can license repeating one.
 already_reported_quiet() {
   local id=$1
   python3 - "$REPORT_STATE" "$id" "$QUIET_REPORT_COOLDOWN_SECONDS" <<'PY'
@@ -690,15 +810,19 @@ raise SystemExit(0 if time.time() - seen < int(cooldown_text) else 1)
 PY
 }
 
+# The hold is how long the condition stays quiet. The default is the full
+# cooldown -- one message per condition per six hours. A delivery that failed
+# passes the short retry window instead, so the next sweep speaks again rather
+# than the fault going quiet on the strength of an alert nobody received.
 remember_quiet_report() {
-  local id=$1
-  python3 - "$REPORT_STATE" "$id" <<'PY'
+  local id=$1 hold=${2:-$QUIET_REPORT_COOLDOWN_SECONDS}
+  python3 - "$REPORT_STATE" "$id" "$QUIET_REPORT_COOLDOWN_SECONDS" "$hold" <<'PY'
 import json
 import os
 import sys
 import time
 
-path, wanted = sys.argv[1:3]
+path, wanted, cooldown_text, hold_text = sys.argv[1:5]
 try:
     with open(path, encoding="utf-8") as handle:
         entries = json.load(handle)["reported"]
@@ -706,7 +830,11 @@ try:
         entries = {}
 except (OSError, ValueError, KeyError):
     entries = {}
-entries[wanted] = time.time()
+cooldown = int(cooldown_text)
+hold = min(int(hold_text), cooldown)
+# already_reported_quiet asks whether now - stamp is under the cooldown, so a
+# shorter hold is a stamp placed that much further back.
+entries[wanted] = time.time() - (cooldown - hold)
 # Keep the file small; a stale id can never match a live session anyway.
 if len(entries) > 200:
     entries = dict(sorted(entries.items(), key=lambda item: item[1])[-200:])
@@ -730,8 +858,8 @@ sweep() {
     evidence=$(json_field "$verdict" evidence)
     if [[ $evidence == manager-missing-thread ]]; then
       report_once serving-thread-mismatch \
-        "Session manager thread count is inconsistent" \
-        "The manager has fewer terminal-serving threads than listed sessions. The count cannot identify which session is affected, so no session was changed. Inspect the manager journal and session history."
+        "Session manager is serving fewer sessions than it lists" \
+        "The manager serves fewer sessions than it lists. The count cannot say which session is affected, so nothing was changed. The manager log and session history show the detail."
       continue
     fi
     id=$(json_field "$verdict" shpool_id)
@@ -739,23 +867,23 @@ sweep() {
     if [[ $evidence == silence-only ]]; then
       # Nothing but silence. Report it and let a human decide; closing a
       # session on this alone would eventually close an idle one.
-      if ! already_reported_quiet "$id"; then
+      if ! already_recorded_incident "$id" \
+           "$(json_field "$verdict" recent_output_age_seconds)" "$evidence"; then
         log "candidate $id is quiet but there is no evidence its terminal is dead; reporting only"
         record_repair "$id" "" "$(json_field "$verdict" title)" \
           "$(json_field "$verdict" provider)" reported \
-          "$(json_field "$verdict" reason)" || true
-        remember_quiet_report "$id" || true
+          "$(json_field "$verdict" reason)" "$evidence" || true
       fi
       continue
     fi
     log "candidate $id has direct evidence its terminal cannot be served"
     if [[ $WATCHDOG_MODE == repair && $(json_field "$verdict" repair_allowed) == True ]]; then
       repair_session "$verdict"
-    elif ! already_reported_quiet "$id"; then
+    elif ! already_recorded_incident "$id" \
+         "$(json_field "$verdict" recent_output_age_seconds)" "$evidence"; then
       record_repair "$id" "" "$(json_field "$verdict" title)" \
         "$(json_field "$verdict" provider)" reported \
-        "$(json_field "$verdict" reason)" || true
-      remember_quiet_report "$id" || true
+        "$(json_field "$verdict" reason)" "$evidence" || true
     fi
   done < <(dead_sessions "$events")
   return 0
@@ -767,8 +895,207 @@ sweep() {
 # open, close and create hung behind it for 73 minutes. Nothing noticed; it was
 # found by walking into it. `list` is read-only and is what the inventory
 # already calls constantly, so asking is free and cannot disturb a session.
+# Its bytes are discarded: this is liveness/report-only and never nominates a
+# repair or any other action. Repair uses guard-live inventory, and `sp repair`
+# binds its close to that guard's exact socket-holder generation.
 manager_answers() {
   sk_timeout "$MANAGER_PROBE_TIMEOUT" "$SK_SHPOOL" list >/dev/null 2>&1
+}
+
+# Carry conversations off accounts that have run dry, and say so afterwards.
+#
+# Ordering matters and is deliberate. The cheap account-level question comes
+# first: `account auto-spent` answers from the usage feed alone, and answers
+# "nothing" whenever the feed is stale or the kill switch is set. Only when an
+# account really is spent does this look at sessions at all, so the ordinary
+# minute costs one feed read and nothing else.
+#
+# The move itself is `sp account-auto-switch`, which re-proves everything from
+# its own fresh snapshot. Nothing about safety is decided here.
+account_guard_pass() {
+  [[ -e $SENTINEL ]] && return 0
+  local now spent inventory targets id line outcome marker provider
+  now=$(date -u '+%s')
+  (( now - ACCOUNT_GUARD_LAST >= ACCOUNT_GUARD_SECONDS )) || return 0
+  ACCOUNT_GUARD_LAST=$now
+  # One pass at a time across the machine, not just within this process. The
+  # resident loop, a hand-run `--once` and the macOS launchd agent can all be
+  # alive together, and "one move per pass" has to mean one move. The ledger
+  # refuses a second reservation anyway; this stops two passes racing for the
+  # same target's remaining reserve before either move is visible in the feed.
+  exec {ACCOUNT_GUARD_FD}>>"$ACCOUNT_GUARD_LOCK" || return 0
+  if ! flock -n "$ACCOUNT_GUARD_FD"; then
+    exec {ACCOUNT_GUARD_FD}>&-
+    log "account guard: another pass holds the lock; skipping this one"
+    return 0
+  fi
+  account_guard_locked_pass
+  local status=$?
+  flock -u "$ACCOUNT_GUARD_FD" 2>/dev/null || true
+  exec {ACCOUNT_GUARD_FD}>&-
+  return "$status"
+}
+
+account_guard_locked_pass() {
+  local now spent inventory targets id line outcome marker provider
+  now=$(date -u '+%s')
+  # Debts first, and before the kill switch is consulted. Switching automatic
+  # moves off stops future moves; it does not un-owe the operator a message
+  # about one that already happened.
+  deliver_account_notices
+  [[ -e $ACCOUNT_SWITCH_OFF ]] && return 0
+  for provider in claude codex; do
+    spent=$(python3 "$SK_INVENTORY_CORE" account auto-spent "$provider" 2>/dev/null) ||
+      continue
+    python3 -c '
+import json
+import sys
+try:
+    value = json.load(sys.stdin)
+except ValueError:
+    raise SystemExit(1)
+raise SystemExit(0 if value.get("fresh") is True and value.get("aliases") else 1)
+' <<<"$spent" || continue
+    # --guard-json, not --json: the mutation guards' snapshot is live-only and
+    # writes nothing, so a periodic account check cannot republish the cached
+    # inventory as a side effect, and cached rows can never name a target.
+    inventory=$("$STATUS_CMD" --guard-json 2>/dev/null) || continue
+    targets=$(python3 -c '
+import json
+import sys
+
+spent = json.loads(sys.argv[1])
+aliases = set(spent.get("aliases") or [])
+provider = spent.get("provider")
+try:
+    data = json.load(sys.stdin)
+except ValueError:
+    raise SystemExit(0)
+for row in data.get("sessions", []):
+    if not isinstance(row, dict):
+        continue
+    identity = row.get("identity") or {}
+    if (
+        row.get("provider") == provider
+        and row.get("account_alias") in aliases
+        and identity.get("uuid")
+        and row.get("mutation_allowed") is True
+    ):
+        raw = str(row.get("shpool_id_raw") or "")
+        if raw:
+            print(raw)
+' "$spent" <<<"$inventory" 2>/dev/null) || continue
+    while IFS= read -r id; do
+      [[ -n $id ]] || continue
+      # One move per pass across the whole estate. If several conversations
+      # share a spent account, the rest are looked at again next time -- with
+      # the target's usage re-read -- so a burst can never push one account
+      # through the reserve in a single sweep.
+      if [[ $WATCHDOG_MODE == repair ]]; then
+        outcome=$(SESSION_KIT_AUTO_SWITCH_MARKER=1 \
+          "$SP_CMD" account-auto-switch "$id" --apply 2>&1) || {
+          log "account guard: $id was not moved: ${outcome//$'\n'/ }"
+          continue
+        }
+      else
+        outcome=$("$SP_CMD" account-auto-switch "$id" --dry-run 2>&1) || {
+          log "account guard: $id could not be judged: ${outcome//$'\n'/ }"
+          continue
+        }
+      fi
+      marker=$(grep -m1 '^SESSION_KIT_AUTO_SWITCH	' <<<"$outcome" || true)
+      line=$(grep -m1 -v '^SESSION_KIT_AUTO_SWITCH	' <<<"$outcome" || true)
+      if [[ -n $marker ]]; then
+        log "account guard: $line"
+        announce_account_move "$id" "$line" "$marker"
+        return 0
+      fi
+      case "$line" in
+        "Would move "*)
+          # Report mode: the watchdog is not permitted to act on live
+          # sessions here, so say what the rule decided and change nothing.
+          if ! already_reported_quiet "account:$id"; then
+            log "account guard (report mode): $line"
+            if notify "A session is on an account that has run dry" \
+              "$line Automatic account changes need SESSION_KIT_WATCHDOG_MODE=repair; nothing was changed." \
+              "$ALERT_TYPE"; then
+              remember_quiet_report "account:$id" || true
+            else
+              remember_quiet_report "account:$id" "$QUIET_RETRY_SECONDS" || true
+            fi
+          fi
+          return 0
+          ;;
+        *"waits for you"*|*"stood down"*)
+          if ! already_reported_quiet "account:$id"; then
+            log "account guard: $line"
+            if notify "A session ran out of account quota" "$line" "$ALERT_TYPE"; then
+              remember_quiet_report "account:$id" || true
+            else
+              remember_quiet_report "account:$id" "$QUIET_RETRY_SECONDS" || true
+            fi
+          fi
+          ;;
+      esac
+    done <<<"$targets"
+  done
+  return 0
+}
+
+# Tell the operator about a move that already happened, exactly once.
+#
+# The claim is taken in the ledger, never here: a watchdog restarted between
+# the move and the message must not send it twice, and two passes must not
+# both claim one move. `account auto-announce` succeeds for exactly one caller.
+#
+# There is deliberately no picker banner row. The picker renders every
+# unacknowledged repair record as "automatic repair failed"
+# (lib/sh/shpool_login_render.sh), so a successful account move written there
+# would read to the operator as a failure. The durable records are this log,
+# the hop ledger, and the action log.
+announce_account_move() {
+  local id=$1 sentence=$2 marker=$3 provider uuid source target token
+  IFS=$'\t' read -r _ _ provider uuid source target token <<<"$marker"
+  [[ -n $provider && -n $uuid && -n $token ]] || {
+    log "account guard: a move was reported without its identity; it cannot be queued for the operator"
+    return 1
+  }
+  python3 "$SK_INVENTORY_CORE" account auto-queue-notice "$provider" "$uuid" \
+    "$token" "$sentence" >/dev/null 2>&1 || true
+  deliver_account_notices
+}
+
+# Try to deliver every notice still owed, oldest first. Runs on every pass, so
+# a notice queued while the notifier was down is retried until it lands.
+deliver_account_notices() {
+  local owed provider uuid token sentence
+  owed=$(python3 "$SK_INVENTORY_CORE" account auto-pending-notices 2>/dev/null) || return 0
+  while IFS=$'\t' read -r provider uuid token sentence; do
+    [[ -n $token ]] || continue
+    if notify "A session moved to another subscription account" "$sentence" \
+      "$ALERT_TYPE"; then
+      python3 "$SK_INVENTORY_CORE" account auto-notice-delivered \
+        "$provider" "$uuid" "$token" >/dev/null 2>&1 || true
+      log "account guard: told the operator about move $token"
+    else
+      # Still owed. Nothing is marked delivered, so the next pass retries.
+      log "account guard: the notice for move $token was not delivered anywhere; it stays queued"
+      return 0
+    fi
+  done < <(printf '%s' "$owed" | python3 -c '
+import json
+import sys
+
+try:
+    value = json.load(sys.stdin)
+except ValueError:
+    raise SystemExit(0)
+for item in value.get("notices", [])[:8]:
+    row = [str(item.get(key) or "") for key in ("provider", "uuid", "token", "sentence")]
+    if any("\t" in field or "\n" in field for field in row):
+        continue
+    print("\t".join(row))
+')
 }
 
 # Is the running daemon still the binary we expect?
@@ -810,8 +1137,11 @@ report_once() {
   local key=$1 subject=$2 body=$3
   already_reported_quiet "health:$key" && return 0
   log "health: $key"
-  notify "$subject" "$body"
-  remember_quiet_report "health:$key" || true
+  if notify "$subject" "$body"; then
+    remember_quiet_report "health:$key" || true
+  else
+    remember_quiet_report "health:$key" "$QUIET_RETRY_SECONDS" || true
+  fi
 }
 
 health_check() {
@@ -827,22 +1157,72 @@ health_check() {
   fi
   if ! daemon_binary_matches; then
     report_once binary-changed "Session manager is running a different build" \
-      "The running session manager is not the build recorded for this machine. The most likely cause is a routine reinstall replacing it, which silently undoes the fix that stops sessions breaking. See shpool-patch/ in the session-kit repository to rebuild and reinstall it."
+      "The running session manager is not the build recorded for this machine. The most likely cause is a routine reinstall replacing it, which silently undoes the fix that stops sessions breaking. Rebuild it from shpool-patch/ in the Session Kit source."
   fi
+}
+
+# Everything the sweep RECORDED rather than announced -- a session reported
+# quiet, a stall flag, another window's open question -- has a durable record
+# and no announcement. This is where those records get a route to a person.
+# Best effort by construction: a router that cannot run must never fail the
+# sweep that finds real faults.
+notice_sweep() {
+  local answer
+  [[ ${SESSION_KIT_NOTICE:-on} != off ]] || return 0
+  # The watchdog's own off switch turns this off too: a person who parked the
+  # watchdog did not ask to keep hearing from it by another road.
+  [[ ! -e $SENTINEL ]] || return 0
+  [[ -x $NOTICE_CMD ]] || return 0
+  if ! answer=$("$NOTICE_CMD" sweep 2>&1); then
+    # Non-zero means it had something to say and reached nobody. That is the
+    # loudest line this function writes, because it is the one that means a
+    # person was not told.
+    log "notice sweep DID NOT REACH THEM: ${answer//$'\n'/ }"
+    return 0
+  fi
+  # ONE key, not two read in an order the encoder never emits. This tested for
+  # '"routed": 0' followed by '"held": 0', and the router sorts its keys -- so
+  # the quiet case could never match and every idle pass wrote a line. At a
+  # 60-second poll that is 1,440 lines a day saying nothing happened.
+  case "$answer" in
+    *'"quiet": true'*) ;;
+    *) log "notice sweep: ${answer//$'\n'/ }" ;;
+  esac
+  return 0
 }
 
 if (( ONCE )); then
   health_check
-  attention_check
   sweep "${SESSION_KIT_WATCHDOG_SINCE:--60 min}"
+  notice_sweep
+  account_guard_pass
   exit 0
 fi
 
-log "watchdog started (mode=${WATCHDOG_MODE} poll=${POLL_SECONDS}s flagged_quiet=${FLAGGED_QUIET_SECONDS}s dead_quiet=${DEAD_QUIET_SECONDS}s attention_notify=${ATTENTION_NOTIFY})"
-trap 'log "watchdog stopping"; exit 0' HUP INT TERM
+log "watchdog started (mode=${WATCHDOG_MODE} poll=${POLL_SECONDS}s flagged_quiet=${FLAGGED_QUIET_SECONDS}s dead_quiet=${DEAD_QUIET_SECONDS}s)"
+# A stop signal must never cut a repair in half. Exiting from the handler did
+# exactly that: the trap fired the moment the in-flight `sp repair` returned,
+# so a session that had just been closed and relaunched got no record and no
+# notification. The signal is remembered instead and acted on between sweeps,
+# which is the behaviour the unit's TimeoutStopSec was written for.
+WATCHDOG_STOPPING=0
+stop_after_this_sweep() {
+  WATCHDOG_STOPPING=1
+  log "watchdog stop requested; finishing the sweep in flight"
+}
+trap stop_after_this_sweep HUP INT TERM
 while true; do
   health_check
-  attention_check
   sweep "-$(( (POLL_SECONDS * 3 + 59) / 60 )) min"
+  notice_sweep
+  account_guard_pass
+  if (( WATCHDOG_STOPPING )); then
+    log "watchdog stopping"
+    exit 0
+  fi
   sleep "$POLL_SECONDS"
+  if (( WATCHDOG_STOPPING )); then
+    log "watchdog stopping"
+    exit 0
+  fi
 done

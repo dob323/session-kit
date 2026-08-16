@@ -9,7 +9,7 @@ import unittest
 
 REPO = Path(__file__).resolve().parents[1]
 SCANNER = REPO / "tools" / "public-scan"
-APPROVED_DASHBOARD = REPO / "docs" / "assets" / "session-kit-dashboard.png"
+APPROVED_PICKER_IMAGE = REPO / "docs" / "assets" / "session-kit-picker.png"
 
 
 class PublicScanTests(unittest.TestCase):
@@ -74,11 +74,11 @@ class PublicScanTests(unittest.TestCase):
         subprocess.run(["git", "-C", self.root, "commit", "-qm", message], check=True)
 
     def copy_dashboard(
-        self, relative: str = "docs/assets/session-kit-dashboard.png"
+        self, relative: str = "docs/assets/session-kit-picker.png"
     ) -> Path:
         target = self.root / relative
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(APPROVED_DASHBOARD, target)
+        shutil.copyfile(APPROVED_PICKER_IMAGE, target)
         return target
 
     def test_clean_tree_ignores_tool_and_git_caches(self) -> None:

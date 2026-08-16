@@ -10,24 +10,47 @@ import re
 import secrets
 import stat
 import time
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 from .common import CollectionError, PROVIDERS, valid_uuid
 from .model import recovery_spec
 from .state_io import (
+    StateLock,
     atomic_write_private_json,
     create_private_json,
+    ensure_private_directory,
     read_private_json,
 )
+from .terminal import TERMINAL_NUMBER_QUARANTINE_SECONDS
+
+# A closed conversation stops being interesting exactly when the number it
+# freed stops being quarantined. One clock for both, so nothing can survive
+# in one register and be forgotten in the other.
+CLOSE_INTENT_RETENTION_SECONDS = TERMINAL_NUMBER_QUARANTINE_SECONDS
+
+# Exact recovery is useful after the session has disappeared, so it has a
+# seven-day housekeeping lifetime of its own.  This is not a stale-reading
+# guard: stale-reading safety is provided by captured record generations below
+# and does not depend on wall time.
+EXACT_RECOVERY_RETENTION_SECONDS = TERMINAL_NUMBER_QUARANTINE_SECONDS
 
 
-LIFECYCLE_SCHEMA_VERSION = 3
+LIFECYCLE_SCHEMA_VERSION = 4
 MAX_LIFECYCLE_BYTES = 16 * 1024
 _SESSION_ID_RE = re.compile(
     r"(?:main(?:[1-9][0-9]*)?|"
     r"s[0-9]{8}-[0-9]{6}-[1-9][0-9]*(?:-[1-9][0-9]*)?)"
 )
 _BOOT_ID_RE = re.compile(r"[0-9a-fA-F-]{8,128}")
+_RECORD_GENERATION_RE = re.compile(r"[0-9a-f]{64}")
+
+LifecycleGeneration = tuple[str, str]
+
+
+def _lifecycle_lock(state_dir: Path) -> StateLock:
+    directory = state_dir / "lifecycle"
+    ensure_private_directory(directory)
+    return StateLock(directory, directory / "lock")
 
 
 def _checked_session_id(session_id: str) -> str:
@@ -98,6 +121,145 @@ def _last_exact_path(
     return None if key is None else state_dir / "lifecycle" / f"{key}.exact.json"
 
 
+# ---- intentional close ---------------------------------------------------
+# A session that somebody closed on purpose must never come back as a crash
+# offer. Intent is recorded as a tombstone keyed by provider:uuid, written by
+# every deliberate close -- a clean provider exit, the exit menu's close, and
+# `k` from the picker -- and read by the crash queue, which refuses to enqueue
+# a conversation that carries one and drops any entry it already holds for it.
+#
+# The tombstone outlives the session it describes (that is the whole point:
+# the session is gone), so it cannot live in the per-generation lifecycle
+# document, which is pruned the moment its session disappears. It expires on
+# the SAME clock as the terminal number it freed -- one policy, not two.
+CLOSE_INTENT_SCHEMA_VERSION = 1
+MAX_CLOSE_INTENT_BYTES = 256 * 1024
+
+
+def close_intent_path(state_dir: Path) -> Path:
+    # Beside the recovery queue it speaks to, NOT inside lifecycle/, whose
+    # every other file is one keyed generation and whose pruner walks the
+    # directory by name.
+    return state_dir / "closed-conversations.json"
+
+
+def close_intent_lock_path(state_dir: Path) -> Path:
+    # One document, many sessions. Every session on the machine tombstones
+    # into the same file, so two closing at the same moment is ordinary rather
+    # than exotic -- and this is the file whose loss makes a deliberate close
+    # come back as unclaimed lost work.
+    return state_dir / "closed-conversations.lock"
+
+
+def close_intent_key(provider: str, uuid: str) -> str:
+    checked = valid_uuid(uuid)
+    if provider not in PROVIDERS or not checked:
+        raise CollectionError("close intent requires a provider and an exact UUID")
+    return f"{provider}:{checked}"
+
+
+def _validated_close_intents(value: Any) -> dict[str, Any]:
+    if (
+        not isinstance(value, Mapping)
+        or value.get("schema_version") != CLOSE_INTENT_SCHEMA_VERSION
+        or not isinstance(value.get("closed"), Mapping)
+    ):
+        return {"schema_version": CLOSE_INTENT_SCHEMA_VERSION, "closed": {}}
+    closed: dict[str, Any] = {}
+    for key, entry in value["closed"].items():
+        if (
+            not isinstance(key, str)
+            or not isinstance(entry, Mapping)
+            or not isinstance(entry.get("at_unix_ms"), int)
+            or isinstance(entry.get("at_unix_ms"), bool)
+        ):
+            continue
+        closed[key] = {"at_unix_ms": entry["at_unix_ms"]}
+    return {"schema_version": CLOSE_INTENT_SCHEMA_VERSION, "closed": closed}
+
+
+def load_close_intents(
+    state_dir: Path,
+    *,
+    now_unix_ms: int | None = None,
+    retention_seconds: float = CLOSE_INTENT_RETENTION_SECONDS,
+) -> dict[str, Any]:
+    """Every unexpired tombstone. Reading one never writes anything."""
+    document = _validated_close_intents(
+        read_private_json(
+            close_intent_path(state_dir),
+            max_bytes=MAX_CLOSE_INTENT_BYTES,
+            allow_missing=True,
+        )
+    )
+    now = int(time.time() * 1000) if now_unix_ms is None else now_unix_ms
+    horizon = now - int(retention_seconds * 1000)
+    document["closed"] = {
+        key: entry
+        for key, entry in document["closed"].items()
+        if entry["at_unix_ms"] >= horizon
+    }
+    return document
+
+
+def record_close_intent(
+    state_dir: Path,
+    *,
+    provider: str,
+    uuid: str,
+    now_unix_ms: int | None = None,
+    retention_seconds: float = CLOSE_INTENT_RETENTION_SECONDS,
+) -> dict[str, Any]:
+    """Mark one conversation as closed on purpose, and expire the stale ones.
+
+    UNDER A LOCK, and the lock is the point. This is a read/modify/replace of
+    ONE document that every session on the machine tombstones into, so two
+    sessions closing in the same second is ordinary. Unlocked, both read the
+    same predecessor and each replaces it: the last writer erases the other's
+    intent, and a conversation somebody deliberately closed comes back offered
+    as unclaimed lost work. Atomic replacement stops a torn file; it does not
+    stop a lost update, and only one of those two failures had been thought
+    about (found in review, 2026-08-15).
+    """
+    key = close_intent_key(provider, uuid)
+    now = int(time.time() * 1000) if now_unix_ms is None else now_unix_ms
+    ensure_private_directory(state_dir)
+    with StateLock(state_dir, close_intent_lock_path(state_dir)):
+        document = load_close_intents(
+            state_dir,
+            now_unix_ms=now,
+            retention_seconds=retention_seconds,
+        )
+        document["closed"][key] = {"at_unix_ms": now}
+        atomic_write_private_json(close_intent_path(state_dir), document)
+    return document
+
+
+def closed_on_purpose(
+    state_dir: Path,
+    *,
+    provider: Any,
+    uuid: Any,
+    intents: Mapping[str, Any] | None = None,
+    now_unix_ms: int | None = None,
+    retention_seconds: float = CLOSE_INTENT_RETENTION_SECONDS,
+) -> bool:
+    """True when this exact conversation carries an unexpired tombstone."""
+    checked = valid_uuid(uuid)
+    if provider not in PROVIDERS or not checked:
+        return False
+    document = (
+        _validated_close_intents(intents)
+        if intents is not None
+        else load_close_intents(
+            state_dir,
+            now_unix_ms=now_unix_ms,
+            retention_seconds=retention_seconds,
+        )
+    )
+    return f"{provider}:{checked}" in document["closed"]
+
+
 def _positive_number(value: Any, label: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise CollectionError(f"lifecycle {label} is invalid")
@@ -111,7 +273,7 @@ def _validated_state(value: Any, expected_key: str | None = None) -> dict[str, A
         and "conversation_uuid" not in value
     ):
         value = {**value, "schema_version": 3, "conversation_uuid": None}
-    if not isinstance(value, Mapping) or set(value) != {
+    legacy_fields = {
         "schema_version",
         "session_key",
         "boot_id",
@@ -124,7 +286,19 @@ def _validated_state(value: Any, expected_key: str | None = None) -> dict[str, A
         "input_tracking",
         "user_input_after_exit",
         "keep",
-    }:
+    }
+    if not isinstance(value, Mapping):
+        raise CollectionError("lifecycle state has an invalid schema")
+    schema_version = value.get("schema_version")
+    expected_fields = (
+        legacy_fields | {"record_generation"}
+        if schema_version == LIFECYCLE_SCHEMA_VERSION
+        else legacy_fields
+    )
+    if (
+        schema_version not in {3, LIFECYCLE_SCHEMA_VERSION}
+        or set(value) != expected_fields
+    ):
         raise CollectionError("lifecycle state has an invalid schema")
     key = value.get("session_key")
     boot_id = value.get("boot_id")
@@ -132,8 +306,7 @@ def _validated_state(value: Any, expected_key: str | None = None) -> dict[str, A
     conversation_uuid = value.get("conversation_uuid")
     exit_code = value.get("exit_code")
     if (
-        value.get("schema_version") != LIFECYCLE_SCHEMA_VERSION
-        or not isinstance(key, str)
+        not isinstance(key, str)
         or not re.fullmatch(r"[0-9a-f]{64}", key)
         or (expected_key is not None and key != expected_key)
         or not isinstance(boot_id, str)
@@ -150,6 +323,13 @@ def _validated_state(value: Any, expected_key: str | None = None) -> dict[str, A
         or not isinstance(value.get("input_tracking"), bool)
         or not isinstance(value.get("user_input_after_exit"), bool)
         or not isinstance(value.get("keep"), bool)
+        or (
+            schema_version == LIFECYCLE_SCHEMA_VERSION
+            and (
+                not isinstance(value.get("record_generation"), str)
+                or not _RECORD_GENERATION_RE.fullmatch(value["record_generation"])
+            )
+        )
     ):
         raise CollectionError("lifecycle state has invalid fields")
     for name in (
@@ -175,6 +355,42 @@ def load_state(state_dir: Path, session_id: str) -> dict[str, Any] | None:
     return None if value is None else _validated_state(value, key)
 
 
+def cleanup_protected(
+    state_dir: Path,
+    session_ids: Iterable[str],
+) -> set[str]:
+    """Session IDs whose own lifecycle record forbids unattended cleanup.
+
+    The exit menu answers "Automatic cleanup is disabled for this terminal"
+    with a durable `keep`, and typing in the shell after the provider exited
+    is the same promise made by using the terminal. Both bind every engine
+    that closes a session without a person present, not only `--auto-close`.
+    Fails closed: a record that exists but will not read or validate protects
+    its session.
+    """
+    protected: set[str] = set()
+    if _lifecycle_secret(state_dir, create=False) is None:
+        return protected
+    for session_id in session_ids:
+        try:
+            checked = _checked_session_id(session_id)
+        except CollectionError:
+            continue
+        path = lifecycle_path(state_dir, checked)
+        if path is None or not path.exists():
+            continue
+        try:
+            state = load_state(state_dir, checked)
+        except CollectionError:
+            protected.add(checked)
+            continue
+        if state is None:
+            continue
+        if state["keep"] or state["user_input_after_exit"]:
+            protected.add(checked)
+    return protected
+
+
 def record_provider_exit(
     state_dir: Path,
     *,
@@ -194,58 +410,60 @@ def record_provider_exit(
         and valid_uuid(conversation_uuid) != conversation_uuid
     ):
         raise CollectionError("provider-exit conversation UUID is invalid")
-    key = session_key(state_dir, session_id, create=True)
-    assert key is not None
-    previous = load_state(state_dir, session_id)
-    same_generation = bool(
-        previous
-        and previous["boot_id"] == boot_id
-        and previous["shell_pid"] == shell_pid
-        and previous["shell_start_ticks"] == shell_start_ticks
-    )
-    if same_generation and previous is not None:
-        prior_conversation = previous.get("conversation_uuid")
-        if previous.get("provider") != provider:
-            raise CollectionError(
-                "provider-exit provider changed within one shell generation"
-            )
-        if (
-            prior_conversation is not None
-            and conversation_uuid is not None
-            and prior_conversation != conversation_uuid
-        ):
-            raise CollectionError(
-                "provider-exit conversation changed within one shell generation"
-            )
-        if conversation_uuid is None:
-            conversation_uuid = prior_conversation
-    value = {
-        "schema_version": LIFECYCLE_SCHEMA_VERSION,
-        "session_key": key,
-        "boot_id": boot_id,
-        "shell_pid": shell_pid,
-        "shell_start_ticks": shell_start_ticks,
-        "provider": provider,
-        "conversation_uuid": valid_uuid(conversation_uuid) or None,
-        "provider_exited_at_monotonic_ns": (
-            time.monotonic_ns() if now_monotonic_ns is None else now_monotonic_ns
-        ),
-        "exit_code": exit_code,
-        "input_tracking": input_tracking,
-        "user_input_after_exit": bool(
-            previous["user_input_after_exit"]
-            if same_generation and previous is not None
-            else False
-        ),
-        "keep": bool(
-            previous["keep"] if same_generation and previous is not None else False
-        ),
-    }
-    checked = _validated_state(value, key)
-    path = lifecycle_path(state_dir, session_id)
-    assert path is not None
-    atomic_write_private_json(path, checked)
-    return checked
+    with _lifecycle_lock(state_dir):
+        key = session_key(state_dir, session_id, create=True)
+        assert key is not None
+        previous = load_state(state_dir, session_id)
+        same_generation = bool(
+            previous
+            and previous["boot_id"] == boot_id
+            and previous["shell_pid"] == shell_pid
+            and previous["shell_start_ticks"] == shell_start_ticks
+        )
+        if same_generation and previous is not None:
+            prior_conversation = previous.get("conversation_uuid")
+            if previous.get("provider") != provider:
+                raise CollectionError(
+                    "provider-exit provider changed within one shell generation"
+                )
+            if (
+                prior_conversation is not None
+                and conversation_uuid is not None
+                and prior_conversation != conversation_uuid
+            ):
+                raise CollectionError(
+                    "provider-exit conversation changed within one shell generation"
+                )
+            if conversation_uuid is None:
+                conversation_uuid = prior_conversation
+        value = {
+            "schema_version": LIFECYCLE_SCHEMA_VERSION,
+            "record_generation": secrets.token_hex(32),
+            "session_key": key,
+            "boot_id": boot_id,
+            "shell_pid": shell_pid,
+            "shell_start_ticks": shell_start_ticks,
+            "provider": provider,
+            "conversation_uuid": valid_uuid(conversation_uuid) or None,
+            "provider_exited_at_monotonic_ns": (
+                time.monotonic_ns() if now_monotonic_ns is None else now_monotonic_ns
+            ),
+            "exit_code": exit_code,
+            "input_tracking": input_tracking,
+            "user_input_after_exit": bool(
+                previous["user_input_after_exit"]
+                if same_generation and previous is not None
+                else False
+            ),
+            "keep": bool(
+                previous["keep"] if same_generation and previous is not None else False
+            ),
+        }
+        checked = _validated_state(value, key)
+        path = lifecycle_path(state_dir, session_id)
+        assert path is not None
+        atomic_write_private_json(path, checked)
+        return checked
 
 
 def update_state(
@@ -259,28 +477,31 @@ def update_state(
     keep: bool | None = None,
 ) -> dict[str, Any]:
     """Record permanent shell use or an explicit keep choice."""
-    current = load_state(state_dir, session_id)
-    if current is None:
-        raise CollectionError("provider-exit lifecycle state is unavailable")
-    if (
-        current["boot_id"] != boot_id
-        or current["shell_pid"] != shell_pid
-        or current["shell_start_ticks"] != shell_start_ticks
-    ):
-        raise CollectionError("provider-exit lifecycle generation changed")
-    if event == "user-input":
-        current["user_input_after_exit"] = True
-    elif event == "keep" and isinstance(keep, bool):
-        current["keep"] = keep
-    else:
-        raise CollectionError("unsupported lifecycle update")
-    key = session_key(state_dir, session_id, create=False)
-    assert key is not None
-    checked = _validated_state(current, key)
-    path = lifecycle_path(state_dir, session_id)
-    assert path is not None
-    atomic_write_private_json(path, checked)
-    return checked
+    with _lifecycle_lock(state_dir):
+        current = load_state(state_dir, session_id)
+        if current is None:
+            raise CollectionError("provider-exit lifecycle state is unavailable")
+        if (
+            current["boot_id"] != boot_id
+            or current["shell_pid"] != shell_pid
+            or current["shell_start_ticks"] != shell_start_ticks
+        ):
+            raise CollectionError("provider-exit lifecycle generation changed")
+        if event == "user-input":
+            current["user_input_after_exit"] = True
+        elif event == "keep" and isinstance(keep, bool):
+            current["keep"] = keep
+        else:
+            raise CollectionError("unsupported lifecycle update")
+        current["schema_version"] = LIFECYCLE_SCHEMA_VERSION
+        current["record_generation"] = secrets.token_hex(32)
+        key = session_key(state_dir, session_id, create=False)
+        assert key is not None
+        checked = _validated_state(current, key)
+        path = lifecycle_path(state_dir, session_id)
+        assert path is not None
+        atomic_write_private_json(path, checked)
+        return checked
 
 
 def _same_shell_generation(
@@ -362,7 +583,8 @@ def _last_exact_document(
     session_hash = session_key(state_dir, session_id, create=True)
     assert session_hash is not None
     return {
-        "schema_version": 1,
+        "schema_version": 2,
+        "record_generation": secrets.token_hex(32),
         "session_key": session_hash,
         "boot_id": boot_id,
         "shell_pid": shell.get("pid"),
@@ -384,7 +606,7 @@ def _validated_last_exact(
     shell_pid: Any,
     shell_start_ticks: Any,
 ) -> dict[str, Any] | None:
-    if not isinstance(value, Mapping) or set(value) != {
+    legacy_fields = {
         "schema_version",
         "session_key",
         "boot_id",
@@ -396,14 +618,22 @@ def _validated_last_exact(
         "display_title",
         "title_source",
         "recovery",
-    }:
+    }
+    if not isinstance(value, Mapping):
+        return None
+    schema_version = value.get("schema_version")
+    expected_fields = (
+        legacy_fields | {"record_generation"}
+        if schema_version == 2
+        else legacy_fields
+    )
+    if schema_version not in {1, 2} or set(value) != expected_fields:
         return None
     provider = value.get("provider")
     uuid = valid_uuid(value.get("uuid"))
     recovery = value.get("recovery")
     if (
-        value.get("schema_version") != 1
-        or value.get("session_key") != expected_key
+        value.get("session_key") != expected_key
         or value.get("boot_id") != boot_id
         or value.get("shell_pid") != shell_pid
         or value.get("shell_start_ticks") != shell_start_ticks
@@ -413,6 +643,13 @@ def _validated_last_exact(
         or recovery.get("available") is not True
         or recovery.get("provider") != provider
         or valid_uuid(recovery.get("uuid")) != uuid
+        or (
+            schema_version == 2
+            and (
+                not isinstance(value.get("record_generation"), str)
+                or not _RECORD_GENERATION_RE.fullmatch(value["record_generation"])
+            )
+        )
     ):
         return None
     return dict(value)
@@ -426,41 +663,43 @@ def persist_last_exact(
     boot_id: str,
 ) -> None:
     """Preserve exact recovery across the provider-exit/cache handoff race."""
-    prior_by_id = {
-        item.get("shpool_id_raw"): item
-        for item in (
-            previous_inventory.get("sessions", ())
-            if isinstance(previous_inventory, Mapping)
-            else ()
-        )
-        if isinstance(item, Mapping) and isinstance(item.get("shpool_id_raw"), str)
-    }
-    for item in inventory.get("sessions", ()):
-        if not isinstance(item, Mapping):
-            continue
-        # The canonical inventory already retains exact identity while the
-        # provider is live. Write a separate handoff record only at the moment
-        # a same-generation live row would otherwise be replaced by an idle
-        # shell row.
-        if item.get("provider") in PROVIDERS:
-            continue
-        document = None
-        prior = prior_by_id.get(item.get("shpool_id_raw"))
-        if isinstance(prior, Mapping) and _same_shell_generation(item, prior):
-            document = _last_exact_document(
-                prior,
-                state_dir=state_dir,
-                boot_id=boot_id,
+    with _lifecycle_lock(state_dir):
+        prior_by_id = {
+            item.get("shpool_id_raw"): item
+            for item in (
+                previous_inventory.get("sessions", ())
+                if isinstance(previous_inventory, Mapping)
+                else ()
             )
-        if document is None:
-            continue
-        path = _last_exact_path(
-            state_dir,
-            str(item["shpool_id_raw"]),
-            create_key=True,
-        )
-        assert path is not None
-        atomic_write_private_json(path, document)
+            if isinstance(item, Mapping)
+            and isinstance(item.get("shpool_id_raw"), str)
+        }
+        for item in inventory.get("sessions", ()):
+            if not isinstance(item, Mapping):
+                continue
+            # The canonical inventory already retains exact identity while the
+            # provider is live. Write a separate handoff record only at the
+            # moment a same-generation live row would otherwise be replaced by
+            # an idle shell row.
+            if item.get("provider") in PROVIDERS:
+                continue
+            document = None
+            prior = prior_by_id.get(item.get("shpool_id_raw"))
+            if isinstance(prior, Mapping) and _same_shell_generation(item, prior):
+                document = _last_exact_document(
+                    prior,
+                    state_dir=state_dir,
+                    boot_id=boot_id,
+                )
+            if document is None:
+                continue
+            path = _last_exact_path(
+                state_dir,
+                str(item["shpool_id_raw"]),
+                create_key=True,
+            )
+            assert path is not None
+            atomic_write_private_json(path, document)
 
 
 def load_last_exact(
@@ -491,49 +730,115 @@ def load_last_exact(
     )
 
 
+def _capturable_generation(path: Path) -> LifecycleGeneration | None:
+    value = read_private_json(
+        path,
+        max_bytes=MAX_LIFECYCLE_BYTES,
+        allow_missing=True,
+    )
+    if not isinstance(value, Mapping):
+        return None
+    generation = value.get("record_generation")
+    if (
+        not isinstance(generation, str)
+        or not _RECORD_GENERATION_RE.fullmatch(generation)
+    ):
+        # Records written by an older release have no exact generation. They
+        # remain readable, but no collector is allowed to retire them.
+        return None
+    return (path.name, generation)
+
+
+def capture_lifecycle_generations(
+    state_dir: Path,
+) -> frozenset[LifecycleGeneration]:
+    """Exact record generations present before the next process reading."""
+    lifecycle_dir = state_dir / "lifecycle"
+    if not lifecycle_dir.exists():
+        return frozenset()
+    captured: set[LifecycleGeneration] = set()
+    try:
+        with _lifecycle_lock(state_dir):
+            for path in lifecycle_dir.iterdir():
+                if not re.fullmatch(
+                    r"[0-9a-f]{64}(?:\.exact)?\.json",
+                    path.name,
+                ):
+                    continue
+                try:
+                    generation = _capturable_generation(path)
+                except (CollectionError, OSError):
+                    continue
+                if generation is not None:
+                    captured.add(generation)
+    except (CollectionError, OSError):
+        return frozenset()
+    return frozenset(captured)
+
+
 def prune_inactive_state(
     state_dir: Path,
     active_session_ids: list[str],
+    *,
+    retire_generations: Iterable[LifecycleGeneration] = (),
 ) -> int:
-    """Remove generation state only after its managed session disappears."""
-    secret = _lifecycle_secret(state_dir, create=False)
-    lifecycle_dir = state_dir / "lifecycle"
-    if secret is None or not lifecycle_dir.exists():
+    """Retire only generations seen before the process reading began."""
+    allowed = frozenset(retire_generations)
+    if not allowed:
         return 0
-    active_keys = {
-        hmac.new(
-            secret,
-            _checked_session_id(session_id).encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest()
-        for session_id in active_session_ids
-    }
-    removed = 0
-    for path in lifecycle_dir.iterdir():
-        match = re.fullmatch(
-            r"([0-9a-f]{64})(?:\.exact)?\.json",
-            path.name,
-        )
-        if not match or match.group(1) in active_keys:
-            continue
-        metadata = path.lstat()
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_uid != os.geteuid()
-            or stat.S_IMODE(metadata.st_mode) != 0o600
-        ):
-            raise CollectionError(
-                "inactive lifecycle state is not a private regular file"
+    lifecycle_dir = state_dir / "lifecycle"
+    if not lifecycle_dir.exists():
+        return 0
+    with _lifecycle_lock(state_dir):
+        secret = _lifecycle_secret(state_dir, create=False)
+        if secret is None:
+            return 0
+        active_keys = {
+            hmac.new(
+                secret,
+                _checked_session_id(session_id).encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
+            for session_id in active_session_ids
+        }
+        removed = 0
+        now = time.time()
+        for path in lifecycle_dir.iterdir():
+            match = re.fullmatch(
+                r"([0-9a-f]{64})(?:\.exact)?\.json",
+                path.name,
             )
-        path.unlink()
-        removed += 1
-    if removed:
-        directory = os.open(lifecycle_dir, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-    return removed
+            if not match or match.group(1) in active_keys:
+                continue
+            metadata = path.lstat()
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+            ):
+                raise CollectionError(
+                    "inactive lifecycle state is not a private regular file"
+                )
+            generation = _capturable_generation(path)
+            if generation not in allowed:
+                continue
+            # Exact recovery intentionally outlives its session for seven days
+            # as housekeeping policy. Ordinary lifecycle/KEEP records have no
+            # age test: their race guard is the captured generation above.
+            if (
+                path.name.endswith(".exact.json")
+                and now - metadata.st_mtime < EXACT_RECOVERY_RETENTION_SECONDS
+            ):
+                continue
+            path.unlink()
+            removed += 1
+        if removed:
+            directory = os.open(lifecycle_dir, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        return removed
 
 
 def apply_provider_exit_states(

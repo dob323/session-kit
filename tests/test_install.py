@@ -12,30 +12,35 @@ import re
 import signal
 import shutil
 import sqlite3
+import importlib.util
+import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 
-from tests.support import THEME_COLORS
-
-
 REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, os.fspath(REPO / "lib"))
+
+from tests.support import THEME_COLORS
+from sessionkit_inventory.common import CollectionError
+from sessionkit_inventory.state_io import StateLock
+
+
 RELEASE_A = "1" * 40
 RELEASE_B = "2" * 40
-# Files that only exist in releases from provider-hook activation onwards. A
-# release without them is what `install_legacy_generation` reproduces, and
-# `configure_provider_hooks` keys its automatic enable on the second one.
-LEGACY_RETIRED_RELEASE_FILES = (
-    "config/codex/hooks.json",
-    "lib/sessionkit_supervisor/provider_hooks.py",
-)
+RELEASE_C = "3" * 40
 # Launchers are compared byte for byte to prove which release a rollback took
 # them from. A fixture release built out of this checkout would otherwise carry
 # launchers identical to the release under test, and the comparison would hold
 # no matter which one the code picked.
 LEGACY_LAUNCHER_STAMP = "# Session Kit legacy generation fixture.\n"
+# A unit name no release carries, so a fixture release that adds it reproduces
+# the one state that breaks a rollback: a running kit whose unit list names a
+# file the release it is activating never had.
+FIXTURE_UNIT = "session-kit-fixture-sweep.service"
 
 
 def host_group_is_private() -> bool:
@@ -68,7 +73,15 @@ class InstallerTests(unittest.TestCase):
         # GitHub's macOS workspace carries an inherited ACL that denies
         # renaming sealed 0555 directories. Real installs live under HOME, so
         # keep Darwin fixtures in the normal per-user temporary directory.
-        temp_parent = None if sys.platform == "darwin" else REPO.parent
+        # Managed worktrees may expose the checkout's parent read-only. /tmp is
+        # writable in that environment and also avoids copying a source tree
+        # into one of its own descendants in tests that stage a release.
+        isolated_test_parent = os.environ.get("SESSION_KIT_TEST_TMPDIR")
+        temp_parent = (
+            Path(isolated_test_parent)
+            if isolated_test_parent
+            else None if sys.platform == "darwin" else Path("/tmp")
+        )
         self.temp = Path(
             tempfile.mkdtemp(
                 prefix="session-kit-install-test.",
@@ -85,8 +98,9 @@ class InstallerTests(unittest.TestCase):
             if command == "shpool":
                 body = (
                     "#!/usr/bin/env bash\n"
-                    "if [[ ${1:-} == version ]]; then echo 'shpool 0.11.0'; fi\n"
-                    "exit 0\n"
+                    "if [[ ${1:-} == version ]]; then echo 'shpool 0.11.0'; exit 0; fi\n"
+                    "echo 'test shpool: refusing non-version command' >&2\n"
+                    "exit 97\n"
                 )
             elif command == "claude":
                 body = "#!/usr/bin/env bash\necho '2.1.221 (Claude Code)'\n"
@@ -100,14 +114,37 @@ class InstallerTests(unittest.TestCase):
         self.env.update(
             {
                 "HOME": str(self.home),
+                # A managed session exports the real profile here, and the
+                # transcript checks honour it; the fixture must own its
+                # ambient profile or foreground runs read the real estate.
+                "CLAUDE_CONFIG_DIR": str(self.home / ".claude"),
                 "PATH": f"{self.fake_bin}:{self.env['PATH']}",
                 "SESSION_KIT_RELEASE_ID": RELEASE_A,
                 "XDG_CONFIG_HOME": str(self.home / ".config"),
+                "XDG_DATA_HOME": str(self.home / ".local/share"),
                 "XDG_STATE_HOME": str(self.home / ".local/state"),
+                "SESSION_KIT_STATE_DIR": str(
+                    self.home / ".local/state/session-kit"
+                ),
+                "SESSION_KIT_CONFIG": str(
+                    self.home / ".config/session-kit/inventory.json"
+                ),
                 "SESSION_KIT_SYSTEMD_ROOT": str(self.temp / "systemd"),
                 "SESSION_KIT_TESTING": "1",
             }
         )
+        real_data_home = (Path.home() / ".local/share").resolve()
+        isolated_paths = (
+            Path(self.env["HOME"]),
+            Path(self.env["XDG_CONFIG_HOME"]),
+            Path(self.env["XDG_DATA_HOME"]),
+            Path(self.env["XDG_STATE_HOME"]),
+        )
+        for path in isolated_paths:
+            self.assertFalse(
+                path.resolve().is_relative_to(real_data_home),
+                f"installer test path escapes into operator data: {path}",
+            )
 
     def tearDown(self) -> None:
         for path in self.temp.rglob("*"):
@@ -134,7 +171,122 @@ class InstallerTests(unittest.TestCase):
             )
         return result
 
-    def test_partial_provider_hook_activation_restores_preimages_and_commits_backups(self) -> None:
+    def run_installer_on_a_terminal(
+        self, keystrokes: str, *args: str
+    ) -> subprocess.CompletedProcess[str]:
+        """Run the installer with a terminal on stdin, the way a person runs
+        it. It asks nothing there: it takes the marked defaults and reports
+        them."""
+        import pty
+
+        parent, child = pty.openpty()
+        try:
+            process = subprocess.Popen(
+                [str(REPO / "install.sh"), *args],
+                cwd=REPO,
+                env=self.env,
+                stdin=child,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            os.close(child)
+            child = -1
+            os.write(parent, keystrokes.encode())
+            output, _ = process.communicate(timeout=180)
+        finally:
+            if child >= 0:
+                os.close(child)
+            os.close(parent)
+        return subprocess.CompletedProcess(
+            args, process.returncode, output, ""
+        )
+
+    def test_installer_asks_nothing_and_reports_the_defaults_it_took(self) -> None:
+        """The installer never asks. It takes the marked defaults on a
+        terminal, installs, and states what it chose with the way back."""
+        completed = self.run_installer_on_a_terminal("")
+        self.assertEqual(0, completed.returncode, completed.stdout)
+        for banned in ("[Y/n]", "[y/N]", "Answer y or n", "cancelled"):
+            self.assertNotIn(banned, completed.stdout)
+        self.assertIn(
+            "Login integration is on. Turn it off with: session-kit disable-login",
+            completed.stdout,
+        )
+        self.assertIn(
+            "History recording is off. Turn it on with: "
+            "session-kit update --journal on",
+            completed.stdout,
+        )
+        self.assertTrue(
+            (self.home / ".local/lib/session-kit/current").is_symlink(),
+            completed.stdout,
+        )
+        self.assertIn(
+            "session-kit managed integration",
+            (self.home / ".bashrc").read_text(encoding="utf-8"),
+        )
+        self.assertTrue((self.home / ".no_shpool_journal").is_file())
+
+    def test_fresh_install_seeds_collection_floor(self) -> None:
+        self.run_installer("--non-interactive")
+
+        floor = self.home / ".local/state/session-kit/collection-sequence-floor.json"
+        self.assertEqual(
+            {"schema_version": 1, "last_collection_start": 1},
+            json.loads(floor.read_text(encoding="utf-8")),
+        )
+        self.assertEqual(0o600, stat.S_IMODE(floor.stat().st_mode))
+
+    def test_install_never_overwrites_existing_collection_floor(self) -> None:
+        state = self.home / ".local/state/session-kit"
+        state.mkdir(parents=True, mode=0o700)
+        floor = state / "collection-sequence-floor.json"
+        original = b'{ "schema_version" : 1, "last_collection_start" : 41 }\n'
+        floor.write_bytes(original)
+        floor.chmod(0o600)
+
+        self.run_installer("--non-interactive")
+
+        self.assertEqual(original, floor.read_bytes())
+
+    def test_install_refuses_underivable_collection_floor_with_exact_remedy(
+        self,
+    ) -> None:
+        state = self.home / ".local/state/session-kit"
+        state.mkdir(parents=True, mode=0o700)
+        inventory = state / "inventory.json"
+        inventory.write_text('{"sessions":[]}\n', encoding="utf-8")
+        inventory.chmod(0o600)
+        command = (
+            f"env SESSION_KIT_STATE_DIR={state} python3 "
+            f"{REPO / 'bin/reset-collection-order.py'}"
+        )
+        expected = (
+            "session-kit-release: collection allocation floor cannot be derived "
+            "from existing state; restart the machine and, before starting a "
+            "picker, sp, shpool_status, or any Session Kit user service, run "
+            f"exactly:\n  {command}\n"
+        )
+
+        refused = self.run_installer("--non-interactive", check=False)
+
+        self.assertNotEqual(0, refused.returncode)
+        self.assertEqual(expected, refused.stderr)
+        self.assertFalse((state / "collection-sequence-floor.json").exists())
+        self.assertFalse((self.home / ".local/lib/session-kit/current").exists())
+
+    def test_interrupted_install_journals_provider_config_preimages_and_commits_backups(
+        self,
+    ) -> None:
+        """The operator's provider config is preimaged before anything runs.
+
+        The installer now owns exact Claude registrations, so an interrupted
+        install must first restore what it found before the retry applies the
+        release again. This proves the journal captured the real preimage --
+        content for the file that was there, `absent` for the one that was not
+        -- and that the committed backup carries the same record.
+        """
         claude = self.home / ".claude"
         claude.mkdir()
         settings = claude / "settings.json"
@@ -142,44 +294,32 @@ class InstallerTests(unittest.TestCase):
         settings.write_bytes(original)
         settings.chmod(0o600)
         codex_hooks = self.home / ".codex" / "hooks.json"
-        claude_command = (
-            '"$HOME/.local/lib/session-kit/current/extras/hooks/sk_session_events.py"'
-        )
 
-        self.env["SESSION_KIT_TEST_FAILPOINT"] = "provider-hooks-claude"
+        self.env["SESSION_KIT_TEST_FAILPOINT"] = "themes"
+        self.env["SESSION_KIT_TEST_FAILPOINT_MODE"] = "kill"
         failed = self.run_installer("--non-interactive", check=False)
-        self.assertNotEqual(0, failed.returncode)
+        self.assertEqual(-signal.SIGKILL, failed.returncode)
         journal_path = self.home / ".local/state/session-kit/lifecycle-transaction.json"
         journal = json.loads(journal_path.read_text(encoding="utf-8"))
         entries = {item["path"]: item for item in journal["entries"]}
         self.assertEqual("file", entries[str(settings)]["kind"])
         self.assertEqual(original, base64.b64decode(entries[str(settings)]["content"]))
         self.assertEqual("absent", entries[str(codex_hooks)]["kind"])
-        activated_settings = json.loads(settings.read_text(encoding="utf-8"))
-        self.assertEqual(
-            claude_command,
-            activated_settings["hooks"]["UserPromptSubmit"][0]["hooks"][0][
-                "command"
-            ],
-        )
         self.assertFalse(codex_hooks.exists())
 
         self.env.pop("SESSION_KIT_TEST_FAILPOINT")
+        self.env.pop("SESSION_KIT_TEST_FAILPOINT_MODE")
         recovered = self.run_installer("--non-interactive")
         self.assertIn(
             "Recovered interrupted Session Kit install transaction", recovered.stdout
         )
         self.assertFalse(journal_path.exists())
-        recovered_settings = json.loads(settings.read_text(encoding="utf-8"))
+        restored = json.loads(settings.read_text(encoding="utf-8"))
+        self.assertEqual("claude-setting", restored["existing"])
         self.assertEqual(
-            claude_command,
-            recovered_settings["hooks"]["UserPromptSubmit"][0]["hooks"][0][
-                "command"
-            ],
+            "~/.claude/statusline.sh", restored["statusLine"]["command"]
         )
-        self.assertEqual(
-            (REPO / "config/codex/hooks.json").read_bytes(), codex_hooks.read_bytes()
-        )
+        self.assertFalse(codex_hooks.exists())
 
         backups = sorted(
             (self.home / ".local/state/session-kit/backups").glob("lifecycle-*.json")
@@ -192,12 +332,15 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual("absent", committed_entries[str(codex_hooks)]["kind"])
 
     def installed(
-        self, *args: str, check: bool = True
+        self,
+        *args: str,
+        check: bool = True,
+        env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         command = self.home / ".local/bin/session-kit"
         result = subprocess.run(
             [str(command), *args],
-            env=self.env,
+            env=env if env is not None else self.env,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -243,6 +386,113 @@ class InstallerTests(unittest.TestCase):
         )
         return source
 
+    def changed_claude_source_fixture(self) -> Path:
+        source = self.clean_source_fixture()
+        for relative in (
+            "config/claude/nameintent_title.sh",
+            "config/claude/statusline.sh",
+        ):
+            path = source / relative
+            path.write_text(
+                path.read_text(encoding="utf-8") + "\n# distinct fixture payload\n",
+                encoding="utf-8",
+            )
+        subprocess.run(["git", "-C", source, "add", "."], check=True)
+        subprocess.run(
+            [
+                "git", "-C", source,
+                "-c", "user.name=Session Kit Tests",
+                "-c", "user.email=session-kit-tests@invalid.example",
+                "commit", "-q", "--amend", "--no-edit",
+            ],
+            check=True,
+        )
+        return source
+
+    def stage_legacy_release(self, source_release: str, target_release: str) -> None:
+        root = self.home / ".local/lib/session-kit/releases"
+        target = root / target_release
+        shutil.copytree(root / source_release, target)
+        self.unseal_release(target)
+        metadata = target / "RELEASE.json"
+        metadata.chmod(0o644)
+        value = json.loads(metadata.read_text(encoding="utf-8"))
+        value["commit"] = target_release
+        metadata.write_text(json.dumps(value) + "\n", encoding="utf-8")
+        shutil.rmtree(target / "config/claude")
+        self.seal_release(target)
+
+    def make_release_fence_unaware(self, release_id: str) -> Path:
+        """Give one retained release the real legacy lock contract.
+
+        Its status command takes only inventory.lock and emits the retained
+        inventory.  The target's StateLock source deliberately contains no
+        generation-2 path, so rollback must decide from code evidence rather
+        than from the synthetic release id.
+        """
+        release = self.home / ".local/lib/session-kit/releases" / release_id
+        self.unseal_release(release)
+        state_io = release / "lib/sessionkit_inventory/state_io.py"
+        state_io.chmod(0o644)
+        state_io.write_text(
+            '"""Pre-generation-2 StateLock fixture."""\n\n'
+            '_PUBLISHING_LOCK_NAME = "inventory.lock"\n\n'
+            "class StateLock:\n"
+            "    pass\n",
+            encoding="utf-8",
+        )
+        status_command = release / "bin/shpool_status"
+        status_command.chmod(0o755)
+        status_command.write_text(
+            """#!/usr/bin/env python3
+import fcntl
+import os
+from pathlib import Path
+import stat
+import sys
+
+if sys.argv[1:] != ["--json"]:
+    raise SystemExit(2)
+root = Path(os.environ["SESSION_KIT_STATE_DIR"])
+lock = root / "inventory.lock"
+flags = os.O_RDWR | os.O_CREAT
+if hasattr(os, "O_CLOEXEC"):
+    flags |= os.O_CLOEXEC
+if hasattr(os, "O_NOFOLLOW"):
+    flags |= os.O_NOFOLLOW
+descriptor = os.open(lock, flags, 0o600)
+try:
+    opened = os.fstat(descriptor)
+    before = lock.lstat()
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or stat.S_IMODE(opened.st_mode) != 0o600
+        or opened.st_uid != os.geteuid()
+        or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+    ):
+        raise SystemExit(1)
+    fcntl.flock(descriptor, fcntl.LOCK_EX)
+    after = lock.lstat()
+    if (opened.st_dev, opened.st_ino) != (after.st_dev, after.st_ino):
+        raise SystemExit(1)
+    sys.stdout.write((root / "inventory.json").read_text(encoding="utf-8"))
+finally:
+    os.close(descriptor)
+""",
+            encoding="utf-8",
+        )
+        self.seal_release(release)
+        return release
+
+    def install_mixed_modern_legacy_history(self) -> None:
+        self.run_installer("--non-interactive")
+        self.stage_legacy_release(RELEASE_A, RELEASE_C)
+        changed = self.changed_claude_source_fixture()
+        self.env["SESSION_KIT_RELEASE_ID"] = RELEASE_B
+        self.installed("update", "--source", str(changed))
+        self.installed("rollback", "--to", RELEASE_A)
+        self.installed("rollback", "--to", RELEASE_C)
+
     def helper_launcher_names(self) -> list[str]:
         """The helper commands the installer keeps, read from the source."""
         source = (REPO / "bin/session-kit").read_text(encoding="utf-8")
@@ -283,15 +533,13 @@ class InstallerTests(unittest.TestCase):
         release.chmod(0o555)
 
     def install_legacy_generation(self) -> None:
-        """Leave the installation a pre-provider-hook release left behind.
+        """Leave the installation an older release left behind.
 
         The rollback proofs below all begin from an installation created by a
-        release older than provider-hook activation. That generation differed
-        in exactly four ways that this installer still has to cope with: the
-        release carries neither provider-hook file, nothing anchors management
-        to a release, the management command is a copy of the release's own
-        `bin/session-kit` rather than the stable launcher, and no provider hook
-        is registered in the user's configuration.
+        release older than the release-anchored manager. That generation
+        differed in two ways this installer still has to cope with: nothing
+        anchors management to a release, and the management command is a copy
+        of the release's own `bin/session-kit` rather than the stable launcher.
 
         The fixture reproduces that state instead of installing the old source
         tree, which is reachable from no public clone, so the proofs run
@@ -304,10 +552,6 @@ class InstallerTests(unittest.TestCase):
         release = root / "releases" / RELEASE_A
 
         self.unseal_release(release)
-        for relative in LEGACY_RETIRED_RELEASE_FILES:
-            retired = release / relative
-            retired.chmod(0o644)
-            retired.unlink()
         # An older release also carries older launchers. Stamping them keeps
         # the byte comparisons that prove which release a launcher came from
         # able to tell the two releases apart.
@@ -332,31 +576,13 @@ class InstallerTests(unittest.TestCase):
                 (release / "deploy/session-kit-launcher").read_bytes()
             )
             helper_path.chmod(0o755)
-        subprocess.run(
-            [
-                sys.executable,
-                str(REPO / "lib/sessionkit_supervisor/provider_hooks.py"),
-                "disable",
-                "--claude-settings",
-                str(self.home / ".claude/settings.json"),
-                "--codex-hooks",
-                str(self.home / ".codex/hooks.json"),
-            ],
-            check=True,
-        )
         for directory in (self.home / ".claude", self.home / ".codex"):
             if directory.is_dir() and not any(directory.iterdir()):
                 directory.rmdir()
 
         # The state the rollback proofs are written against, asserted rather
         # than assumed.
-        for relative in LEGACY_RETIRED_RELEASE_FILES:
-            self.assertFalse(
-                (release / relative).exists(),
-                f"legacy release must not carry {relative}",
-            )
         self.assertFalse((root / "manager").exists())
-        self.assertFalse((self.home / ".codex/hooks.json").exists())
         self.assertEqual(RELEASE_A, (root / "current").resolve().name)
         self.assertEqual(
             (release / "bin/session-kit").read_bytes(), launcher.read_bytes()
@@ -384,7 +610,7 @@ class InstallerTests(unittest.TestCase):
 
     def test_check_is_read_only(self) -> None:
         result = self.run_installer("--check")
-        self.assertIn("OK    source: installable", result.stdout)
+        self.assertIn("OK    source             installable", result.stdout)
         self.assertEqual(list(self.home.iterdir()), [])
 
     def test_check_reports_direct_and_fallback_systemd_transports(self) -> None:
@@ -396,19 +622,26 @@ class InstallerTests(unittest.TestCase):
         env["SESSION_KIT_SYSTEMCTL_LOG"] = str(log)
 
         cases = (
-            ("0", "1", 0, "OK    user service manager: systemd", ["--user show-environment"]),
+            (
+                "0",
+                "1",
+                0,
+                "OK    services           systemd user manager is available",
+                ["--user show-environment"],
+            ),
             (
                 "1",
                 "0",
                 0,
-                "WARN  user service manager: available through local-machine transport; direct user socket is unavailable",
+                "WARN  services           systemd user manager is available through "
+                "local-machine transport; direct user socket is unavailable",
                 ["--user show-environment", "--user --machine=@.host show-environment"],
             ),
             (
                 "1",
                 "1",
                 1,
-                "FAIL  systemd user manager is unavailable",
+                "FAIL  services           systemd user manager is unavailable",
                 ["--user show-environment", "--user --machine=@.host show-environment"],
             ),
         )
@@ -467,28 +700,214 @@ class InstallerTests(unittest.TestCase):
                     check=False,
                 )
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn(f"source file missing: {relative}", result.stdout)
+                self.assertIn(
+                    f"FAIL  source-files       missing from the source: {relative}",
+                    result.stdout,
+                )
                 path.write_bytes(payload)
+
+    # The Codex version this branch's finding was measured against. If Codex
+    # is upgraded, the test below fails ON PURPOSE: someone has to re-measure
+    # rather than assume the finding still holds.
+    MEASURED_CODEX_VERSION = "0.145.0"
+
+    def test_codex_gets_no_kit_file_because_codex_cannot_use_one(self) -> None:
+        """Codex has no `/kit`, and installing a file that pretends otherwise
+        is worse than installing none.
+
+        Measured 2026-08-15 against codex-cli 0.145.0, three ways:
+
+          * its app-server protocol has 54 client methods and NO channel for a
+            custom command -- `skills/list` is the only invoke-by-name surface;
+          * `skills/list` against a home holding a full `prompts/` directory
+            returned 28 skills, none of them from `prompts/`;
+          * with a `skills/kit/SKILL.md` present and reported by `skills/list`
+            as enabled, the real TUI driven in remote mode drew a slash menu of
+            built-ins only -- `/model /fast /ide /permissions /keymap /vim
+            /experimental /approve` -- and `/ki` rendered `no matches`.
+
+        So `~/.codex/prompts/kit.md` was a file nothing ever read, and the docs
+        repeated its existence as a capability. Ctrl-q is the Codex answer and
+        needs no file at all. An older Codex did honour `prompts/`, which is
+        why this used to be true.
+        """
+        claude = self.home / ".claude"
+        claude.mkdir()
+        codex = self.home / ".codex"
+        codex.mkdir()
+        accounts = self.home / ".local/share/session-kit/accounts"
+        (accounts / "codex" / "wren").mkdir(parents=True)
+
+        self.run_installer("--non-interactive")
+
+        # Claude still gets the verb; Codex gets nothing, anywhere.
+        self.assertTrue((claude / "commands" / "kit.md").is_file())
+        self.assertFalse((codex / "prompts" / "kit.md").exists())
+        self.assertFalse((codex / "prompts").exists())
+        self.assertFalse(
+            (accounts / "codex" / "wren" / "prompts" / "kit.md").exists()
+        )
+
+    def test_the_codex_finding_is_pinned_to_the_version_it_was_measured_on(
+        self,
+    ) -> None:
+        """A version bump must force a re-measurement, not an assumption.
+
+        The test above encodes a fact about codex-cli 0.145.0's behaviour, not
+        a law. If Codex ever restores custom slash commands, the right response
+        is to measure it again -- protocol methods, then the menu the real
+        client draws -- and give the verb back. This is the tripwire that makes
+        someone look.
+        """
+        codex = shutil.which("codex")
+        if codex is None:
+            self.skipTest("no codex on this machine to measure")
+        result = subprocess.run(
+            [codex, "--version"], capture_output=True, text=True, timeout=60
+        )
+        if result.returncode != 0:
+            self.skipTest(f"codex --version failed: {result.stderr.strip()}")
+        version = result.stdout.strip()
+        self.assertIn(
+            self.MEASURED_CODEX_VERSION,
+            version,
+            "Codex changed version since the /kit finding was measured "
+            f"({version!r} is not {self.MEASURED_CODEX_VERSION}). Re-measure "
+            "before trusting test_codex_gets_no_kit_file_because_codex_cannot_"
+            "use_one: check whether the app-server protocol has gained a "
+            "custom-command channel, and drive the real TUI to read its slash "
+            "menu. If /kit works again, restore the verb and this pin.",
+        )
+
+    def test_only_the_typed_kit_verb_may_ever_detach(self) -> None:
+        """The bare word `kit` must do nothing.
+
+        Claude Code merged custom commands into skills, so a file in
+        `commands/` is model-invocable by default. This one's body opens with
+        an injected `!`shpool detach``, which runs when the skill content is
+        RENDERED -- before the model reads any of it -- and `allowed-tools`
+        pre-approves the command, so nothing prompts. An operator typed the
+        bare word `kit` as an ordinary message, the model matched it against
+        the description, and their terminal detached mid-turn while output was
+        still painting (2026-08-15).
+
+        `disable-model-invocation: true` is the documented field that keeps
+        `/kit` working while removing the description from the model's context
+        entirely, so there is nothing left to match. Asserted on the INSTALLED
+        file, because that is the one a provider reads.
+        """
+        claude = self.home / ".claude"
+        claude.mkdir()
+        accounts = self.home / ".local/share/session-kit/accounts"
+        (accounts / "claude" / "work").mkdir(parents=True)
+
+        self.run_installer("--non-interactive")
+
+        for path in (
+            claude / "commands" / "kit.md",
+            accounts / "claude" / "work" / "commands" / "kit.md",
+        ):
+            with self.subTest(path=str(path)):
+                body = path.read_text(encoding="utf-8")
+                front = body.split("---")[1]
+                self.assertIn("disable-model-invocation: true", front)
+                # The injected command is still there -- the fix is the gate
+                # on WHO may fire it, not the removal of what it does.
+                self.assertIn("!`shpool detach`", body)
+                # And the typed verb still works: the file is still a command
+                # named kit, with its tool grant intact.
+                self.assertEqual("kit.md", path.name)
+                self.assertIn("allowed-tools: Bash(shpool detach:*)", front)
+
+    def test_the_kit_verb_reaches_every_enrolled_account_profile(self) -> None:
+        """A session the kit launches on an account reads that account's
+        commands, not ~/.claude's: CLAUDE_CONFIG_DIR replaces the config root
+        rather than adding to it. A verb installed only in the home directory
+        is invisible in exactly the sessions it exists for — which is what the
+        live drill found, with /kit unknown inside a managed session."""
+        (self.home / ".claude").mkdir()
+        accounts = self.home / ".local/share/session-kit/accounts"
+        for alias in ("work", "spare"):
+            (accounts / "claude" / alias).mkdir(parents=True)
+        (accounts / "codex" / "wren").mkdir(parents=True)
+
+        self.run_installer("--non-interactive")
+
+        for alias in ("work", "spare"):
+            path = accounts / "claude" / alias / "commands" / "kit.md"
+            with self.subTest(alias=alias):
+                self.assertTrue(path.is_file(), path)
+                self.assertIn("shpool detach", path.read_text(encoding="utf-8"))
+                self.assertEqual(0o600, path.stat().st_mode & 0o777)
+        # Codex profiles get nothing: measured 2026-08-15, codex-cli 0.145.0
+        # never reads prompts/ and has no custom slash namespace, so a file
+        # here would be a claim rather than a capability. See
+        # test_codex_gets_no_kit_file_because_codex_cannot_use_one.
+        self.assertFalse((accounts / "codex" / "wren" / "prompts").exists())
+
+    def test_the_kit_verb_skips_a_provider_that_is_not_installed(self) -> None:
+        # No provider home is not a failure to report: it is a provider that
+        # is not on this machine. (The Codex home is not a fair test of this:
+        # the kit creates it itself for the window themes.)
+        self.run_installer("--non-interactive")
+        self.assertFalse((self.home / ".claude" / "commands").exists())
+
+    def test_the_kit_verb_ignores_the_account_profile_of_the_running_session(
+        self,
+    ) -> None:
+        """An install run from inside a managed session inherits that
+        session's account profile in CLAUDE_CONFIG_DIR. A machine-wide verb
+        installed into one rotating profile is invisible to the next account,
+        and writes into a directory the installer was never asked to touch."""
+        claude = self.home / ".claude"
+        claude.mkdir()
+        profile = self.home / "account-profile"
+        (profile / "commands").mkdir(parents=True)
+        environment = dict(self.env, CLAUDE_CONFIG_DIR=str(profile))
+        result = subprocess.run(
+            [str(REPO / "install.sh"), "--non-interactive"],
+            cwd=REPO,
+            env=environment,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertTrue((claude / "commands" / "kit.md").is_file())
+        self.assertFalse((profile / "commands" / "kit.md").exists())
+
+    def test_the_kit_verb_never_writes_through_a_symlink(self) -> None:
+        claude = self.home / ".claude"
+        claude.mkdir()
+        commands = claude / "commands"
+        commands.mkdir(mode=0o700)
+        elsewhere = self.home / "not-a-command.md"
+        elsewhere.write_text("untouched\n", encoding="utf-8")
+        (commands / "kit.md").symlink_to(elsewhere)
+
+        self.run_installer("--non-interactive")
+
+        self.assertTrue((commands / "kit.md").is_symlink())
+        self.assertEqual("untouched\n", elsewhere.read_text(encoding="utf-8"))
 
     @unittest.skipUnless(
         host_group_is_private(), "this host does not give the account a private group"
     )
     def test_install_accepts_a_group_writable_provider_directory(self) -> None:
         # A private-group distribution with a 002 umask leaves the provider
-        # config directory at 0775, which exposes it to no other account.
+        # config directory at 0775, which exposes it to no other account. The
+        # install still writes through it -- the /kit verb is the write that
+        # remains -- and leaves the operator's own mode alone.
         claude = self.home / ".claude"
         claude.mkdir(mode=0o775)
         claude.chmod(0o775)
 
         checked = self.run_installer("--check")
-        self.assertIn("OK    provider config:", checked.stdout)
+        self.assertIn("OK    source             installable", checked.stdout)
         self.run_installer("--non-interactive")
 
-        settings = json.loads((claude / "settings.json").read_text(encoding="utf-8"))
-        self.assertEqual(
-            '"$HOME/.local/lib/session-kit/current/extras/hooks/sk_session_events.py"',
-            settings["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"],
-        )
+        self.assertTrue((claude / "commands" / "kit.md").is_file())
         self.assertEqual(0o775, claude.stat().st_mode & 0o777)
 
     @unittest.skipUnless(
@@ -502,11 +921,14 @@ class InstallerTests(unittest.TestCase):
         codex.chmod(0o775)
 
         checked = self.run_installer("--check")
-        self.assertIn("OK    Codex home:", checked.stdout)
+        self.assertIn(
+            "OK    codex-home         the theme layout is owner-controlled",
+            checked.stdout,
+        )
         self.run_installer("--non-interactive")
 
         self.assertTrue((codex / "themes/sk-red.tmTheme").is_file())
-        self.assertTrue((codex / "hooks.json").is_file())
+        self.assertFalse((codex / "prompts").exists())
         self.assertEqual(0o775, codex.stat().st_mode & 0o777)
 
     @unittest.skipUnless(
@@ -515,10 +937,9 @@ class InstallerTests(unittest.TestCase):
     def test_interrupted_install_recovers_through_group_writable_directories(
         self,
     ) -> None:
-        # Recovery revalidates every recorded provider hook and theme ancestor.
-        # Reaching the hook step at all is new, so recovery has to accept the
-        # same directories the install accepted or an interrupted install can
-        # never be finished.
+        # Recovery revalidates every recorded provider-config and theme
+        # ancestor, so it has to accept the same directories the install
+        # accepted or an interrupted install can never be finished.
         claude = self.home / ".claude"
         claude.mkdir(mode=0o700)
         claude.chmod(0o775)
@@ -527,12 +948,14 @@ class InstallerTests(unittest.TestCase):
         codex.chmod(0o775)
         journal = self.home / ".local/state/session-kit/lifecycle-transaction.json"
 
-        self.env["SESSION_KIT_TEST_FAILPOINT"] = "provider-hooks-claude"
+        self.env["SESSION_KIT_TEST_FAILPOINT"] = "themes"
+        self.env["SESSION_KIT_TEST_FAILPOINT_MODE"] = "kill"
         interrupted = self.run_installer("--non-interactive", check=False)
-        self.assertNotEqual(0, interrupted.returncode)
+        self.assertEqual(-signal.SIGKILL, interrupted.returncode)
         self.assertTrue(journal.is_file())
 
         self.env.pop("SESSION_KIT_TEST_FAILPOINT")
+        self.env.pop("SESSION_KIT_TEST_FAILPOINT_MODE")
         recovered = self.run_installer("--non-interactive")
 
         self.assertIn(
@@ -540,33 +963,32 @@ class InstallerTests(unittest.TestCase):
         )
         self.assertFalse(journal.exists())
         self.assertTrue((self.home / ".local/lib/session-kit/current").is_symlink())
-        self.assertTrue((claude / "settings.json").is_file())
+        self.assertTrue((claude / "commands" / "kit.md").is_file())
         self.assertEqual(0o775, claude.stat().st_mode & 0o777)
         self.assertEqual(0o775, codex.stat().st_mode & 0o777)
 
-    def test_world_writable_provider_directory_stops_install_before_any_write(
+    def test_world_writable_provider_directory_is_never_written_through(
         self,
     ) -> None:
+        """A directory any account can write is never a write target.
+
+        Provider commands still treat an unavailable provider as absent, but
+        the required Claude status line and hook may not be silently skipped.
+        The overall install therefore refuses and names the unsafe directory.
+        """
         claude = self.home / ".claude"
         claude.mkdir(mode=0o700)
         claude.chmod(0o777)
 
-        checked = self.run_installer("--check", check=False)
-        self.assertNotEqual(0, checked.returncode)
-        self.assertIn("FAIL  provider config:", checked.stdout)
-        self.assertIn(f"chmod go-w {claude}", checked.stdout)
-
+        self.run_installer("--check")
         refused = self.run_installer("--non-interactive", check=False)
+
         self.assertNotEqual(0, refused.returncode)
-        self.assertIn(f"chmod go-w {claude}", refused.stdout)
-        # Nothing was installed, so no release tree, launcher, or transaction
-        # journal is left for the operator to recover.
-        self.assertFalse((self.home / ".local/lib/session-kit").exists())
-        self.assertFalse((self.home / ".local/bin/sp").exists())
-        self.assertFalse(
-            (self.home / ".local/state/session-kit/lifecycle-transaction.json").exists()
-        )
+        self.assertIn("Claude home is not an owner-controlled directory", refused.stderr)
+        self.assertEqual(0o777, claude.stat().st_mode & 0o777)
+        self.assertEqual([], sorted(path.name for path in claude.iterdir()))
         self.assertFalse((claude / "settings.json").exists())
+        self.assertFalse((claude / "commands").exists())
 
     def test_noninteractive_install_is_local_and_login_opt_in(self) -> None:
         self.run_installer("--non-interactive")
@@ -583,6 +1005,12 @@ class InstallerTests(unittest.TestCase):
         )
         self.assertEqual(receipt["installed_release"], RELEASE_A)
         self.assertTrue((self.home / ".local/bin/sp").is_file())
+        reset_tool = current / "bin/reset-collection-order.py"
+        self.assertTrue(reset_tool.is_file())
+        self.assertTrue(reset_tool.stat().st_mode & 0o111)
+        self.assertTrue(
+            (current / "extras/statusline-quota-refresh.example").is_file()
+        )
         self.assertTrue(
             (current / "lib/sessionkit_inventory/__init__.py").is_file()
         )
@@ -606,6 +1034,436 @@ class InstallerTests(unittest.TestCase):
         service = (self.temp / "systemd/shpool.service").read_text(encoding="utf-8")
         self.assertIn(f"ExecStart={self.fake_bin / 'shpool'} daemon", service)
         self.assertNotIn("@SHPOOL@", service)
+
+    def test_install_registers_claude_integration_in_every_account_profile(self) -> None:
+        accounts = self.home / ".local/share/session-kit/accounts/claude"
+        for alias in ("one", "two"):
+            profile = accounts / alias
+            profile.mkdir(parents=True)
+            (profile / "settings.json").write_text(
+                json.dumps({"keep": alias}), encoding="utf-8"
+            )
+
+        self.run_installer("--non-interactive")
+
+        for settings_path in (
+            self.home / ".claude/settings.json",
+            accounts / "one/settings.json",
+            accounts / "two/settings.json",
+        ):
+            settings = json.loads(settings_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                settings["statusLine"],
+                {
+                    "type": "command",
+                    "command": "~/.claude/statusline.sh",
+                    "refreshInterval": 2,
+                },
+            )
+            for event in ("SessionStart", "UserPromptSubmit", "Stop"):
+                commands = [
+                    hook.get("command")
+                    for group in settings["hooks"][event]
+                    for hook in group["hooks"]
+                    if isinstance(hook, dict)
+                ]
+                self.assertIn("~/.claude/hooks/nameintent_title.sh", commands)
+
+        result = self.installed("doctor", "--json")
+        names = {row["name"]: row for row in json.loads(result.stdout)["checks"]}
+        self.assertEqual("ok", names["naming-hook"]["status"])
+        self.assertEqual("ok", names["statusline"]["status"])
+
+        (self.home / ".claude/statusline.sh").write_text(
+            "#!/bin/sh\nexit 0\n", encoding="utf-8"
+        )
+        drifted = self.installed("doctor", "--json")
+        drifted_names = {
+            row["name"]: row for row in json.loads(drifted.stdout)["checks"]
+        }
+        self.assertEqual("warn", drifted_names["statusline"]["status"])
+        self.assertIn("content", drifted_names["statusline"]["detail"])
+
+    def test_install_refuses_unrelated_claude_statusline_without_force(self) -> None:
+        settings_path = self.home / ".claude/settings.json"
+        settings_path.parent.mkdir()
+        original_status = {
+            "type": "command",
+            "command": "/opt/operator/statusline",
+            "refreshInterval": 9,
+        }
+        settings_path.write_text(
+            json.dumps({"statusLine": original_status}) + "\n", encoding="utf-8"
+        )
+        settings_path.chmod(0o600)
+
+        refused = self.run_installer("--non-interactive", check=False)
+
+        self.assertNotEqual(0, refused.returncode)
+        self.assertIn("refusing unrelated Claude statusLine", refused.stderr)
+        self.assertIn("--force", refused.stderr)
+        self.assertEqual(
+            original_status,
+            json.loads(settings_path.read_text(encoding="utf-8"))["statusLine"],
+        )
+        self.assertFalse((self.home / ".local/lib/session-kit/current").exists())
+        self.assertFalse(
+            (self.home / ".local/state/session-kit/lifecycle-transaction.json").exists()
+        )
+
+    def test_update_statusline_refusal_happens_before_release_transaction(self) -> None:
+        self.run_installer("--non-interactive")
+        root = self.home / ".local/lib/session-kit"
+        current = root / "current"
+        manager = root / "manager"
+        receipt = self.home / ".local/state/session-kit/install.json"
+        settings_path = self.home / ".claude/settings.json"
+        settings = json.loads(settings_path.read_text(encoding="utf-8"))
+        custom_status = {
+            "type": "command",
+            "command": "/opt/operator/update-status",
+        }
+        settings["statusLine"] = custom_status
+        settings_path.write_text(json.dumps(settings) + "\n", encoding="utf-8")
+        receipt_before = receipt.read_bytes()
+        releases_before = sorted(path.name for path in (root / "releases").iterdir())
+
+        self.env["SESSION_KIT_RELEASE_ID"] = RELEASE_B
+        refused = self.installed(
+            "update", "--source", str(REPO), check=False
+        )
+
+        self.assertNotEqual(0, refused.returncode)
+        self.assertIn("refusing unrelated Claude statusLine", refused.stderr)
+        self.assertEqual(RELEASE_A, current.resolve().name)
+        self.assertEqual(RELEASE_A, manager.resolve().name)
+        self.assertEqual(receipt_before, receipt.read_bytes())
+        self.assertEqual(
+            releases_before,
+            sorted(path.name for path in (root / "releases").iterdir()),
+        )
+        self.assertEqual(
+            custom_status,
+            json.loads(settings_path.read_text(encoding="utf-8"))["statusLine"],
+        )
+        self.assertFalse(
+            (self.home / ".local/state/session-kit/lifecycle-transaction.json").exists()
+        )
+
+    def test_update_rejects_malformed_backup_entry_before_release_flip(self) -> None:
+        self.run_installer("--non-interactive")
+        root = self.home / ".local/lib/session-kit"
+        current = root / "current"
+        manager = root / "manager"
+        receipt = self.home / ".local/state/session-kit/install.json"
+        backups = self.home / ".local/state/session-kit/claude-statusline-backups.json"
+        settings = self.home / ".claude/settings.json"
+        backups.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "entries": {str(settings): {"present": "not-bool"}},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        receipt_before = receipt.read_bytes()
+        releases_before = sorted(path.name for path in (root / "releases").iterdir())
+
+        self.env["SESSION_KIT_RELEASE_ID"] = RELEASE_B
+        refused = self.installed("update", "--source", str(REPO), check=False)
+
+        self.assertNotEqual(0, refused.returncode)
+        self.assertIn("invalid Claude status-line backup", refused.stderr)
+        self.assertEqual(RELEASE_A, current.resolve().name)
+        self.assertEqual(RELEASE_A, manager.resolve().name)
+        self.assertEqual(receipt_before, receipt.read_bytes())
+        self.assertEqual(
+            releases_before,
+            sorted(path.name for path in (root / "releases").iterdir()),
+        )
+        self.assertFalse(
+            (self.home / ".local/state/session-kit/lifecycle-transaction.json").exists()
+        )
+
+    def test_enrolled_profile_statusline_is_preserved_without_blocking_install(self) -> None:
+        profile = (
+            self.home
+            / ".local/share/session-kit/accounts/claude/independent"
+        )
+        profile.mkdir(parents=True)
+        custom_status = {
+            "type": "command",
+            "command": "/opt/profile/statusline",
+            "refreshInterval": 7,
+        }
+        settings_path = profile / "settings.json"
+        settings_path.write_text(
+            json.dumps({"keep": True, "statusLine": custom_status}) + "\n",
+            encoding="utf-8",
+        )
+
+        installed = self.run_installer("--non-interactive")
+
+        self.assertEqual(0, installed.returncode, installed.stderr)
+        self.assertIn(
+            f"skipping Claude statusLine rewrite in {settings_path}",
+            installed.stderr,
+        )
+        settings = json.loads(settings_path.read_text(encoding="utf-8"))
+        self.assertEqual(custom_status, settings["statusLine"])
+        self.assertTrue(settings["keep"])
+        for event in ("SessionStart", "UserPromptSubmit", "Stop"):
+            commands = [
+                hook.get("command")
+                for group in settings["hooks"][event]
+                for hook in group["hooks"]
+                if isinstance(hook, dict)
+            ]
+            self.assertIn("~/.claude/hooks/nameintent_title.sh", commands)
+
+    def test_force_install_restores_preexisting_statusline_on_uninstall(self) -> None:
+        settings_path = self.home / ".claude/settings.json"
+        settings_path.parent.mkdir()
+        original_status = {
+            "type": "command",
+            "command": "/opt/operator/statusline",
+            "padding": {"left": 1},
+        }
+        settings_path.write_text(
+            json.dumps({"keep": True, "statusLine": original_status}) + "\n",
+            encoding="utf-8",
+        )
+        settings_path.chmod(0o600)
+
+        self.run_installer("--non-interactive", "--force")
+        installed = json.loads(settings_path.read_text(encoding="utf-8"))
+        self.assertEqual("~/.claude/statusline.sh", installed["statusLine"]["command"])
+
+        self.env["SESSION_KIT_RELEASE_ID"] = RELEASE_B
+        self.installed("update", "--source", str(REPO))
+        self.installed("uninstall")
+
+        restored = json.loads(settings_path.read_text(encoding="utf-8"))
+        self.assertTrue(restored["keep"])
+        self.assertEqual(original_status, restored["statusLine"])
+        self.assertFalse(
+            (self.home / ".local/state/session-kit/claude-statusline-backups.json").exists()
+        )
+
+    def test_force_update_preserves_statusline_set_after_install(self) -> None:
+        settings_path = self.home / ".claude/settings.json"
+        self.run_installer("--non-interactive")
+        settings = json.loads(settings_path.read_text(encoding="utf-8"))
+        operator_status = {
+            "type": "command",
+            "command": "/opt/operator/after-install",
+        }
+        settings["statusLine"] = operator_status
+        settings_path.write_text(json.dumps(settings) + "\n", encoding="utf-8")
+
+        self.env["SESSION_KIT_RELEASE_ID"] = RELEASE_B
+        self.installed("update", "--source", str(REPO), "--force")
+        self.installed("uninstall")
+
+        restored = json.loads(settings_path.read_text(encoding="utf-8"))
+        self.assertEqual(operator_status, restored["statusLine"])
+
+    def test_force_update_refreshes_changed_operator_statusline_backup(self) -> None:
+        settings_path = self.home / ".claude/settings.json"
+        settings_path.parent.mkdir()
+        first_status = {
+            "type": "command",
+            "command": "/opt/operator/first",
+        }
+        settings_path.write_text(
+            json.dumps({"statusLine": first_status}) + "\n", encoding="utf-8"
+        )
+        self.run_installer("--non-interactive", "--force")
+
+        settings = json.loads(settings_path.read_text(encoding="utf-8"))
+        current_status = {
+            "type": "command",
+            "command": "/opt/operator/current",
+        }
+        settings["statusLine"] = current_status
+        settings_path.write_text(json.dumps(settings) + "\n", encoding="utf-8")
+
+        self.env["SESSION_KIT_RELEASE_ID"] = RELEASE_B
+        self.installed("update", "--source", str(REPO), "--force")
+        self.installed("uninstall")
+
+        restored = json.loads(settings_path.read_text(encoding="utf-8"))
+        self.assertEqual(current_status, restored["statusLine"])
+
+    def test_force_update_preserves_enrolled_statusline_set_after_install(self) -> None:
+        profile = self.home / ".local/share/session-kit/accounts/claude/independent"
+        profile.mkdir(parents=True)
+        settings_path = profile / "settings.json"
+        settings_path.write_text('{"keep":true}\n', encoding="utf-8")
+        self.run_installer("--non-interactive")
+
+        settings = json.loads(settings_path.read_text(encoding="utf-8"))
+        operator_status = {
+            "type": "command",
+            "command": "/opt/operator/enrolled-current",
+        }
+        settings["statusLine"] = operator_status
+        settings_path.write_text(json.dumps(settings) + "\n", encoding="utf-8")
+
+        self.env["SESSION_KIT_RELEASE_ID"] = RELEASE_B
+        self.installed("update", "--source", str(REPO), "--force")
+        self.installed("uninstall")
+
+        restored = json.loads(settings_path.read_text(encoding="utf-8"))
+        self.assertTrue(restored["keep"])
+        self.assertEqual(operator_status, restored["statusLine"])
+
+    def _assert_unusable_claude_settings_do_not_block_lifecycle(
+        self, *, enrolled: bool, bad_kind: str
+    ) -> None:
+        if enrolled:
+            profile = self.home / ".local/share/session-kit/accounts/claude/broken"
+        else:
+            profile = self.home / ".claude"
+        profile.mkdir(parents=True)
+        settings_path = profile / "settings.json"
+        fixtures = {
+            "invalid-json": (b"{\n", "invalid JSON"),
+            "non-object": (b"[]\n", "top level is not an object"),
+            "bad-hooks-group": (
+                b'{"hooks":{"SessionStart":{}}}\n',
+                "SessionStart hooks setting is not a list",
+            ),
+            "oversize": (b"x" * 1_048_577, "larger than 1 MiB"),
+            "foreign-owner": (
+                b'{"operator":true}\n',
+                "not owned by the current user",
+            ),
+        }
+        original, reason = fixtures[bad_kind]
+        settings_path.write_bytes(original)
+        settings_path.chmod(0o600)
+        if bad_kind == "foreign-owner":
+            foreign_uid = next(
+                entry.pw_uid for entry in pwd.getpwall() if entry.pw_uid != os.geteuid()
+            )
+            os.chown(settings_path, foreign_uid, -1)
+
+        def assert_skipped(result: subprocess.CompletedProcess[str]) -> None:
+            self.assertEqual(0, result.returncode, result.stderr)
+            matching = [
+                line
+                for line in result.stderr.splitlines()
+                if f"skipping unusable Claude settings file {settings_path}:" in line
+            ]
+            self.assertEqual(1, len(matching), result.stderr)
+            self.assertIn(reason, matching[0])
+            self.assertEqual(original, settings_path.read_bytes())
+
+        assert_skipped(self.run_installer("--non-interactive", check=False))
+        root = self.home / ".local/lib/session-kit"
+        self.assertEqual(RELEASE_A, (root / "current").resolve().name)
+
+        self.env["SESSION_KIT_RELEASE_ID"] = RELEASE_B
+        assert_skipped(
+            self.installed("update", "--source", str(REPO), check=False)
+        )
+        self.assertEqual(RELEASE_B, (root / "current").resolve().name)
+
+        assert_skipped(self.installed("rollback", "--to", RELEASE_A, check=False))
+        self.assertEqual(RELEASE_A, (root / "current").resolve().name)
+
+    def test_invalid_json_default_settings_do_not_block_lifecycle(self) -> None:
+        self._assert_unusable_claude_settings_do_not_block_lifecycle(
+            enrolled=False, bad_kind="invalid-json"
+        )
+
+    def test_invalid_json_enrolled_settings_do_not_block_lifecycle(self) -> None:
+        self._assert_unusable_claude_settings_do_not_block_lifecycle(
+            enrolled=True, bad_kind="invalid-json"
+        )
+
+    def test_non_object_default_settings_do_not_block_lifecycle(self) -> None:
+        self._assert_unusable_claude_settings_do_not_block_lifecycle(
+            enrolled=False, bad_kind="non-object"
+        )
+
+    def test_non_object_enrolled_settings_do_not_block_lifecycle(self) -> None:
+        self._assert_unusable_claude_settings_do_not_block_lifecycle(
+            enrolled=True, bad_kind="non-object"
+        )
+
+    def test_bad_hooks_default_settings_do_not_block_lifecycle(self) -> None:
+        self._assert_unusable_claude_settings_do_not_block_lifecycle(
+            enrolled=False, bad_kind="bad-hooks-group"
+        )
+
+    def test_bad_hooks_enrolled_settings_do_not_block_lifecycle(self) -> None:
+        self._assert_unusable_claude_settings_do_not_block_lifecycle(
+            enrolled=True, bad_kind="bad-hooks-group"
+        )
+
+    def test_oversize_default_settings_do_not_block_lifecycle(self) -> None:
+        self._assert_unusable_claude_settings_do_not_block_lifecycle(
+            enrolled=False, bad_kind="oversize"
+        )
+
+    def test_oversize_enrolled_settings_do_not_block_lifecycle(self) -> None:
+        self._assert_unusable_claude_settings_do_not_block_lifecycle(
+            enrolled=True, bad_kind="oversize"
+        )
+
+    @unittest.skipUnless(os.geteuid() == 0, "requires permission to create a foreign owner")
+    def test_foreign_owned_default_settings_do_not_block_lifecycle(self) -> None:
+        self._assert_unusable_claude_settings_do_not_block_lifecycle(
+            enrolled=False, bad_kind="foreign-owner"
+        )
+
+    @unittest.skipUnless(os.geteuid() == 0, "requires permission to create a foreign owner")
+    def test_foreign_owned_enrolled_settings_do_not_block_lifecycle(self) -> None:
+        self._assert_unusable_claude_settings_do_not_block_lifecycle(
+            enrolled=True, bad_kind="foreign-owner"
+        )
+
+    def test_preledger_kit_statusline_is_removed_on_uninstall(self) -> None:
+        settings_path = self.home / ".claude/settings.json"
+        settings_path.parent.mkdir()
+        settings_path.write_text(
+            json.dumps(
+                {
+                    "keep": True,
+                    "statusLine": {
+                        "type": "command",
+                        "command": "~/.claude/statusline.sh",
+                        "refreshInterval": 2,
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        settings_path.chmod(0o600)
+
+        self.run_installer("--non-interactive")
+        self.installed("uninstall")
+
+        restored = json.loads(settings_path.read_text(encoding="utf-8"))
+        self.assertTrue(restored["keep"])
+        self.assertNotIn("statusLine", restored)
+
+    def test_install_fails_when_claude_integration_directory_is_unsafe(self) -> None:
+        claude_home = self.home / ".claude"
+        claude_home.mkdir(mode=0o700)
+        hooks = claude_home / "hooks"
+        hooks.mkdir(mode=0o777)
+        hooks.chmod(0o777)
+
+        refused = self.run_installer("--non-interactive", check=False)
+
+        self.assertNotEqual(0, refused.returncode)
+        self.assertIn("Claude hooks directory is not owner-controlled", refused.stderr)
 
     def test_initial_install_can_import_existing_provider_projects(self) -> None:
         claude_project = self.home / "work/claude-project"
@@ -718,12 +1576,564 @@ class InstallerTests(unittest.TestCase):
 
     def test_update_and_rollback_switch_exact_releases(self) -> None:
         self.run_installer("--non-interactive")
+        floor = self.home / ".local/state/session-kit/collection-sequence-floor.json"
+        floor_bytes = floor.read_bytes()
         self.env["SESSION_KIT_RELEASE_ID"] = RELEASE_B
         self.installed("update", "--source", str(REPO))
         current = self.home / ".local/lib/session-kit/current"
         self.assertEqual(current.resolve().name, RELEASE_B)
         self.installed("rollback")
         self.assertEqual(current.resolve().name, RELEASE_A)
+        self.assertEqual(floor_bytes, floor.read_bytes())
+
+    def test_rollback_unfences_a_code_proven_legacy_release_for_a_fresh_picker(
+        self,
+    ) -> None:
+        self.run_installer("--non-interactive")
+        legacy = self.make_release_fence_unaware(RELEASE_A)
+        self.env["SESSION_KIT_RELEASE_ID"] = RELEASE_B
+        self.installed("update", "--source", str(REPO))
+
+        state = Path(self.env["SESSION_KIT_STATE_DIR"])
+        inventory = state / "inventory.json"
+        inventory.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "sessions": [
+                        {"display_title": "Alpha", "shpool_id_raw": "human-alpha"},
+                        {"display_title": "Beta", "shpool_id_raw": "human-beta"},
+                    ],
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        inventory.chmod(0o600)
+        sentinel = state / "inventory.lock"
+        sentinel.write_bytes(b"session-kit publishing lock generation 2\n")
+        sentinel.chmod(0o400)
+
+        refused = subprocess.run(
+            [str(legacy / "bin/shpool_status"), "--json"],
+            env=self.env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertNotEqual(0, refused.returncode)
+        self.assertEqual("", refused.stdout)
+
+        rolled_back = self.installed("rollback", "--to", RELEASE_A)
+
+        self.assertIn("Rolled back Session Kit", rolled_back.stdout)
+        self.assertEqual(0o600, stat.S_IMODE(sentinel.stat().st_mode))
+        self.assertEqual(b"", sentinel.read_bytes())
+        fresh = subprocess.run(
+            [str(self.home / ".local/bin/shpool_status"), "--json"],
+            env=self.env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(0, fresh.returncode, fresh.stderr)
+        self.assertEqual(
+            ["human-alpha", "human-beta"],
+            [row["shpool_id_raw"] for row in json.loads(fresh.stdout)["sessions"]],
+        )
+
+    def test_rollback_keeps_the_fence_for_a_code_proven_aware_release(self) -> None:
+        self.run_installer("--non-interactive")
+        self.env["SESSION_KIT_RELEASE_ID"] = RELEASE_B
+        self.installed("update", "--source", str(REPO))
+        state = Path(self.env["SESSION_KIT_STATE_DIR"])
+        sentinel = state / "inventory.lock"
+        expected = b"session-kit publishing lock generation 2\n"
+        sentinel.write_bytes(expected)
+        sentinel.chmod(0o400)
+
+        self.installed("rollback", "--to", RELEASE_A)
+
+        current = self.home / ".local/lib/session-kit/current"
+        self.assertEqual(RELEASE_A, current.resolve().name)
+        self.assertEqual(0o400, stat.S_IMODE(sentinel.stat().st_mode))
+        self.assertEqual(expected, sentinel.read_bytes())
+
+    def test_crash_after_unfence_cannot_select_legacy_code_behind_the_fence(
+        self,
+    ) -> None:
+        self.run_installer("--non-interactive")
+        self.make_release_fence_unaware(RELEASE_A)
+        self.env["SESSION_KIT_RELEASE_ID"] = RELEASE_B
+        self.installed("update", "--source", str(REPO))
+        state = Path(self.env["SESSION_KIT_STATE_DIR"])
+        sentinel = state / "inventory.lock"
+        sentinel.write_bytes(b"session-kit publishing lock generation 2\n")
+        sentinel.chmod(0o400)
+        self.env["SESSION_KIT_TEST_FAILPOINT"] = "rollback-unfenced"
+        self.env["SESSION_KIT_TEST_FAILPOINT_MODE"] = "kill"
+
+        killed = self.installed("rollback", "--to", RELEASE_A, check=False)
+
+        self.assertEqual(-signal.SIGKILL, killed.returncode)
+        current = self.home / ".local/lib/session-kit/current"
+        self.assertEqual(RELEASE_B, current.resolve().name)
+        self.assertEqual(0o600, stat.S_IMODE(sentinel.stat().st_mode))
+        self.env.pop("SESSION_KIT_TEST_FAILPOINT")
+        self.env.pop("SESSION_KIT_TEST_FAILPOINT_MODE")
+        recovered = self.installed("rollback", "--to", RELEASE_A)
+        self.assertIn("Recovered interrupted Session Kit rollback", recovered.stdout)
+        self.assertEqual(RELEASE_A, current.resolve().name)
+        self.assertEqual(0o600, stat.S_IMODE(sentinel.stat().st_mode))
+
+    def test_generation_two_publisher_cannot_refence_during_legacy_rollback(
+        self,
+    ) -> None:
+        self.run_installer("--non-interactive")
+        self.make_release_fence_unaware(RELEASE_A)
+        self.env["SESSION_KIT_RELEASE_ID"] = RELEASE_B
+        self.installed("update", "--source", str(REPO))
+        state = Path(self.env["SESSION_KIT_STATE_DIR"])
+        sentinel = state / "inventory.lock"
+        sentinel.write_bytes(b"session-kit publishing lock generation 2\n")
+        sentinel.chmod(0o400)
+        events: list[str] = []
+
+        def publish_in_gap() -> None:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                try:
+                    if stat.S_IMODE(sentinel.stat().st_mode) == 0o600:
+                        events.append("unfenced")
+                        try:
+                            with StateLock(state, state / "inventory-v2.lock"):
+                                events.append("published")
+                        except CollectionError as exc:
+                            events.append(str(exc))
+                        return
+                except OSError:
+                    pass
+            events.append("unfence-not-observed")
+
+        publisher = threading.Thread(
+            target=publish_in_gap, name="generation-two-publisher"
+        )
+        publisher.start()
+        rolled_back = self.installed("rollback", "--to", RELEASE_A)
+        publisher.join(12)
+
+        self.assertFalse(publisher.is_alive())
+        self.assertIn("Rolled back Session Kit", rolled_back.stdout)
+        self.assertEqual(
+            RELEASE_A,
+            (self.home / ".local/lib/session-kit/current").resolve().name,
+        )
+        self.assertEqual(0o600, stat.S_IMODE(sentinel.stat().st_mode))
+        self.assertNotIn("published", events)
+        self.assertTrue(
+            any("legacy rollback selected" in event for event in events), events
+        )
+
+    def test_forward_update_retires_the_legacy_rollback_hold(self) -> None:
+        self.run_installer("--non-interactive")
+        self.make_release_fence_unaware(RELEASE_A)
+        self.env["SESSION_KIT_RELEASE_ID"] = RELEASE_B
+        self.installed("update", "--source", str(REPO))
+        state = Path(self.env["SESSION_KIT_STATE_DIR"])
+        inventory = state / "inventory.json"
+        inventory.write_text(
+            '{"schema_version":1,"sessions":[]}\n', encoding="utf-8"
+        )
+        inventory.chmod(0o600)
+        sentinel = state / "inventory.lock"
+        sentinel.write_bytes(b"session-kit publishing lock generation 2\n")
+        sentinel.chmod(0o400)
+
+        self.installed("rollback", "--to", RELEASE_A)
+
+        hold = state / "inventory-rollback-v2"
+        self.assertTrue(hold.is_file())
+        self.assertEqual(0o400, stat.S_IMODE(hold.stat().st_mode))
+        self.assertEqual(
+            b"session-kit legacy rollback selected\n", hold.read_bytes()
+        )
+        self.assertEqual(0o600, stat.S_IMODE(sentinel.stat().st_mode))
+
+        self.installed("update", "--source", str(REPO))
+        refreshed = subprocess.run(
+            [str(self.home / ".local/bin/shpool_status"), "--json"],
+            env=self.env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+        self.assertEqual(0, refreshed.returncode, refreshed.stderr)
+        self.assertFalse(hold.exists())
+        self.assertEqual(0o400, stat.S_IMODE(sentinel.stat().st_mode))
+
+    def test_each_legacy_rollback_fence_kill_point_leaves_a_safe_pair(self) -> None:
+        cases = (
+            ("rollback-fence-marked", RELEASE_B, 0o400),
+            ("rollback-unfenced", RELEASE_B, 0o600),
+            ("current", RELEASE_A, 0o600),
+        )
+        for failpoint, selected, lock_mode in cases:
+            with self.subTest(failpoint=failpoint):
+                try:
+                    self.run_installer("--non-interactive")
+                    self.make_release_fence_unaware(RELEASE_A)
+                    self.env["SESSION_KIT_RELEASE_ID"] = RELEASE_B
+                    self.installed("update", "--source", str(REPO))
+                    state = Path(self.env["SESSION_KIT_STATE_DIR"])
+                    inventory = state / "inventory.json"
+                    inventory.write_text(
+                        '{"schema_version":1,"sessions":[]}\n', encoding="utf-8"
+                    )
+                    inventory.chmod(0o600)
+                    sentinel = state / "inventory.lock"
+                    sentinel.write_bytes(
+                        b"session-kit publishing lock generation 2\n"
+                    )
+                    sentinel.chmod(0o400)
+                    self.env["SESSION_KIT_TEST_FAILPOINT"] = failpoint
+                    self.env["SESSION_KIT_TEST_FAILPOINT_MODE"] = "kill"
+
+                    killed = self.installed(
+                        "rollback", "--to", RELEASE_A, check=False
+                    )
+
+                    self.assertEqual(-signal.SIGKILL, killed.returncode)
+                    current = self.home / ".local/lib/session-kit/current"
+                    self.assertEqual(selected, current.resolve().name)
+                    self.assertEqual(
+                        lock_mode, stat.S_IMODE(sentinel.stat().st_mode)
+                    )
+                    hold = state / "inventory-rollback-v2"
+                    self.assertEqual(0o400, stat.S_IMODE(hold.stat().st_mode))
+                    self.assertEqual(
+                        b"session-kit legacy rollback selected\n",
+                        hold.read_bytes(),
+                    )
+                    if selected == RELEASE_A:
+                        fresh = subprocess.run(
+                            [
+                                str(self.home / ".local/bin/shpool_status"),
+                                "--json",
+                            ],
+                            env=self.env,
+                            text=True,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            check=False,
+                        )
+                        self.assertEqual(0, fresh.returncode, fresh.stderr)
+                finally:
+                    self.env.pop("SESSION_KIT_TEST_FAILPOINT", None)
+                    self.env.pop("SESSION_KIT_TEST_FAILPOINT_MODE", None)
+                    self.tearDown()
+                    self.setUp()
+
+    def test_rollback_refuses_a_lookalike_fence_before_selecting_legacy_code(
+        self,
+    ) -> None:
+        self.run_installer("--non-interactive")
+        self.make_release_fence_unaware(RELEASE_A)
+        self.env["SESSION_KIT_RELEASE_ID"] = RELEASE_B
+        self.installed("update", "--source", str(REPO))
+        state = Path(self.env["SESSION_KIT_STATE_DIR"])
+        sentinel = state / "inventory.lock"
+        lookalike = b"session-kit publishing lock generation two\n"
+        sentinel.write_bytes(lookalike)
+        sentinel.chmod(0o400)
+
+        refused = self.installed("rollback", "--to", RELEASE_A, check=False)
+
+        self.assertNotEqual(0, refused.returncode)
+        self.assertIn("not the exact generation-2 fence", refused.stderr)
+        current = self.home / ".local/lib/session-kit/current"
+        self.assertEqual(RELEASE_B, current.resolve().name)
+        self.assertEqual(lookalike, sentinel.read_bytes())
+        self.assertEqual(0o400, stat.S_IMODE(sentinel.stat().st_mode))
+
+    def test_rollback_accepts_legacy_release_without_claude_payload(self) -> None:
+        self.run_installer("--non-interactive")
+        root = self.home / ".local/lib/session-kit"
+        legacy = root / "releases" / RELEASE_A
+        self.unseal_release(legacy)
+        shutil.rmtree(legacy / "config/claude")
+        self.seal_release(legacy)
+
+        self.env["SESSION_KIT_RELEASE_ID"] = RELEASE_B
+        self.installed("update", "--source", str(REPO))
+        statusline = self.home / ".claude/statusline.sh"
+        modern_statusline = statusline.read_bytes()
+
+        rolled_back = self.installed("rollback", "--to", RELEASE_A)
+
+        self.assertIn("Rolled back Session Kit", rolled_back.stdout)
+        self.assertEqual(RELEASE_A, (root / "current").resolve().name)
+        self.assertEqual(modern_statusline, statusline.read_bytes())
+
+    def test_rollback_skips_statusline_drift_and_still_flips_release(self) -> None:
+        self.run_installer("--non-interactive")
+        self.env["SESSION_KIT_RELEASE_ID"] = RELEASE_B
+        self.installed("update", "--source", str(REPO))
+        settings_path = self.home / ".claude/settings.json"
+        settings = json.loads(settings_path.read_text(encoding="utf-8"))
+        custom_status = {
+            "type": "command",
+            "command": "/opt/operator/emergency-status",
+        }
+        settings["statusLine"] = custom_status
+        settings_path.write_text(json.dumps(settings) + "\n", encoding="utf-8")
+
+        rolled_back = self.installed("rollback", "--to", RELEASE_A)
+
+        self.assertIn("Rolled back Session Kit", rolled_back.stdout)
+        self.assertIn(
+            f"skipping Claude statusLine rewrite in {settings_path}",
+            rolled_back.stderr,
+        )
+        self.assertNotIn("--force", rolled_back.stderr)
+        self.assertEqual(
+            RELEASE_A,
+            (self.home / ".local/lib/session-kit/current").resolve().name,
+        )
+        self.assertEqual(
+            custom_status,
+            json.loads(settings_path.read_text(encoding="utf-8"))["statusLine"],
+        )
+
+    def test_doctor_uses_integration_ledger_after_legacy_rollback(self) -> None:
+        self.install_mixed_modern_legacy_history()
+
+        doctor = self.installed("doctor", "--json")
+
+        checks = {row["name"]: row for row in json.loads(doctor.stdout)["checks"]}
+        self.assertEqual("ok", checks["naming-hook"]["status"])
+        self.assertEqual("ok", checks["statusline"]["status"])
+        self.assertNotIn("content", checks["naming-hook"]["detail"])
+        self.assertNotIn("content", checks["statusline"]["detail"])
+
+    def test_doctor_requires_owner_only_modes_for_claude_scripts(self) -> None:
+        self.run_installer("--non-interactive")
+        hook = self.home / ".claude/hooks/nameintent_title.sh"
+        statusline = self.home / ".claude/statusline.sh"
+        hook.chmod(0o755)
+        statusline.chmod(0o755)
+
+        doctor = self.installed("doctor", "--json")
+
+        checks = {row["name"]: row for row in json.loads(doctor.stdout)["checks"]}
+        self.assertEqual("warn", checks["naming-hook"]["status"])
+        self.assertIn("hook file", checks["naming-hook"]["detail"])
+        self.assertEqual("warn", checks["statusline"]["status"])
+        self.assertIn("status line file", checks["statusline"]["detail"])
+
+    def test_uninstall_removes_ledger_owned_scripts_after_legacy_rollback(self) -> None:
+        self.install_mixed_modern_legacy_history()
+        hook = self.home / ".claude/hooks/nameintent_title.sh"
+        statusline = self.home / ".claude/statusline.sh"
+        manager_statusline = (
+            self.home
+            / ".local/lib/session-kit/manager/config/claude/statusline.sh"
+        )
+        self.assertTrue(hook.is_file())
+        self.assertTrue(statusline.is_file())
+        self.assertNotEqual(statusline.read_bytes(), manager_statusline.read_bytes())
+
+        self.installed("uninstall")
+
+        self.assertFalse(hook.exists())
+        self.assertFalse(statusline.exists())
+        self.assertFalse(
+            (self.home / ".local/state/session-kit/claude-integration.json").exists()
+        )
+
+    def test_uninstall_partial_ledger_removes_recorded_file_and_retains_ledger(self) -> None:
+        self.run_installer("--non-interactive")
+        hook = self.home / ".claude/hooks/nameintent_title.sh"
+        statusline = self.home / ".claude/statusline.sh"
+        ledger_path = self.home / ".local/state/session-kit/claude-integration.json"
+        ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+        ledger["files"].pop(str(statusline))
+        ledger_path.write_text(json.dumps(ledger) + "\n", encoding="utf-8")
+
+        removed = self.installed("uninstall")
+
+        self.assertFalse(hook.exists())
+        self.assertTrue(statusline.is_file())
+        self.assertTrue(ledger_path.is_file())
+        self.assertIn("incomplete Claude integration ledger retained", removed.stderr)
+        self.assertIn(str(statusline), removed.stderr)
+
+    def test_uninstall_digest_drift_retains_only_unremoved_ledger_entry(self) -> None:
+        self.run_installer("--non-interactive")
+        hook = self.home / ".claude/hooks/nameintent_title.sh"
+        statusline = self.home / ".claude/statusline.sh"
+        ledger_path = self.home / ".local/state/session-kit/claude-integration.json"
+        statusline.write_text(
+            statusline.read_text(encoding="utf-8") + "\n# operator edit\n",
+            encoding="utf-8",
+        )
+
+        removed = self.installed("uninstall")
+
+        self.assertFalse(hook.exists())
+        self.assertTrue(statusline.is_file())
+        ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+        self.assertEqual({str(statusline)}, set(ledger["files"]))
+        self.assertIn("Claude integration ledger retained", removed.stderr)
+        self.assertIn(str(statusline), removed.stderr)
+
+    def assert_uninstall_refusal_preserves_login(
+        self, ledger_name: str, invalid_payload: object, expected_message: str
+    ) -> None:
+        self.run_installer("--non-interactive", "--enable-login")
+        state = self.home / ".local/state/session-kit"
+        (state / ledger_name).write_text(
+            json.dumps(invalid_payload) + "\n", encoding="utf-8"
+        )
+        marker = state / "integration-ready-v1"
+        bashrc = self.home / ".bashrc"
+        self.assertTrue(marker.is_file())
+        self.assertIn("session-kit managed integration", bashrc.read_text(encoding="utf-8"))
+
+        refused = self.installed("uninstall", check=False)
+
+        self.assertNotEqual(0, refused.returncode)
+        self.assertIn(expected_message, refused.stderr)
+        self.assertFalse((state / "lifecycle-transaction.json").exists())
+        self.assertTrue(marker.is_file())
+        self.assertIn("session-kit managed integration", bashrc.read_text(encoding="utf-8"))
+
+    def test_uninstall_invalid_integration_ledger_preserves_login(self) -> None:
+        self.assert_uninstall_refusal_preserves_login(
+            "claude-integration.json",
+            {"schema_version": 1, "release_id": RELEASE_A, "files": {"bad": "0" * 64}},
+            "invalid Claude integration ledger",
+        )
+
+    def test_uninstall_invalid_statusline_backup_preserves_login(self) -> None:
+        self.assert_uninstall_refusal_preserves_login(
+            "claude-statusline-backups.json",
+            {"schema_version": 1, "entries": {"relative": {"present": False}}},
+            "invalid Claude status-line backup",
+        )
+
+    def test_uninstall_post_preflight_failure_recovers_login_and_journal(self) -> None:
+        self.run_installer("--non-interactive", "--enable-login")
+        failing_rm = self.fake_bin / "rm"
+        failing_rm.write_text("#!/usr/bin/env bash\nexit 77\n", encoding="utf-8")
+        failing_rm.chmod(0o755)
+        state = self.home / ".local/state/session-kit"
+        marker = state / "integration-ready-v1"
+        bashrc = self.home / ".bashrc"
+
+        refused = self.installed("uninstall", check=False)
+
+        self.assertEqual(77, refused.returncode)
+        self.assertIn("Recovered interrupted Session Kit uninstall", refused.stdout)
+        self.assertFalse((state / "lifecycle-transaction.json").exists())
+        self.assertTrue(marker.is_file())
+        self.assertIn("session-kit managed integration", bashrc.read_text(encoding="utf-8"))
+        self.assertTrue((self.home / ".claude/statusline.sh").is_file())
+        self.assertTrue((self.home / ".claude/hooks/nameintent_title.sh").is_file())
+
+    def test_doctor_warns_for_invalid_statusline_backup_ledger(self) -> None:
+        self.run_installer("--non-interactive")
+        backups = self.home / ".local/state/session-kit/claude-statusline-backups.json"
+        backups.write_text(
+            json.dumps({"schema_version": 1, "entries": {"relative": {"present": False}}})
+            + "\n",
+            encoding="utf-8",
+        )
+
+        doctor = self.installed("doctor", "--json")
+
+        checks = {row["name"]: row for row in json.loads(doctor.stdout)["checks"]}
+        self.assertEqual("warn", checks["claude-statusline-backups"]["status"])
+        self.assertIn("invalid data", checks["claude-statusline-backups"]["detail"])
+
+    def test_doctor_warns_for_existing_unsafe_integration_ledger(self) -> None:
+        self.run_installer("--non-interactive")
+        ledger_path = self.home / ".local/state/session-kit/claude-integration.json"
+        target = ledger_path.with_name("unsafe-ledger-target.json")
+        ledger_path.rename(target)
+        ledger_path.symlink_to(target)
+
+        doctor = self.installed("doctor", "--json")
+
+        checks = {row["name"]: row for row in json.loads(doctor.stdout)["checks"]}
+        self.assertEqual("warn", checks["claude-integration-ledger"]["status"])
+        self.assertIn("symbolic link", checks["claude-integration-ledger"]["detail"])
+        self.assertEqual("warn", checks["naming-hook"]["status"])
+        self.assertEqual("warn", checks["statusline"]["status"])
+
+    def test_uninstall_rejects_unexpected_integration_ledger_key(self) -> None:
+        self.run_installer("--non-interactive")
+        hook = self.home / ".claude/hooks/nameintent_title.sh"
+        statusline = self.home / ".claude/statusline.sh"
+        ledger_path = self.home / ".local/state/session-kit/claude-integration.json"
+        ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+        ledger["files"][str(self.home / "unrelated-script")] = "0" * 64
+        ledger_path.write_text(json.dumps(ledger) + "\n", encoding="utf-8")
+
+        refused = self.installed("uninstall", check=False)
+
+        self.assertNotEqual(0, refused.returncode)
+        self.assertIn("invalid Claude integration ledger", refused.stderr)
+        self.assertTrue(hook.is_file())
+        self.assertTrue(statusline.is_file())
+        self.assertTrue(ledger_path.is_file())
+
+    def test_uninstall_removes_per_account_quota_cache_tree(self) -> None:
+        self.run_installer("--non-interactive")
+        account = self.home / ".local/share/session-kit/accounts/claude/work"
+        account.mkdir(parents=True)
+        credentials = account / ".credentials.json"
+        credentials.write_text('{"token":"fixture-only"}\n', encoding="utf-8")
+        cache = self.home / ".claude/cache/session-kit-quota/work-fixture"
+        probe = cache / "probe-home/.claude"
+        probe.mkdir(parents=True)
+        (cache / "quota_headers").write_text("x-probe-account: fixture\n", encoding="utf-8")
+        (probe / ".credentials.json").symlink_to(credentials)
+
+        self.installed("uninstall")
+
+        self.assertFalse((self.home / ".claude/cache/session-kit-quota").exists())
+        self.assertTrue(credentials.is_file())
+
+    def test_real_installed_release_layouts_are_legacy_or_complete(self) -> None:
+        """Exercise every real rollback payload shape without changing it."""
+        releases = Path.home() / ".local/lib/session-kit/releases"
+        if not releases.is_dir():
+            self.skipTest("no installed Session Kit release corpus")
+        layouts: dict[str, int] = {"legacy": 0, "modern": 0}
+        visited = 0
+        for release in sorted(releases.iterdir()):
+            if not release.is_dir():
+                continue
+            title = release / "config/claude/nameintent_title.sh"
+            status = release / "config/claude/statusline.sh"
+            shape = (
+                title.is_file() and not title.is_symlink(),
+                status.is_file() and not status.is_symlink(),
+            )
+            self.assertIn(
+                shape,
+                {(False, False), (True, True)},
+                f"partial Claude integration payload in {release.name}",
+            )
+            layouts["modern" if shape == (True, True) else "legacy"] += 1
+            visited += 1
+        self.assertGreater(visited, 0)
+        self.assertGreater(layouts["legacy"], 0)
+        self.assertGreater(layouts["modern"], 0)
 
     def test_legacy_rollback_keeps_modern_manager_for_forward_update(self) -> None:
         self.install_legacy_generation()
@@ -740,7 +2150,6 @@ class InstallerTests(unittest.TestCase):
 
         self.assertEqual(RELEASE_A, current.resolve().name)
         self.assertEqual(RELEASE_B, manager.resolve().name)
-        self.assertFalse((self.home / ".codex/hooks.json").exists())
         self.assertEqual(
             (release_b / "deploy/session-kit-launcher").read_bytes(),
             launcher.read_bytes(),
@@ -755,26 +2164,10 @@ class InstallerTests(unittest.TestCase):
         self.assertIn("Installed Session Kit release", updated.stdout)
         self.assertEqual(RELEASE_B, current.resolve().name)
         self.assertEqual(RELEASE_B, manager.resolve().name)
-        self.assertTrue((self.home / ".codex/hooks.json").is_file())
-        for path in (
-            self.home / ".claude/settings.json",
-            self.home / ".codex/hooks.json",
-        ):
-            document = json.loads(path.read_text(encoding="utf-8"))
-            owned = [
-                hook
-                for groups in document["hooks"].values()
-                for group in groups
-                for hook in group["hooks"]
-                if hook.get("sessionKitProvenance", {}).get("owner")
-                == "session-kit"
-            ]
-            self.assertEqual(1, len(owned))
         doctor = self.installed("doctor", "--json")
         checks = {row["name"]: row for row in json.loads(doctor.stdout)["checks"]}
         self.assertEqual("ok", checks["manager"]["status"])
         self.assertEqual("ok", checks["manager-launcher"]["status"])
-        self.assertEqual("ok", checks["provider-hooks"]["status"])
 
     def test_direct_manager_rollback_pins_preflip_launcher_source(self) -> None:
         self.install_legacy_generation()
@@ -809,33 +2202,28 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(78, result.returncode)
         self.assertIn("unsafe manager link", result.stderr)
 
-    def test_rollback_to_release_without_provider_hooks_and_next_recovery_succeed(self) -> None:
+    def test_rollback_to_a_legacy_release_and_next_recovery_succeed(self) -> None:
         self.install_legacy_generation()
-        legacy_release = self.home / ".local/lib/session-kit/releases" / RELEASE_A
-        self.assertFalse(
-            (legacy_release / "lib/sessionkit_supervisor/provider_hooks.py").exists()
-        )
-        self.assertFalse((legacy_release / "config/codex/hooks.json").exists())
 
         self.env["SESSION_KIT_RELEASE_ID"] = RELEASE_B
         self.run_installer("--non-interactive")
         current = self.home / ".local/lib/session-kit/current"
         self.assertEqual(RELEASE_B, current.resolve().name)
-        self.assertTrue((self.home / ".codex/hooks.json").is_file())
 
         rolled_back = self.installed("rollback", "--to", RELEASE_A)
         self.assertIn("Rolled back Session Kit", rolled_back.stdout)
         self.assertEqual(RELEASE_A, current.resolve().name)
-        self.assertFalse((self.home / ".codex/hooks.json").exists())
 
         self.env["SESSION_KIT_TEST_FAILPOINT"] = "current"
+        self.env["SESSION_KIT_TEST_FAILPOINT_MODE"] = "kill"
         interrupted = self.installed(
             "update", "--source", str(REPO), check=False
         )
-        self.assertNotEqual(0, interrupted.returncode)
+        self.assertEqual(-signal.SIGKILL, interrupted.returncode)
         journal = self.home / ".local/state/session-kit/lifecycle-transaction.json"
         self.assertTrue(journal.is_file())
         self.env.pop("SESSION_KIT_TEST_FAILPOINT")
+        self.env.pop("SESSION_KIT_TEST_FAILPOINT_MODE")
         recovered = self.installed("update", "--source", str(REPO))
         self.assertIn("Recovered interrupted Session Kit install", recovered.stdout)
         self.assertFalse(journal.exists())
@@ -892,7 +2280,7 @@ class InstallerTests(unittest.TestCase):
         self.assertFalse(journal.exists())
         self.assertIn("Installed Session Kit release", recovered.stdout)
 
-    def test_install_uninstall_preserves_colocated_user_hooks_byte_exact(self) -> None:
+    def test_install_owns_claude_integration_and_preserves_other_hooks(self) -> None:
         claude_settings = self.home / ".claude/settings.json"
         codex_hooks = self.home / ".codex/hooks.json"
         claude_settings.parent.mkdir()
@@ -916,24 +2304,86 @@ class InstallerTests(unittest.TestCase):
             path.chmod(0o600)
 
         self.run_installer("--non-interactive")
-        active_claude = claude_settings.read_text(encoding="utf-8")
-        self.assertIn("quota_human_session.py", active_claude)
-        self.assertIn("nameintent_title.sh", active_claude)
-        self.assertIn("sessionKitProvenance", active_claude)
+        settings = json.loads(claude_settings.read_text(encoding="utf-8"))
+        self.assertTrue(settings["keep"])
+        self.assertEqual(
+            settings["statusLine"],
+            {
+                "type": "command",
+                "command": "~/.claude/statusline.sh",
+                "refreshInterval": 2,
+            },
+        )
+        prompt_commands = [
+            hook["command"]
+            for group in settings["hooks"]["UserPromptSubmit"]
+            for hook in group["hooks"]
+            if isinstance(hook, dict) and "command" in hook
+        ]
+        self.assertIn("python3 ~/.claude/hooks/quota_human_session.py", prompt_commands)
+        self.assertIn("sh ~/.claude/hooks/nameintent_title.sh", prompt_commands)
+        self.assertIn("~/.claude/hooks/nameintent_title.sh", prompt_commands)
+        self.assertEqual(
+            (self.home / ".claude/hooks/nameintent_title.sh").read_bytes(),
+            (REPO / "config/claude/nameintent_title.sh").read_bytes(),
+        )
+        self.assertEqual(
+            (self.home / ".claude/statusline.sh").read_bytes(),
+            (REPO / "config/claude/statusline.sh").read_bytes(),
+        )
+        self.assertEqual(codex_original, codex_hooks.read_bytes())
         self.installed("uninstall")
-        self.assertEqual(claude_original, claude_settings.read_bytes())
+        restored = json.loads(claude_settings.read_text(encoding="utf-8"))
+        self.assertTrue(restored["keep"])
+        self.assertNotIn("statusLine", restored)
+        remaining_commands = [
+            hook["command"]
+            for group in restored["hooks"]["UserPromptSubmit"]
+            for hook in group["hooks"]
+            if isinstance(hook, dict) and "command" in hook
+        ]
+        self.assertEqual(
+            remaining_commands,
+            [
+                "python3 ~/.claude/hooks/quota_human_session.py",
+                "sh ~/.claude/hooks/nameintent_title.sh",
+            ],
+        )
+        self.assertFalse((self.home / ".claude/hooks/nameintent_title.sh").exists())
+        self.assertFalse((self.home / ".claude/statusline.sh").exists())
         self.assertEqual(codex_original, codex_hooks.read_bytes())
 
-    def test_update_defaults_journals_off_and_allows_explicit_opt_in(self) -> None:
+    def test_update_preserves_journal_choice_unless_explicitly_changed(self) -> None:
+        # The old default flipped journals OFF on every update; that silent
+        # flip erased all terminal recordings 2026-07-30..08-12. An update now
+        # keeps the operator's choice in both directions unless --journal is
+        # passed explicitly.
         self.run_installer("--journal", "on", "--non-interactive")
         sentinel = self.home / ".no_shpool_journal"
         self.assertFalse(sentinel.exists())
         self.env["SESSION_KIT_RELEASE_ID"] = RELEASE_B
         self.installed("update", "--source", str(REPO))
+        self.assertFalse(sentinel.exists())
+        self.installed(
+            "update", "--source", str(REPO), "--journal", "off"
+        )
+        self.assertTrue(sentinel.is_file())
+        self.installed("update", "--source", str(REPO))
         self.assertTrue(sentinel.is_file())
         self.installed(
             "update", "--source", str(REPO), "--journal", "on"
         )
+        self.assertFalse(sentinel.exists())
+
+    def test_noninteractive_rollover_keeps_journals_on(self) -> None:
+        # The exact 2026-08-12 regression: a --non-interactive reinstall over
+        # an existing installation re-created the kill switch and silently
+        # stopped all new-session recording.
+        self.run_installer("--journal", "on", "--non-interactive")
+        sentinel = self.home / ".no_shpool_journal"
+        self.assertFalse(sentinel.exists())
+        self.env["SESSION_KIT_RELEASE_ID"] = RELEASE_B
+        self.run_installer("--non-interactive")
         self.assertFalse(sentinel.exists())
 
     def test_interrupted_update_recovers_before_retry(self) -> None:
@@ -945,15 +2395,15 @@ class InstallerTests(unittest.TestCase):
         )
         self.assertNotEqual(failed.returncode, 0)
         current = self.home / ".local/lib/session-kit/current"
-        self.assertEqual(current.resolve().name, RELEASE_B)
+        self.assertEqual(current.resolve().name, RELEASE_A)
         transaction = (
             self.home / ".local/state/session-kit/lifecycle-transaction.json"
         )
-        self.assertTrue(transaction.is_file())
+        self.assertFalse(transaction.exists())
+        self.assertIn("Recovered interrupted Session Kit install", failed.stdout)
 
         del self.env["SESSION_KIT_TEST_FAILPOINT"]
         recovered = self.installed("update", "--source", str(REPO))
-        self.assertIn("Recovered interrupted Session Kit install", recovered.stdout)
         self.assertEqual(current.resolve().name, RELEASE_B)
         self.assertFalse(transaction.exists())
         backups = list(
@@ -1059,10 +2509,19 @@ class InstallerTests(unittest.TestCase):
         self.installed("enable-login")
         self.assertTrue((self.home / ".local/bin/kit").is_file())
         shpool_config = self.home / ".config/shpool/config.toml"
-        self.assertIn(
-            f'shell = "{expected_config_bash}"',
-            shpool_config.read_text(encoding="utf-8"),
-        )
+        installed_config = shpool_config.read_text(encoding="utf-8")
+        self.assertIn(f'shell = "{expected_config_bash}"', installed_config)
+        # Ctrl-q is what docs/usage.md tells people to press to leave a
+        # conversation running, so a fresh install has to make it true. Stock
+        # shpool 0.11 detaches on the two-key chord Ctrl-Space Ctrl-q and a
+        # lone Ctrl-q does nothing at all; shipping the instruction without
+        # the binding passed for the one machine whose private config already
+        # had it, and was false for every new setup (found in review,
+        # 2026-08-15). That is the worst shape of documentation bug: it
+        # survives the only test anyone will actually run.
+        self.assertIn("[[keybinding]]", installed_config)
+        self.assertIn('binding = "Ctrl-q"', installed_config)
+        self.assertIn('action = "detach"', installed_config)
 
         self.env["SESSION_KIT_RELEASE_ID"] = RELEASE_B
         self.installed("update", "--source", str(REPO))
@@ -1119,6 +2578,243 @@ class InstallerTests(unittest.TestCase):
         self.assertFalse((self.home / ".local/lib/session-kit").exists())
         self.assertFalse((self.home / ".local/bin/sp").exists())
 
+    def test_the_release_ships_bytecode_caches_that_validate(self) -> None:
+        """A cache that does not match its source is worse than none.
+
+        `cp -R` renews every mtime, so a cache built while the source tree was
+        in use records a timestamp the copy does not have. Python then compiled
+        from source on every import -- 112-148 ms where a valid cache costs 41 --
+        and could never repair it: the release is read-only and
+        `shpool_status` exports PYTHONDONTWRITEBYTECODE=1 for that reason.
+        """
+        self.run_installer()
+        release = (
+            self.home / ".local/lib/session-kit/releases" / RELEASE_A / "lib"
+        )
+        caches = sorted(release.rglob("*.pyc"))
+        self.assertTrue(caches, msg="no bytecode caches were shipped")
+        stale = []
+        for cache in caches:
+            source = cache.parents[1] / (cache.name.split(".")[0] + ".py")
+            self.assertTrue(source.exists(), msg=f"orphan cache: {cache}")
+            data = cache.read_bytes()
+            flags = int.from_bytes(data[4:8], "little")
+            # Hash-based (PEP 552): valid whatever the mtimes are, which is the
+            # only kind a copied, resealed tree can promise.
+            if not flags & 0b1:
+                stale.append(f"{cache.name}: mtime-based")
+                continue
+            if data[8:16] != importlib.util.source_hash(source.read_bytes()):
+                stale.append(f"{cache.name}: hash does not match its source")
+        self.assertEqual([], stale)
+
+    def test_doctor_reports_the_recording_footprint_without_removing_any(
+        self,
+    ) -> None:
+        """The largest thing the kit writes, and the only feed with no policy.
+
+        Recordings go when their session is closed or pruned, and nothing ages
+        them out -- 2.6 GB on a two-week-old box, 470 MB of it belonging to
+        sessions that no longer existed. Doctor states the number and warns past
+        a bound the operator sets. It deletes nothing: a recording is the history
+        `sp find` and `sp history` read.
+        """
+        self.run_installer()
+        journals = self.home / ".local/state/shpool-journal/s20260101-000000-1"
+        journals.mkdir(parents=True)
+        old = journals / "segment-000001.raw"
+        old.write_bytes(b"x" * 4096)
+        stale = time.time() - 40 * 86400
+        os.utime(old, (stale, stale))
+
+        result = self.installed("doctor", "--json", check=False)
+        checks = {row["name"]: row for row in json.loads(result.stdout)["checks"]}
+        self.assertEqual("warn", checks["journals"]["status"])
+        self.assertIn(
+            "SESSION_KIT_JOURNAL_RETENTION_DAYS", checks["journals"]["detail"]
+        )
+        # Nothing was removed by looking.
+        self.assertTrue(old.exists())
+
+        # And the bound is the operator's: a wider one is satisfied.
+        self.env["SESSION_KIT_JOURNAL_RETENTION_DAYS"] = "90"
+        result = self.installed("doctor", "--json", check=False)
+        checks = {row["name"]: row for row in json.loads(result.stdout)["checks"]}
+        self.assertEqual("ok", checks["journals"]["status"])
+        self.assertTrue(old.exists())
+
+    def test_doctor_names_a_disabled_live_channel_on_the_kill_switch_line(
+        self,
+    ) -> None:
+        """A kill switch that doctor cannot see is a false all-clear.
+
+        The picker's three live channels default on; each is turned off by
+        0/off/no/false in any case. Doctor's own `kill-switches` row must name a
+        disabled one instead of reporting that none is active -- otherwise the
+        line meant to surface a turned-off feature lies about the three newest.
+        """
+        self.run_installer()
+
+        clean = self.installed("doctor", "--json", check=False)
+        row = {r["name"]: r for r in json.loads(clean.stdout)["checks"]}["kill-switches"]
+        self.assertEqual("ok", row["status"])
+        self.assertIn("no supported kill switch", row["detail"])
+
+        for var, spelling in (
+            ("SESSION_KIT_PICKER_EVENTS", "0"),
+            ("SESSION_KIT_PICKER_PULSE", " Off "),
+            ("SESSION_KIT_CLAUDE_SOCKET", "false"),
+        ):
+            self.env[var] = spelling
+        result = self.installed("doctor", "--json", check=False)
+        row = {r["name"]: r for r in json.loads(result.stdout)["checks"]}["kill-switches"]
+        self.assertEqual("warn", row["status"])
+        for var in (
+            "SESSION_KIT_PICKER_EVENTS",
+            "SESSION_KIT_PICKER_PULSE",
+            "SESSION_KIT_CLAUDE_SOCKET",
+        ):
+            self.assertIn(var, row["detail"])
+        for var in (
+            "SESSION_KIT_PICKER_EVENTS",
+            "SESSION_KIT_PICKER_PULSE",
+            "SESSION_KIT_CLAUDE_SOCKET",
+        ):
+            self.env.pop(var)
+
+    # ---- what is running vs what was shipped ------------------------------
+    #
+    # A release rolls by writing new unit files and moving `current`. systemd
+    # keeps serving the previous unit definitions until it is told, and a
+    # long-running kit process keeps executing the inode it started with. Ten
+    # activations passed over one watchdog process on a live box: every fix
+    # shipped that day ran nowhere, and doctor reported green throughout.
+
+    def fake_systemctl(self, *, reload: str = "no", main_pid: str = "0") -> Path:
+        """A systemctl that answers the two queries doctor asks and logs calls.
+
+        The real one is never reached from a test: `SESSION_KIT_SYSTEMCTL_CMD`
+        is the seam, and without it the kit skips this work entirely under the
+        test flag rather than restarting the operator's own units.
+        """
+        log = self.temp / "systemctl.log"
+        tool = self.fake_bin / "fake-systemctl"
+        tool.write_text(
+            "#!/usr/bin/env bash\n"
+            f'printf "%s\\n" "$*" >> {log}\n'
+            "case \"$*\" in\n"
+            f'  *NeedDaemonReload*) printf "NeedDaemonReload={reload}\\nMainPID={main_pid}\\n" ;;\n'
+            '  *UnitFileState*) printf "UnitFileState=enabled\\nActiveState=active\\n" ;;\n'
+            "esac\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        tool.chmod(0o755)
+        self.env["SESSION_KIT_SYSTEMCTL_CMD"] = str(tool)
+        return log
+
+    def start_release_process(
+        self, release: str, *, evidence: str = "script"
+    ) -> subprocess.Popen[str]:
+        """A live process that belongs to `release`, the way the watchdog does.
+
+        Two kinds of evidence, both of which doctor reads: `script` is the
+        descriptor bash keeps open on the file it exec'd, which resolves through
+        `current` to the release as it was at exec time; `environ` is the
+        release directory the launcher exports, for a process whose descriptors
+        cannot be read.
+        """
+        root = self.home / ".local/lib/session-kit/releases" / release
+        if evidence == "environ":
+            environment = dict(self.env)
+            environment["SESSION_KIT_RELEASE_DIR"] = str(root)
+            return subprocess.Popen(
+                ["/usr/bin/env", "bash", "-c", "read -r _line"],
+                env=environment,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+        script = root / "bin/fixture_watchdog"
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text(
+            "#!/usr/bin/env bash\nread -r _line\n", encoding="utf-8"
+        )
+        script.chmod(0o755)
+        return subprocess.Popen(
+            ["/usr/bin/env", "bash", str(script)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+
+    def test_activation_reloads_the_units_and_restarts_the_watchdog(self) -> None:
+        log = self.fake_systemctl()
+        self.run_installer()
+        called = log.read_text(encoding="utf-8").splitlines()
+        self.assertIn("--user daemon-reload", called)
+        self.assertIn(
+            "--user try-restart session-kit-watchdog.service", called
+        )
+        # The session daemon is never restarted by an activation: that would
+        # end every managed session.
+        for line in called:
+            self.assertNotIn("shpool.service", line)
+            self.assertNotIn("shpool.socket", line)
+
+    def test_doctor_fails_when_the_running_watchdog_is_another_release(
+        self,
+    ) -> None:
+        self.run_installer()
+        stale = "b" * 40
+        process = self.start_release_process(stale)
+        try:
+            self.fake_systemctl(main_pid=str(process.pid))
+            result = self.installed("doctor", "--json", check=False)
+            checks = {
+                row["name"]: row for row in json.loads(result.stdout)["checks"]
+            }
+            self.assertEqual("fail", checks["release-running"]["status"])
+            self.assertIn("not the installed", checks["release-running"]["detail"])
+            self.assertIn(
+                "systemctl --user restart session-kit-watchdog.service",
+                checks["release-running"]["detail"],
+            )
+            self.assertNotEqual(0, result.returncode)
+        finally:
+            process.stdin.close()
+            process.wait(timeout=10)
+
+    def test_doctor_passes_when_the_running_watchdog_is_this_release(
+        self,
+    ) -> None:
+        self.run_installer()
+        process = self.start_release_process(RELEASE_A, evidence="environ")
+        try:
+            self.fake_systemctl(main_pid=str(process.pid))
+            result = self.installed("doctor", "--json", check=False)
+            checks = {
+                row["name"]: row for row in json.loads(result.stdout)["checks"]
+            }
+            self.assertEqual("ok", checks["release-running"]["status"])
+            self.assertEqual("ok", checks["units-loaded"]["status"])
+        finally:
+            process.stdin.close()
+            process.wait(timeout=10)
+
+    def test_doctor_fails_when_systemd_has_not_read_the_new_units(self) -> None:
+        self.run_installer()
+        self.fake_systemctl(reload="yes")
+        result = self.installed("doctor", "--json", check=False)
+        checks = {row["name"]: row for row in json.loads(result.stdout)["checks"]}
+        self.assertEqual("fail", checks["units-loaded"]["status"])
+        self.assertIn(
+            "systemctl --user daemon-reload", checks["units-loaded"]["detail"]
+        )
+        self.assertNotEqual(0, result.returncode)
+
     def test_doctor_json_reports_install(self) -> None:
         self.run_installer("--enable-login")
         result = self.installed("doctor", "--json")
@@ -1129,6 +2825,62 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(names["login"]["status"], "ok")
         self.assertEqual(names["codex-themes"]["status"], "ok")
         self.assertEqual(names["acceptance"]["status"], "warn")
+
+    def test_every_entry_point_speaks_with_one_prefix_and_one_sentence(
+        self,
+    ) -> None:
+        """One error prefix, and one prerequisite sentence in all three places.
+
+        The launcher used to print `session-kit launcher:` on twelve lines, and
+        the same macOS prerequisite was three different sentences."""
+        launcher = (REPO / "deploy/session-kit-launcher").read_text(
+            encoding="utf-8"
+        )
+        printed = re.findall(r'echo "([^"]+)" >&2', launcher)
+        self.assertEqual(12, len(printed), printed)
+        for message in printed:
+            self.assertTrue(
+                message.startswith("session-kit: "), message
+            )
+        sentence = (
+            "session-kit: macOS needs Homebrew Bash 4 or newer. "
+            "Install it with: brew install bash python rust"
+        )
+        for relative in ("install.sh", "bin/session-kit", "deploy/session-kit-launcher"):
+            self.assertIn(
+                sentence,
+                (REPO / relative).read_text(encoding="utf-8"),
+                relative,
+            )
+
+    def test_doctor_and_check_render_one_row_form_with_one_set_of_names(
+        self,
+    ) -> None:
+        """The two reports a person runs when something is wrong agree.
+
+        One renderer, one name per check: `check` used to print
+        `OK    operating system: Linux` where `doctor` printed
+        `OK    platform           linux`."""
+        row = re.compile(r"^(OK|WARN|FAIL)\s{2,}(\S+)\s+(\S.*)$")
+        self.run_installer("--non-interactive")
+        doctor = self.installed("doctor")
+        checked = self.run_installer("--check")
+        names = {}
+        for label, output in (("doctor", doctor.stdout), ("check", checked.stdout)):
+            parsed = [row.match(line) for line in output.splitlines() if line.strip()]
+            self.assertTrue(all(parsed), output)
+            names[label] = {match.group(2) for match in parsed}
+            for match in parsed:
+                self.assertEqual(
+                    f"{match.group(1):<5} {match.group(2):<18} {match.group(3)}",
+                    match.group(0),
+                    output,
+                )
+        for shared in ("platform", "prerequisites", "services", "provider", "process"):
+            self.assertIn(shared, names["doctor"])
+            self.assertIn(shared, names["check"])
+        self.assertIn("OK    platform           linux", doctor.stdout)
+        self.assertIn("OK    platform           linux", checked.stdout)
 
     def test_doctor_warns_when_only_systemd_machine_transport_works(self) -> None:
         self.run_installer("--non-interactive")
@@ -1172,35 +2924,6 @@ class InstallerTests(unittest.TestCase):
         (codex / "AGENTS.md").write_text("run sp self-name once\n", encoding="utf-8")
         claude.mkdir(exist_ok=True)
         (claude / "CLAUDE.md").write_text("run sp self-name once\n", encoding="utf-8")
-        hooks = claude / "hooks"
-        hooks.mkdir()
-        title_hook = hooks / "nameintent_title.sh"
-        title_hook.write_text(
-            "#!/bin/sh\n"
-            "cat >/dev/null\n"
-            "printf '%s\\n' '{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"sessionTitle\":\"Session Kit Doctor Fixture\"}}'\n",
-            encoding="utf-8",
-        )
-        title_hook.chmod(0o700)
-        hook = {
-            "hooks": [
-                {
-                    "type": "command",
-                    "command": "~/.claude/hooks/nameintent_title.sh",
-                }
-            ]
-        }
-        (claude / "settings.json").write_text(
-            json.dumps(
-                {
-                    "hooks": {
-                        event: [hook]
-                        for event in ("SessionStart", "UserPromptSubmit", "Stop")
-                    }
-                }
-            ),
-            encoding="utf-8",
-        )
         acceptance = self.home / ".config/session-kit/release-acceptance.json"
         acceptance.write_text(
             json.dumps(
@@ -1227,15 +2950,34 @@ class InstallerTests(unittest.TestCase):
 
         result = self.installed("doctor", "--json", check=False)
 
-        self.assertNotEqual(0, result.returncode)
+        # Nothing here is a `fail`, so the run itself succeeds; the kill-switch
+        # warning is reported without being turned into an exit code.
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
         self.assertNotIn("secret-color-value", result.stdout)
         names = {row["name"]: row for row in json.loads(result.stdout)["checks"]}
         self.assertEqual(names["naming-instructions"]["status"], "ok")
         self.assertEqual(names["naming-hook"]["status"], "ok")
         self.assertEqual(names["acceptance"]["status"], "ok")
         self.assertEqual(names["kill-switches"]["status"], "warn")
-        self.assertEqual(names["provider-hooks"]["status"], "fail")
         self.assertIn("SESSION_KIT_NO_COLOR", names["kill-switches"]["detail"])
+        # Who owns the tab name (K3). Nothing is silencing it in this fixture.
+        self.assertEqual(names["tab-title"]["status"], "ok")
+
+        # The vendor's own off-switch silences the kit's title too (drill,
+        # 2026-08-13), so doctor has to name it when it is set.
+        silenced = self.installed(
+            "doctor",
+            "--json",
+            check=False,
+            env={**self.env, "CLAUDE_CODE_DISABLE_TERMINAL_TITLE": "1"},
+        )
+        silenced_names = {
+            row["name"]: row for row in json.loads(silenced.stdout)["checks"]
+        }
+        self.assertEqual(silenced_names["tab-title"]["status"], "warn")
+        self.assertIn(
+            "CLAUDE_CODE_DISABLE_TERMINAL_TITLE", silenced_names["tab-title"]["detail"]
+        )
 
         stale = json.loads(acceptance.read_text(encoding="utf-8"))
         stale["release_id"] = RELEASE_B
@@ -1251,7 +2993,7 @@ class InstallerTests(unittest.TestCase):
         self.run_installer("--non-interactive")
         claude = self.home / ".claude"
         hooks = claude / "hooks"
-        hooks.mkdir(parents=True)
+        hooks.mkdir(parents=True, exist_ok=True)
         title_hook = hooks / "nameintent_title.sh"
         title_hook.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         title_hook.chmod(0o700)
@@ -1278,15 +3020,47 @@ class InstallerTests(unittest.TestCase):
 
         result = self.installed("doctor", "--json", check=False)
 
-        self.assertNotEqual(0, result.returncode)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
         names = {row["name"]: row for row in json.loads(result.stdout)["checks"]}
         self.assertEqual(names["naming-hook"]["status"], "warn")
-        self.assertEqual(names["provider-hooks"]["status"], "fail")
+        self.assertIn("hook content", names["naming-hook"]["detail"])
         self.assertIn("SessionStart", names["naming-hook"]["detail"])
         self.assertIn("UserPromptSubmit", names["naming-hook"]["detail"])
 
+    def test_doctor_reports_a_wrong_shaped_title_template(self) -> None:
+        self.run_installer("--non-interactive")
+        template = self.home / ".codex/session-kit/terminal-title.toml"
+        template.write_text('tui = "scalar"\n', encoding="utf-8")
+
+        result = self.installed("doctor", "--json", check=False)
+
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        names = {row["name"]: row for row in json.loads(result.stdout)["checks"]}
+        self.assertEqual("warn", names["tab-title"]["status"])
+        self.assertIn("tui must be a table", names["tab-title"]["detail"])
+
+    def test_doctor_reports_the_durable_codex_titler_failure(self) -> None:
+        self.run_installer("--non-interactive")
+        record = self.home / ".local/state/session-kit/codex-autotitle-error.json"
+        record.write_text(
+            json.dumps(
+                {
+                    "detail": "Codex thread store unreadable: page two broke",
+                    "at": "2026-08-13T12:00:00Z",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = self.installed("doctor", "--json", check=False)
+
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        names = {row["name"]: row for row in json.loads(result.stdout)["checks"]}
+        self.assertEqual("warn", names["codex-titles"]["status"])
+        self.assertIn("page two broke", names["codex-titles"]["detail"])
+
     def test_doctor_uses_custom_codex_home_for_themes_and_instructions(self) -> None:
-        codex_home = self.temp / "private-codex"
+        codex_home = self.home / "private-codex"
         codex_home.mkdir(mode=0o700)
         self.env["CODEX_HOME"] = str(codex_home)
         self.run_installer("--non-interactive")
@@ -1446,11 +3220,13 @@ class InstallerTests(unittest.TestCase):
         for changed_home in ("", str(self.home / "unsafe-b")):
             self.env["CODEX_HOME"] = str(codex_a)
             self.env["SESSION_KIT_TEST_FAILPOINT"] = "themes"
+            self.env["SESSION_KIT_TEST_FAILPOINT_MODE"] = "kill"
             interrupted = self.installed(
                 "update", "--source", str(REPO), check=False
             )
-            self.assertNotEqual(interrupted.returncode, 0)
+            self.assertEqual(-signal.SIGKILL, interrupted.returncode)
             self.env.pop("SESSION_KIT_TEST_FAILPOINT")
+            self.env.pop("SESSION_KIT_TEST_FAILPOINT_MODE")
             if changed_home:
                 unsafe_b = Path(changed_home)
                 unsafe_b.mkdir(mode=0o700)
@@ -1520,12 +3296,13 @@ class InstallerTests(unittest.TestCase):
         red.chmod(0o600)
         self.env["SESSION_KIT_RELEASE_ID"] = RELEASE_B
         self.env["SESSION_KIT_TEST_FAILPOINT"] = "themes"
+        self.env["SESSION_KIT_TEST_FAILPOINT_MODE"] = "kill"
 
         interrupted = self.installed(
             "update", "--source", str(REPO), check=False
         )
 
-        self.assertNotEqual(interrupted.returncode, 0)
+        self.assertEqual(-signal.SIGKILL, interrupted.returncode)
         transaction = json.loads(
             (self.home / ".local/state/session-kit/lifecycle-transaction.json").read_text(
                 encoding="utf-8"
@@ -1539,6 +3316,7 @@ class InstallerTests(unittest.TestCase):
         self.assertNotEqual(red.read_text(encoding="utf-8"), "pre-update-theme\n")
 
         self.env.pop("SESSION_KIT_TEST_FAILPOINT")
+        self.env.pop("SESSION_KIT_TEST_FAILPOINT_MODE")
         recovered = self.installed(
             "update", "--source", str(self.temp / "missing-source"), check=False
         )
@@ -1565,6 +3343,390 @@ class InstallerTests(unittest.TestCase):
         names = {row["name"]: row for row in payload["checks"]}
         self.assertEqual(names["release"]["status"], "fail")
         self.assertIn("lib/sessionkit_inventory/common.py", names["release"]["detail"])
+
+    def unit_adding_source_fixture(self) -> Path:
+        """A copy of this checkout that ships one more systemd unit than it
+        does, named in its own `systemd_units` list.
+
+        That is the only shape in which the rollback defect appears: the list
+        an activation reads belongs to the RUNNING kit, so a release that adds
+        a unit hands the next rollback a name the older release never carried.
+        A fixture that adds the file without adding the name, or the name
+        without the file, reproduces nothing.
+        """
+        source = self.clean_source_fixture()
+        (source / "systemd" / FIXTURE_UNIT).write_text(
+            "[Unit]\n"
+            "Description=Session Kit fixture unit\n"
+            "\n"
+            "[Service]\n"
+            "Type=oneshot\n"
+            "ExecStart=/bin/true\n",
+            encoding="utf-8",
+        )
+        entry = source / "bin/session-kit"
+        text = entry.read_text(encoding="utf-8")
+        listed = "  session-kit-watchdog.service\n)"
+        self.assertIn(listed, text, "bin/session-kit no longer declares systemd_units")
+        entry.write_text(
+            text.replace(
+                listed, f"  session-kit-watchdog.service\n  {FIXTURE_UNIT}\n)", 1
+            ),
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "-C", source, "add", "."], check=True)
+        subprocess.run(
+            [
+                "git", "-C", source,
+                "-c", "user.name=Session Kit Tests",
+                "-c", "user.email=session-kit-tests@invalid.example",
+                "commit", "-q", "--amend", "--no-edit",
+            ],
+            check=True,
+        )
+        return source
+
+    def test_rollback_to_a_release_that_predates_a_unit_completes(self) -> None:
+        """Adding a systemd unit must not remove the undo for adding it.
+
+        The rollback runs the release being left, so its unit list names a file
+        the target release does not have. Copying that file used to fail and
+        take the whole transaction with it, which left the installation on the
+        release the operator was trying to leave -- with no way back to any
+        release older than the one that added the unit.
+        """
+        self.run_installer("--non-interactive")
+        service_root = self.temp / "systemd"
+        carried = {
+            path.name: path.read_bytes() for path in sorted(service_root.iterdir())
+        }
+        self.assertIn("shpool.service", carried)
+        self.assertNotIn(FIXTURE_UNIT, carried)
+
+        self.env["SESSION_KIT_RELEASE_ID"] = RELEASE_B
+        self.installed("update", "--source", str(self.unit_adding_source_fixture()))
+        stale = service_root / FIXTURE_UNIT
+        self.assertTrue(stale.is_file(), "the fixture release installed no new unit")
+
+        rolled_back = self.installed("rollback")
+
+        current = self.home / ".local/lib/session-kit/current"
+        self.assertEqual(RELEASE_A, current.resolve().name)
+        self.assertIn(
+            f"{FIXTURE_UNIT} is not part of this release", rolled_back.stderr
+        )
+        # The stale unit's program is the release that is now current, which
+        # does not take the arguments the unit passes it, so leaving the file
+        # would leave systemd running a failing job on a timer.
+        self.assertFalse(stale.exists() or stale.is_symlink())
+        # Everything the target release does carry survives, byte for byte.
+        self.assertEqual(
+            sorted(carried), sorted(path.name for path in service_root.iterdir())
+        )
+        for name, content in carried.items():
+            self.assertEqual(content, (service_root / name).read_bytes(), name)
+        receipt = json.loads(
+            (self.home / ".local/state/session-kit/install.json").read_text()
+        )
+        self.assertEqual(RELEASE_A, receipt["installed_release"])
+
+    def test_uninstall_removes_the_unit_files_it_installed(self) -> None:
+        """An uninstall that leaves unit files behind leaves systemd pointing
+        at code the same command just deleted."""
+        self.run_installer("--non-interactive")
+        service_root = self.temp / "systemd"
+        self.assertTrue((service_root / "shpool.socket").is_file())
+
+        self.installed("uninstall", "--purge-code", "--purge-config")
+
+        self.assertEqual([], sorted(path.name for path in service_root.iterdir()))
+
+    def write_systemctl_state_fixture(self) -> Path:
+        """A systemctl that answers `is-enabled` and `is-active` from the
+        environment, so a test can name the state systemd is in."""
+        systemctl = self.fake_bin / "systemctl-state"
+        systemctl.write_text(
+            "#!/usr/bin/env bash\n"
+            "case ${2:-} in\n"
+            "  is-enabled) printf '%s\\n' \"${FIXTURE_ENABLED:-disabled}\" ;;\n"
+            "  is-active) printf '%s\\n' \"${FIXTURE_ACTIVE:-inactive}\" ;;\n"
+            "esac\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        systemctl.chmod(0o755)
+        return systemctl
+
+    def test_uninstall_refuses_while_systemd_holds_an_enablement(self) -> None:
+        """Removing the unit file of a unit systemd has enabled leaves the
+        manager holding a job whose file is gone. The documented verb comes
+        first, and nothing is removed until it has.
+
+        `is-enabled` has four answers that mean systemd is holding this file,
+        not one, and a check that reads only `enabled` deletes the file under
+        the other three.
+        """
+        self.run_installer("--non-interactive")
+        env = self.env.copy()
+        env["SESSION_KIT_SYSTEMCTL_CMD"] = str(self.write_systemctl_state_fixture())
+
+        for state in ("enabled", "enabled-runtime", "linked", "linked-runtime"):
+            with self.subTest(is_enabled=state):
+                env["FIXTURE_ENABLED"] = state
+                refused = self.installed(
+                    "uninstall",
+                    "--purge-code",
+                    "--purge-config",
+                    check=False,
+                    env=env,
+                )
+                self.assertNotEqual(0, refused.returncode)
+                self.assertIn("session-kit services disable", refused.stderr)
+                self.assertTrue((self.temp / "systemd/shpool.socket").is_file())
+                self.assertTrue((self.home / ".local/bin/sp").exists())
+                self.assertTrue(
+                    (self.home / ".local/lib/session-kit/current").is_symlink()
+                )
+
+    def test_uninstall_proceeds_while_a_unit_runs_without_an_enablement(self) -> None:
+        """A running daemon is holding live sessions. Uninstall says so and
+        removes its files; it does not make the way out of an installation go
+        through killing every session in it."""
+        self.run_installer("--non-interactive")
+        env = self.env.copy()
+        env["SESSION_KIT_SYSTEMCTL_CMD"] = str(self.write_systemctl_state_fixture())
+        env["FIXTURE_ENABLED"] = "disabled"
+        env["FIXTURE_ACTIVE"] = "active"
+
+        removed = self.installed(
+            "uninstall", "--purge-code", "--purge-config", check=False, env=env
+        )
+
+        self.assertEqual(0, removed.returncode, removed.stderr)
+        self.assertIn("is still running and is left running", removed.stderr)
+        self.assertEqual([], sorted(path.name for path in (self.temp / "systemd").iterdir()))
+
+    def test_uninstall_refuses_a_symlinked_unit_path_and_spares_its_target(
+        self,
+    ) -> None:
+        """A unit path that is a symlink is not this installation's file to
+        delete, and the removal must not reach through it."""
+        self.run_installer("--non-interactive")
+        decoy = self.temp / "decoy-outside-the-service-root"
+        decoy.write_text("operator file\n", encoding="utf-8")
+        planted = self.temp / "systemd/shpool.socket"
+        planted.unlink()
+        planted.symlink_to(decoy)
+
+        refused = self.installed(
+            "uninstall", "--purge-code", "--purge-config", check=False
+        )
+
+        self.assertNotEqual(0, refused.returncode)
+        self.assertIn("refusing", refused.stderr)
+        self.assertEqual("operator file\n", decoy.read_text(encoding="utf-8"))
+        self.assertTrue(planted.is_symlink())
+        self.assertTrue((self.home / ".local/bin/sp").exists())
+
+
+class SystemdUnitLoopTests(unittest.TestCase):
+    """Drive `install_systemd_units` directly, with a service root of the
+    test's own making.
+
+    The end-to-end proof above shows the loop reached from a real rollback.
+    These pin what the loop does with the cases a release cannot be built to
+    contain -- a symlinked unit path, a unit name carrying a path -- and the
+    half that deletes, which is the half worth proving twice.
+    """
+
+    STALE = "session-kit-fixture-stale.service"
+    TEMPLATE = "[Unit]\nDescription=fixture\n\n[Service]\nExecStart=@SHPOOL@ daemon\n"
+
+    def setUp(self) -> None:
+        self.temp = Path(
+            tempfile.mkdtemp(prefix="session-kit-units-test.", dir=Path("/tmp"))
+        ).resolve()
+        self.home = self.temp / "home"
+        self.install_root = self.home / ".local/lib/session-kit"
+        self.service_root = self.temp / "systemd"
+        self.fake_bin = self.temp / "bin"
+        self.service_root.mkdir()
+        self.fake_bin.mkdir()
+        (self.install_root / "releases").mkdir(parents=True)
+        shpool = self.fake_bin / "shpool"
+        shpool.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        shpool.chmod(0o755)
+        self.harness = self.temp / "harness.sh"
+        self.harness.write_text(
+            "#!/usr/bin/env bash\n"
+            # The dispatcher runs under these options; the abort this branch
+            # fixes only happens under them.
+            "set -euo pipefail\n"
+            "install_root=$1\n"
+            "service_root=$2\n"
+            "release_id=$3\n"
+            "shift 3\n"
+            "systemd_units=(\"$@\")\n"
+            "die() { printf 'session-kit: %s\\n' \"$*\" >&2; exit 1; }\n"
+            "platform() { printf 'linux\\n'; }\n"
+            'source "$SESSION_KIT_MODULE"\n'
+            'install_systemd_units "$release_id"\n',
+            encoding="utf-8",
+        )
+        self.harness.chmod(0o755)
+        self.env = os.environ.copy()
+        self.env.update(
+            {
+                "HOME": str(self.home),
+                "CLAUDE_CONFIG_DIR": str(self.home / ".claude"),
+                "PATH": f"{self.fake_bin}:{self.env['PATH']}",
+                "XDG_CONFIG_HOME": str(self.home / ".config"),
+                "XDG_DATA_HOME": str(self.home / ".local/share"),
+                "XDG_STATE_HOME": str(self.home / ".local/state"),
+                "SESSION_KIT_ROOT": str(self.install_root),
+                "SESSION_KIT_SYSTEMD_ROOT": str(self.service_root),
+                "SESSION_KIT_TESTING": "1",
+                "SESSION_KIT_MODULE": str(REPO / "lib/sh/session_kit_install.sh"),
+            }
+        )
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.temp)
+
+    def stage_release(self, release_id: str, units: dict[str, str]) -> None:
+        root = self.install_root / "releases" / release_id / "systemd"
+        root.mkdir(parents=True)
+        for name, content in units.items():
+            (root / name).write_text(content, encoding="utf-8")
+
+    def install_units(
+        self, release_id: str, units: tuple[str, ...]
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                str(self.harness),
+                str(self.install_root),
+                str(self.service_root),
+                release_id,
+                *units,
+            ],
+            env=self.env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+    def test_a_unit_the_release_does_not_carry_is_removed_and_named(self) -> None:
+        self.stage_release(RELEASE_A, {"shpool.service": self.TEMPLATE})
+        stale = self.service_root / self.STALE
+        stale.write_text("stale unit\n", encoding="utf-8")
+
+        result = self.install_units(RELEASE_A, ("shpool.service", self.STALE))
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertFalse(stale.exists() or stale.is_symlink())
+        self.assertIn(f"{self.STALE} is not part of this release", result.stderr)
+        self.assertIn(f"systemctl --user disable {self.STALE}", result.stderr)
+        installed = (self.service_root / "shpool.service").read_text(encoding="utf-8")
+        self.assertIn(f"ExecStart={self.fake_bin}/shpool daemon", installed)
+
+    def test_a_unit_the_release_carries_is_kept_and_rewritten(self) -> None:
+        """The pruning half must not reach a unit the target release has."""
+        self.stage_release(
+            RELEASE_A,
+            {"shpool.service": self.TEMPLATE, "shpool.socket": "[Socket]\n"},
+        )
+        kept = self.service_root / "shpool.socket"
+        kept.write_text("foreign content\n", encoding="utf-8")
+
+        result = self.install_units(RELEASE_A, ("shpool.service", "shpool.socket"))
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertTrue(kept.is_file() and not kept.is_symlink())
+        self.assertEqual("[Socket]\n", kept.read_text(encoding="utf-8"))
+        self.assertNotIn("shpool.socket is not part of", result.stderr)
+
+    def test_a_symlinked_stale_unit_is_neither_followed_nor_removed(self) -> None:
+        """`rm` on a symlink would take the link, not its target -- but the
+        link is not this installation's file either, and the guard that keeps
+        the deletion off it is worth a test of its own."""
+        self.stage_release(RELEASE_A, {"shpool.service": self.TEMPLATE})
+        decoy = self.temp / "decoy-outside-the-service-root"
+        decoy.write_text("operator file\n", encoding="utf-8")
+        planted = self.service_root / self.STALE
+        planted.symlink_to(decoy)
+
+        result = self.install_units(RELEASE_A, ("shpool.service", self.STALE))
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertTrue(decoy.is_file())
+        self.assertEqual("operator file\n", decoy.read_text(encoding="utf-8"))
+        self.assertTrue(planted.is_symlink())
+        self.assertIn(f"{self.STALE} is not part of this release", result.stderr)
+        self.assertNotIn("was removed", result.stderr)
+
+    def test_a_symlinked_live_unit_is_replaced_without_writing_through(self) -> None:
+        """The copying half installs over the link, never through it."""
+        self.stage_release(
+            RELEASE_A,
+            {"shpool.service": self.TEMPLATE, "shpool.socket": "[Socket]\n"},
+        )
+        decoy = self.temp / "decoy-outside-the-service-root"
+        decoy.write_text("operator file\n", encoding="utf-8")
+        planted = self.service_root / "shpool.socket"
+        planted.symlink_to(decoy)
+
+        result = self.install_units(RELEASE_A, ("shpool.service", "shpool.socket"))
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("operator file\n", decoy.read_text(encoding="utf-8"))
+        self.assertFalse(planted.is_symlink())
+        self.assertEqual("[Socket]\n", planted.read_text(encoding="utf-8"))
+
+    def test_a_unit_name_that_leaves_the_service_root_is_refused(self) -> None:
+        """Both halves join the name onto a directory. A name carrying a path
+        would copy a file in from outside the release and delete one from
+        outside the service root, so the name is refused before either."""
+        escaping = "../escape.service"
+        release = self.install_root / "releases" / RELEASE_A
+        self.stage_release(RELEASE_A, {"shpool.service": self.TEMPLATE})
+        (release / "escape.service").write_text("payload\n", encoding="utf-8")
+        victim = self.temp / "escape.service"
+        victim.write_text("operator file\n", encoding="utf-8")
+        self.assertEqual(victim, (self.service_root / escaping).resolve())
+
+        result = self.install_units(RELEASE_A, ("shpool.service", escaping))
+
+        self.assertEqual("operator file\n", victim.read_text(encoding="utf-8"))
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn(f"refusing unsafe unit name: {escaping}", result.stderr)
+
+    def test_every_malformed_unit_name_is_refused(self) -> None:
+        self.stage_release(RELEASE_A, {"shpool.service": self.TEMPLATE})
+        for name in ("../escape.service", "..", ".", "sub/dir.service", ""):
+            with self.subTest(name=name):
+                result = self.install_units(RELEASE_A, ("shpool.service", name))
+                self.assertEqual(0, result.returncode, result.stderr)
+                self.assertIn("refusing unsafe unit name", result.stderr)
+
+    def test_a_release_without_the_templated_unit_does_not_abort(self) -> None:
+        """The templating step reads shpool.service straight after the loop.
+        A release that does not carry it leaves nothing to fill in, and
+        reading it anyway would restore the abort the loop just removed."""
+        self.stage_release(RELEASE_A, {"shpool.socket": "[Socket]\n"})
+        (self.service_root / "shpool.service").write_text(
+            "stale service\n", encoding="utf-8"
+        )
+
+        result = self.install_units(RELEASE_A, ("shpool.service", "shpool.socket"))
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertFalse((self.service_root / "shpool.service").exists())
+        self.assertEqual(
+            "[Socket]\n",
+            (self.service_root / "shpool.socket").read_text(encoding="utf-8"),
+        )
 
 
 if __name__ == "__main__":

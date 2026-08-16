@@ -15,42 +15,51 @@ import argparse
 import contextlib
 import datetime as dt
 import hashlib
+import fcntl
 import json
 import os
 from pathlib import Path
 import re
 import shutil  # noqa: F401  # re-exported facade symbol
+import signal
 import stat as statmod
 import subprocess
 import sys
 import tempfile
 import time
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 _SESSION_KIT_LIB_DIR = os.fspath(Path(__file__).resolve().parent)
 if _SESSION_KIT_LIB_DIR not in sys.path:
     sys.path.insert(0, _SESSION_KIT_LIB_DIR)
 
-from sessionkit_messages import command as _messages  # noqa: E402
-from sessionkit_messages.envelope import MessageError  # noqa: E402
-from sessionkit_events import queue as _events  # noqa: E402
 from sessionkit_inventory import collector as _collector  # noqa: E402
 from sessionkit_inventory import accounts as _accounts  # noqa: E402
+from sessionkit_inventory import attention as _attention  # noqa: E402
 from sessionkit_inventory import colors as _colors  # noqa: E402
 from sessionkit_inventory import common as _common  # noqa: E402
+from sessionkit_inventory import labels as _labels  # noqa: E402
+from sessionkit_inventory import idle_state as _idle_state  # noqa: E402
 from sessionkit_inventory import lifecycle as _lifecycle  # noqa: E402
 from sessionkit_inventory import model as _model  # noqa: E402
 from sessionkit_inventory import migration as _migration  # noqa: E402
 from sessionkit_inventory import names as _names  # noqa: E402
 from sessionkit_inventory import names_push as _names_push  # noqa: E402
+from sessionkit_inventory import closed_sessions as _closed_sessions  # noqa: E402
+from sessionkit_inventory import origins as _origins  # noqa: E402
+from sessionkit_inventory import transcripts as _transcripts  # noqa: E402
 from sessionkit_inventory import processes as _processes  # noqa: E402
 from sessionkit_inventory import recovery as _recovery  # noqa: E402
+from sessionkit_inventory import recovery_list as _recovery_list  # noqa: E402
+from sessionkit_inventory import printed_selectors as _printed  # noqa: E402
 from sessionkit_inventory import render as _render  # noqa: E402
 from sessionkit_inventory import providers as _providers  # noqa: E402
 from sessionkit_inventory import providers_claude as _providers_claude  # noqa: E402
 from sessionkit_inventory import providers_codex as _providers_codex  # noqa: E402
 from sessionkit_inventory import state_io as _state_io  # noqa: E402
+from sessionkit_inventory import subagent_sweep as _subagent_sweep  # noqa: E402
 from sessionkit_inventory import self_name as _self_name  # noqa: E402
+from sessionkit_inventory import session_model as _session_model_reader  # noqa: E402
 from sessionkit_inventory import snapshot as _snapshot  # noqa: E402
 from sessionkit_inventory import terminal as _terminal  # noqa: E402
 from sessionkit_inventory import validation as _validation  # noqa: E402
@@ -97,7 +106,6 @@ from sessionkit_inventory.recovery import (  # noqa: E402, F401
     _pending_conflict_fields,
     _pending_evidence,
     _pending_preferred_entry,
-    _remove_pending_entry,
 )
 from sessionkit_inventory.model import (  # noqa: E402, F401
     _agent_identity,
@@ -175,6 +183,12 @@ MAX_PRIVATE_JSON_BYTES = 1024 * 1024
 MAX_CODEX_SESSION_INDEX_BYTES = 4 * 1024 * 1024
 DEFAULT_MAX_PROC_NODES = 16384
 ABSENT_ALIAS_CONFIG_BACKUP = b"session-kit-alias-config-absent-v1\n"
+# `lifecycle reopen` answers with the reopened provider's own outcome so the
+# managed shell can make the same clean-close / crash-menu decision it makes
+# for a first exit. 0 is a clean provider exit and this status is a crashed
+# one; every other status is a refusal to reopen anything at all, which is
+# why the reopened provider's own code is not passed through directly.
+LIFECYCLE_REOPENED_PROVIDER_CRASHED = 76
 Runner = Callable[[Sequence[str], float], str]
 
 def _runtime_platform() -> str:
@@ -392,6 +406,31 @@ def claim_automatic_name(
         return f"automatic name not claimed: {exc}"
 
 
+def release_automatic_name_claim(
+    provider: str, uuid: str, *, environ: Mapping[str, str] | None = None
+) -> bool:
+    """Release an untouched claim after its first durable write failed."""
+    exact = _common.valid_uuid(uuid)
+    if provider not in PROVIDERS or not exact:
+        return False
+    path = _scoped_config_path(environ)
+    config = _scoped_state_config(environ)
+    if path is None or config is None:
+        return False
+    try:
+        return _names.release_automatic_name_claim(
+            config,
+            provider,
+            exact,
+            atomic_write_json=atomic_write_json,
+            config_path=lambda: path,
+            private_alias_document=_private_alias_document,
+            private_alias_parent=_private_alias_parent,
+        )
+    except (CollectionError, OSError):
+        return False
+
+
 def default_journal_dir() -> Path:
     return _common.default_journal_dir(
         environ=os.environ,
@@ -478,7 +517,30 @@ def _command_json(
 
 
 def _parse_claude_payload(payload: Any) -> list[dict[str, Any]]:
-    return _providers_claude._parse_claude_payload(payload, palette=CLAUDE_SESSION_COLORS)
+    """Read the poll rows, corrected by whatever the Notification hook recorded.
+
+    The hook records are read once per snapshot, for exactly the sessions the
+    poll returned: a session Claude does not list is not a session the picker
+    can act on, so a record without a live row is nobody's evidence.
+    """
+    source = _attention.attention_source(os.environ)
+    records: dict[str, dict[str, Any]] = {}
+    if source != "poll" and isinstance(payload, list):
+        state_dir = _attention.default_state_dir(os.environ, Path.home())
+        records = _attention.read_all(
+            state_dir,
+            [
+                item.get("sessionId")
+                for item in payload
+                if isinstance(item, Mapping)
+            ],
+        )
+    return _providers_claude._parse_claude_payload(
+        payload,
+        palette=CLAUDE_SESSION_COLORS,
+        attention_records=records,
+        attention_source=source,
+    )
 
 
 def read_claude_transcript_signals(
@@ -605,6 +667,23 @@ def daemon_generation(
     return _processes.daemon_generation(
         process_table,
         is_shpool_daemon=_is_shpool_daemon,
+    )
+
+
+def _payload_daemon_identity(
+    process_table: Mapping[int, Mapping[str, Any]],
+) -> dict[str, int] | None:
+    """Exact holder generation for binding one shpool list payload."""
+    # Linux exposes the authoritative listener inode and each candidate's fd
+    # tree. Darwin's bounded native scanner has no equivalent socket-owner
+    # primitive here, so its safe ordinary case is one definite daemon with
+    # the same generation on all three observations; multiple or unreadable-
+    # argv candidates still refuse in _kit_daemons.
+    require_holder = _require_supported_platform().startswith("linux")
+    return _processes.daemon_generation(
+        process_table,
+        is_shpool_daemon=_is_shpool_daemon,
+        require_socket_holder=require_holder,
     )
 
 
@@ -901,6 +980,21 @@ def apply_retained_setup_attributions(
     )
 
 
+# One repeatable launch, one key. The pattern is the exact shape a launcher
+# stamps onto a process, so a stray or truncated value can never bind a
+# dispatch to an inventory row.
+_LAUNCH_KEY_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+_DAEMON_BINDING_UNSET = object()
+
+
+def _exact_launch_key(value: object) -> str:
+    """Return the exact launch idempotency key, or "" when the value is not one."""
+    if not isinstance(value, str):
+        return ""
+    candidate = value.strip()
+    return candidate if _LAUNCH_KEY_RE.match(candidate) else ""
+
+
 def build_inventory(
     shpool_payload: Any,
     claude_payload: Any,
@@ -912,8 +1006,73 @@ def build_inventory(
     config: Mapping[str, Any],
     now: float | None = None,
     recent_output_by_shpool_id: Mapping[str, int] | None = None,
+    *,
+    daemon_binding: Mapping[str, Any] | None | object = _DAEMON_BINDING_UNSET,
 ) -> dict[str, Any]:
     """Pure inventory composition for fixture tests and the live collector."""
+    # A live binding is the daemon identity observed immediately before and
+    # after the list payload, then revalidated before this composition. Never
+    # choose a different daemon after those names have already been supplied.
+    # Pure one-daemon fixture callers retain their historical fast path; a
+    # multi-daemon fixture without payload provenance is deliberately refused.
+    binding_refused = False
+    if daemon_binding is _DAEMON_BINDING_UNSET:
+        observed = tuple(
+            _processes._kit_daemons(process_table, _is_shpool_daemon)
+        )
+        definite = tuple(
+            pid
+            for pid, process in process_table.items()
+            if _is_shpool_daemon(process)
+        )
+        unknown = tuple(
+            pid
+            for pid, process in process_table.items()
+            if _processes._is_unknown_shpool_daemon(process)
+        )
+        daemon_pids = observed if len(definite) == 1 and not unknown else ()
+        binding_refused = len(daemon_pids) != 1
+    elif isinstance(daemon_binding, Mapping):
+        pid = daemon_binding.get("pid")
+        start_ticks = daemon_binding.get("process_start_ticks")
+        process = process_table.get(pid) if isinstance(pid, int) else None
+        if (
+            isinstance(pid, int)
+            and not isinstance(pid, bool)
+            and isinstance(start_ticks, int)
+            and not isinstance(start_ticks, bool)
+            and isinstance(process, Mapping)
+            and process.get("start_ticks") == start_ticks
+            and _is_shpool_daemon(process)
+        ):
+            daemon_pids = (pid,)
+        else:
+            daemon_pids = ()
+            binding_refused = True
+    else:
+        daemon_pids = ()
+        binding_refused = True
+
+    def roots_from_selection(
+        session_names: Iterable[str],
+        table: Mapping[int, Mapping[str, Any]],
+    ) -> tuple[dict[str, int], dict[str, list[str]]]:
+        return _processes.shpool_roots(
+            session_names,
+            table,
+            is_shpool_daemon=_is_shpool_daemon,
+            daemon_pids=daemon_pids,
+        )
+
+    def generation_from_selection(
+        table: Mapping[int, Mapping[str, Any]],
+    ) -> dict[str, int] | None:
+        return _processes.daemon_generation(
+            table,
+            is_shpool_daemon=_is_shpool_daemon,
+            daemon_pids=daemon_pids,
+        )
+
     inventory = _collector.build_inventory(
         shpool_payload,
         claude_payload,
@@ -924,8 +1083,8 @@ def build_inventory(
         now,
         recent_output_by_shpool_id,
         descendants=descendants,
-        shpool_roots=shpool_roots,
-        daemon_generation=daemon_generation,
+        shpool_roots=roots_from_selection,
+        daemon_generation=generation_from_selection,
         parse_claude_payload=_parse_claude_payload,
         native_claude_uuid=_native_claude_uuid,
         claude_subagents=claude_subagents,
@@ -939,9 +1098,18 @@ def build_inventory(
         claude_palette=CLAUDE_SESSION_COLORS,
         default_max_proc_nodes=DEFAULT_MAX_PROC_NODES,
     )
-    from sessionkit_messages.envelope import valid_idempotency_key
-
+    if binding_refused:
+        for item in inventory.get("sessions", ()):
+            if not isinstance(item, dict):
+                continue
+            item["mutation_allowed"] = False
+            item["mutation_rejection_reason"] = "daemon-identity-unresolved"
     children = _children_index(process_table)
+    # Where the per-conversation model cache lives. Without a state directory
+    # (fixture composition, `--no-write` inspection) every model read is a
+    # bounded scan instead: slower, never wrong, and it writes nothing.
+    raw_state_dir = config.get("state_dir")
+    model_cache_dir = Path(str(raw_state_dir)) if raw_state_dir else None
     for item in inventory.get("sessions", ()):
         if not isinstance(item, dict):
             continue
@@ -961,7 +1129,7 @@ def build_inventory(
         for candidate_pid in candidate_pids:
             candidate = process_table.get(candidate_pid, {})
             model = candidate.get("requested_model")
-            launch_key = valid_idempotency_key(
+            launch_key = _exact_launch_key(
                 candidate.get("launch_idempotency_key")
             )
             argv = candidate.get("cmdline")
@@ -984,7 +1152,117 @@ def build_inventory(
             model, launch_key = next(iter(evidence))
             item["actual_model"] = model
             item["launch_idempotency_key"] = launch_key
+        # What model this session is on RIGHT NOW, for every row rather than
+        # only the keyed launches above. The conversation's own record is the
+        # source (picker-rows ruling): a launch argument is not what a session
+        # runs. Handoff capability still comes from the process evidence.
+        item.update(_live_model_fields(item, process_table, model_cache_dir))
+        item["model_handoff_capable"] = _model_handoff_capable(
+            item, process_table
+        )
     return inventory
+
+
+def _live_model_fields(
+    item: Mapping[str, Any],
+    process_table: Mapping[int, Mapping[str, Any]],
+    cache_dir: Path | None,
+) -> dict[str, str]:
+    """The model a session runs now, its product name, and where that came from.
+
+    The command line is the fallback, never the answer. `--model` records what
+    a session was STARTED with; a person who types `/model` inside it changes
+    what it actually runs and never touches argv again, so a row built from the
+    process table shows the wrong model, confidently, for the rest of that
+    session's life. The conversation's own record moves when the person moves
+    the model, so that is what is read — and the command line answers only for
+    a session whose record this machine cannot reach.
+    """
+    provider = _common.clean_text(item.get("provider"), 20).casefold()
+    if provider not in PROVIDERS:
+        return {
+            "model": "",
+            "display_model": "",
+            "model_source": "",
+            "model_state": _labels.MODEL_STATE_NOT_APPLICABLE,
+        }
+    identity = item.get("identity")
+    raw_uuid = identity.get("uuid") if isinstance(identity, Mapping) else None
+    uuid = _common.valid_uuid(raw_uuid) if isinstance(raw_uuid, str) else ""
+    live, found = (
+        _session_model_reader.current_model(
+            provider,
+            key=uuid,
+            locate=lambda: _transcripts.locate_transcript(provider, uuid),
+            cache_dir=cache_dir,
+        )
+        if uuid
+        else ("", False)
+    )
+    if live:
+        return {
+            "model": live,
+            "display_model": _session_model_reader.human_model_name(provider, live),
+            "model_source": _session_model_reader.SOURCE_TRANSCRIPT,
+            "launch_model": "",
+            "model_state": "",
+        }
+    # The launch argument is recorded as evidence and is NEVER shown as the live
+    # model. `--model` says what the session was STARTED with; a `/model` typed
+    # inside it does not touch argv, and a conversation resumed from another
+    # machine has no local record at all — no record is proof of nothing, not
+    # proof that the launch value is still current. Showing it would be a
+    # confident wrong answer, and the operator asked for this column filled in
+    # order to trust it. What the kit cannot prove, it does not say.
+    #
+    # The row still says WHICH kind of no: a conversation this machine can read
+    # that has simply not been answered yet is a different fact from one whose
+    # record is gone.
+    return {
+        "model": "",
+        "display_model": "",
+        "model_source": "",
+        "launch_model": _session_model(item, process_table),
+        "model_state": (
+            _labels.MODEL_STATE_NO_REPLY_YET if found else _labels.MODEL_STATE_UNREADABLE
+        ),
+    }
+
+
+def _session_model(
+    item: Mapping[str, Any], process_table: Mapping[int, Mapping[str, Any]]
+) -> str:
+    """The model a session's live provider was started with, or ""."""
+    identity = item.get("identity")
+    pid = identity.get("pid") if isinstance(identity, Mapping) else None
+    if not isinstance(pid, int) or isinstance(pid, bool):
+        return ""
+    process = process_table.get(pid)
+    if not isinstance(process, Mapping):
+        return ""
+    argv = process.get("cmdline")
+    model = _arg_value(argv, "--model") if isinstance(argv, list) else ""
+    if not model:
+        model = process.get("requested_model") or ""
+    return _common.clean_text(model, 80)
+
+
+def _model_handoff_capable(
+    item: Mapping[str, Any], process_table: Mapping[int, Mapping[str, Any]]
+) -> bool:
+    """Whether the managed shell can prove and rebuild this model request."""
+    model = _common.clean_text(item.get("model"), 80)
+    if not model:
+        return True
+    identity = item.get("identity")
+    pid = identity.get("pid") if isinstance(identity, Mapping) else None
+    process = process_table.get(pid) if isinstance(pid, int) else None
+    if not isinstance(process, Mapping):
+        return False
+    argv = process.get("cmdline")
+    command_model = _arg_value(argv, "--model") if isinstance(argv, list) else ""
+    requested_model = _common.clean_text(process.get("requested_model"), 80)
+    return command_model == model and requested_model == model
 
 
 def apply_provider_title_states(
@@ -1021,8 +1299,47 @@ def apply_provider_title_states(
             item["provider_title_state"] = "ready"
 
 
+_PROVIDER_MARKER_GENERATION = re.compile(r"[A-Za-z0-9:._-]{1,256}")
+
+
+def _provider_marker_generation(path: Path, name: str) -> tuple[str, str] | None:
+    try:
+        value = path.read_text(encoding="utf-8", errors="strict").strip()
+    except OSError:
+        return None
+    if not _PROVIDER_MARKER_GENERATION.fullmatch(value):
+        return None
+    return (name, value)
+
+
+def capture_provider_untitled_generations(
+    state_dir: Path,
+) -> frozenset[tuple[str, str]]:
+    """Exact untitled-marker generations present before process collection."""
+    marker_root = Path(state_dir) / "provider-untitled"
+    try:
+        markers = list(marker_root.iterdir())
+    except OSError:
+        return frozenset()
+    captured: set[tuple[str, str]] = set()
+    for marker in markers:
+        try:
+            if marker.is_symlink() or not marker.is_file():
+                continue
+            generation = _provider_marker_generation(marker, marker.name)
+            if generation is not None:
+                captured.add(generation)
+        except OSError:
+            continue
+    return frozenset(captured)
+
+
 def _quarantine_orphaned_provider_untitled_markers(
-    config: Mapping[str, Any], inventory: Mapping[str, Any], *, now: float | None = None
+    config: Mapping[str, Any],
+    inventory: Mapping[str, Any],
+    *,
+    now: float | None = None,
+    retire_generations: Iterable[tuple[str, str]] = (),
 ) -> list[dict[str, str]]:
     """Quarantine old markers only after fresh inventory proves absence."""
     if inventory.get("source") != "live" or inventory.get("stale") is not False:
@@ -1032,6 +1349,9 @@ def _quarantine_orphaned_provider_untitled_markers(
         for item in inventory.get("sessions", ())
         if isinstance(item, Mapping)
     }
+    allowed = frozenset(retire_generations)
+    if not allowed:
+        return []
     paths = _state_paths(config)
     marker_root = paths["root"] / "provider-untitled"
     try:
@@ -1076,6 +1396,15 @@ def _quarantine_orphaned_provider_untitled_markers(
             if destination.exists() or destination.is_symlink():
                 continue
             os.replace(marker, destination)
+            actual = _provider_marker_generation(destination, marker.name)
+            if actual not in allowed:
+                try:
+                    marker.hardlink_to(destination)
+                except FileExistsError:
+                    # A still-newer marker already owns the live name.
+                    pass
+                destination.unlink(missing_ok=True)
+                continue
             moved.append(
                 {
                     "marker": marker.name,
@@ -1118,6 +1447,7 @@ def collect_live(
         read_codex_db=read_codex_db,
         recent_output_times=recent_output_times,
         build_inventory=build_inventory,
+        daemon_identity=_payload_daemon_identity,
         apply_provider_title_states=apply_provider_title_states,
         apply_retained_setup_attributions=apply_retained_setup_attributions,
     )
@@ -1298,6 +1628,8 @@ def prune_automatic_titles(
     config: Mapping[str, Any],
     inventory: Mapping[str, Any],
     prune_token: str,
+    *,
+    revalidate_inventory: Callable[[], Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Apply only the exact orphan set previously exposed by a dry-run token."""
     return _names.prune_automatic_titles(
@@ -1311,6 +1643,7 @@ def prune_automatic_titles(
         exact_active_title_keys=_exact_active_title_keys,
         private_alias_document=_private_alias_document,
         private_alias_parent=_private_alias_parent,
+        revalidate_inventory=revalidate_inventory,
     )
 
 
@@ -1443,7 +1776,11 @@ def _codex_title_echoes_prompt(title: str, first_message: str) -> bool:
 
 
 def codex_bounce_prepare(
-    uuid: str, codex_root: Path | None = None, now: float | None = None
+    uuid: str,
+    codex_root: Path | None = None,
+    now: float | None = None,
+    *,
+    mirror_index: bool = True,
 ) -> str:
     """Resolve the real name a bounced Codex process should boot under."""
     return _names_push.codex_bounce_prepare(
@@ -1452,6 +1789,7 @@ def codex_bounce_prepare(
         now,
         codex_home=_codex_home,
         max_session_index_bytes=MAX_CODEX_SESSION_INDEX_BYTES,
+        mirror_index=mirror_index,
     )
 
 
@@ -1478,8 +1816,11 @@ def codex_pending_auto_titles(
         load_config=load_config,
         max_session_index_bytes=MAX_CODEX_SESSION_INDEX_BYTES,
         push_live_rename=_push_codex_live_rename,
+        human_named=human_named_keys,
         name_owner=name_owner,
         claim_name=claim_automatic_name,
+        release_claim=release_automatic_name_claim,
+        record_pushed=record_pushed_title,
         adopt_native=adopt_native_rename,
     )
 
@@ -1493,13 +1834,20 @@ def _append_codex_index_entry(index: Path, uuid: str, title: str) -> None:
 
 
 def _push_codex_thread_title(
-    codex_root: Path, uuid: str, title: str
+    codex_root: Path,
+    uuid: str,
+    title: str,
+    *,
+    timeout_seconds: float = 1.0,
+    still_automatic: Callable[[], bool] | None = None,
 ) -> tuple[list[str], list[str]]:
     """Set threads.title in Codex's own state database."""
     return _names_push._push_codex_thread_title(
         codex_root,
         uuid,
         title,
+        timeout_seconds=timeout_seconds,
+        still_automatic=still_automatic,
     )
 
 
@@ -1539,7 +1887,12 @@ def _ws_request(
 
 
 def _push_codex_live_rename(
-    kit_state_dir: Path, uuid: str, title: str
+    kit_state_dir: Path,
+    uuid: str,
+    title: str,
+    *,
+    timeout_seconds: float | None = None,
+    still_automatic: Callable[[], bool] | None = None,
 ) -> tuple[list[str], list[str]]:
     """Repaint live app-server-backed Codex windows with the new name."""
     return _names_push._push_codex_live_rename(
@@ -1548,7 +1901,61 @@ def _push_codex_live_rename(
         title,
         max_sockets=MAX_CODEX_LIVE_RENAME_SOCKETS,
         max_frame=MAX_CODEX_LIVE_RENAME_FRAME,
+        timeout_seconds=timeout_seconds,
+        still_automatic=still_automatic,
     )
+
+
+DEFAULT_CODEX_TITLE_ITEMS = '["activity", "thread"]'
+
+
+def _codex_title_items(environ: Mapping[str, str]) -> str:
+    """The tab-title items a kit Codex launch passes, or "" when it passes none.
+
+    Same answer as the launcher's, from the same deployed template: the kit
+    owns the tab name on both providers (K3), and every path that starts a
+    Codex process for a kit session has to agree about what goes on it.
+    """
+    switch = str(environ.get("SESSION_KIT_TAB_TITLE", "")).strip().casefold()
+    if switch == "off":
+        return ""
+    template = _codex_home(environ) / "session-kit" / "terminal-title.toml"
+    try:
+        if template.is_symlink():
+            raise OSError("refusing a symlinked template")
+        import tomllib
+
+        value = tomllib.loads(template.read_text(encoding="utf-8")).get("tui", {}).get(
+            "terminal_title"
+        )
+    except (OSError, ValueError, ImportError, AttributeError):
+        return DEFAULT_CODEX_TITLE_ITEMS
+    if not isinstance(value, list) or not value or len(value) > 12:
+        return DEFAULT_CODEX_TITLE_ITEMS
+    items = []
+    for item in value:
+        if not isinstance(item, str) or not re.fullmatch(r"[a-z][a-z-]{0,31}", item):
+            return DEFAULT_CODEX_TITLE_ITEMS
+        items.append(f'"{item}"')
+    return "[" + ", ".join(items) + "]"
+
+
+def codex_live_capabilities(kit_state_dir: Path) -> dict[str, bool]:
+    """What a live Codex app-server in this installation can be asked to do."""
+    return _names_push.codex_live_capabilities(kit_state_dir)
+
+
+def push_codex_live_color(
+    kit_state_dir: Path, uuid: str, color: str, send=None
+) -> tuple[list[str], list[str]]:
+    """The one place the recolour path asks about repainting a live Codex window.
+
+    Live rename already works through the app-server; a live recolour has no
+    control in the installed build, so this answers with the real reason and
+    never a false success. WS-F flips it by writing the capability file and
+    passing its client as ``send``.
+    """
+    return _names_push.push_codex_live_color(kit_state_dir, uuid, color, send=send)
 
 
 def _push_codex_title(
@@ -1683,6 +2090,8 @@ def _reserve_conversation_color(
 def reconcile_session_colors(
     config: Mapping[str, Any],
     sessions: Sequence[Mapping[str, Any]],
+    *,
+    revalidate_sessions: Callable[[], Sequence[Mapping[str, Any]]] | None = None,
 ) -> dict[str, Any]:
     """Settle every live same-provider colour collision in one idempotent pass."""
     return _colors.reconcile_conversation_colors(
@@ -1698,6 +2107,7 @@ def reconcile_session_colors(
         color_for_session=session_color,
         free_color=first_free_color,
         palette_for=palette_for_provider,
+        revalidate_sessions=revalidate_sessions,
     )
 
 
@@ -1744,6 +2154,8 @@ def mutate_canonical_color(
     provider: str,
     uuid: str,
     color: str | None,
+    *,
+    only_if_absent: bool = False,
 ) -> dict[str, str]:
     return _colors.mutate_canonical_color(
         config,
@@ -1758,6 +2170,7 @@ def mutate_canonical_color(
         valid_colors=_valid_colors,
         atomic_write_json=atomic_write_json,
         palette=palette_for_provider(provider),
+        only_if_absent=only_if_absent,
     )
 
 
@@ -2370,7 +2783,12 @@ def _parse_utc_timestamp(value: Any, label: str) -> dt.datetime:
     return parsed.astimezone(dt.timezone.utc)
 
 
-def update_recovery_state(paths: Mapping[str, Path], inventory: Mapping[str, Any]) -> None:
+def update_recovery_state(
+    paths: Mapping[str, Path],
+    inventory: Mapping[str, Any],
+    *,
+    collection_start: int | None = None,
+) -> None:
     """Preserve exact pre-generation recovery data until explicitly resolved.
 
     ``recovery-manifest.json`` is the latest nonempty generation.  When a new
@@ -2378,16 +2796,109 @@ def update_recovery_state(paths: Mapping[str, Path], inventory: Mapping[str, Any
     ``recovery-pending.json`` before the current manifest can advance.  Empty
     and partial post-reboot inventories therefore cannot erase the queue.
     """
-    return _recovery.update_recovery_state(
-        paths,
-        inventory,
-        schema_version=SCHEMA_VERSION,
-        recovery_manifest=recovery_manifest,
-        read_state_json=_read_state_json,
-        has_recovery_entries=_has_recovery_entries,
-        generation_key=_generation_key,
-        atomic_write_json=atomic_write_json,
+
+    def locked_atomic_write(path: Path, payload: Any) -> None:
+        if path == paths["pending"]:
+            _state_io._require_pending_publication_lock(path)
+        atomic_write_json(path, payload)
+
+    def locked_collection_write(
+        current_paths: Mapping[str, Path],
+        path: Path,
+        payload: Any,
+        *,
+        collection_start: int | None,
+    ) -> None:
+        if path == paths["pending"]:
+            _state_io._require_pending_publication_lock(path)
+        _state_io.write_collection_json(
+            current_paths,
+            path,
+            payload,
+            collection_start=collection_start,
+        )
+
+    with _state_io.publication_lock(paths):
+        return _recovery.update_recovery_state(
+            paths,
+            inventory,
+            schema_version=SCHEMA_VERSION,
+            recovery_manifest=recovery_manifest,
+            read_state_json=_read_state_json,
+            has_recovery_entries=_has_recovery_entries,
+            generation_key=_generation_key,
+            atomic_write_json=locked_atomic_write,
+            collection_start=collection_start,
+            write_collection_json=(
+                locked_collection_write
+                if collection_start is not None
+                else None
+            ),
+        )
+
+
+def enqueue_lost_conversations(
+    paths: Mapping[str, Path],
+    inventory: Mapping[str, Any],
+    previous_inventory: Mapping[str, Any] | None,
+    *,
+    boot_id: str,
+    collection_start: int | None = None,
+    config: Mapping[str, Any] | None = None,
+) -> list[str]:
+    """Queue conversations whose session vanished with the provider still in it."""
+    diagnostics: list[str] = []
+
+    def locked_atomic_write(path: Path, payload: Any) -> None:
+        if path == paths["pending"]:
+            _state_io._require_pending_publication_lock(path)
+        atomic_write_json(path, payload)
+
+    def locked_collection_write(
+        current_paths: Mapping[str, Path],
+        path: Path,
+        payload: Any,
+        *,
+        collection_start: int | None,
+    ) -> None:
+        if path == paths["pending"]:
+            _state_io._require_pending_publication_lock(path)
+        _state_io.write_collection_json(
+            current_paths,
+            path,
+            payload,
+            collection_start=collection_start,
+        )
+
+    publication_paths = (
+        _state_paths(config)
+        if isinstance(config, Mapping) and config.get("state_dir")
+        else _state_paths({"state_dir": paths["pending"].parent})
     )
+    with _state_io.publication_lock(publication_paths):
+        queued = _recovery.enqueue_lost_conversations(
+            inventory,
+            previous_inventory,
+            paths=paths,
+            schema_version=SCHEMA_VERSION,
+            boot_id=boot_id,
+            read_state_json=_read_state_json,
+            atomic_write_json=locked_atomic_write,
+            valid_recovery_state=_valid_recovery_state,
+            closed_on_purpose=_closed_on_purpose_reader(
+                config, diagnostic_sink=diagnostics
+            ),
+            now_unix_ms=int(time.time() * 1000),
+            collection_start=collection_start,
+            write_collection_json=(
+                locked_collection_write
+                if collection_start is not None
+                else None
+            ),
+        )
+    for diagnostic in diagnostics:
+        print(f"session inventory: {diagnostic}", file=sys.stderr)
+    return queued
 
 
 def source_generation_key(boot_id: Any, generation: Any) -> str | None:
@@ -2398,9 +2909,141 @@ def source_generation_key(boot_id: Any, generation: Any) -> str | None:
     )
 
 
-def flatten_pending(value: Any) -> dict[str, Any]:
+_ACTION_ENUM = re.compile(r"[a-z][a-z_]{0,31}")
+_ACTION_SESSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}")
+
+
+def _append_action_record(
+    path: Path, action: str, outcome: str, session: str | None = None
+) -> dict[str, Any]:
+    """One line on the shared action log, in the shape every reader expects.
+
+    Same file, same lock, and the same four keys the shell logger writes, plus
+    the session when the caller can name one. Records that fail the shape are
+    dropped by whichever writer next rewrites the file, so the shape is the
+    contract rather than a convention.
+    """
+    if not _ACTION_ENUM.fullmatch(action) or not _ACTION_ENUM.fullmatch(outcome):
+        raise CollectionError("action log entries take lower-case words")
+    record: dict[str, Any] = {
+        "action": action,
+        "at_unix_ms": time.time_ns() // 1_000_000,
+        "outcome": outcome,
+        "schema_version": 1,
+    }
+    if session is not None:
+        if not _ACTION_SESSION.fullmatch(session):
+            raise CollectionError("action log session name is invalid")
+        record["session"] = session
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    descriptor = os.open(
+        lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600
+    )
+    try:
+        os.fchmod(descriptor, 0o600)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
+        os.chmod(path, 0o600)
+    finally:
+        os.close(descriptor)
+    return record
+
+
+def _closed_on_purpose_reader(
+    config: Mapping[str, Any] | None = None,
+    *,
+    diagnostic_sink: list[str] | None = None,
+    closed_ledger_keys: set[str] | None = None,
+) -> Callable[[Any, Any], bool]:
+    """Honour a tombstone only while its closed-ledger row is findable.
+
+    A close intent is a suppression record: it says crash recovery should not
+    offer the conversation.  The closed-sessions row is the record that makes
+    that suppression safe.  The two files can be replaced independently, so
+    the tombstone alone is never enough evidence.  Validate the complete
+    ledger through the same streaming snapshot used by the lists, lazily on
+    the first tombstoned candidate, and fail open on every disagreement.
+    """
+    settings = load_config() if config is None else config
+    try:
+        state_dir = _state_paths(settings)["root"]
+        intents = _lifecycle.load_close_intents(state_dir)
+    except (CollectionError, OSError):
+        # A tombstone store that cannot be read must not hide crash offers:
+        # failing open here shows MORE recovery work, never less.
+        return lambda provider, uuid: False
+
+    ledger_keys: set[str] | None = closed_ledger_keys
+    ledger_error: str | None = None
+    reported: set[str] = set()
+
+    def diagnose(message: str) -> None:
+        if diagnostic_sink is not None and message not in reported:
+            diagnostic_sink.append(message)
+            reported.add(message)
+
+    def load_ledger_keys() -> set[str]:
+        nonlocal ledger_keys, ledger_error
+        if ledger_keys is not None:
+            return ledger_keys
+        ledger_keys = set()
+        try:
+            # ``closed_snapshot`` validates the complete ledger before it
+            # yields any rows and keeps row memory bounded for a large file.
+            with _closed_sessions.closed_snapshot(limit=None) as rows:
+                for row in rows:
+                    provider = row.get("provider")
+                    uuid = valid_uuid(row.get("uuid"))
+                    if provider in PROVIDERS and uuid:
+                        ledger_keys.add(f"{provider}:{uuid}")
+        except (CollectionError, OSError) as exc:
+            ledger_keys.clear()
+            ledger_error = str(exc)
+        return ledger_keys
+
+    def closed(provider: Any, uuid: Any) -> bool:
+        tombstoned = _lifecycle.closed_on_purpose(
+            state_dir,
+            provider=provider,
+            uuid=uuid,
+            intents=intents,
+        )
+        if not tombstoned:
+            return False
+        exact = valid_uuid(uuid)
+        key = f"{provider}:{exact}" if provider in PROVIDERS and exact else ""
+        if key and key in load_ledger_keys():
+            return True
+        if ledger_error:
+            diagnose(
+                f"close-intent inconsistency for {key or 'an invalid conversation'}: "
+                "its tombstone was ignored because the closed-sessions ledger "
+                f"could not be completely validated ({ledger_error}); recovery "
+                "will keep offering the conversation"
+            )
+        else:
+            diagnose(
+                f"close-intent inconsistency for {key or 'an invalid conversation'}: "
+                "a tombstone exists but its row is missing from the completely "
+                "validated closed-sessions ledger; recovery will keep offering "
+                "the conversation"
+            )
+        return False
+
+    return closed
+
+
+def flatten_pending(
+    value: Any,
+    *,
+    config: Mapping[str, Any] | None = None,
+    closed_ledger_keys: set[str] | None = None,
+) -> dict[str, Any]:
     """Return one safe recovery candidate per exact provider conversation."""
-    return _recovery.flatten_pending(
+    diagnostics: list[str] = []
+    flattened = _recovery.flatten_pending(
         value,
         schema_version=SCHEMA_VERSION,
         valid_recovery_state=_valid_recovery_state,
@@ -2408,17 +3051,231 @@ def flatten_pending(value: Any) -> dict[str, Any]:
         pending_preferred_entry=_pending_preferred_entry,
         pending_conflict_fields=_pending_conflict_fields,
         pending_evidence=_pending_evidence,
+        closed_on_purpose=_closed_on_purpose_reader(
+            config,
+            diagnostic_sink=diagnostics,
+            closed_ledger_keys=closed_ledger_keys,
+        ),
     )
+    if diagnostics:
+        flattened["diagnostics"] = diagnostics
+    return flattened
 
 
-def list_pending(config: Mapping[str, Any]) -> dict[str, Any]:
+def list_pending(
+    config: Mapping[str, Any], *, closed_ledger_keys: set[str] | None = None
+) -> dict[str, Any]:
     return _recovery.list_pending(
         config,
         state_paths=_state_paths,
         state_lock=StateLock,
         read_state_json=_read_state_json,
-        flatten_pending=flatten_pending,
+        # THIS config, not the ambient one: the tombstones that decide what is
+        # still recovery work live beside the queue being read.
+        flatten_pending=lambda value: flatten_pending(
+            value, config=config, closed_ledger_keys=closed_ledger_keys
+        ),
     )
+
+
+def _closed_keys(rows: Iterable[Mapping[str, Any]]) -> set[str]:
+    keys: set[str] = set()
+    snapshot_keys = getattr(rows, "conversation_keys", None)
+    if callable(snapshot_keys):
+        for provider, uuid in snapshot_keys():
+            exact = valid_uuid(uuid)
+            if provider in PROVIDERS and exact:
+                keys.add(f"{provider}:{exact}")
+        return keys
+    for row in rows:
+        provider = row.get("provider")
+        uuid = valid_uuid(row.get("uuid"))
+        if provider in PROVIDERS and uuid:
+            keys.add(f"{provider}:{uuid}")
+    return keys
+
+
+def recovery_list_payload(
+    config: Mapping[str, Any],
+    *,
+    include_closed: bool = True,
+    include_projection_inputs: bool = False,
+    closed_rows: Iterable[dict[str, Any]] | None = None,
+    closed_ledger_keys: set[str] | None = None,
+) -> dict[str, Any]:
+    """The one list of conversations that can be brought back.
+
+    Every recovery surface reads this. It gathers the three stores that know
+    about a session that is no longer open, plus the inventory that says which
+    conversations are open right now, and hands them to one projection. The
+    two surfaces used to read two different stores and agree on almost
+    nothing; the number of lists is the fix, not the contents of either.
+    """
+    if include_closed and (closed_rows is None or closed_ledger_keys is None):
+        with _closed_sessions.closed_snapshot(
+            limit=None, still_readable=_conversation_is_readable
+        ) as snapshot:
+            keys = _closed_keys(snapshot)
+            return recovery_list_payload(
+                config,
+                include_closed=include_closed,
+                include_projection_inputs=include_projection_inputs,
+                closed_rows=snapshot,
+                closed_ledger_keys=keys,
+            )
+
+    paths = _state_paths(config)
+    pending_payload = list_pending(
+        config, closed_ledger_keys=closed_ledger_keys
+    )
+    pending = pending_payload.get("entries") or []
+    manifest = _read_state_json(paths["manifest"])
+    manifest_sessions = (
+        list((manifest.get("sessions") or {}).values())
+        if isinstance(manifest, Mapping)
+        else []
+    )
+    live = _read_state_json(paths["inventory"])
+    # Open is open. A conversation running outside the kit is as live as one
+    # inside it, and offering it for restore invites exactly the collision
+    # this list exists to prevent -- the picker refused those at the last
+    # moment and `sp restore` did not refuse them at all.
+    live_sessions = (
+        list(live.get("sessions") or []) + list(live.get("outside_agents") or [])
+        if isinstance(live, Mapping)
+        else []
+    )
+    closed = list(closed_rows or ()) if include_closed else []
+    aliases = canonical_aliases(config)
+    automatic_titles = canonical_automatic_titles(config)
+    numbers = _terminal_number_bindings(paths["terminal_numbers"])
+    rows = _recovery_list.recovery_rows(
+        manifest_sessions=manifest_sessions,
+        closed_rows=closed,
+        pending_entries=pending,
+        live_sessions=live_sessions,
+        aliases=aliases,
+        automatic_titles=automatic_titles,
+        numbers=numbers,
+        # One readability rule for every store. The ledger asks it above; the
+        # crash manifest and the pending queue never asked it at all, so a
+        # conversation whose transcript is gone was offered as a full restore
+        # by two of the three sources and hidden by the third.
+        still_readable=_conversation_is_readable,
+    )
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "generated_at": _utc_now(),
+        "entries": rows,
+    }
+    if pending_payload.get("diagnostics"):
+        payload["diagnostics"] = list(pending_payload["diagnostics"])
+    if include_projection_inputs:
+        # `sp recover` streams the potentially huge closed ledger separately.
+        # These are the bounded inputs needed to give each streamed row the
+        # same name, stable number and live-conversation exclusion as the one
+        # projection above, without serializing the ledger into one document.
+        payload["projection_inputs"] = {
+            "aliases": aliases,
+            "automatic_titles": automatic_titles,
+            "numbers": numbers,
+            "live": [
+                [row.get("provider"), (row.get("identity") or {}).get("uuid")]
+                for row in live_sessions
+                if isinstance(row, Mapping)
+                and isinstance(row.get("identity"), Mapping)
+            ],
+        }
+    return payload
+
+
+def _write_recovery_snapshot(*, config: Mapping[str, Any], allow_large: bool) -> None:
+    """Stream projection inputs and Closed rows from one ledger snapshot."""
+
+    with _closed_sessions.closed_snapshot(
+        limit=None,
+        still_readable=_conversation_is_readable,
+        allow_large=allow_large,
+    ) as snapshot:
+        keys = _closed_keys(snapshot)
+        projection = recovery_list_payload(
+            config,
+            include_closed=False,
+            include_projection_inputs=True,
+            closed_rows=snapshot,
+            closed_ledger_keys=keys,
+        )
+        json.dump(
+            {"recovery_projection": projection},
+            sys.stdout,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        sys.stdout.write("\n")
+        for row in snapshot:
+            json.dump(row, sys.stdout, ensure_ascii=False, sort_keys=True)
+            sys.stdout.write("\n")
+
+
+def _printed_rows_from(payload: str, *, json_lines: bool = False) -> Iterable[Any]:
+    """The rows a surface just printed, read back from what it printed them from.
+
+    A file when the picker passes the payload it drew from, standard input when
+    `sp recover` pipes back the same bytes it rendered. Never a fresh
+    projection: the whole point is to record the list that was SHOWN, and a
+    rebuild here would record a list nobody has seen and call it the screen.
+    """
+    if json_lines:
+        def rows() -> Iterator[Any]:
+            handle = (
+                Path(payload).open(encoding="utf-8")
+                if payload
+                else contextlib.nullcontext(sys.stdin)
+            )
+            with handle as stream:
+                for number, line in enumerate(stream, 1):
+                    if not line.strip():
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except ValueError as exc:
+                        raise CollectionError(
+                            f"recovery screen row {number} is invalid JSON"
+                        ) from exc
+                    if not isinstance(row, Mapping):
+                        raise CollectionError(
+                            f"recovery screen row {number} must be an object"
+                        )
+                    yield row
+
+        return rows()
+    text = (
+        Path(payload).read_text(encoding="utf-8")
+        if payload
+        else sys.stdin.read()
+    )
+    if not text.strip():
+        return []
+    document = json.loads(text)
+    if not isinstance(document, Mapping):
+        raise CollectionError("a recovery screen payload must be a JSON object")
+    entries = document.get("entries")
+    return list(entries) if isinstance(entries, list) else []
+
+
+def _terminal_number_bindings(path: Path) -> dict[str, Any]:
+    """The conversation-to-number bindings, read without taking a lock.
+
+    A listing verb never mutates, and the binding it needs outlives the
+    session: the registry is keyed by conversation, so a number survives the
+    close that ends its terminal. That is the whole reason a closed session
+    can still be shown under the number it has everywhere else.
+    """
+    document = _read_state_json(path)
+    if not isinstance(document, Mapping):
+        return {}
+    bindings = document.get("bindings")
+    return dict(bindings) if isinstance(bindings, Mapping) else {}
 
 
 def acknowledge_pending(
@@ -2441,11 +3298,9 @@ def acknowledge_pending(
         state_lock=StateLock,
         read_state_json=_read_state_json,
         valid_recovery_state=_valid_recovery_state,
-        flatten_pending=flatten_pending,
+        flatten_pending=lambda value: flatten_pending(value, config=config),
         collect_live=collect_live,
         strict_live_inventory=strict_live_inventory,
-        remove_pending_entry=_remove_pending_entry,
-        atomic_write_json=atomic_write_json,
     )
 
 
@@ -2512,7 +3367,7 @@ def _apply_worktree_labels(
     if "state_dir" not in config:
         return inventory
     try:
-        from sessionkit_supervisor import worktrees as _worktrees
+        from sessionkit_inventory import worktrees as _worktrees
 
         registry = _worktrees.labels(config["state_dir"], os.environ)
     except (CollectionError, OSError, ValueError, ImportError):
@@ -2529,6 +3384,39 @@ def _apply_worktree_labels(
     return inventory
 
 
+def _apply_session_idle_states(
+    current: dict[str, Any],
+    previous: Mapping[str, Any] | None,
+    *,
+    state_dir: Path,
+) -> dict[str, Any]:
+    _idle_state.apply_idle_evidence(
+        current,
+        previous,
+        state_dir=state_dir,
+        transcript_snapshot=lambda provider, uuid: (
+            _transcripts.transcript_snapshot(provider, uuid)
+        ),
+    )
+    sessions = current.get("sessions")
+    if isinstance(sessions, list):
+        stall_seconds = _render.stall_threshold_seconds()
+        for row in sessions:
+            if isinstance(row, dict):
+                # ``publish_view_fields`` ran during collection, before the
+                # differential transcript overlay. Refresh the published
+                # machine field as well as the render-time answer so every
+                # consumer receives the new idle verdict.
+                row["state"] = _labels.session_state(
+                    row, stall_seconds=stall_seconds
+                )
+        sessions.sort(key=_model.canonical_session_order_key)
+        for index, row in enumerate(sessions, start=1):
+            if isinstance(row, dict):
+                row["row"] = index
+    return current
+
+
 def snapshot(*, write_state: bool = True, config: dict[str, Any] | None = None) -> dict[str, Any]:
     settings = config if config is not None else load_config()
     inventory = _snapshot.snapshot(
@@ -2542,13 +3430,34 @@ def snapshot(*, write_state: bool = True, config: dict[str, Any] | None = None) 
         collect_live=collect_live,
         boot_id_factory=_boot_id,
         persist_last_exact=_lifecycle.persist_last_exact,
+        enqueue_lost_conversations=enqueue_lost_conversations,
+        apply_session_origins=_origins.apply_session_origins,
+        capture_bounce_receipts=_origins.capture_bounce_receipts,
+        capture_bounce_cleanup_generations=(
+            _origins.capture_bounce_cleanup_generations
+        ),
+        capture_lifecycle_generations=(
+            _lifecycle.capture_lifecycle_generations
+        ),
+        capture_origin_generations=_origins.capture_origin_generations,
+        capture_provider_untitled_generations=(
+            capture_provider_untitled_generations
+        ),
+        capture_session_color_generations=capture_session_color_generations,
+        prune_origins=_origins.prune_origins,
+        publish_session_colors=publish_session_colors,
         apply_provider_exit_states=_lifecycle.apply_provider_exit_states,
         prune_inactive_state=_lifecycle.prune_inactive_state,
+        prune_model_cache=_session_model_reader.prune_cache,
+        apply_session_idle_states=_apply_session_idle_states,
         read_terminal_registry=_read_terminal_registry,
         read_terminal_retirements=_read_terminal_retirements,
         apply_terminal_numbers=apply_terminal_numbers,
         terminal_retirement_payload=_terminal_retirement_payload,
         atomic_write_json=atomic_write_json,
+        allocate_collection_start=_state_io.allocate_collection_start,
+        preflight_collection_documents=_state_io.preflight_collection_documents,
+        write_collection_json=_state_io.write_collection_json,
         quarantine_orphaned_provider_untitled_markers=(
             _quarantine_orphaned_provider_untitled_markers
         ),
@@ -2558,6 +3467,267 @@ def snapshot(*, write_state: bool = True, config: dict[str, Any] | None = None) 
     return inventory
 
 
+
+
+def _transcript_reachability(config: Mapping[str, Any]) -> dict[str, Any]:
+    """How many recorded conversations this machine can still read.
+
+    Read-only: the last published snapshot is read, never built, so a doctor
+    run neither talks to a provider nor writes state. A snapshot that cannot be
+    read is a warning about the check, never a verdict about the sessions.
+    """
+    snapshot_path = _state_paths(config)["inventory"]
+    try:
+        payload = _state_io.read_private_json(
+            snapshot_path, max_bytes=8 * 1024 * 1024, allow_missing=True
+        )
+    except (CollectionError, OSError):
+        payload = None
+    if not isinstance(payload, Mapping) or not isinstance(
+        payload.get("sessions"), list
+    ):
+        return {
+            "status": "warn",
+            "checked": 0,
+            "unreadable": [],
+            "detail": (
+                f"no readable session list at {snapshot_path}, so nothing was"
+                " checked"
+            ),
+        }
+    recorded = str(payload.get("generated_at") or "an unknown time")
+    checked = 0
+    unreadable: list[str] = []
+    for row in payload["sessions"]:
+        if not isinstance(row, Mapping) or row.get("provider") not in PROVIDERS:
+            continue
+        identity = row.get("identity")
+        uuid = valid_uuid(identity.get("uuid")) if isinstance(identity, Mapping) else None
+        if not uuid:
+            continue
+        checked += 1
+        if _transcripts.locate_transcript(str(row["provider"]), uuid) is None:
+            unreadable.append(_common.clean_text(row.get("title"), 60) or "a session")
+    if checked == 0:
+        detail = f"the list recorded at {recorded} holds no provider session"
+        status = "ok"
+    elif unreadable:
+        detail = (
+            f"{len(unreadable)} of {checked} sessions in the list recorded at "
+            f"{recorded} have no transcript this machine can read: "
+            + "; ".join(unreadable[:5])
+            + ("; and more" if len(unreadable) > 5 else "")
+        )
+        status = "warn"
+    else:
+        detail = (
+            f"all {checked} provider sessions in the list recorded at {recorded}"
+            " have a transcript this machine can read"
+        )
+        status = "ok"
+    return {
+        "status": status,
+        "checked": checked,
+        "unreadable": unreadable,
+        "detail": detail,
+    }
+
+
+SESSION_COLOR_DIR = "session-color"
+
+
+def _session_color_generation(row: Mapping[str, Any]) -> str | None:
+    shell = row.get("shpool_shell")
+    if not isinstance(shell, Mapping):
+        return None
+    pid = shell.get("pid")
+    ticks = shell.get("process_start_ticks")
+    if (
+        isinstance(pid, bool)
+        or not isinstance(pid, int)
+        or isinstance(ticks, bool)
+        or not isinstance(ticks, int)
+    ):
+        return None
+    identity = f"{row.get('shpool_id_raw')}:{pid}:{ticks}"
+    return hashlib.sha256(identity.encode()).hexdigest()
+
+
+def _published_color_generation(path: Path) -> tuple[str, str] | None:
+    try:
+        fields = path.read_text(encoding="utf-8", errors="strict").split()
+    except OSError:
+        return None
+    if len(fields) != 3 or not re.fullmatch(r"[0-9a-f]{64}", fields[2]):
+        return None
+    return (path.name, fields[2])
+
+
+def capture_session_color_generations(
+    state_dir: Path,
+) -> frozenset[tuple[str, str]]:
+    directory = Path(state_dir) / SESSION_COLOR_DIR
+    try:
+        entries = list(directory.iterdir())
+    except OSError:
+        return frozenset()
+    captured: set[tuple[str, str]] = set()
+    for path in entries:
+        try:
+            if path.is_symlink() or not path.is_file():
+                continue
+            generation = _published_color_generation(path)
+            if generation is not None:
+                captured.add(generation)
+        except OSError:
+            continue
+    return frozenset(captured)
+
+
+def publish_session_colors(
+    inventory: Mapping[str, Any],
+    *,
+    state_dir: Path,
+    retire_generations: Iterable[tuple[str, str]] = (),
+) -> int:
+    """Write each live session's colour where its own shell can read it.
+
+    The in-session prompt cannot afford to parse the inventory on every line,
+    so it used a colour constant — which is how one session came to be green in
+    the picker and a different colour in its own terminal. One tiny file per
+    session, rewritten only when the colour actually changes, costs the prompt
+    a single read and ends the second owner.
+    """
+    directory = Path(state_dir) / SESSION_COLOR_DIR
+    written = 0
+    live: set[str] = set()
+    rows = inventory.get("sessions") if isinstance(inventory, Mapping) else None
+    if not isinstance(rows, list):
+        return 0
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        shpool_id = row.get("shpool_id_raw")
+        color = row.get("display_color")
+        if not isinstance(shpool_id, str) or not shpool_id or "/" in shpool_id:
+            continue
+        code = _colors.SESSION_SGR.get(color if isinstance(color, str) else "")
+        if not code:
+            continue
+        live.add(shpool_id)
+        generation = _session_color_generation(row)
+        line = f"{color} {code}{f' {generation}' if generation else ''}\n"
+        path = directory / shpool_id
+        try:
+            if path.is_file() and path.read_text(encoding="utf-8") == line:
+                continue
+            _state_io.ensure_private_directory(directory)
+            temporary = directory / f".{shpool_id}.{os.getpid()}"
+            temporary.write_text(line, encoding="utf-8")
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, path)
+            written += 1
+        except OSError:
+            continue
+    # A colour file outliving its session would paint the next session that
+    # reuses the name. They go when the session does.
+    allowed = frozenset(retire_generations)
+    try:
+        for path in directory.iterdir():
+            if path.name.startswith(".") or path.name in live:
+                continue
+            if _published_color_generation(path) not in allowed:
+                continue
+            with contextlib.suppress(OSError):
+                path.unlink()
+    except OSError:
+        pass
+    return written
+
+
+def _conversation_is_readable(provider: str, uuid: str) -> bool:
+    """True while this machine can still READ that conversation's record.
+
+    Locating the file is not reading it. A transcript that exists with mode
+    000 -- a botched chmod, a restore from an archive that lost its bits, a
+    file owned by another account -- was located happily and then reported as
+    `restorable: true`, which is a promise the kit cannot keep and which the
+    person only discovers when the restore fails. Found in review 2026-08-15,
+    together with the close path that trusted the same answer.
+
+    So the file is opened. One byte is enough: an empty transcript is a real
+    conversation that has not been written to yet, while EACCES, EISDIR or a
+    vanished path are all "this cannot come back".
+    """
+    found = _transcripts.locate_transcript(provider, uuid)
+    if found is None:
+        return False
+    try:
+        with open(found, "rb") as handle:
+            handle.read(1)
+    except OSError:
+        return False
+    return True
+
+
+def _record_closed_session(
+    config: Mapping[str, Any],
+    *,
+    provider: str,
+    uuid: str = "",
+    shpool_id: str = "",
+    title: str = "",
+    cwd: str = "",
+    origin: str = "",
+    account_alias: str = "",
+) -> dict[str, Any]:
+    """Append one deliberate close, filling in what the caller did not know."""
+    title_source = ""
+    if not title or not cwd or not origin:
+        try:
+            cached = _read_state_json(_state_paths(config)["inventory"])
+        except (CollectionError, OSError):
+            cached = None
+        known = _closed_sessions.entry_from_inventory(
+            cached if isinstance(cached, Mapping) else None,
+            provider=provider,
+            uuid=uuid,
+            shpool_id=shpool_id,
+        )
+        # Only a title read from the row carries that row's provenance. One
+        # the caller passed in is theirs, and nothing here knows where it
+        # came from -- so it is recorded without a source rather than under
+        # somebody else's.
+        if not title:
+            title_source = known["title_source"]
+        title = title or known["title"]
+        cwd = cwd or known["cwd"]
+        origin = origin or known["origin"]
+        account_alias = account_alias or known["account_alias"]
+    try:
+        return _closed_sessions.record_close(
+            provider=provider,
+            uuid=uuid,
+            title=title,
+            title_source=title_source,
+            cwd=cwd,
+            # "unknown", never "human". This row is provenance, it outlives
+            # the session, and a session nobody stamped has none to record; a
+            # default of "human" turns that absence into a positive claim that
+            # every future restore reads back as fact.
+            origin=origin or _closed_sessions.UNKNOWN_ORIGIN,
+            shpool_id=shpool_id,
+            account_alias=account_alias,
+        )
+    except (CollectionError, OSError) as exc:
+        # The close already happened. A ledger that cannot be written costs
+        # the person a listing, never the close they asked for.
+        return {
+            "recorded": False,
+            "provider": provider,
+            "uuid": uuid,
+            "reason": str(exc),
+        }
 
 
 def _short_path(path: str) -> str:
@@ -2588,43 +3758,186 @@ def render_detail(
     *,
     state_dir: Path | str | None = None,
 ) -> str:
-    """One session in full, for a person to read."""
-    activity: Mapping[str, Any] | None = None
-    now_ms = int(time.time() * 1000)
-    row = lookup(inventory, selector)
-    if row is not None and state_dir is not None:
-        try:
-            queue = _events.build_attention_queue(
-                inventory,
-                Path(state_dir),
-                now_ms=now_ms,
-                mutate=False,
-            )
-            identity = row.get("identity")
-            uuid = identity.get("uuid") if isinstance(identity, Mapping) else None
-            key = f"{row.get('provider')}:{uuid}"
-            activity = next(
-                (
-                    item
-                    for item in queue.get("items", [])
-                    if isinstance(item, Mapping) and item.get("thread_key") == key
-                ),
-                None,
-            )
-            projected = queue.get("as_of_unix_ms")
-            if isinstance(projected, int) and not isinstance(projected, bool):
-                now_ms = projected
-        except (OSError, ValueError):
-            activity = None
+    """One session in full, for a person to read.
+
+    `state_dir` is still accepted so every caller keeps working; the activity
+    line it used to feed came from the retired attention queue, and a detail
+    view now renders from the inventory row alone.
+    """
     return _render.render_detail(
         inventory,
         selector,
         home_factory=_home,
-        activity=activity,
-        now_ms=now_ms,
+        activity=None,
+        now_ms=int(time.time() * 1000),
     )
 
 
+
+
+# The fleet flagger writes one file; these are the same bounds the picker reads
+# it with. A hostile or corrupt file must never hide the rest of the estate and
+# must never stall a login.
+FLEET_STALLS_MAX_BYTES = 262_144
+FLEET_STALLS_FRESH_SECONDS = 300
+FLEET_STALLS_MAX_RECORDS = 200
+
+
+def _fleet_state_dir() -> Path:
+    """Where the fleet keeps its own state. SESSION_KIT_FLEET_DIR overrides."""
+    override = os.environ.get("SESSION_KIT_FLEET_DIR")
+    if override:
+        return Path(override).expanduser()
+    return _home() / ".local" / "state" / "fleet"
+
+
+def read_fleet_stalls(*, now: float | None = None) -> dict[str, list[str]]:
+    """Stall flags the fleet raised, as {identifier: reasons}.
+
+    Only the three reasons `docs/voice.md` calls degrees of **needs you** are
+    returned. `orphan` is the fourth reason the flagger can write and is
+    deliberately dropped: an orphaned session is a dead session, not a person's
+    turn, and folding it in would make the count lie. A stale file (the flagger
+    stopped running) is no evidence at all and reads as no flags.
+    """
+    path = _fleet_state_dir() / "stalls.json"
+    try:
+        if path.stat().st_size > FLEET_STALLS_MAX_BYTES:
+            return {}
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(payload, Mapping):
+        return {}
+    try:
+        generated_at = float(payload.get("generated_at") or 0)
+    except (TypeError, ValueError):
+        return {}
+    moment = time.time() if now is None else now
+    if moment - generated_at >= FLEET_STALLS_FRESH_SECONDS:
+        return {}
+    records = payload.get("stalled")
+    records = records if isinstance(records, list) else []
+    flags: dict[str, list[str]] = {}
+    for record in records[:FLEET_STALLS_MAX_RECORDS]:
+        if not isinstance(record, Mapping):
+            continue
+        key = clean_text(record.get("key"), 200)
+        reason = clean_text(record.get("reason"), 32).casefold()
+        if not key or reason not in _labels.STALL_REASONS_NEEDS_YOU:
+            continue
+        reasons = flags.setdefault(key, [])
+        if reason not in reasons:
+            reasons.append(reason)
+    return flags
+
+
+def _stall_identifiers(row: Mapping[str, Any]) -> tuple[str, ...]:
+    """Every identifier the flagger could have keyed this row by.
+
+    It keys by the first of conversation uuid, shpool id, title that it finds,
+    against an inventory it read at its own moment. Matching any of them keeps
+    a flag attached to its session when a later collection resolves an identity
+    the flagger did not have.
+    """
+    identity = row.get("identity")
+    identity = identity if isinstance(identity, Mapping) else {}
+    candidates = (
+        identity.get("uuid"),
+        row.get("uuid"),
+        row.get("shpool_id_raw"),
+        row.get("shpool_id"),
+        row.get("title"),
+    )
+    seen: list[str] = []
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate and candidate not in seen:
+            seen.append(candidate)
+    return tuple(seen)
+
+
+def _view_seconds_since(timestamp_ms: Any, now_ms: int) -> int | None:
+    if isinstance(timestamp_ms, bool) or not isinstance(timestamp_ms, int):
+        return None
+    if timestamp_ms <= 0:
+        return None
+    return max(0, (now_ms - timestamp_ms) // 1000)
+
+
+def _view_text(value: Any, limit: int = 120) -> str | None:
+    text = clean_text(value, limit)
+    return text or None
+
+
+def publish_view_fields(
+    inventory: dict[str, Any],
+    *,
+    stalls: Mapping[str, list[str]] | None = None,
+    now_ms: int | None = None,
+) -> dict[str, Any]:
+    """Add the fields every picker reads, on top of the collectors' evidence.
+
+    Additive by contract: nothing here renames or removes a field, because the
+    login picker parses this same document and a rename would blind the screen
+    a person is looking at. `lib/sessionkit_inventory/SNAPSHOT.md` is the
+    written form of what this publishes.
+
+    One field is not merely added: a session the fleet flagged as unsurfaced,
+    unanswered or silent comes back with `needs_you` true and the reasons
+    listed. That is the point -- "needs you" means one thing, and it means it at
+    the source rather than in each screen's own arithmetic.
+    """
+    sessions = inventory.get("sessions")
+    if not isinstance(sessions, list):
+        return inventory
+    flags = read_fleet_stalls() if stalls is None else stalls
+    as_of = now_ms if isinstance(now_ms, int) and not isinstance(now_ms, bool) else int(
+        time.time() * 1000
+    )
+    stall_seconds = _render.stall_threshold_seconds()
+    for row in sessions:
+        if not isinstance(row, dict):
+            continue
+        reasons: list[str] = []
+        if flags:
+            for identifier in _stall_identifiers(row):
+                for reason in flags.get(identifier, ()):
+                    if reason not in reasons:
+                        reasons.append(reason)
+        if reasons:
+            row["needs_you"] = True
+        row["needs_you_reasons"] = reasons
+        number = row.get("terminal_number")
+        row["number"] = (
+            number
+            if isinstance(number, int) and not isinstance(number, bool) and number > 0
+            else None
+        )
+        row["attached"] = row.get("availability") == _labels.AVAILABILITY_ATTACHED
+        row["state"] = _labels.session_state(row, stall_seconds=stall_seconds)
+        row["age_seconds"] = _view_seconds_since(row.get("started_at_unix_ms"), as_of)
+        count = row.get("active_subagent_count")
+        if not isinstance(count, int) or isinstance(count, bool):
+            subagents = row.get("subagents")
+            count = len(subagents) if isinstance(subagents, list) else 0
+        row["subagent_count"] = count
+        row["account_alias"] = _view_text(row.get("account_alias"), 20)
+        # Collected by another pass and simply carried through, so the field is
+        # in the contract before the collector exists and no screen has to grow
+        # a special case the day it lands.
+        row["model"] = _view_text(row.get("model"), 80)
+        # The identifier is for a machine; the name is what every screen puts
+        # in the column, and the state is why there is no name when there is
+        # none. All three ride the same document so no surface has to guess.
+        row["display_model"] = _view_text(row.get("display_model"), 80)
+        row["model_source"] = _view_text(row.get("model_source"), 40)
+        row["model_state"] = _view_text(row.get("model_state"), 40)
+        # Evidence, never copy: what the process was started with. No screen
+        # reads it, because a session's launch argument is not what it runs.
+        row["launch_model"] = _view_text(row.get("launch_model"), 80)
+        row["model_handoff_capable"] = row.get("model_handoff_capable") is True
+        row["origin"] = _view_text(row.get("origin"), 40)
+    return inventory
 
 
 def strict_live_inventory(inventory: Mapping[str, Any]) -> bool:
@@ -2652,6 +3965,117 @@ def load_inventory_input(path: str | Path) -> dict[str, Any]:
 def _json_print(value: Any) -> None:
     json.dump(value, sys.stdout, indent=2, sort_keys=True)
     sys.stdout.write("\n")
+
+
+def _terminate_exact_process(pid: int, start_ticks: int) -> str:
+    """TERM, then bounded KILL, addressed to one pidfd-pinned generation.
+
+    The TERM must really land before KILL is allowed. Each delivery re-reads
+    PID/start ticks after opening the pidfd, so a recycled PID is never a
+    target. Synthetic process trees require an explicit test-only delivery
+    seam; they must never make a host PID with the same number signalable.
+    """
+    if pid <= 0 or start_ticks <= 0:
+        raise CollectionError("exact process generation is invalid")
+    root = _common.proc_root()
+    send_signal = None
+    if root == Path("/proc") and not _subagent_sweep._HAS_PIDFD:
+        raise CollectionError("pidfd-pinned exact signal delivery is unavailable")
+    if root != Path("/proc"):
+        mode = os.environ.get("SESSION_KIT_TEST_EXACT_SIGNAL", "")
+        if os.environ.get("SESSION_KIT_TESTING") != "1" or mode not in {
+            "remove",
+            "survive",
+        }:
+            raise CollectionError(
+                "exact signal delivery is unavailable for the synthetic process table"
+            )
+
+        def synthetic_send(target: int, signum: int) -> None:
+            log_path = os.environ.get("SESSION_KIT_TEST_EXACT_SIGNAL_LOG", "")
+            if log_path:
+                with open(log_path, "a", encoding="utf-8") as handle:
+                    handle.write(f"{target}\t{start_ticks}\t{signum}\n")
+            if mode == "remove":
+                shutil.rmtree(root / str(target))
+
+        send_signal = synthetic_send
+
+    def still_exact() -> bool:
+        return _subagent_sweep._still_the_process(root, pid, start_ticks)
+
+    grace_seconds = 0.0 if send_signal is not None else 2.0
+
+    if not still_exact():
+        return "already-gone"
+    term_delivered = False
+    try:
+        _subagent_sweep._deliver_exact_process(
+            root,
+            pid,
+            start_ticks,
+            signal.SIGTERM,
+            send_signal=send_signal,
+        )
+        term_delivered = True
+    except ProcessLookupError:
+        return "already-gone"
+    except OSError as exc:
+        raise CollectionError(f"exact TERM delivery failed: {exc}") from exc
+
+    deadline = time.monotonic() + grace_seconds
+    while still_exact() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if not still_exact():
+        return "terminated"
+    if not term_delivered:  # defensive: KILL may only follow a delivered TERM
+        raise CollectionError("exact TERM was not delivered; KILL was not attempted")
+    try:
+        _subagent_sweep._deliver_exact_process(
+            root,
+            pid,
+            start_ticks,
+            signal.SIGKILL,
+            send_signal=send_signal,
+        )
+    except ProcessLookupError:
+        return "terminated"
+    except OSError as exc:
+        raise CollectionError(f"exact KILL delivery failed: {exc}") from exc
+    deadline = time.monotonic() + grace_seconds
+    while still_exact() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if still_exact():
+        raise CollectionError(
+            f"verified process PID {pid} start {start_ticks} survives TERM and KILL"
+        )
+    return "killed"
+
+
+def _write_closed_sessions(
+    *, limit: int | None, allow_large: bool, json_lines: bool
+) -> None:
+    """Validate first, then stream one selected row at a time to stdout."""
+
+    with _closed_sessions.closed_snapshot(
+        limit=limit,
+        still_readable=_conversation_is_readable,
+        allow_large=allow_large,
+    ) as rows:
+        if json_lines:
+            for row in rows:
+                json.dump(row, sys.stdout, ensure_ascii=False, sort_keys=True)
+                sys.stdout.write("\n")
+            return
+        sys.stdout.write(
+            '{"schema_version":' + str(SCHEMA_VERSION) + ',"closed":['
+        )
+        separator = ""
+        for row in rows:
+            sys.stdout.write(separator)
+            json.dump(row, sys.stdout, ensure_ascii=False, sort_keys=True)
+            separator = ","
+        sys.stdout.write("]}\n")
 
 
 def _platform_command(args: argparse.Namespace) -> int:
@@ -2686,6 +4110,85 @@ def _platform_command(args: argparse.Namespace) -> int:
         if not value:
             raise CollectionError("current boot identity is unavailable")
         print(value)
+        return 0
+    if args.platform_action == "shpool-holder-generation":
+        # This is deliberately smaller than a live inventory collection. A
+        # caller that already has one raw client payload needs to know who
+        # answered that exact read, without issuing another client request.
+        # Linux can answer from the listening socket inode and the daemons'
+        # fd tables. Darwin has no equivalent observer in this release, so a
+        # destructive caller must refuse there instead of treating a unique
+        # process name as socket authorship.
+        if platform == DARWIN_PLATFORM:
+            raise CollectionError("exact shpool socket holder is unavailable on Darwin")
+        table = platform_process_table(
+            _common.proc_root(), DEFAULT_MAX_PROC_NODES
+        )
+        identity = _payload_daemon_identity(table)
+        # Synthetic command fixtures cannot own a real Unix listener. Their
+        # existing daemon-PID seam is accepted only behind the testing gate,
+        # and only when it names an exact readable daemon generation. Live
+        # code never reaches this branch.
+        if identity is None and os.environ.get("SESSION_KIT_TESTING") == "1":
+            fixture_pid = os.environ.get("SESSION_KIT_DAEMON_PID", "")
+            if fixture_pid.isdigit():
+                pid = int(fixture_pid)
+                process = table.get(pid)
+                if (
+                    isinstance(process, Mapping)
+                    and (
+                        _is_shpool_daemon(process)
+                        or clean_text(process.get("comm"), 128) == "shpool"
+                    )
+                ):
+                    start = process.get("start_ticks")
+                    if isinstance(start, int) and not isinstance(start, bool):
+                        identity = {"pid": pid, "process_start_ticks": start}
+        if identity is None:
+            raise CollectionError("exact shpool socket holder is unavailable")
+        print(f"{identity['pid']}\t{identity['process_start_ticks']}")
+        return 0
+    if args.platform_action == "terminate-exact-process":
+        if platform == DARWIN_PLATFORM:
+            raise CollectionError("pidfd-pinned exact termination is unavailable on Darwin")
+        print(_terminate_exact_process(args.pid, args.process_generation))
+        return 0
+    if args.platform_action == "exact-shell-gone":
+        # A raw list losing a name proves only that a manager lost a record.
+        # A close is complete only when the exact shell generation is gone
+        # while the daemon generation on both sides of that observation is
+        # unchanged. PID reuse is a successful disappearance of the old
+        # generation; unreadable evidence refuses.
+        if platform == DARWIN_PLATFORM:
+            raise CollectionError("exact post-close shell proof is unavailable on Darwin")
+        root = _common.proc_root()
+
+        def exact_stat(pid: int) -> tuple[int, int, int] | None:
+            try:
+                return _proc_stat(root / str(pid) / "stat")
+            except FileNotFoundError:
+                return None
+            except (OSError, ValueError) as exc:
+                raise CollectionError(
+                    f"process generation for PID {pid} is unreadable"
+                ) from exc
+
+        daemon_before = exact_stat(args.daemon_pid)
+        if (
+            daemon_before is None
+            or daemon_before[0] != args.daemon_pid
+            or daemon_before[2] != args.daemon_generation
+        ):
+            raise CollectionError("bound shpool daemon generation changed")
+        shell = exact_stat(args.shell_pid)
+        daemon_after = exact_stat(args.daemon_pid)
+        if daemon_after != daemon_before:
+            raise CollectionError("bound shpool daemon generation changed during close proof")
+        if shell is not None and shell[2] == args.shell_generation:
+            raise CollectionError(
+                f"verified shell PID {args.shell_pid} start {args.shell_generation} survives"
+            )
+        print("gone")
         return 0
     if args.platform_action == "process-table":
         table = platform_process_table(
@@ -2753,6 +4256,47 @@ def _alias_command(args: argparse.Namespace, config: dict[str, Any]) -> int:
         return 0
     if args.alias_action == "migrate-runtime":
         _json_print(migrate_runtime_aliases(config))
+        return 0
+    if args.alias_action == "push":
+        # Re-assert a name the kit already holds, without renaming anything.
+        # A restore starts a NEW provider process for an old conversation, and
+        # that process reads its name from the provider's own store at start:
+        # if the kit's name never made it there (or a later provider write
+        # replaced it), the restored window comes back nameless while the
+        # picker still shows the name. Restore calls this so the name is in
+        # place before the provider reads it.
+        key = f"{args.provider}:{str(args.uuid).lower()}"
+        title = canonical_aliases(config).get(key) or ""
+        if not title:
+            # The alias tier is the name a person gave this session, so it is
+            # always safe to re-assert. The automatic tier is not: if somebody
+            # renamed the conversation in the window and no inventory build has
+            # adopted it yet, pushing the kit's derived title would overwrite
+            # the person's name in the provider's own store -- and the evidence
+            # adoption needs to recover it goes with it. Ownership decides.
+            owner = (
+                canonical_name_ownership(config).get(key, {}).get("owner") or ""
+            )
+            if owner != "human":
+                title = canonical_automatic_titles(config).get(key) or ""
+        payload = {"schema_version": SCHEMA_VERSION, "title": title}
+        if not title:
+            # Nothing named this conversation, so nothing is missing from the
+            # provider store either. Silence here is the truth.
+            payload.update({"provider_title_pushes": [], "provider_title_warnings": []})
+            _json_print(payload)
+            return 0
+        payload.update(propagate_provider_title(args.provider, args.uuid, title))
+        _json_print(payload)
+        # Three outcomes, told apart because the caller says something
+        # different about each. Nothing landed: the window comes back nameless.
+        # Something landed and something did not -- Codex writes an index entry
+        # and a database title, and the status bar reads the database one, so a
+        # half-push leaves the name on one surface and not the one people see.
+        if not payload.get("provider_title_pushes"):
+            return 1
+        if payload.get("provider_title_warnings"):
+            return 3
         return 0
     title = str(args.title) if args.alias_action == "set" else None
     aliases = mutate_canonical_alias(config, args.provider, args.uuid, title)
@@ -2845,9 +4389,22 @@ def _color_command(args: argparse.Namespace, config: dict[str, Any]) -> int:
                 file=sys.stderr,
             )
             return 1
+
+        def revalidate_sessions() -> list[Mapping[str, Any]]:
+            current = snapshot(write_state=False, config=config)
+            if current.get("source") != "live" or current.get("stale") is not False:
+                raise CollectionError(
+                    "session colors changed while fresh inventory was unavailable"
+                )
+            return [
+                *current.get("sessions", ()),
+                *current.get("outside_agents", ()),
+            ]
+
         result = reconcile_session_colors(
             config,
             [*live.get("sessions", ()), *live.get("outside_agents", ())],
+            revalidate_sessions=revalidate_sessions,
         )
         # Push each moved color the way `set` does, so a window that is already
         # open shows the new one at its next start or resume instead of waiting
@@ -2905,6 +4462,64 @@ def _color_command(args: argparse.Namespace, config: dict[str, Any]) -> int:
                 **propagate_provider_color(args.provider, args.uuid, effective),
             }
         )
+        return 0
+    if args.color_action == "bounce-ready":
+        # Can a restart actually paint this session's colour?
+        #
+        # `effective` alone answers nothing: it falls back to a hash of the
+        # conversation's identity, so it succeeds for any valid uuid. The real
+        # question is whether the record the provider reads at start exists --
+        # for Claude, an agent-color record in the conversation's transcript;
+        # for Codex, the theme file the launcher passes on the command line.
+        # Without it the restart costs the person their window and changes
+        # nothing.
+        effective = session_color(
+            args.provider, args.uuid, canonical_colors(config)
+        )
+        if not effective:
+            return 1
+        exact = valid_uuid(args.uuid)
+        if not exact:
+            return 1
+        if args.provider == "claude":
+            applied = False
+            for transcript in _names_push._claude_transcripts(_home(), exact):
+                try:
+                    with open(transcript, encoding="utf-8") as handle:
+                        for line in handle:
+                            try:
+                                record = json.loads(line)
+                            except ValueError:
+                                continue
+                            if (
+                                isinstance(record, Mapping)
+                                and record.get("type") == "agent-color"
+                                and record.get("agentColor") == effective
+                            ):
+                                applied = True
+                except OSError:
+                    continue
+            if not applied:
+                print(
+                    "session inventory: no color record for this conversation; "
+                    "a restart would not change its color",
+                    file=sys.stderr,
+                )
+                return 1
+        else:
+            theme = _codex_home() / "themes" / f"sk-{effective}.tmTheme"
+            try:
+                ready = theme.is_file() and not theme.is_symlink()
+            except OSError:
+                ready = False
+            if not ready:
+                print(
+                    "session inventory: no Codex theme for this color; "
+                    "a restart would not change its color",
+                    file=sys.stderr,
+                )
+                return 1
+        print(effective)
         return 0
     if args.color_action == "effective":
         effective = session_color(
@@ -2979,20 +4594,104 @@ def _automatic_title_command(
         raise CollectionError(
             "automatic title prune requires a fresh live inventory"
         )
-    _json_print(prune_automatic_titles(config, live, args.prune_token))
+
+    def revalidate_inventory() -> Mapping[str, Any]:
+        current = snapshot(write_state=False, config=config)
+        if current.get("source") != "live" or current.get("stale") is not False:
+            raise CollectionError(
+                "automatic title prune requires a fresh live inventory under lock"
+            )
+        return current
+
+    _json_print(
+        prune_automatic_titles(
+            config,
+            live,
+            args.prune_token,
+            revalidate_inventory=revalidate_inventory,
+        )
+    )
     return 0
+
+
+def _render_account_list(profiles: list[dict[str, Any]]) -> str:
+    """`sp account list` for a person.
+
+    The JSON document this used to print carried profile_dir filesystem paths
+    and epoch milliseconds -- machine facts, in a place the help promises
+    "enrolled accounts and last verification". The document is still one
+    `--json` away.
+    """
+    if not profiles:
+        return f"  {_labels.empty_state('Accounts')}"
+    now_ms = int(time.time() * 1000)
+    count = len(profiles)
+    lines = [f"  {count} {_labels.plural(count, 'account')}", ""]
+    for provider in sorted({str(item.get("provider")) for item in profiles}):
+        group = [item for item in profiles if item.get("provider") == provider]
+        lines.append(f"  {_labels.provider_name(provider)}")
+        alias_width = max(len(str(item.get("alias") or "")) for item in group)
+        email_width = max(len(str(item.get("email") or "")) for item in group)
+        plan_width = max(
+            len(str(item.get("plan") or _labels.MISSING)) for item in group
+        )
+        for item in group:
+            verified = _labels.relative_time(
+                int(item.get("verified_at_unix_ms") or 0), now_ms
+            )
+            row = (
+                f"    {str(item.get('alias') or ''):<{alias_width}}  "
+                f"{str(item.get('email') or ''):<{email_width}}  "
+                f"{str(item.get('plan') or _labels.MISSING):<{plan_width}}  "
+                f"verified {verified}"
+            )
+            if item.get("enabled") is False:
+                row = f"{row}  (disabled)"
+            lines.append(row.rstrip())
+    return "\n".join(lines)
+
+
+def _snapshot_session_row(
+    snapshot: str | None, shpool_id: str | None
+) -> dict[str, Any] | None:
+    """One session row out of a guard snapshot, or None when it is not exactly one.
+
+    The automatic switch decides on the same snapshot the picker's own guard
+    writes, and refuses on anything but a unique match: two rows claiming one
+    shell is precisely the state in which moving the wrong conversation is
+    possible.
+    """
+    if not snapshot or not shpool_id:
+        return None
+    try:
+        with open(snapshot, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    rows = [
+        row
+        for row in data.get("sessions", [])
+        if isinstance(row, dict) and row.get("shpool_id_raw") == shpool_id
+    ]
+    return rows[0] if len(rows) == 1 else None
 
 
 def _account_command(args: argparse.Namespace, config: dict[str, Any]) -> int:
     """Run one owner-only account profile or switch-transaction verb."""
     action = args.account_action
     if action == "list":
-        _json_print(
-            {
-                "schema_version": _accounts.ACCOUNT_SCHEMA_VERSION,
-                "profiles": _accounts.list_profiles(config, args.provider),
-            }
-        )
+        profiles = _accounts.list_profiles(config, args.provider)
+        if getattr(args, "account_json", False):
+            _json_print(
+                {
+                    "schema_version": _accounts.ACCOUNT_SCHEMA_VERSION,
+                    "profiles": profiles,
+                }
+            )
+        else:
+            print(_render_account_list(profiles))
     elif action == "choices":
         _json_print(_accounts.account_choices(config, args.provider))
     elif action == "configure-feeds":
@@ -3051,6 +4750,74 @@ def _account_command(args: argparse.Namespace, config: dict[str, Any]) -> int:
         if color:
             payload.update(propagate_provider_color(args.provider, args.uuid, color))
         _json_print(payload)
+    elif action == "auto-plan":
+        from sessionkit_inventory import account_guard as _guard
+
+        _json_print(
+            _guard.plan(
+                config,
+                args.provider,
+                args.uuid,
+                _snapshot_session_row(
+                    getattr(args, "snapshot", None), getattr(args, "shpool_id", None)
+                ),
+            )
+        )
+    elif action == "auto-spent":
+        from sessionkit_inventory import account_guard as _guard
+
+        _json_print(_guard.spent_aliases(config, args.provider))
+    elif action == "auto-begin":
+        from sessionkit_inventory import account_guard as _guard
+
+        # Reserves the conversation's one move and prints the token that names
+        # it. Called before anything irreversible, so a failure afterwards can
+        # never leave a moved conversation looking unmoved.
+        print(
+            _guard.begin_hop(
+                config,
+                args.provider,
+                args.uuid,
+                args.source_alias,
+                args.target_alias,
+                reason=args.reason,
+            )
+        )
+    elif action in ("auto-commit", "auto-release"):
+        from sessionkit_inventory import account_guard as _guard
+
+        verb = _guard.commit_hop if action == "auto-commit" else _guard.release_hop
+        return 0 if verb(config, args.provider, args.uuid, args.token) else 1
+    elif action == "auto-target-ok":
+        from sessionkit_inventory import account_guard as _guard
+
+        value = _guard.target_still_eligible(config, args.provider, args.alias)
+        _json_print(value)
+        return 0 if value["eligible"] else 1
+    elif action == "auto-queue-notice":
+        from sessionkit_inventory import account_guard as _guard
+
+        # Records the debt only. Delivery claims it separately, so a notifier
+        # that is down leaves the operator still owed the sentence.
+        return (
+            0
+            if _guard.queue_notice(
+                config, args.provider, args.uuid, args.token, args.sentence
+            )
+            else 1
+        )
+    elif action == "auto-notice-delivered":
+        from sessionkit_inventory import account_guard as _guard
+
+        return (
+            0
+            if _guard.notice_delivered(config, args.provider, args.uuid, args.token)
+            else 1
+        )
+    elif action == "auto-pending-notices":
+        from sessionkit_inventory import account_guard as _guard
+
+        _json_print({"notices": _guard.pending_notices(config)})
     elif action == "switch-prepare":
         _json_print(
             _accounts.prepare_switch(
@@ -3076,9 +4843,41 @@ def _account_command(args: argparse.Namespace, config: dict[str, Any]) -> int:
     return 0
 
 
+def _live_session_names(payload_text: str) -> list[str] | None:
+    """Session names from a ``shpool list --json`` payload, or ``None``.
+
+    ``None`` is the answer that matters. "The list could not be read" and
+    "there are no sessions" produce the same empty list, and one of those two
+    means remove every working copy — so the difference has to survive as far
+    as the caller, which turns ``None`` into a refusal rather than a sweep.
+
+    This lives here rather than in the shell that used to do it because the
+    shell had no way to tell an enumerator that failed from a machine with
+    nothing running: both produced an empty array, and the next line read the
+    empty array as "nothing is alive". A single stray row that is not a session
+    refuses the whole payload; a list this cannot fully account for is not a
+    list of what is alive.
+    """
+    try:
+        payload = json.loads(payload_text)
+    except (ValueError, TypeError):
+        return None
+    rows = payload.get("sessions") if isinstance(payload, dict) else payload
+    if not isinstance(rows, list):
+        return None
+    names: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            return None
+        name = row.get("name")
+        if isinstance(name, str) and name.strip():
+            names.append(name.strip())
+    return names
+
+
 def _worktree_command(args: argparse.Namespace, config: dict[str, Any]) -> int:
     """One worktree-isolation verb; prints its JSON result."""
-    from sessionkit_supervisor import worktrees as _worktrees
+    from sessionkit_inventory import worktrees as _worktrees
 
     state_dir = Path(config["state_dir"])
     if args.worktree_action == "materialize":
@@ -3089,8 +4888,70 @@ def _worktree_command(args: argparse.Namespace, config: dict[str, Any]) -> int:
                 state_dir=state_dir,
                 start_ref=args.start_ref,
                 environ=os.environ,
+                auto=bool(getattr(args, "auto", False)),
+                origin=str(getattr(args, "origin", "") or ""),
             )
         )
+        return 0
+    if args.worktree_action == "copy-check":
+        # "Should a delegated session be given a copy of this repository
+        # without being asked?" Exit 0 with the reason when the answer is no.
+        reason = _worktrees.auto_copy_refusal(args.repo, os.environ)
+        if reason:
+            print(reason)
+            return 0
+        return 1
+    if args.worktree_action == "release":
+        verdict = _worktrees.release(
+            state_dir,
+            shpool_id=args.shpool_id or None,
+            path=args.path or None,
+            merged_into_ref=args.merged_into,
+            environ=os.environ,
+        )
+        if args.as_json:
+            _json_print(verdict)
+        else:
+            print(_worktrees.render_verdict(verdict), end="")
+        return 0
+    if args.worktree_action == "sweep":
+        # A sweep with no list of what is alive is not a sweep of nothing —
+        # it is a sweep of everything. The list is required, and `--none-alive`
+        # is how a caller says an empty list is what it means.
+        active = list(args.active or [])
+        none_alive = bool(args.none_alive)
+        if getattr(args, "active_stdin", False):
+            names = _live_session_names(sys.stdin.read())
+            if names is None:
+                print(
+                    "the live session list could not be read, so nothing was "
+                    "swept; an unreadable list is never read as 'nothing is "
+                    "alive'",
+                    file=sys.stderr,
+                )
+                return 2
+            active.extend(names)
+            # A payload that parsed cleanly and held no sessions is the one
+            # case where an empty list really does mean nothing is alive.
+            none_alive = True
+        if not active and not none_alive:
+            print(
+                "sweep needs --active SHPOOL_ID for each session that is alive, "
+                "or --none-alive to say there are none",
+                file=sys.stderr,
+            )
+            return 2
+        verdicts = _worktrees.release_idle(
+            state_dir,
+            active,
+            merged_into_ref=args.merged_into,
+            environ=os.environ,
+        )
+        if args.as_json:
+            _json_print({"schema_version": SCHEMA_VERSION, "released": verdicts})
+        else:
+            for verdict in verdicts:
+                print(_worktrees.render_verdict(verdict), end="")
         return 0
     if args.worktree_action == "bind":
         _json_print(
@@ -3117,6 +4978,7 @@ def _worktree_command(args: argparse.Namespace, config: dict[str, Any]) -> int:
             repo=args.repo,
             branch=args.branch,
             environ=os.environ,
+            include_released=bool(getattr(args, "include_released", False)),
         )
         _json_print(record or {})
         return 0 if record else 2
@@ -3131,124 +4993,6 @@ def _worktree_command(args: argparse.Namespace, config: dict[str, Any]) -> int:
             environ=os.environ,
         )
     )
-    return 0
-
-
-def _receipt_command(args: argparse.Namespace, config: dict[str, Any]) -> int:
-    """One run-receipt verb. Exit 3 means a plan reached its cap and stopped."""
-    from sessionkit_supervisor import receipts as _receipts
-
-    state_dir = Path(config["state_dir"])
-    if args.receipt_action == "cap":
-        cap = _receipts.set_cap(
-            state_dir=state_dir,
-            msg_id=args.msg_id,
-            max_usd_est=args.max_usd,
-            soft_usd_est=args.soft_usd,
-            max_tokens=args.max_tokens,
-            max_iterations=args.max_iterations,
-            note=args.note,
-        )
-        # The approval line is the point of the verb: a cap nobody is shown is
-        # not a cap the operator approved.
-        print(_receipts.format_cap(cap), file=sys.stderr)
-        _json_print(cap)
-        return 0
-    if args.receipt_action == "gate":
-        state = _receipts.gate(state_dir, args.msg_id)
-        _json_print(state)
-        return 0 if state["allowed"] else 3
-    if args.receipt_action == "open":
-        _json_print(
-            _receipts.open_run(
-                state_dir=state_dir,
-                msg_id=args.msg_id,
-                branch=args.branch,
-                provider=args.provider,
-                model=args.model,
-                launch_key=args.launch_key,
-                isolation_mode=args.isolation,
-                isolation_path=args.isolation_path,
-                isolation_reason=args.isolation_reason,
-            )
-        )
-        return 0
-    if args.receipt_action == "spend":
-        record = _receipts.record_spend(
-            state_dir=state_dir,
-            receipt_id=args.receipt,
-            usd_est=args.usd,
-            tokens=args.tokens,
-            iterations=args.iterations,
-            source=args.source,
-        )
-        _json_print(record)
-        if record.get("stop_reason") == "cap_breached":
-            print(_receipts.render_run(record), file=sys.stderr, end="")
-            return 3
-        for warning in record.get("cap_state", {}).get("warnings", []):
-            print(f"cost cap warning: {warning}", file=sys.stderr)
-        return 0
-    if args.receipt_action == "verifier":
-        _json_print(
-            _receipts.record_verifier(
-                state_dir=state_dir,
-                receipt_id=args.receipt,
-                result=args.result,
-                command=args.verifier_command,
-                exit_code=args.exit_code,
-                evidence=args.evidence,
-            )
-        )
-        return 0
-    if args.receipt_action == "files":
-        _json_print(
-            _receipts.record_changed_files(
-                state_dir=state_dir,
-                receipt_id=args.receipt,
-                repo=args.repo,
-                since=args.since,
-            )
-        )
-        return 0
-    if args.receipt_action == "close":
-        _json_print(
-            _receipts.close_run(
-                state_dir=state_dir,
-                receipt_id=args.receipt,
-                stop_reason=args.stop_reason,
-                stop_detail=args.detail,
-                worker_identity=args.worker_identity,
-                allow_unverified=args.allow_unverified,
-            )
-        )
-        return 0
-    if args.receipt_action == "list":
-        runs = (
-            _receipts.runs_for(state_dir, args.msg_id)
-            if args.msg_id
-            else _receipts.all_runs(state_dir)
-        )
-        _json_print({"schema_version": SCHEMA_VERSION, "receipts": runs})
-        return 0
-    if args.receipt and args.msg_id:
-        raise CollectionError("show one receipt or one plan, not both")
-    if args.receipt:
-        shown = _receipts.read_run(state_dir, args.receipt)
-        if shown is None:
-            print(f"no run receipt {args.receipt}", file=sys.stderr)
-            return 2
-        if args.as_json:
-            _json_print(shown)
-        else:
-            print(_receipts.render_run(shown), end="")
-        return 0
-    if not args.msg_id:
-        raise CollectionError("receipt show needs --receipt or --msg-id")
-    if args.as_json:
-        _json_print(_receipts.cap_state(state_dir, args.msg_id))
-    else:
-        print(_receipts.render_plan(state_dir, args.msg_id), end="")
     return 0
 
 
@@ -3276,8 +5020,22 @@ def _parser() -> argparse.ArgumentParser:
     worker_model_parser = subparsers.add_parser("validate-worker-model")
     worker_model_parser.add_argument("provider", choices=PROVIDERS)
     worker_model_parser.add_argument("model")
+    model_available_parser = subparsers.add_parser("model-availability")
+    model_available_parser.add_argument("provider", choices=PROVIDERS)
+    model_available_parser.add_argument("model")
+    model_available_parser.add_argument(
+        "--flag",
+        default="--model-anyway",
+        help="the flag a person repeats to ask for the model anyway",
+    )
+    model_available_parser.add_argument("--json", dest="as_json", action="store_true")
+    model_served_parser = subparsers.add_parser("model-served")
+    model_served_parser.add_argument("provider", choices=PROVIDERS)
+    model_served_parser.add_argument("requested")
+    model_served_parser.add_argument("served")
     bounce_parser = subparsers.add_parser("codex-bounce-title")
     bounce_parser.add_argument("uuid")
+    bounce_parser.add_argument("--read-only", action="store_true")
     claude_bounce_parser = subparsers.add_parser("claude-bounce-title")
     claude_bounce_parser.add_argument("uuid")
     platform_parser = subparsers.add_parser("platform")
@@ -3286,6 +5044,15 @@ def _parser() -> argparse.ArgumentParser:
     )
     platform_subparsers.add_parser("boot-id")
     platform_subparsers.add_parser("process-table")
+    platform_subparsers.add_parser("shpool-holder-generation")
+    platform_terminate = platform_subparsers.add_parser("terminate-exact-process")
+    platform_terminate.add_argument("pid", type=int)
+    platform_terminate.add_argument("process_generation", type=int)
+    platform_shell_gone = platform_subparsers.add_parser("exact-shell-gone")
+    platform_shell_gone.add_argument("daemon_pid", type=int)
+    platform_shell_gone.add_argument("daemon_generation", type=int)
+    platform_shell_gone.add_argument("shell_pid", type=int)
+    platform_shell_gone.add_argument("shell_generation", type=int)
     platform_app_dir = platform_subparsers.add_parser("app-server-dir")
     platform_app_dir.add_argument("state_root")
     platform_app_dir.add_argument("session_id")
@@ -3318,6 +5085,9 @@ def _parser() -> argparse.ArgumentParser:
     alias_set.add_argument("provider", choices=PROVIDERS)
     alias_set.add_argument("uuid")
     alias_set.add_argument("title")
+    alias_push = alias_subparsers.add_parser("push")
+    alias_push.add_argument("provider", choices=PROVIDERS)
+    alias_push.add_argument("uuid")
     alias_delete = alias_subparsers.add_parser("delete")
     alias_delete.add_argument("provider", choices=PROVIDERS)
     alias_delete.add_argument("uuid")
@@ -3337,6 +5107,9 @@ def _parser() -> argparse.ArgumentParser:
     color_effective = color_subparsers.add_parser("effective")
     color_effective.add_argument("provider", choices=PROVIDERS)
     color_effective.add_argument("uuid")
+    color_ready = color_subparsers.add_parser("bounce-ready")
+    color_ready.add_argument("provider", choices=PROVIDERS)
+    color_ready.add_argument("uuid")
     color_propagate = color_subparsers.add_parser("propagate")
     color_propagate.add_argument("provider", choices=PROVIDERS)
     color_propagate.add_argument("uuid")
@@ -3371,6 +5144,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     account_list = account_subparsers.add_parser("list")
     account_list.add_argument("provider", nargs="?", choices=sorted(_accounts.PROVIDERS))
+    account_list.add_argument("--json", dest="account_json", action="store_true")
     account_choices = account_subparsers.add_parser("choices")
     account_choices.add_argument("provider", choices=sorted(_accounts.PROVIDERS))
     account_feeds = account_subparsers.add_parser("configure-feeds")
@@ -3390,6 +5164,37 @@ def _parser() -> argparse.ArgumentParser:
     account_source = account_subparsers.add_parser("source")
     account_source.add_argument("provider", choices=sorted(_accounts.PROVIDERS))
     account_source.add_argument("uuid")
+    account_auto_plan = account_subparsers.add_parser("auto-plan")
+    account_auto_plan.add_argument("provider", choices=sorted(_accounts.PROVIDERS))
+    account_auto_plan.add_argument("uuid")
+    account_auto_plan.add_argument("--snapshot")
+    account_auto_plan.add_argument("--shpool-id", dest="shpool_id")
+    account_auto_spent = account_subparsers.add_parser("auto-spent")
+    account_auto_spent.add_argument("provider", choices=sorted(_accounts.PROVIDERS))
+    account_auto_begin = account_subparsers.add_parser("auto-begin")
+    account_auto_begin.add_argument("provider", choices=sorted(_accounts.PROVIDERS))
+    account_auto_begin.add_argument("uuid")
+    account_auto_begin.add_argument("source_alias")
+    account_auto_begin.add_argument("target_alias")
+    account_auto_begin.add_argument("--reason", default="")
+    for account_action in ("auto-commit", "auto-release"):
+        account_auto_state = account_subparsers.add_parser(account_action)
+        account_auto_state.add_argument("provider", choices=sorted(_accounts.PROVIDERS))
+        account_auto_state.add_argument("uuid")
+        account_auto_state.add_argument("token")
+    account_auto_target = account_subparsers.add_parser("auto-target-ok")
+    account_auto_target.add_argument("provider", choices=sorted(_accounts.PROVIDERS))
+    account_auto_target.add_argument("alias")
+    account_auto_queue = account_subparsers.add_parser("auto-queue-notice")
+    account_auto_queue.add_argument("provider", choices=sorted(_accounts.PROVIDERS))
+    account_auto_queue.add_argument("uuid")
+    account_auto_queue.add_argument("token")
+    account_auto_queue.add_argument("sentence")
+    account_auto_done = account_subparsers.add_parser("auto-notice-delivered")
+    account_auto_done.add_argument("provider", choices=sorted(_accounts.PROVIDERS))
+    account_auto_done.add_argument("uuid")
+    account_auto_done.add_argument("token")
+    account_subparsers.add_parser("auto-pending-notices")
     account_bind = account_subparsers.add_parser("bind")
     account_bind.add_argument("provider", choices=sorted(_accounts.PROVIDERS))
     account_bind.add_argument("uuid")
@@ -3422,11 +5227,98 @@ def _parser() -> argparse.ArgumentParser:
     pending_subparsers = pending_parser.add_subparsers(
         dest="pending_action", required=True
     )
-    pending_subparsers.add_parser("list")
+    pending_list = pending_subparsers.add_parser("list")
+    pending_list.add_argument("--without-closed", action="store_true")
+    pending_list.add_argument("--projection-inputs", action="store_true")
+    pending_list.add_argument("--stream-closed", action="store_true")
+    pending_list.add_argument("--stream-recovery-snapshot", action="store_true")
+    pending_list.add_argument("--allow-large-ledger", action="store_true")
     pending_ack = pending_subparsers.add_parser("ack")
     pending_ack.add_argument("source_generation_key")
     pending_ack.add_argument("old_shpool_id")
     pending_ack.add_argument("uuid")
+    # What a recovery screen printed beside each row, and the one question an
+    # action asks about it: does that word still name the same conversation?
+    # A word like "unnamed", or the clock face a shared name falls back to, is
+    # a property of the list rather than of the conversation, so a list rebuilt
+    # between printing it and acting on it can move it to another row.
+    printed_parser = subparsers.add_parser("recovery-selectors")
+    printed_subparsers = printed_parser.add_subparsers(
+        dest="printed_action", required=True
+    )
+    printed_remember = printed_subparsers.add_parser("remember")
+    printed_remember.add_argument("--payload", default="")
+    printed_remember.add_argument("--json-lines", action="store_true")
+    printed_check = printed_subparsers.add_parser("check")
+    printed_check.add_argument("selector")
+    printed_check.add_argument("provider")
+    printed_check.add_argument("uuid")
+    # Closing on purpose is not a crash, and the queue has to be told so by
+    # whoever did it. The in-session verb rides the lifecycle proof; this one
+    # exists for `k` on the picker, which closes a session it is not inside.
+    # The session shell carries no kit environment, so it cannot source the
+    # shell logger. It gets the same log through the one program it always
+    # has a path to.
+    action_parser = subparsers.add_parser("action-log")
+    action_parser.add_argument("action")
+    action_parser.add_argument("outcome")
+    action_parser.add_argument("--session", default=None)
+    # Who asked for a session, stamped by the verb that creates it. The
+    # picker's default view is the person's own screen; anything a machine
+    # started belongs behind a counted row, and only the creator knows which
+    # it is.
+    origin_parser = subparsers.add_parser("origin")
+    origin_subparsers = origin_parser.add_subparsers(
+        dest="origin_action", required=True
+    )
+    origin_record = origin_subparsers.add_parser("record")
+    origin_record.add_argument("shpool_id")
+    origin_record.add_argument("origin", choices=sorted(_origins.ORIGINS))
+    origin_subparsers.add_parser("list")
+    # Closing a session ends the terminal, never the conversation. Every
+    # deliberate close lands here so the conversation can be listed and
+    # restored afterwards, for as long as its transcript exists.
+    closed_parser = subparsers.add_parser("closed-sessions")
+    closed_subparsers = closed_parser.add_subparsers(
+        dest="closed_action", required=True
+    )
+    closed_record = closed_subparsers.add_parser("record")
+    closed_record.add_argument("provider", choices=sorted(_closed_sessions.PROVIDERS))
+    closed_record.add_argument("--uuid", default="")
+    closed_record.add_argument("--session", default="")
+    closed_record.add_argument("--title", default="")
+    closed_record.add_argument("--cwd", default="")
+    closed_record.add_argument("--origin", default="")
+    closed_record.add_argument("--account", default="")
+    closed_list = closed_subparsers.add_parser("list")
+    closed_list.add_argument("--limit", type=int, default=_closed_sessions.MAX_ENTRIES)
+    closed_list.add_argument("--allow-large-ledger", action="store_true")
+    closed_stream = closed_subparsers.add_parser("stream")
+    closed_stream.add_argument("--limit", type=int, default=_closed_sessions.MAX_ENTRIES)
+    closed_stream.add_argument("--allow-large-ledger", action="store_true")
+    closed_forget = closed_subparsers.add_parser("forget")
+    closed_forget.add_argument("provider", choices=("claude", "codex"))
+    closed_forget.add_argument("uuid")
+    # Can every conversation this machine recorded still be READ here? A
+    # session running under a rotated account profile once had its transcript
+    # on this disk while the tool asking for it reported none, because one
+    # resolver knew a root the other did not. Nothing warned.
+    transcript_parser = subparsers.add_parser("transcript")
+    transcript_subparsers = transcript_parser.add_subparsers(
+        dest="transcript_action", required=True
+    )
+    transcript_locate = transcript_subparsers.add_parser("locate")
+    transcript_locate.add_argument("provider", choices=("claude", "codex"))
+    transcript_locate.add_argument("uuid")
+    transcript_subparsers.add_parser("reachability")
+    intent_parser = subparsers.add_parser("close-intent")
+    intent_subparsers = intent_parser.add_subparsers(
+        dest="intent_action", required=True
+    )
+    intent_record = intent_subparsers.add_parser("record")
+    intent_record.add_argument("provider", choices=sorted(PROVIDERS))
+    intent_record.add_argument("uuid")
+    intent_subparsers.add_parser("list")
     manifest_parser = subparsers.add_parser("recovery-manifest")
     manifest_subparsers = manifest_parser.add_subparsers(
         dest="manifest_action", required=True
@@ -3448,114 +5340,17 @@ def _parser() -> argparse.ArgumentParser:
     lifecycle_subparsers.add_parser("provider-exited")
     lifecycle_subparsers.add_parser("user-input")
     lifecycle_subparsers.add_parser("reopen")
+    lifecycle_closed = lifecycle_subparsers.add_parser("closed")
+    # Closing a session that CRASHED is only better than leaving it in the
+    # list if the conversation comes back afterwards. With this flag the verb
+    # is a single decision — close and keep the conversation, or change
+    # nothing at all — so the caller can keep a session it must not lose
+    # without the asking itself leaving a record behind.
+    lifecycle_closed.add_argument(
+        "--only-with-conversation", action="store_true"
+    )
     lifecycle_keep = lifecycle_subparsers.add_parser("keep")
     lifecycle_keep.add_argument("choice", choices=("on", "off"))
-    message_parser = subparsers.add_parser("msg")
-    message_subparsers = message_parser.add_subparsers(
-        dest="msg_action", required=True
-    )
-    message_resolve = message_subparsers.add_parser("resolve")
-    message_resolve.add_argument("--target", required=True)
-    message_send = message_subparsers.add_parser("send")
-    message_send.add_argument("--target", required=True)
-    message_send.add_argument("--text", required=True)
-    message_send.add_argument("--fyi", action="store_true")
-    # One repeatable purpose, one message. A caller that cannot prove delivery
-    # repeats the send under the same key rather than minting a second copy.
-    message_send.add_argument("--key", dest="idempotency_key")
-    message_report = message_subparsers.add_parser("report")
-    message_report.add_argument("--id", dest="msg_id")
-    message_report.add_argument("--key", dest="idempotency_key")
-    message_mark_read = message_subparsers.add_parser("mark-read")
-    message_mark_read.add_argument("--thread", required=True)
-    message_reply = message_subparsers.add_parser("reply")
-    message_reply.add_argument("msg_id")
-    message_reply.add_argument("--text", required=True)
-    message_subparsers.add_parser("list")
-    message_subparsers.add_parser("unread-count")
-    message_queue = message_subparsers.add_parser("queue")
-    message_queue.add_argument("--mark-seen", dest="queue_mark_seen")
-    # The intake spool: the durable side of a project that arrived as a
-    # message. Every verb is machine JSON — the entries carry thread keys and
-    # message ids, which belong in a record and never in an operator's view.
-    message_intake = message_subparsers.add_parser("intake")
-    intake_subparsers = message_intake.add_subparsers(
-        dest="intake_action", required=True
-    )
-    intake_record = intake_subparsers.add_parser("record")
-    intake_record.add_argument("--msg-id", dest="msg_id", required=True)
-    intake_record.add_argument("--source", required=True)
-    intake_record.add_argument("--key", dest="intake_key")
-    intake_record.add_argument("--summary")
-    intake_record.add_argument("--terminal", type=int)
-    intake_record.add_argument("--title")
-    intake_record.add_argument("--cwd")
-    # The automatic producer's entry point: one provider hook payload on
-    # stdin, at most one intake out. The hooks call the library directly; this
-    # is the same door for anything that cannot.
-    intake_subparsers.add_parser("from-hook")
-    # Detached provider hooks use this exact real facade verb to wake an
-    # already-running supervisor after the durable intake write.
-    intake_subparsers.add_parser("flush")
-    intake_subparsers.add_parser("dismiss-machine")
-    # What the spool still owes the supervisor: the count first, then the
-    # notices themselves. Read-only — `flush` is the verb that delivers.
-    intake_subparsers.add_parser("pending")
-    intake_ack = intake_subparsers.add_parser("ack")
-    intake_ack.add_argument("--msg-id", dest="msg_id", required=True)
-    intake_ack.add_argument("--text", required=True)
-    intake_preflight = intake_subparsers.add_parser("preflight")
-    intake_preflight.add_argument("--msg-id", dest="msg_id", required=True)
-    intake_preflight.add_argument("--source-event-id", dest="source_event_id")
-    intake_preflight.add_argument("--analysis", required=True)
-    intake_preflight.add_argument("--scope", required=True)
-    intake_preflight.add_argument("--required-expertise", dest="required_expertise", required=True)
-    # The plan's shape is the plan's business; what it must cover is not.
-    intake_preflight.add_argument(
-        "--required-tags",
-        dest="required_tags",
-        action="append",
-        required=True,
-        help="expertise this project needs; repeat or comma-separate",
-    )
-    intake_preflight.add_argument("--worker-plan-json", dest="worker_plan_json", required=True)
-    intake_preflight.add_argument("--risks", required=True)
-    intake_preflight.add_argument("--tests", required=True)
-    intake_preflight.add_argument("--manual-policy-exception", dest="manual_policy_exception")
-    intake_delegate = intake_subparsers.add_parser("delegate")
-    intake_delegate.add_argument("--msg-id", dest="msg_id", required=True)
-    intake_delegate.add_argument(
-        "--branch", dest="branches", action="append", required=True
-    )
-    intake_report = intake_subparsers.add_parser("report")
-    intake_report.add_argument("--msg-id", dest="msg_id", required=True)
-    intake_report.add_argument("--branch", required=True)
-    intake_report.add_argument(
-        "--state", dest="duty_state", required=True, choices=("completed", "failed")
-    )
-    intake_report.add_argument("--summary", required=True)
-    intake_report.add_argument("--reporter", dest="reporter_identity")
-    intake_retry = intake_subparsers.add_parser("retry")
-    intake_retry.add_argument("--msg-id", dest="msg_id", required=True)
-    intake_retry.add_argument("--branch", required=True)
-    intake_retry.add_argument(
-        "--launch-key", dest="idempotency_key", required=True
-    )
-    intake_reset = intake_subparsers.add_parser("reset")
-    intake_reset.add_argument("--msg-id", dest="msg_id", required=True)
-    intake_reset.add_argument("--branch", required=True)
-    intake_reset.add_argument("--summary")
-    intake_cancel = intake_subparsers.add_parser("cancel")
-    intake_cancel.add_argument("--msg-id", dest="msg_id", required=True)
-    intake_cancel.add_argument("--branch", required=True)
-    intake_cancel.add_argument("--summary", required=True)
-    intake_duties = intake_subparsers.add_parser("duties")
-    intake_duties.add_argument("--msg-id", dest="msg_id")
-    for intake_relay in ("progress", "complete"):
-        intake_note = intake_subparsers.add_parser(intake_relay)
-        intake_note.add_argument("--msg-id", dest="msg_id", required=True)
-        intake_note.add_argument("--text", required=True)
-    intake_subparsers.add_parser("open")
     worktree_parser = subparsers.add_parser("worktree")
     worktree_subparsers = worktree_parser.add_subparsers(
         dest="worktree_action", required=True
@@ -3564,6 +5359,46 @@ def _parser() -> argparse.ArgumentParser:
     worktree_materialize.add_argument("--repo", required=True)
     worktree_materialize.add_argument("--branch", required=True)
     worktree_materialize.add_argument("--start-ref", dest="start_ref", default="HEAD")
+    worktree_materialize.add_argument(
+        "--auto",
+        action="store_true",
+        help="the kit chose this branch for delegated work, so the copy is "
+        "released again when the session closes",
+    )
+    worktree_materialize.add_argument("--origin", default="")
+    worktree_copy_check = worktree_subparsers.add_parser("copy-check")
+    worktree_copy_check.add_argument("--repo", required=True)
+    worktree_release = worktree_subparsers.add_parser("release")
+    worktree_release.add_argument("--shpool-id", dest="shpool_id", default="")
+    worktree_release.add_argument("--path", default="")
+    worktree_release.add_argument("--merged-into", dest="merged_into", default="HEAD")
+    worktree_release.add_argument("--json", dest="as_json", action="store_true")
+    worktree_sweep = worktree_subparsers.add_parser("sweep")
+    worktree_sweep.add_argument(
+        "--active",
+        action="append",
+        default=[],
+        metavar="SHPOOL_ID",
+        help="a session that is still live; repeat for more",
+    )
+    worktree_sweep.add_argument("--merged-into", dest="merged_into", default="HEAD")
+    worktree_sweep.add_argument(
+        "--none-alive",
+        dest="none_alive",
+        action="store_true",
+        help="there are no live sessions; without this an empty --active list is refused",
+    )
+    worktree_sweep.add_argument(
+        "--active-stdin",
+        dest="active_stdin",
+        action="store_true",
+        help=(
+            "read a shpool list --json payload on stdin and take the live "
+            "session names from it; a payload that cannot be read refuses the "
+            "sweep instead of being treated as an empty list"
+        ),
+    )
+    worktree_sweep.add_argument("--json", dest="as_json", action="store_true")
     worktree_bind = worktree_subparsers.add_parser("bind")
     worktree_bind.add_argument("--path", required=True)
     worktree_bind.add_argument("--shpool-id", dest="shpool_id", default="")
@@ -3574,6 +5409,13 @@ def _parser() -> argparse.ArgumentParser:
     worktree_lookup.add_argument("--path")
     worktree_lookup.add_argument("--repo")
     worktree_lookup.add_argument("--branch")
+    worktree_lookup.add_argument(
+        "--include-released",
+        dest="include_released",
+        action="store_true",
+        help="also answer for a copy that has been given back, so a caller can "
+        "find the repository it came from",
+    )
     worktree_teardown = worktree_subparsers.add_parser("teardown")
     worktree_teardown.add_argument("--path")
     worktree_teardown.add_argument("--repo")
@@ -3582,549 +5424,7 @@ def _parser() -> argparse.ArgumentParser:
         "--merged-into", dest="merged_into", default="HEAD"
     )
     worktree_teardown.add_argument("--force", action="store_true")
-    receipt_parser = subparsers.add_parser("receipt")
-    receipt_subparsers = receipt_parser.add_subparsers(
-        dest="receipt_action", required=True
-    )
-    receipt_cap = receipt_subparsers.add_parser("cap")
-    receipt_cap.add_argument("--msg-id", dest="msg_id", required=True)
-    receipt_cap.add_argument("--max-usd", dest="max_usd", type=float)
-    receipt_cap.add_argument("--soft-usd", dest="soft_usd", type=float)
-    receipt_cap.add_argument("--max-tokens", dest="max_tokens", type=int)
-    receipt_cap.add_argument("--max-iterations", dest="max_iterations", type=int)
-    receipt_cap.add_argument("--note", default="")
-    receipt_gate = receipt_subparsers.add_parser("gate")
-    receipt_gate.add_argument("--msg-id", dest="msg_id", required=True)
-    receipt_open = receipt_subparsers.add_parser("open")
-    receipt_open.add_argument("--msg-id", dest="msg_id", required=True)
-    receipt_open.add_argument("--branch", default="")
-    receipt_open.add_argument("--provider", default="")
-    receipt_open.add_argument("--model", default="")
-    receipt_open.add_argument("--launch-key", dest="launch_key", default="")
-    receipt_open.add_argument(
-        "--isolation", choices=("worktree", "none"), default="none"
-    )
-    receipt_open.add_argument("--isolation-path", dest="isolation_path", default="")
-    receipt_open.add_argument(
-        "--isolation-reason", dest="isolation_reason", default=""
-    )
-    receipt_spend = receipt_subparsers.add_parser("spend")
-    receipt_spend.add_argument("--receipt", required=True)
-    receipt_spend.add_argument("--usd", type=float, default=0.0)
-    receipt_spend.add_argument("--tokens", type=int, default=0)
-    receipt_spend.add_argument("--iterations", type=int, default=0)
-    receipt_spend.add_argument("--source", required=True)
-    receipt_verifier = receipt_subparsers.add_parser("verifier")
-    receipt_verifier.add_argument("--receipt", required=True)
-    receipt_verifier.add_argument(
-        "--result", required=True, choices=("passed", "failed", "unverified")
-    )
-    # dest is deliberately not "command": the top-level subparser stores the
-    # chosen verb there, and a plain --command would overwrite it mid-parse.
-    receipt_verifier.add_argument(
-        "--command", dest="verifier_command", default=""
-    )
-    receipt_verifier.add_argument("--exit-code", dest="exit_code", type=int)
-    receipt_verifier.add_argument("--evidence", default="")
-    receipt_files = receipt_subparsers.add_parser("files")
-    receipt_files.add_argument("--receipt", required=True)
-    receipt_files.add_argument("--repo")
-    receipt_files.add_argument("--since", default="")
-    receipt_close = receipt_subparsers.add_parser("close")
-    receipt_close.add_argument("--receipt", required=True)
-    receipt_close.add_argument(
-        "--stop-reason",
-        dest="stop_reason",
-        required=True,
-        choices=("completed", "cap_breached", "failed", "abandoned", "cancelled"),
-    )
-    receipt_close.add_argument("--detail", default="")
-    receipt_close.add_argument("--worker-identity", dest="worker_identity", default="")
-    receipt_close.add_argument(
-        "--allow-unverified", dest="allow_unverified", action="store_true"
-    )
-    receipt_show = receipt_subparsers.add_parser("show")
-    receipt_show.add_argument("--receipt")
-    receipt_show.add_argument("--msg-id", dest="msg_id")
-    receipt_show.add_argument("--json", dest="as_json", action="store_true")
-    receipt_list = receipt_subparsers.add_parser("list")
-    receipt_list.add_argument("--msg-id", dest="msg_id")
     return parser
-
-
-def _messages_run(action: str, config: dict[str, Any], **fields: Any) -> tuple[int, Any]:
-    """One messaging verb, with the process evidence only the facade owns."""
-    return _messages.run(
-        action,
-        config=config,
-        environ=os.environ,
-        home=_home(),
-        snapshot_inventory=snapshot,
-        process_table_reader=platform_process_table,
-        prove_caller=prove_self_name_caller,
-        max_proc_nodes=int(config.get("max_proc_nodes", DEFAULT_MAX_PROC_NODES)),
-        **fields,
-    )
-
-
-def _worker_worktree_branch(
-    assignment: Mapping[str, Any],
-    *,
-    cwd: Path,
-    environ: Mapping[str, str],
-) -> str:
-    """The branch a delegated worker should be isolated on, or "" for none.
-
-    Isolation is the default for delegated work: the plan already recorded a
-    branch per worker, so the worker gets that branch as its own worktree and
-    two workers on one project stop editing the same files. Two cases answer "no"
-    honestly instead of failing a launch — a project that is not a git
-    repository, and an operator who set SESSION_KIT_WORKER_WORKTREE=0. The run
-    receipt records which it was.
-    """
-    from sessionkit_supervisor.worktrees import repository_root, valid_branch
-
-    choice = environ.get("SESSION_KIT_WORKER_WORKTREE", "").strip().casefold()
-    if choice in ("0", "off", "false", "no"):
-        return ""
-    branch = str(assignment.get("branch") or "").strip()
-    if not branch:
-        return ""
-    if repository_root(cwd) is None:
-        return ""
-    return valid_branch(branch)
-
-
-def _refuse_unlaunchable_delegation(
-    msg_id: str,
-    *,
-    branches: Sequence[str],
-    cwd: Path,
-    state_dir: Path,
-) -> None:
-    """Refuse a delegation that cannot succeed, before anything is reserved.
-
-    Both refusals here are knowable in advance: the plan is already at its cost
-    cap, or a branch it wants is checked out somewhere else. Discovering either
-    one inside the launcher would be worse than useless — by then the worker row
-    says dispatching, and the refusal reads as an uncertain dispatch that a
-    person has to reconcile by hand.
-    """
-    from sessionkit_supervisor import receipts as _receipts
-    from sessionkit_supervisor import worktrees as _worktrees
-
-    if not msg_id:
-        return
-    allowed = _receipts.gate(state_dir, msg_id)
-    if not allowed["allowed"]:
-        raise CollectionError(
-            f"plan {msg_id} reached its cost cap; no worker starts: {allowed['reason']}"
-        )
-    for branch in branches:
-        if not _worker_worktree_branch({"branch": branch}, cwd=cwd, environ=os.environ):
-            continue
-        planned = _worktrees.preflight(
-            repo=cwd, branch=branch, state_dir=state_dir, environ=os.environ
-        )
-        if planned["blocked_by"]:
-            raise CollectionError(
-                f"worker branch {branch} cannot be isolated: {planned['reason']}"
-            )
-
-
-def _launch_intake_worker(
-    assignment: Mapping[str, Any],
-    *,
-    cwd: Path,
-    environ: Mapping[str, str],
-    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
-) -> Mapping[str, Any]:
-    """Run the installed exact-model worker launcher; its stdout proves nothing."""
-    from sessionkit_messages.envelope import valid_idempotency_key
-    from sessionkit_supervisor.intake import validate_requested_model
-
-    provider = str(assignment.get("provider") or "")
-    model = validate_requested_model(provider, assignment.get("requested_model"))
-    launch_key = valid_idempotency_key(assignment.get("idempotency_key"))
-    if not launch_key:
-        raise CollectionError("worker launch has no exact idempotency key")
-    if not cwd.is_absolute() or not cwd.is_dir():
-        raise CollectionError("worker launch directory is unavailable")
-    sp_raw = environ.get("SESSION_KIT_SP_CMD") or os.fspath(
-        Path(__file__).resolve().parents[1] / "bin" / "sp"
-    )
-    sp_path = Path(sp_raw)
-    try:
-        sp_info = sp_path.lstat()
-    except OSError as exc:
-        raise CollectionError("installed Session Kit launcher is unavailable") from exc
-    if (
-        not sp_path.is_absolute()
-        or statmod.S_ISLNK(sp_info.st_mode)
-        or not statmod.S_ISREG(sp_info.st_mode)
-        or not os.access(sp_path, os.X_OK)
-    ):
-        raise CollectionError("installed Session Kit launcher is unavailable")
-    launch_env = dict(environ)
-    launch_env["SESSION_KIT_BACKGROUND"] = "1"
-    prompt_path: Path | None = None
-    argv = [
-        os.fspath(sp_path), "new", provider,
-        "--model", model, "--launch-key", launch_key,
-    ]
-    worktree_branch = _worker_worktree_branch(assignment, cwd=cwd, environ=environ)
-    if worktree_branch:
-        argv.extend(("--worktree", worktree_branch))
-    if provider == "codex":
-        # A new Codex process has no conversation identity until its first
-        # submitted prompt creates a rollout.  Reconciliation deliberately
-        # refuses an identity-free process, so bootstrap the managed worker
-        # with a private no-work prompt and let the supervisor send the actual
-        # scoped assignment only after exact model/identity proof succeeds.
-        descriptor, raw_prompt_path = tempfile.mkstemp(
-            prefix="session-kit-worker-", suffix=".prompt"
-        )
-        prompt_path = Path(raw_prompt_path)
-        try:
-            os.fchmod(descriptor, 0o600)
-            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                handle.write(
-                    "Session Kit initialized this managed worker. Do not inspect, "
-                    "change, or execute anything yet. Wait for the Fleet Supervisor "
-                    "to send the scoped assignment. It arrives as a Session Kit "
-                    "operator message carrying your task, its acceptance criteria, "
-                    "the deliverable, and the command you report back with.\n"
-                )
-                handle.flush()
-                os.fsync(handle.fileno())
-        except BaseException:
-            with contextlib.suppress(OSError):
-                os.close(descriptor)
-            with contextlib.suppress(OSError):
-                prompt_path.unlink()
-            raise
-        argv.extend(("--prompt-file", os.fspath(prompt_path)))
-    try:
-        completed = runner(
-            argv,
-            cwd=os.fspath(cwd),
-            env=launch_env,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=180,
-            check=False,
-        )
-    finally:
-        if prompt_path is not None:
-            with contextlib.suppress(OSError):
-                prompt_path.unlink()
-    if completed.returncode != 0:
-        detail = clean_text(completed.stderr or completed.stdout, 300)
-        raise CollectionError(
-            f"installed worker launcher exited {completed.returncode}: {detail}"
-        )
-    return {"dispatched": True, "launch_idempotency_key": launch_key}
-
-
-def _reconcile_intake_worker(
-    assignment: Mapping[str, Any],
-    inventory: Mapping[str, Any],
-    *,
-    config: Mapping[str, Any] | None = None,
-) -> Mapping[str, Any]:
-    """Independently bind one dispatch to one exact fresh inventory row."""
-    from sessionkit_messages.envelope import valid_idempotency_key
-    from sessionkit_supervisor.intake import validate_requested_model
-
-    if inventory.get("source") != "live" or inventory.get("stale") is not False:
-        raise CollectionError("worker reconciliation requires fresh live inventory")
-    launch_key = valid_idempotency_key(assignment.get("idempotency_key"))
-    provider = str(assignment.get("provider") or "")
-    model = validate_requested_model(provider, assignment.get("requested_model"))
-    matches = [
-        row for row in inventory.get("sessions", ())
-        if isinstance(row, Mapping)
-        and row.get("launch_idempotency_key") == launch_key
-    ]
-    if not launch_key or len(matches) != 1:
-        raise CollectionError("inventory has no unique exact worker launch key")
-    row = matches[0]
-    identity = row.get("identity")
-    uuid = valid_uuid(identity.get("uuid")) if isinstance(identity, Mapping) else ""
-    if (
-        row.get("provider") != provider
-        or row.get("actual_model") != model
-        or not isinstance(identity, Mapping)
-        or identity.get("confidence") != "exact"
-        or not uuid
-        or row.get("setup_incomplete") is True
-    ):
-        raise CollectionError("inventory worker provider, model, or identity is unproven")
-    worker_title = ""
-    if config is not None:
-        tokens = [
-            token
-            for token in re.split(
-                r"[^A-Za-z0-9]+", str(assignment.get("branch") or "")
-            )
-            if token
-        ][:5]
-        if len(tokens) == 1:
-            tokens.append("Worker")
-        if tokens:
-            worker_title = " ".join(
-                token.upper() if any(character.isdigit() for character in token)
-                else token.capitalize()
-                for token in tokens
-            )
-            try:
-                mutate_canonical_self_name(config, provider, uuid, worker_title)
-                propagate_provider_title(provider, uuid, worker_title)
-            except CollectionError as exc:
-                if "a human name owns this session" in str(exc):
-                    worker_title = ""
-                else:
-                    raise
-    return {
-        "inventory_verified": True,
-        "provider": provider,
-        "actual_model": model,
-        "worker_identity": f"{provider}:{uuid}",
-        "worker_title": worker_title,
-        "launch_idempotency_key": launch_key,
-    }
-
-
-def _intake_command(args: argparse.Namespace, config: dict[str, Any]) -> int:
-    """Run one intake-spool verb and print its JSON result.
-
-    Both relay paths are the messaging core's own verbs: a note to the source
-    thread is a `send` under the note's idempotency key, an acknowledgement is
-    a `reply` to the intake itself. The spool records what they did and never
-    reaches a session on its own.
-    """
-    # The supervisor package pulls its MCP surface in at import time; one
-    # intake verb must not put that cost on every snapshot.
-    from sessionkit_supervisor import intake as _intake
-
-    def deliver(*, thread_key: str, text: str, key: str) -> Mapping[str, Any]:
-        try:
-            _code, payload = _messages_run(
-                "send",
-                config,
-                target=f"key:{thread_key}",
-                text=text,
-                fyi=True,
-                idempotency_key=key,
-            )
-        except MessageError as exc:
-            # A send the core refused — an exited source session, a kill
-            # switch — is a note still owed, recorded with the reason. Losing
-            # it to an exception would leave the spool claiming nothing was
-            # ever written.
-            return {
-                "msg_id": None,
-                "targets": [
-                    {
-                        "thread_key": thread_key,
-                        "status": "unreachable",
-                        "detail": str(exc),
-                    }
-                ],
-            }
-        return payload if isinstance(payload, Mapping) else {}
-
-    def reply(*, msg_id: str, text: str) -> Mapping[str, Any]:
-        _code, payload = _messages_run("reply", config, msg_id=msg_id, text=text)
-        return payload if isinstance(payload, Mapping) else {}
-
-    hook_payload = None
-    if args.intake_action == "from-hook":
-        hook_payload = json.loads(sys.stdin.read() or "{}")
-        if not isinstance(hook_payload, Mapping):
-            raise MessageError("a hook payload must be a JSON object")
-    worker_plan = ()
-    required_tags: tuple[str, ...] = ()
-    if args.intake_action == "preflight":
-        worker_plan = json.loads(args.worker_plan_json)
-        if not isinstance(worker_plan, list):
-            raise MessageError("worker plan JSON must be an array")
-        required_tags = tuple(
-            tag.strip()
-            for raw in (args.required_tags or ())
-            for tag in str(raw).split(",")
-            if tag.strip()
-        )
-    launcher: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None
-    reconciler: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None
-    if args.intake_action == "delegate":
-        spool = _intake.Spool(Path(config["state_dir"]))
-        # Two things the delegate verb itself already knows, and this lookup
-        # has to agree with or the launcher is handed nowhere to run. The
-        # entry stores the project's directory as `source_cwd` — a stored
-        # entry is validated into that fixed key set, so no on-disk entry has
-        # ever carried a plain `cwd`. And `delegate` names its intake through
-        # `resolve`, so any id the project was delivered under has to reach
-        # the same entry here.
-        primary = spool.resolve(getattr(args, "msg_id", ""))
-        entry = spool.read_entry(primary) if primary else None
-        cwd_raw = entry.get("source_cwd") if isinstance(entry, Mapping) else None
-        launch_cwd = Path(cwd_raw) if isinstance(cwd_raw, str) and cwd_raw else Path("")
-        _refuse_unlaunchable_delegation(
-            primary,
-            branches=getattr(args, "branches", None) or (),
-            cwd=launch_cwd,
-            state_dir=Path(config["state_dir"]),
-        )
-
-        def launch(assignment: Mapping[str, Any]) -> Mapping[str, Any]:
-            # Everything that can refuse this worker refuses it before the
-            # provider process exists: the plan's cost cap, then the worktree
-            # its branch needs. A failure after the launch would leave a live
-            # worker behind an "uncertain dispatch", which costs a person a
-            # manual reconcile; a failure here costs nothing.
-            from sessionkit_supervisor import receipts as _receipts
-            from sessionkit_supervisor import worktrees as _worktrees
-
-            state_dir = Path(config["state_dir"])
-            allowed = _receipts.gate(state_dir, primary)
-            if not allowed["allowed"]:
-                raise CollectionError(
-                    f"plan {primary} reached its cost cap; no worker starts: "
-                    + allowed["reason"]
-                )
-            branch = _worker_worktree_branch(
-                assignment, cwd=launch_cwd, environ=os.environ
-            )
-            isolation_path = ""
-            isolation_reason = ""
-            if branch:
-                isolation_path = str(
-                    _worktrees.materialize(
-                        repo=launch_cwd,
-                        branch=branch,
-                        state_dir=state_dir,
-                        environ=os.environ,
-                    )["path"]
-                )
-            elif _worktrees.repository_root(launch_cwd) is None:
-                isolation_reason = "project directory is not a git repository"
-            else:
-                isolation_reason = "SESSION_KIT_WORKER_WORKTREE is off"
-            receipt = _receipts.open_run(
-                state_dir=state_dir,
-                msg_id=primary,
-                branch=str(assignment.get("branch") or ""),
-                provider=str(assignment.get("provider") or ""),
-                model=str(assignment.get("requested_model") or ""),
-                launch_key=str(assignment.get("idempotency_key") or ""),
-                isolation_mode="worktree" if branch else "none",
-                isolation_path=isolation_path,
-                isolation_reason=isolation_reason,
-            )
-            try:
-                result = _launch_intake_worker(
-                    assignment, cwd=launch_cwd, environ=os.environ
-                )
-            except BaseException as exc:
-                _receipts.close_run(
-                    state_dir=state_dir,
-                    receipt_id=str(receipt["receipt_id"]),
-                    stop_reason="failed",
-                    stop_detail=f"launch failed: {exc}",
-                    allow_unverified=True,
-                )
-                raise
-            return {**result, "receipt_id": receipt["receipt_id"]}
-
-        def reconcile(assignment: Mapping[str, Any]) -> Mapping[str, Any]:
-            return _reconcile_intake_worker(
-                assignment, snapshot(config=config), config=config
-            )
-
-        launcher = launch
-        reconciler = reconcile
-    else:
-        spool = _intake.Spool(Path(config["state_dir"]))
-    code, payload = _intake.run(
-        args.intake_action,
-        spool=spool,
-        deliver=deliver,
-        reply=reply,
-        msg_id=getattr(args, "msg_id", None),
-        source=getattr(args, "source", None),
-        intake_key=getattr(args, "intake_key", None),
-        summary=getattr(args, "summary", None),
-        terminal=getattr(args, "terminal", None),
-        title=getattr(args, "title", None),
-        text=getattr(args, "text", None),
-        cwd=getattr(args, "cwd", None),
-        branches=getattr(args, "branches", None) or (),
-        worker_plan=worker_plan,
-        source_event_id=getattr(args, "source_event_id", None),
-        analysis=getattr(args, "analysis", None),
-        scope=getattr(args, "scope", None),
-        required_expertise=getattr(args, "required_expertise", None),
-        required_expertise_tags=required_tags,
-        branch=getattr(args, "branch", None),
-        duty_state=getattr(args, "duty_state", None),
-        reporter_identity=getattr(args, "reporter_identity", None),
-        idempotency_key=getattr(args, "idempotency_key", None),
-        risks=getattr(args, "risks", None),
-        tests=getattr(args, "tests", None),
-        manual_policy_exception=getattr(args, "manual_policy_exception", None),
-        launcher=launcher,
-        reconciler=reconciler,
-        payload=hook_payload,
-        state_dir=Path(config["state_dir"]),
-        environ=os.environ,
-    )
-    _json_print(payload)
-    return code
-
-
-def _msg_command(args: argparse.Namespace, config: dict[str, Any]) -> int:
-    """Run one mass-messaging verb and print its JSON result."""
-    if args.msg_action == "queue":
-        if args.queue_mark_seen:
-            timestamp = _events.mark_seen(
-                Path(config["state_dir"]), args.queue_mark_seen
-            )
-            _json_print(
-                {
-                    "thread_key": _events.valid_thread_key(args.queue_mark_seen),
-                    "seen_unix_ms": timestamp,
-                }
-            )
-            return 0
-        queue_input = os.environ.get("SESSION_KIT_INPUT_SNAPSHOT")
-        queue_inventory = (
-            load_inventory_input(queue_input)
-            if queue_input
-            else snapshot(config=config)
-        )
-        _json_print(
-            _events.build_attention_queue(
-                queue_inventory,
-                Path(config["state_dir"]),
-            )
-        )
-        return 0
-    if args.msg_action == "intake":
-        return _intake_command(args, config)
-    code, payload = _messages_run(
-        args.msg_action,
-        config,
-        target=getattr(args, "target", None),
-        text=getattr(args, "text", None),
-        fyi=getattr(args, "fyi", False),
-        msg_id=getattr(args, "msg_id", None),
-        thread=getattr(args, "thread", None),
-        idempotency_key=getattr(args, "idempotency_key", None),
-    )
-    _json_print(payload)
-    return code
 
 
 def _lifecycle_environment() -> tuple[Path, str, str, int, int]:
@@ -4163,6 +5463,28 @@ def _prove_lifecycle_caller(
     ):
         raise CollectionError(
             "lifecycle caller is outside the exact managed shell generation"
+        )
+
+
+def _prove_unchanged_daemon_generation(live: Mapping[str, Any]) -> None:
+    """Re-prove the daemon behind a validated snapshot is still the same one."""
+    expected = live.get("daemon_generation")
+    platform = _require_supported_platform()
+    proc_root = _common.proc_root()
+    process_table = (
+        scan_darwin_process_table(DEFAULT_MAX_PROC_NODES)
+        if platform == DARWIN_PLATFORM
+        else scan_process_table(proc_root, DEFAULT_MAX_PROC_NODES)
+    )
+    current = daemon_generation(process_table)
+    if (
+        not isinstance(expected, Mapping)
+        or current is None
+        or current.get("pid") != expected.get("pid")
+        or current.get("process_start_ticks") != expected.get("process_start_ticks")
+    ):
+        raise CollectionError(
+            "the shpool daemon generation changed; nothing reopened"
         )
 
 
@@ -4247,6 +5569,75 @@ def _lifecycle_committed_conversation(
     return exact
 
 
+MODEL_REFUSED_EXIT = 3
+
+
+def _model_availability_command(args: argparse.Namespace) -> int:
+    """Is the model that was asked for the model that will serve the session?
+
+    Exit 0 when it is, or when nothing on this machine can say. Exit
+    ``MODEL_REFUSED_EXIT`` when this host would answer the request with a
+    different model, or does not offer it at all — with the reason on standard
+    error, because the caller's job is to stop rather than to substitute.
+    """
+    from sessionkit_inventory import worker_model as _worker_model
+
+    state_dir = Path(load_config()["state_dir"])
+    if args.command == "model-served":
+        _json_print(
+            _worker_model.record_served(
+                state_dir, args.provider, args.requested, args.served
+            )
+        )
+        return 0
+    verdict = _worker_model.availability(
+        args.provider, args.model, state_dir=state_dir, environ=os.environ
+    )
+    if args.as_json:
+        _json_print(verdict)
+    if verdict["verdict"] not in _worker_model.REFUSALS:
+        if not args.as_json:
+            # An answer of "unknown" belongs on stderr with the refusals, not
+            # on stdout: the callers capture stderr, and an unknown that lands
+            # on stdout is an unknown the person never sees. "This is the model
+            # you asked for and nothing here could confirm it" is exactly the
+            # sentence R11 exists to make sure gets said.
+            stream = (
+                sys.stdout
+                if verdict["verdict"] != _worker_model.UNKNOWN
+                else sys.stderr
+            )
+            stream.write(f"{verdict['reason']}\n")
+        return 0
+    sys.stderr.write(_worker_model.render_availability(verdict, flag=args.flag))
+    return MODEL_REFUSED_EXIT
+
+
+def _release_session_worktree(state_dir: Path, session_id: str) -> dict[str, Any]:
+    """Give back the working copy a closing session was given, if it had one.
+
+    This runs inside the session that is ending -- `bye`, or a provider that
+    exited cleanly -- so it is deliberately quiet and never raises: an exit
+    must not fail because of a directory. The core keeps the copy, and says
+    why, whenever there is unmerged work or anybody still in it.
+    """
+    try:
+        from sessionkit_inventory import worktrees as _worktrees
+
+        verdict = _worktrees.release(
+            state_dir, shpool_id=session_id, environ=os.environ
+        )
+        # A copy kept because there is work in it is the one thing on this path
+        # a person has to be told. The JSON goes to the caller's /dev/null; the
+        # sentence goes to standard error, which the close path leaves open for
+        # exactly this.
+        if verdict.get("action") in (_worktrees.KEPT, _worktrees.MANY):
+            sys.stderr.write(_worktrees.render_verdict(verdict))
+        return verdict
+    except Exception:  # noqa: BLE001 - an exit is never failed by this
+        return {"action": "none", "reason": "worktree release was unavailable"}
+
+
 def _lifecycle_command(args: argparse.Namespace) -> int:
     state_dir, session_id, boot_id, shell_pid, shell_start = (
         _lifecycle_environment()
@@ -4276,6 +5667,168 @@ def _lifecycle_command(args: argparse.Namespace) -> int:
             exit_code=exit_code,
             input_tracking=True,
         )
+    elif args.lifecycle_action == "closed":
+        # Intent, recorded by the shell that is about to end. A session with
+        # no exact conversation (a plain managed shell) has nothing to
+        # tombstone and says so instead of inventing a key.
+        #
+        # THE DOCUMENT MUST BELONG TO THIS SHELL, not merely to this session
+        # id. `_prove_lifecycle_caller` checks the caller against /proc; it
+        # says nothing about the record, which was then loaded by session id
+        # alone. A reused shpool id -- `main2` closes, a new `main2` opens
+        # before the collector prunes the old document -- let a fresh shell
+        # tombstone the PREVIOUS occupant's conversation, and `update_state`
+        # had guarded exactly this since it was written ("provider-exit
+        # lifecycle generation changed"). Found in review 2026-08-15, along
+        # with the comment further down that claimed this binding already
+        # existed; it was true of `load_last_exact` and not of this.
+        state = _lifecycle.load_state(state_dir, session_id)
+        if state is not None and (
+            state.get("boot_id") != boot_id
+            or state.get("shell_pid") != shell_pid
+            or state.get("shell_start_ticks") != shell_start
+        ):
+            state = None
+        provider = (state or {}).get("provider")
+        conversation = valid_uuid((state or {}).get("conversation_uuid"))
+        if args.only_with_conversation and (state or {}).get("keep"):
+            # `keep_session` says "automatic cleanup is off for this session",
+            # and a crash is not the person asking for anything. This flag is
+            # only ever passed by an automatic close, so the marker binds here
+            # exactly as it binds the reaper (reaper.py `_safe_candidate`
+            # requires provider_exit_keep is False). `bye` and a clean provider
+            # exit pass no flag and still close: those ARE the person asking.
+            _json_print({"recorded": False, "reason": "keep is set"})
+            return 0
+        if provider in PROVIDERS and not conversation:
+            # A provider ran here and the record names no conversation.
+            # That is not "there was none": Codex allocates its thread ID
+            # inside the TUI, so a session started with `sp new` never hands
+            # one back to the shell, and its provider-exit record carries
+            # none. Such a session could then never be closed into anything
+            # but history — the one shape that loses the conversation — so it
+            # sat in the list until the 72-hour reaper.
+            #
+            # The collector proved an exact conversation while the provider
+            # was still live and kept it for exactly this handoff. THIS record
+            # validates itself against the boot, the shell PID and the shell
+            # start (`_validated_last_exact`), so it can only ever name the
+            # conversation this shell generation ran; `record_provider_exit`
+            # refuses a conversation that changes inside one generation, so
+            # there is only one to name. The same record already decides what
+            # the picker offers to recover for these sessions
+            # (lifecycle.apply_provider_exit_states).
+            retained = _lifecycle.load_last_exact(
+                state_dir,
+                session_id,
+                boot_id=boot_id,
+                shell_pid=shell_pid,
+                shell_start_ticks=shell_start,
+            )
+            if retained is not None and retained["provider"] == provider:
+                conversation = retained["uuid"]
+        if provider not in PROVIDERS or not conversation:
+            if args.only_with_conversation:
+                # The caller asked to close ONLY if the conversation survives
+                # the close. It would not, so nothing is recorded and nothing
+                # is closed; the caller keeps the session, which is the only
+                # thing left that still knows which conversation this was.
+                # Answering used to write the history-only row below, so
+                # merely ASKING put a closed row on the list for a session
+                # that then stayed open and kept running.
+                _json_print({"recorded": False, "reason": "no exact conversation"})
+                return 0
+            # A plain managed shell has no conversation to tombstone, but the
+            # person still closed something on purpose. It goes on the closed
+            # list as history: its scrollback is all there ever was.
+            row = _record_closed_session(
+                load_config(), provider="shell", shpool_id=session_id
+            )
+            if isinstance(row, Mapping) and row.get("recorded") is False:
+                _json_print(row)
+                return 1
+            released = _release_session_worktree(state_dir, session_id)
+            _json_print(
+                {
+                    "recorded": True,
+                    "provider": "shell",
+                    "reason": "no exact conversation; shell history was recorded",
+                    "worktree": released,
+                }
+            )
+            return 0
+        # Asked ONCE, and reported either way. An automatic close refuses on a
+        # no; a close the person asked for still happens, but says so, because
+        # "closed, and here it is in Closed sessions" is a promise the list
+        # will quietly break when it filters the row out as unreadable.
+        restorable = _conversation_is_readable(provider, conversation)
+        if args.only_with_conversation and not restorable:
+            # A syntactically valid UUID is not a conversation you can get
+            # back. The transcript is what a restore actually reads, and the
+            # closed-sessions list drops any row whose transcript this machine
+            # cannot read -- so closing on the UUID alone ended the live
+            # session AND produced a row the person would never even see.
+            # An automatic close asks the same question the list will ask
+            # later, before it does anything irreversible.
+            _json_print(
+                {"recorded": False, "reason": "the conversation cannot be read back"}
+            )
+            return 0
+        # THE LEDGER ROW FIRST, AND THE TOMBSTONE ONLY IF IT LANDED.
+        #
+        # These two records do opposite jobs. The ledger row is what makes a
+        # closed conversation findable; the tombstone is what stops the crash
+        # queue offering it as lost work. Written in the old order -- tombstone
+        # first, ledger second, neither checked -- a full disk produced the one
+        # state with no way back: no row to restore from, and recovery told not
+        # to offer it. The operator was told "the conversation is in Closed
+        # sessions" while it was reachable from nowhere at all.
+        #
+        # So the findable record is written first and its result is read. No
+        # row means no tombstone: a conversation the crash queue offers by
+        # mistake is a nuisance, and one that no surface will ever mention
+        # again is the thing this branch exists to prevent.
+        row = _record_closed_session(
+            load_config(),
+            provider=provider,
+            uuid=conversation,
+            shpool_id=session_id,
+        )
+        if isinstance(row, Mapping) and row.get("recorded") is False:
+            _json_print(
+                {
+                    "recorded": False,
+                    "reason": row.get("reason")
+                    or "the closed-sessions ledger could not be written",
+                }
+            )
+            return 1
+        # The row landed, so the conversation is findable and the close is
+        # safe to allow. A tombstone that cannot be written after that costs
+        # the person one wrong offer from the crash queue -- annoying, and
+        # strictly better than refusing a close whose conversation is already
+        # safely listed. It is reported rather than hidden.
+        tombstoned = True
+        try:
+            _lifecycle.record_close_intent(
+                state_dir,
+                provider=provider,
+                uuid=conversation,
+            )
+        except (CollectionError, OSError):
+            tombstoned = False
+        released = _release_session_worktree(state_dir, session_id)
+        _json_print(
+            {
+                "recorded": True,
+                "provider": provider,
+                "uuid": conversation,
+                "tombstoned": tombstoned,
+                "restorable": restorable,
+                "worktree": released,
+            }
+        )
+        return 0
     elif args.lifecycle_action == "user-input":
         value = _lifecycle.update_state(
             state_dir,
@@ -4292,28 +5845,52 @@ def _lifecycle_command(args: argparse.Namespace) -> int:
         settings = load_config()
         live = snapshot(write_state=True, config=settings)
         item = lookup(live, session_id)
+        # One sentence per condition. The menu that offers this reopen prints
+        # what comes back here, and a single "recovery is unavailable" for six
+        # different causes told the person nothing about which of them to fix.
+        if not guard_live_inventory(live):
+            raise CollectionError(
+                "the live session list could not be trusted; nothing reopened"
+            )
+        if item is None:
+            raise CollectionError(
+                "this terminal is no longer in the live session list;"
+                " nothing reopened"
+            )
+        if item.get("provider") != "shell":
+            raise CollectionError(
+                "this terminal is already running a provider; nothing reopened"
+            )
+        if item.get("exited_provider") != state["provider"]:
+            raise CollectionError(
+                "the recorded exit was not the provider this terminal last ran;"
+                " nothing reopened"
+            )
+        shell = item.get("shpool_shell")
         if (
-            item is None
-            or not guard_live_inventory(live)
-            or item.get("provider") != "shell"
-            or item.get("exited_provider") != state["provider"]
-            or item.get("shpool_shell", {}).get("pid") != shell_pid
-            or item.get("shpool_shell", {}).get("process_start_ticks")
-            != shell_start
+            not isinstance(shell, Mapping)
+            or shell.get("pid") != shell_pid
+            or shell.get("process_start_ticks") != shell_start
         ):
             raise CollectionError(
-                "exact provider-exit recovery is unavailable; nothing reopened"
+                "this shell is not the one that recorded the exit;"
+                " nothing reopened"
             )
         recovery = item.get("recovery")
         if not isinstance(recovery, Mapping):
             raise CollectionError(
-                "exact provider recovery is unavailable; nothing reopened"
+                "no conversation was recorded for this terminal; nothing reopened"
             )
         provider = state["provider"]
         uuid = valid_uuid(recovery.get("uuid"))
-        if recovery.get("provider") != provider or not uuid:
+        if recovery.get("provider") != provider:
             raise CollectionError(
-                "exact provider recovery is unavailable; nothing reopened"
+                f"the recorded conversation is not a {provider} one;"
+                " nothing reopened"
+            )
+        if not uuid:
+            raise CollectionError(
+                "the recorded conversation has no usable id; nothing reopened"
             )
         expected = recovery_spec(provider, uuid, recovery.get("cwd"))
         if recovery.get("argv") != expected["argv"]:
@@ -4331,6 +5908,13 @@ def _lifecycle_command(args: argparse.Namespace) -> int:
             )
             if theme_color:
                 argv[1:1] = ["-c", f'tui.theme="sk-{theme_color}"']
+            # And the same for the tab name (K3). Without it, a crash-reopen
+            # came back writing the personal config's title items over the
+            # name the kit had just put on the tab, so that one window
+            # disagreed with the picker until it was closed and opened again.
+            title_items = _codex_title_items(os.environ)
+            if title_items:
+                argv[1:1] = ["-c", f"tui.terminal_title={title_items}"]
         elif provider == "claude":
             signals = read_claude_transcript_signals(uuid)
             provider_name = signals["agent_name"] or signals["ai_title"]
@@ -4341,7 +5925,14 @@ def _lifecycle_command(args: argparse.Namespace) -> int:
             raise CollectionError(
                 "provider recovery directory is unavailable; nothing reopened"
             )
+        # The snapshot above is evidence with an age, and everything between
+        # it and this line is work. A daemon that restarted in that window
+        # would leave this terminal describing a generation that no longer
+        # exists, so the generation is proven once more with nothing left to
+        # do but launch.
+        _prove_unchanged_daemon_generation(live)
         completed = subprocess.run(argv, cwd=cwd, check=False)
+        exit_code = completed.returncode % 256
         value = _lifecycle.record_provider_exit(
             state_dir,
             session_id=session_id,
@@ -4349,10 +5940,14 @@ def _lifecycle_command(args: argparse.Namespace) -> int:
             shell_pid=shell_pid,
             shell_start_ticks=shell_start,
             provider=provider,
-            exit_code=completed.returncode % 256,
+            exit_code=exit_code,
             input_tracking=True,
         )
-        return 0
+        # The reopened provider's own outcome is the answer, because the
+        # caller has to make the same decision it makes for a first exit:
+        # a clean exit closes the terminal, a crash stops at the menu.
+        # Reporting success either way redrew the menu after a clean /exit.
+        return 0 if exit_code == 0 else LIFECYCLE_REOPENED_PROVIDER_CRASHED
     else:
         value = _lifecycle.update_state(
             state_dir,
@@ -4371,7 +5966,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         if args.command == "validate-worker-model":
-            from sessionkit_supervisor.intake import validate_requested_model
+            from sessionkit_inventory.worker_model import validate_requested_model
 
             print(validate_requested_model(args.provider, args.model))
             return 0
@@ -4379,12 +5974,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _platform_command(args)
         if args.command == "lifecycle":
             return _lifecycle_command(args)
+        if args.command in ("model-availability", "model-served"):
+            return _model_availability_command(args)
         config = load_config()
         if args.command == "recovery-command":
             _json_print(recovery_spec(args.provider, args.uuid, args.cwd))
             return 0
         if args.command == "codex-bounce-title":
-            bounce_title = codex_bounce_prepare(args.uuid)
+            bounce_title = codex_bounce_prepare(
+                args.uuid, mirror_index=not args.read_only
+            )
             if not bounce_title:
                 return 1
             print(bounce_title)
@@ -4403,15 +6002,29 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _automatic_title_command(args, config)
         if args.command == "account":
             return _account_command(args, config)
-        if args.command == "msg":
-            return _msg_command(args, config)
         if args.command == "worktree":
             return _worktree_command(args, config)
-        if args.command == "receipt":
-            return _receipt_command(args, config)
         if args.command == "recovery-pending":
             if args.pending_action == "list":
-                _json_print(list_pending(config))
+                if args.stream_recovery_snapshot:
+                    _write_recovery_snapshot(
+                        config=config, allow_large=args.allow_large_ledger
+                    )
+                    return 0
+                if args.stream_closed:
+                    _write_closed_sessions(
+                        limit=_closed_sessions.MAX_ENTRIES,
+                        allow_large=args.allow_large_ledger,
+                        json_lines=True,
+                    )
+                    return 0
+                _json_print(
+                    recovery_list_payload(
+                        config,
+                        include_closed=not args.without_closed,
+                        include_projection_inputs=args.projection_inputs,
+                    )
+                )
                 return 0
             _json_print(
                 acknowledge_pending(
@@ -4420,6 +6033,168 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.old_shpool_id,
                     args.uuid,
                 )
+            )
+            return 0
+        if args.command == "recovery-selectors":
+            state_dir = _state_paths(config)["root"]
+            if args.printed_action == "remember":
+                _json_print(
+                    _printed.remember_printed(
+                        state_dir,
+                        _printed_rows_from(
+                            args.payload, json_lines=args.json_lines
+                        ),
+                    )
+                )
+                return 0
+            verdict = _printed.check_printed(
+                state_dir, args.selector, args.provider, args.uuid
+            )
+            _json_print(verdict)
+            # A word that was printed for a different conversation is not a
+            # near miss to be reported and ridden past: the caller must be able
+            # to tell it apart from agreement without reading the document.
+            return 4 if verdict["verdict"] == _printed.DISAGREES else 0
+        if args.command == "action-log":
+            _json_print(
+                _append_action_record(
+                    _state_paths(config)["root"] / "action-events.jsonl",
+                    args.action,
+                    args.outcome,
+                    args.session,
+                )
+            )
+            return 0
+        if args.command == "origin":
+            state_dir = _state_paths(config)["root"]
+            if args.origin_action == "list":
+                _json_print(_origins.load_origins(state_dir))
+                return 0
+            _origins.record_origin(
+                state_dir,
+                shpool_id=args.shpool_id,
+                origin=args.origin,
+            )
+            _json_print(
+                {
+                    "recorded": True,
+                    "shpool_id": args.shpool_id,
+                    "origin": args.origin,
+                }
+            )
+            return 0
+        if args.command == "transcript":
+            if args.transcript_action == "locate":
+                found = _transcripts.locate_transcript(args.provider, args.uuid)
+                if found is None:
+                    raise CollectionError(
+                        f"no {args.provider} transcript on this machine for that"
+                        " conversation"
+                    )
+                _json_print({"provider": args.provider, "path": os.fspath(found)})
+                return 0
+            _json_print(_transcript_reachability(config))
+            return 0
+        if args.command == "closed-sessions":
+            if args.closed_action in ("list", "stream"):
+                _write_closed_sessions(
+                    limit=args.limit,
+                    allow_large=args.allow_large_ledger,
+                    json_lines=args.closed_action == "stream",
+                )
+                return 0
+            if args.closed_action == "forget":
+                _json_print(
+                    {
+                        "forgotten": _closed_sessions.forget(
+                            args.provider, args.uuid
+                        )
+                    }
+                )
+                return 0
+            row = _record_closed_session(
+                config,
+                provider=args.provider,
+                uuid=args.uuid,
+                shpool_id=args.session,
+                title=args.title,
+                cwd=args.cwd,
+                origin=args.origin,
+                account_alias=args.account,
+            )
+            _json_print(row)
+            # The answer has to be in the EXIT STATUS as well, because that is
+            # the only part the close paths read: both spell this verb
+            # `>/dev/null 2>&1 && return 0`. Exiting zero on a failed append
+            # made a lost row indistinguishable from a filed one and printed
+            # `Closed ...` over a session that reached no list at all -- the
+            # same shape as the sibling verb below, in the branch that handles
+            # a plain managed shell (found in review, 2026-08-15).
+            if isinstance(row, Mapping) and row.get("recorded") is False:
+                return 1
+            return 0
+        if args.command == "close-intent":
+            state_dir = _state_paths(config)["root"]
+            if args.intent_action == "list":
+                _json_print(_lifecycle.load_close_intents(state_dir))
+                return 0
+            # Refuse a key the tombstone store would reject, BEFORE writing
+            # anything. The ledger goes first from here on, so an argument that
+            # only the tombstone validates would otherwise leave a closed-list
+            # row for a conversation that can never be tombstoned or found.
+            _lifecycle.close_intent_key(args.provider, args.uuid)
+            # THE LEDGER ROW FIRST, AND THE TOMBSTONE ONLY IF IT LANDED.
+            #
+            # A tombstone says "not a crash"; the ledger row says "here it is".
+            # Written in the old order -- tombstone first, ledger second,
+            # neither checked -- a ledger that cannot be written produced the
+            # one state with no way back: no row to restore from, and recovery
+            # told not to offer it. This verb is the shared one, so BOTH live
+            # close paths ran it after they had already killed the session
+            # (`sp close` in lib/sh/sp_commands.sh, `k` in lib/sh/sp_picker.sh)
+            # and both were told `recorded: true`. The conversation was on
+            # neither surface, and nothing on screen said so.
+            #
+            # So the findable record is written first and its result is read.
+            # No row means no tombstone and no close: the crash queue keeps
+            # offering the conversation, which is the one remaining way back
+            # to it (found in review, 2026-08-15).
+            row = _record_closed_session(
+                config, provider=args.provider, uuid=args.uuid
+            )
+            if isinstance(row, Mapping) and row.get("recorded") is False:
+                # Non-zero on purpose. Both callers branch on the exit status,
+                # and this is the status that makes them say so out loud.
+                _json_print(
+                    {
+                        "recorded": False,
+                        "provider": args.provider,
+                        "uuid": args.uuid,
+                        "reason": row.get("reason")
+                        or "the closed-sessions ledger could not be written",
+                    }
+                )
+                return 1
+            # The row landed, so the conversation is findable and suppressing
+            # the crash offer is safe. A tombstone that cannot be written after
+            # that costs one wrong offer from the crash queue -- reported, not
+            # hidden, and strictly better than losing the conversation.
+            tombstoned = True
+            try:
+                _lifecycle.record_close_intent(
+                    state_dir,
+                    provider=args.provider,
+                    uuid=args.uuid,
+                )
+            except (CollectionError, OSError):
+                tombstoned = False
+            _json_print(
+                {
+                    "recorded": True,
+                    "provider": args.provider,
+                    "uuid": args.uuid,
+                    "tombstoned": tombstoned,
+                }
             )
             return 0
         if args.command == "recovery-manifest":
@@ -4453,11 +6228,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             inventory = snapshot(
                 write_state=not (
-                    args.command == "snapshot"
-                    and (args.no_write or args.guard_live)
+                    args.command == "render"
+                    or (
+                        args.command == "snapshot"
+                        and (args.no_write or args.guard_live)
+                    )
                 ),
                 config=config,
             )
+        # The state file keeps the collectors' own evidence; what leaves here
+        # for a screen carries the published view as well. Publishing at the
+        # boundary is why a stall flag can fold into `needs_you` for every
+        # reader without rewriting what the next collection compares against.
+        inventory = publish_view_fields(inventory)
         if args.command == "snapshot":
             if args.strict_live and not strict_live_inventory(inventory):
                 print(
@@ -4475,7 +6258,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "render":
             print(render_inventory(inventory, rows_only=args.rows))
         elif args.command == "waiting-count":
-            print(sum(1 for item in inventory["sessions"] if item.get("needs_you")))
+            print(
+                sum(
+                    1
+                    for item in inventory["sessions"]
+                    if item.get("blocking_question") or item.get("needs_you")
+                )
+            )
         elif args.command == "lookup":
             item = lookup(inventory, args.selector)
             if item is None:
@@ -4487,7 +6276,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             # This is what a person is shown instead.
             if lookup(inventory, args.selector) is None:
                 print(
-                    "no single session matches that selector", file=sys.stderr
+                    "session-kit: no session matches that selector",
+                    file=sys.stderr,
                 )
                 return 2
             print(
@@ -4499,7 +6289,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 end="",
             )
         return 0
-    except (CollectionError, MessageError, OSError, ValueError) as exc:
+    except (CollectionError, OSError, ValueError) as exc:
         print(f"session inventory: {exc}", file=sys.stderr)
         return 1
 

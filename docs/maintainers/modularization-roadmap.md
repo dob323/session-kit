@@ -1,181 +1,78 @@
-# Inventory modularization roadmap
+# Inventory modularization contract
 
-`lib/session_inventory.py` remains the executable compatibility entry point
-while implementation moves into `lib/sessionkit_inventory/`.
+`lib/session_inventory.py` is the executable and import-compatible facade for
+the inventory. Focused implementation lives in `lib/sessionkit_inventory/`,
+but the split is intentionally incomplete: the facade still contains CLI
+parsing, compatibility wrappers, and implementation retained by older tests
+and callers.
 
-That move is done. Configuration, Linux process inspection, provider
-discovery, inventory assembly, state, naming, recovery, and rendering all live
-in the package; the facade is CLI parsing plus 155 `return _<module>.`
-delegations over 22 modules. It stays in place because installed command paths
-name it. `docs/architecture.md` describes the shipped layout.
+This file records the boundary that future moves must preserve. The current
+module inventory is in [Architecture](../architecture.md#inventory-package).
 
-## Compatibility contract
+## Compatibility rules
 
-Through at least one public minor release:
+- The facade remains executable and importable by path.
+- Tested symbols, signatures, exit codes, JSON fields, and rendered behaviour
+  remain available until a release explicitly changes their contract.
+- Package modules never import the facade.
+- Imports perform no process scan, lock, configuration read, or state write.
+- A move preserves every test patch point or updates the test to patch the
+  module that really resolves the name.
+- Refactoring does not select a release, refresh a service, or mutate live
+  session state.
 
-- `lib/session_inventory.py` stays executable and importable by path.
-- Existing tested symbols, signatures, exit codes, JSON fields, and rendered
-  behavior remain available.
-- Extracted modules never import the facade.
-- Imports perform no process scans, locks, configuration reads, or state writes.
-- Existing test patch points continue to work.
-- A refactor never moves the installed release link or restarts a service.
+## Patch-point ownership
 
-Patch-point scope after extraction: a package module may resolve a sibling
-package symbol directly (the leaf-import convention), and from that moment
-patching the same name on the facade no longer reaches package-internal
-callers — the patch applies silently against nothing and the test stays
-green against the real implementation. Every symbol an existing test patches
-on the facade must therefore stay call-time-injected by its facade wrapper;
-that set is verified per move. New tests must patch either the package module
-attribute that is actually in the call path or a facade name proven to
-intercept (a `wraps=` recording or an observable behavior flip), never an
-unverified facade attribute.
+A facade wrapper can inject collaborators at call time. In that case patching
+the facade name still reaches the implementation. A package function can also
+import a sibling directly; then the resolving package module owns the patch
+point, and changing the similarly named facade attribute does nothing.
 
-### Package-only patch points
+Use one of these proofs when writing a test:
 
-Names on this ledger are resolved inside the package. Patch them on the module
-that resolves them; patching them on the facade reaches nothing and the test
-stays green against the real implementation. This table is derived from the tree
-by an AST scan rather than maintained by hand — a ledger that misdirects is
-worse than no ledger, because it carries authority.
+1. patch the attribute on the module whose function resolves it; or
+2. patch the facade and demonstrate interception with `wraps=` or an observable
+   behaviour change.
 
-A name lands here two ways. It is **imported** from a sibling package module, or
-it is **defined** in a package module that also has a facade wrapper, and a
-sibling function in that same module calls the local definition rather than the
-wrapper.
+Never assume that a re-exported name is an interception point. That mistake is
+silent: the test runs against the real dependency and can pass without testing
+the intended case.
 
-| Name | Resolved in | Patch on |
-| --- | --- | --- |
-| `_read_bounded_owner_file` | `names`, `terminal` (and `state_io`, which defines it) | the module whose read you are debugging — an alias-document read is `names`, a terminal-registry read is `terminal` |
-| `_state_paths` | `names` | `sessionkit_inventory.names` |
-| `StateLock` | `names` | `sessionkit_inventory.names` |
-| `_codex_state_databases` | `names`, `names_push` | the module whose path you are on |
-| `_ws_send_frame` | `names_push` | `sessionkit_inventory.names_push` |
-| `_ws_recv_frame` | `names_push` | `sessionkit_inventory.names_push` |
-| `_ws_request` | `names_push` | `sessionkit_inventory.names_push` |
-| `_append_codex_index_entry` | `names_push` | `sessionkit_inventory.names_push` |
-| `_codex_title_echoes_prompt` | `names_push` | `sessionkit_inventory.names_push` |
-| `_push_codex_thread_title` | `names_push` | `sessionkit_inventory.names_push` |
-| `_session_kit_state_dir` | `names_push` | `sessionkit_inventory.names_push` |
-| `_first_text_block` | `self_name` | `sessionkit_inventory.self_name` |
-| `_terminal_ai_key` | `terminal` | `sessionkit_inventory.terminal` |
-| `_terminal_generation_key` | `terminal` | `sessionkit_inventory.terminal` |
-| `_missing_shell_generation_is_quarantinable` | `terminal`, `validation` | the module whose check you are debugging |
-| `_missing_shell_generation_is_quarantined` | `validation` | `sessionkit_inventory.validation` |
-| `_display_width`, `_display_title`, `_format_age`, `stall_threshold_seconds` | `render` | `sessionkit_inventory.render` |
-| `_positive_int`, `_proc_stat` | `reaper` | `sessionkit_inventory.reaper` |
-| `_agent_identity`, `_base_agent`, `_shell_title`, `_empty_recovery`, `recovery_spec` | `collector` | `sessionkit_inventory.collector` |
-| `_parse_shpool_payload`, `_is_native_claude`, `_is_native_codex`, `_codex_turn_state`, `_children_index`, `_process_age` | `collector` | `sessionkit_inventory.collector` |
-| `_process_ancestor_chain` | `self_name` | `sessionkit_inventory.self_name` |
-| `PROVIDERS` | eight modules | the module under test — it is a frozen set, so patching it anywhere is unusual |
+Shared state helpers deserve particular care. Some modules accept locks,
+paths, and publishers as injected arguments; others import the same helpers
+locally. Inspect the call path before patching. Prefer call-time injection for
+new state-moving code when it keeps recovery ordering visible and testable.
 
-The `common` primitives — `valid_uuid`, `clean_text`, `CollectionError`,
-`PROVIDERS`, `automatic_naming_enabled`, `normalize_automatic_title` and the
-`_valid_*` validators — are leaf-imported by nearly every module by design and
-are not listed row by row. None is a patch point today.
+Constants need the same proof. A differential test using the real constant
+cannot show that a patch stopped reaching its consumer. Change the constant in
+the test and observe the result.
 
-**The split-treatment hazard.** `colors` takes `StateLock` and `_state_paths` as
-injected arguments; `names` imports the same two directly. Both choices are
-defensible on their own, and the inconsistency between them is the problem: a
-facade patch on `StateLock` intercepts a colour write and silently does nothing
-for a naming write, with nothing in either module telling you which side you are
-on. Before patching a shared state helper, check which module owns the path you
-are exercising. Prefer injection when adding a new consumer, so the set of names
-that behave one way keeps shrinking rather than growing. `recovery` follows that
-rule and injects both.
+## Moving code safely
 
-**A module can add no rows at all.** `recovery` and `snapshot` take every
-collaborator as a call-time argument — the state reader and publisher, the lock,
-the live collector, the strict live guard, the terminal helpers, the lifecycle
-passes, their own siblings — so an AST re-derivation over the tree after both
-moves produced the same names as before them, with the two new modules appearing
-only under the `common` primitives below. Full injection is the right default for
-the modules that rewrite state a person depends on immediately after losing work,
-where a patch that lands on nothing is worse than a verbose signature. It is not
-free: the signatures are long, and each new argument is a name a caller can pass
-wrongly. Weigh that per module rather than copying either extreme.
+A coherent extraction follows this sequence:
 
-`snapshot` gets a second benefit from it. That function is an ordering — take a
-collection, and if it is complete publish the inventory, the terminal registry
-and the recovery manifest under one lock, in the order a crash between any two
-of them can survive. With every step arriving as an argument, the file reads as
-the sequence itself rather than as a call graph you have to hold in your head.
+1. freeze the symbol, signature, CLI, and patch-point behaviour;
+2. move one focused responsibility without changing its output;
+3. keep a facade wrapper where installed callers or tests import it;
+4. prove normal import and direct file execution;
+5. run focused tests for unsafe files, symlinks, interrupted writes, locks, and
+   idempotency where state is involved;
+6. run the full suite and public-export checks;
+7. verify install and rollback with the package present and with a deliberately
+   incomplete package refused.
 
-Constants are the trap this ledger exists to record. A differential run with
-every constant at its real value cannot detect a constant that stopped being
-reachable: the behavior is identical, so the comparison is clean. Only patching
-one and observing the result finds it. Four were caught this way —
-`COLOR_RESERVATION_MAX_AGE_SECONDS`, `LAUNCH_COLOR_MAX_AGE_SECONDS`,
-`TERMINAL_NUMBER_QUARANTINE_SECONDS` and `_TITLE_TRAILING_STOPWORDS` — and all
-four were restored to call-time injection rather than listed here. The last of
-them looked like a documentation case by every rule available (consumed only
-in-module, unpinned, unread by any test) and turned out to change behavior when
-patched. Patch it and watch; do not reason about whether it matters.
+Do not combine a file move with a user-visible behaviour change. A mechanical
+move should have one answer to the question “what changed?”: only where the
+implementation lives.
 
-## The package as shipped
+## Completion criterion
 
-Fourteen modules were the original target; twenty-two shipped. The eight below
-the first fourteen were extracted after this roadmap was written.
+The long-term split is complete only when the facade contains compatibility
+wrappers, CLI parsing, and `main`, no focused implementation remains there, no
+package module imports it, and install, export, doctor, and rollback all enforce
+package completeness.
 
-| Module | Responsibility |
-| --- | --- |
-| `common.py` | constants, paths, normalization, configuration, command runner |
-| `state_io.py` | private reads, locks, atomic writes, JSON and checksums |
-| `processes.py` | Linux process table, ancestry, generations, boot identity |
-| `providers.py` | shared provider helpers and the shpool snapshot reader |
-| `model.py` | session records, titles, reply and provider-exit state |
-| `collector.py` | bounded read-only joins |
-| `names.py` | manual and automatic names |
-| `terminal.py` | terminal-number and generation state |
-| `validation.py` | strict snapshot and input validation |
-| `recovery.py` | exact recovery transactions |
-| `reaper.py` | 72-hour eligibility state and final safety proof |
-| `snapshot.py` | collection and private-state orchestration |
-| `render.py` | width, semantic color, dashboard, detail, JSON, and lookup |
-| `self_name.py` | caller proof and automatic naming |
-| `accounts.py` | subscription account profiles, roster, rotation advice |
-| `colors.py` | provider palettes and per-session color state |
-| `lifecycle.py` | managed-shell lifecycle events |
-| `migration.py` | state migrations between releases |
-| `names_push.py` | pushing local titles back to the providers |
-| `projects.py` | project shortcut discovery and management |
-| `providers_claude.py` | read-only Claude Code readers |
-| `providers_codex.py` | read-only Codex readers |
-
-The dependency graph must stay acyclic. Recovery and cleanup accept explicit
-callbacks rather than importing the facade.
-
-## Sequence
-
-1. Freeze facade behavior with symbol, signature, CLI, and patch-point tests.
-2. Move pure common and configuration helpers.
-3. Move private state I/O.
-4. Move Linux process discovery.
-5. Move provider readers.
-6. Move the data model and collector.
-7. Move validation and rendering separately.
-8. Move naming and terminal-number state.
-9. Move recovery and cleanup transactions.
-10. Move snapshot and self-name orchestration.
-11. Certify install, public export, rollback, and both private and public tests
-    twice.
-
-Do not combine file movement with a behavior change.
-
-## Checks for each step
-
-- compile the facade and package;
-- run focused and full tests;
-- import through normal import and direct file execution;
-- verify the symbol and signature manifest;
-- scan the public tree and reachable history;
-- build the public export and prove package completeness;
-- verify installer and doctor rejection of a partial package;
-- compare frozen Linux fixtures;
-- test unsafe modes, symlinks, interrupted writes, idempotency, and locks for
-  state-moving work.
-
-The split is complete when the facade contains compatibility wrappers, CLI
-parsing, and `main`; no focused module imports it; export and install tools
-enforce package completeness; and rollback passes from an immutable candidate.
+That criterion is not met merely because a module with the right name exists.
+The facade still has substantive implementation today, so future work should
+describe each extracted responsibility rather than declaring the migration
+finished as a whole.

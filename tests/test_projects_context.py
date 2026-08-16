@@ -233,29 +233,8 @@ def session(cwd: str, **overrides: object) -> dict[str, object]:
     return row
 
 
-def intake(cwd: str, **overrides: object) -> dict[str, object]:
-    row = {
-        "msg_id": "0123abcd",
-        "state": "delegated",
-        "summary": "do the thing",
-        "source_cwd": cwd,
-        "received_unix_ms": 1,
-        "workers": [
-            {"branch": "feature/one", "provider": "claude", "launch_state": "verified"},
-            {
-                "branch": "feature/two",
-                "provider": "codex",
-                "launch_state": "dispatching",
-            },
-            {"branch": "feature/three"},
-        ],
-    }
-    row.update(overrides)
-    return row
-
-
 class ResumeContextTests(ProjectFixture):
-    def test_context_gathers_sessions_and_intakes_under_the_project(self) -> None:
+    def test_context_gathers_sessions_under_the_project(self) -> None:
         self.manifest()
         project = self.project()
         result = context.project_context(
@@ -265,23 +244,11 @@ class ResumeContextTests(ProjectFixture):
                 session(os.fspath(self.repo / "sub"), shpool_id="s2"),
                 session(os.fspath(self.root / "elsewhere"), shpool_id="s3"),
             ],
-            intakes=[
-                intake(os.fspath(self.repo / "sub")),
-                intake(os.fspath(self.root)),
-            ],
         )
         self.assertEqual(result["counts"]["sessions"], 2)
-        self.assertEqual(result["counts"]["intakes"], 1)
-        self.assertEqual(result["counts"]["open_intakes"], 1)
         self.assertEqual(result["counts"]["team_roles"], 1)
         self.assertEqual(
-            result["intakes"][0]["workers"],
-            {
-                "recorded": 3,
-                "planned": 2,
-                "launched": 1,
-                "branches": ["feature/one", "feature/three", "feature/two"],
-            },
+            [row["shpool_id"] for row in result["sessions"]], ["s1", "s2"]
         )
 
     def test_a_context_view_carries_only_the_fields_it_declares(self) -> None:
@@ -296,10 +263,10 @@ class ResumeContextTests(ProjectFixture):
     def test_an_unreadable_store_is_named_rather_than_read_as_empty(self) -> None:
         self.manifest()
         result = context.project_context(
-            self.project(), unavailable=["the intake spool is unreadable"]
+            self.project(), unavailable=["the session snapshot is unreadable"]
         )
-        self.assertEqual(result["counts"]["intakes"], 0)
-        self.assertEqual(result["unavailable"], ["the intake spool is unreadable"])
+        self.assertEqual(result["counts"]["sessions"], 0)
+        self.assertEqual(result["unavailable"], ["the session snapshot is unreadable"])
 
     def test_a_worktree_counts_as_the_project_it_was_cut_from(self) -> None:
         worktree = self.root / "wt-feature"
@@ -549,7 +516,7 @@ class CommandLineTests(ProjectFixture):
             encoding="utf-8",
         )
         completed = self.run_cli(
-            "context", "demo", "--snapshot", os.fspath(snapshot), "--no-intakes"
+            "context", "demo", "--snapshot", os.fspath(snapshot)
         )
         self.assertEqual(completed.returncode, cli.EXIT_OK, completed.stderr)
         value = json.loads(completed.stdout)
@@ -565,7 +532,6 @@ class CommandLineTests(ProjectFixture):
             "demo",
             "--snapshot",
             os.fspath(self.root / "absent.json"),
-            "--no-intakes",
         )
         self.assertEqual(completed.returncode, cli.EXIT_OK, completed.stderr)
         value = json.loads(completed.stdout)

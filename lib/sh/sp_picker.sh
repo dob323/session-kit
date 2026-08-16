@@ -21,9 +21,37 @@ picker_attach_id() {
   args+=(--cmd /bin/false)
   [[ -z $cwd ]] || args+=(--dir "$cwd")
   args+=("$id")
+  # The same terminal binding attach_id does, for the same reason: this is the
+  # door the login menu and the TUI picker attach through, and BOTH known ways
+  # of handing down a non-terminal descriptor reach it -- the stale /dev/null
+  # left on the picker's stderr by shpool_login_live.sh:376, and the TUI
+  # launcher's stderr FIFO (bin/shpool_login_launcher:75). X19 lane finding F1
+  # was this pair drifting apart -- a change to one belongs in the other.
+  #
+  # SCOPED here, unlike attach_id: that one execs, so its binding dies with the
+  # process, while this one returns and an unscoped binding outlived the attach
+  # -- everything `sp` printed afterwards bypassed the launcher's capture and
+  # landed on the screen out of order. Armed here, released on every exit path
+  # below and in `sp`'s traps.
+  sk_handoff_guard_arm "$id"
   sk_push_session_color "${SK_PROOF_PROVIDER:-}" "${SK_PROOF_UUID:-}"
+  # The picker's own open and takeover come through here rather than through
+  # attach_id, so the kit's tab name is written here too -- with the same kill
+  # switch and the same scrub, instead of a raw write that honoured neither.
+  sk_tab_title "$(sk_human_label "${SK_TITLE:-}" "${SK_PROVIDER:-}" "${SK_NUMBER:-}")"
+  # The scrollback refill must cover this door too: the login menu and the TUI
+  # picker attach through here, not through attach_id (X19 lane finding F1).
+  # Before the first attempt, so the 0.7s retry below never replays twice.
+  sk_replay_history "$id"
   assert_input_modes
+  if [[ $force == 1 ]] &&
+     ! sk_shpool_holder_is "$SK_PROOF_DAEMON_PID" "$SK_PROOF_DAEMON_START"; then
+    sk_handoff_guard_release 1
+    sk_die "the socket author changed before takeover; nothing was moved"
+    return 1
+  fi
   if "$SK_SHPOOL" "${args[@]}"; then
+    sk_handoff_guard_release 0
     return 0
   fi
   # One retry after a beat: takeovers and just-released sessions race the
@@ -31,7 +59,19 @@ picker_attach_id() {
   # first attempts failing regularly.
   sleep 0.7
   assert_input_modes
-  "$SK_SHPOOL" "${args[@]}"
+  local sk_attach_rc=0
+  if [[ $force == 1 ]] &&
+     ! sk_shpool_holder_is "$SK_PROOF_DAEMON_PID" "$SK_PROOF_DAEMON_START"; then
+    sk_handoff_guard_release 1
+    sk_die "the socket author changed before takeover retry; nothing was moved"
+    return 1
+  fi
+  "$SK_SHPOOL" "${args[@]}" || sk_attach_rc=$?
+  # The client has exited and been waited on, so the terminal is ours to check.
+  # A session that died badly leaves it raw -- unusable, no echo -- and this is
+  # where that gets put right instead of the person discovering it.
+  sk_handoff_guard_release "$sk_attach_rc"
+  return $sk_attach_rc
 }
 
 picker_action_event() {
@@ -87,6 +127,27 @@ picker_refresh_title() {
   return "$PICKER_REFUSED_STATUS"
 }
 
+# The picker already proved the exact displayed row.  Reuse the public model
+# verb for every safety check and for the actual restart; this adapter only
+# converts the picker's private proof into that verb's exact selector.
+picker_change_model() {
+  local proof=$1 requested=$2
+  picker_action_event model_change requested
+  picker_load_fresh "$proof" || {
+    picker_action_event model_change refused
+    return "$PICKER_REFUSED_STATUS"
+  }
+  local id=$SK_ID
+  local status=0
+  SESSION_KIT_CONFIRM_ID=$id change_model_target "$id" "$requested" || status=$?
+  if (( status == 0 )); then
+    picker_action_event model_change returned
+  else
+    picker_action_event model_change failed
+  fi
+  return "$status"
+}
+
 picker_open() {
   local proof=$1
   picker_action_event picker_open requested
@@ -115,7 +176,17 @@ picker_open() {
   # the lifetime of the attachment. Release it immediately before the guarded
   # name-only request; --cmd /bin/false prevents a persistent raced replacement.
   sk_lock_release 9
-  picker_bounce_codex "$id" automatic || picker_bounce_claude "$id" automatic || true
+  # A name first: it is the common case and it applies the colour too, since
+  # the window restarts either way. If no name can be applied but a recolour
+  # is still waiting -- the session was busy or attached when `sp color` asked
+  # -- the colour gets its own restart, which is the one an unnamed session
+  # could never get.
+  if ! picker_bounce_codex "$id" automatic && ! picker_bounce_claude "$id" automatic; then
+    if [[ -f $SK_STATE_DIR/provider-recolor/$id ]]; then
+      picker_bounce_codex "$id" automatic color ||
+        picker_bounce_claude "$id" automatic color || true
+    fi
+  fi
   if picker_attach_id "$id" "$cwd"; then
     picker_action_event picker_open returned
     return 0
@@ -140,7 +211,7 @@ picker_takeover() {
   local id=$SK_ID title=$SK_TITLE provider=$SK_PROVIDER
   sk_confirm_exact "Move session to this window" "$id" "$title" "$provider" \
     "${SK_NUMBER:-}" || {
-    echo "Move cancelled."
+    echo "Nothing changed."
     picker_action_event picker_takeover cancelled
     return "$PICKER_REFUSED_STATUS"
   }
@@ -169,37 +240,45 @@ picker_takeover() {
 picker_close() {
   local proof=$1
   picker_action_event picker_close requested
-  picker_load_fresh "$proof" || {
+  sk_prepare_state && sk_load_picker_proof "$proof" && make_guard_snapshot &&
+    { sk_picker_proof_matches "$SNAPSHOT" ||
+      sk_picker_proof_matches_dead_shell "$SNAPSHOT"; } || {
+    sk_die "displayed session changed; nothing changed"
     picker_action_event picker_close refused
     return 1
   }
   local id=$SK_ID title=$SK_TITLE provider=$SK_PROVIDER
   sk_confirm_exact "Close session and everything running inside it" \
     "$id" "$title" "$provider" "${SK_NUMBER:-}" || {
-    echo "Close cancelled."
+    echo "Nothing changed."
     picker_action_event picker_close cancelled
     return 1
   }
   picker_lock || return 1
-  if ! picker_revalidate_locked; then
+  if ! picker_revalidate_locked &&
+     ! sk_picker_proof_matches_dead_shell "$SNAPSHOT"; then
     sk_lock_release 9
     sk_die "displayed session changed while confirming; nothing closed"
     picker_action_event picker_close state_changed
     return 1
   fi
-  sk_kill_status=0
-  sk_timeout 20 "$SK_SHPOOL" kill "$id" || sk_kill_status=$?
-  if (( sk_kill_status == 124 || sk_kill_status == 137 )); then
-    sk_die "the close did not confirm within 20s — the session may or may not have ended; refresh the list before acting again"
-    sk_lock_release 9 2>/dev/null
-    return 1
-  fi
-  if (( sk_kill_status != 0 )); then
+  local shell_outcome manager_cleanup=0
+  if ! shell_outcome=$(sk_terminate_exact_shell \
+      "$SK_PROOF_DAEMON_PID" "$SK_PROOF_DAEMON_START" \
+      "$SK_PROOF_SHELL_PID" "$SK_PROOF_SHELL_START" 2>&1); then
+    sk_cleanup_dead_shpool_entry "$id" \
+      "$SK_PROOF_DAEMON_PID" "$SK_PROOF_DAEMON_START" \
+      "$SK_PROOF_SHELL_PID" "$SK_PROOF_SHELL_START" \
+      "$SK_PROOF_STARTED" || true
     sk_lock_release 9
-    sk_die "shpool refused to close the exact displayed session"
+    sk_die "the exact displayed shell was not terminated ($shell_outcome)"
     picker_action_event picker_close failed
     return 1
   fi
+  sk_cleanup_dead_shpool_entry "$id" \
+    "$SK_PROOF_DAEMON_PID" "$SK_PROOF_DAEMON_START" \
+    "$SK_PROOF_SHELL_PID" "$SK_PROOF_SHELL_START" \
+    "$SK_PROOF_STARTED" || manager_cleanup=$?
   sk_lock_release 9
   # "Everything running inside it" must be TRUE: a provider wedged on a
   # terminal write survives the shell's SIGHUP and lingers outside shpool,
@@ -208,6 +287,40 @@ picker_close() {
   sk_reap_session_leftovers \
     "${SK_PROOF_PROVIDER_PID:-}" "${SK_PROOF_PROVIDER_START:-}" \
     "${SK_PROOF_SHELL_PID:-}" "${SK_PROOF_SHELL_START:-}"
+  # Somebody chose this. The crash queue must never offer it back as work
+  # that was lost — a tombstone says the difference out loud, and the close
+  # itself is already done, so a store that cannot be written costs a
+  # diagnostic, never the close.
+  #
+  # The diagnostic has to reach THEM, not just the action log. An event nobody
+  # reads is how `k` printed a bare "Closed …" over a conversation that had
+  # landed on neither surface (found in review, 2026-08-15).
+  if [[ ${SK_PROOF_PROVIDER:-} == claude || ${SK_PROOF_PROVIDER:-} == codex ]] &&
+     [[ -n ${SK_PROOF_UUID:-} ]]; then
+    python3 "$INVENTORY_CORE" close-intent record \
+      "$SK_PROOF_PROVIDER" "$SK_PROOF_UUID" >/dev/null 2>&1 || {
+      picker_action_event picker_close intent_unrecorded
+      # The provider transcript survives, but `sp recover` validates the same
+      # broken Closed ledger and may refuse its whole list. Say that boundary
+      # rather than promising an offer the command cannot print.
+      sk_die "the session closed, but it could not be added to Closed sessions — the provider conversation remains on disk, but repair the Closed sessions ledger before relying on \`sp recover\`" || true
+    }
+  else
+    # A shell close is ledgered too, so `sp recover` lists it (history only).
+    python3 "$INVENTORY_CORE" closed-sessions record shell --session "$id" \
+      >/dev/null 2>&1 || {
+      picker_action_event picker_close intent_unrecorded
+      sk_die "the session closed, but it could not be added to Closed sessions" || true
+    }
+  fi
+  # A delegated session was given its own copy of the code; the close gives it
+  # back, and says so when it keeps one because of unmerged work.
+  sk_release_worktree "$id"
+  if (( manager_cleanup != 0 )); then
+    picker_action_event picker_close manager_entry_remains
+    sk_die "the exact shell closed, but manager entry $id remains; Session Kit could not finish the close"
+    return 1
+  fi
   picker_action_event picker_close closed
   printf 'Closed %s\n' "$(sk_human_label "$title" "$SK_PROOF_PROVIDER")"
 }
@@ -218,7 +331,7 @@ picker_close() {
 # True while an exact conversation is still visible anywhere in the live
 # inventory, including as a process outside shpool.
 conversation_is_active() {
-  local provider=$1 uuid=$2
+  local provider=$1 uuid=$2 stale_id=${3:-}
   make_guard_snapshot || return 2
   local answer
   answer=$(python3 -c '
@@ -226,7 +339,12 @@ import json,sys
 d=json.load(open(sys.argv[1]))
 wanted_provider=sys.argv[2]
 wanted_uuid=sys.argv[3].lower()
-rows=d.get("sessions",[])+d.get("outside_agents",[])
+stale_id=sys.argv[4]
+rows=[
+    row for row in d.get("sessions",[])
+    if not stale_id or row.get("shpool_id_raw") != stale_id
+]
+rows+=d.get("outside_agents",[])
 print("yes" if any(
     isinstance(row,dict)
     and row.get("provider")==wanted_provider
@@ -234,30 +352,36 @@ print("yes" if any(
     and row["identity"]["uuid"].lower()==wanted_uuid
     for row in rows
 ) else "no")
-' "$SNAPSHOT" "$provider" "$uuid") || return 2
+' "$SNAPSHOT" "$provider" "$uuid" "$stale_id") || return 2
   [[ $answer == yes ]]
 }
 
 finish_recovery_after_kill() {
   local id=$1 provider=$2 uuid=$3 cwd=$4
   local shell_pid=$5 shell_start=$6 provider_pid=$7 provider_start=$8
+  local origin SK_RESTORE_IGNORE_STALE_ID=$id
+  # An unstamped session declares NOTHING rather than declaring "human": a
+  # declaration outranks the closed-session record, so inventing one here
+  # would overwrite what the ledger knows about the conversation being
+  # reopened. Empty leaves the restore to read that record as usual.
+  origin=$(sk_session_origin "$SNAPSHOT" "$id") || origin=
   sk_reap_session_leftovers \
     "$provider_pid" "$provider_start" \
     "$shell_pid" "$shell_start"
-  # A provider wedged on a terminal write can outlive `shpool kill` by a few
+  # A provider wedged on a terminal write can outlive its shell by a few
   # seconds. Relaunching while its identity is still visible would be refused
   # as a duplicate conversation -- which would leave the session closed and
   # nothing brought back. Wait for it to disappear first.
   local attempt
   for attempt in {1..60}; do
-    conversation_is_active "$provider" "$uuid" || break
+    conversation_is_active "$provider" "$uuid" "$id" || break
     sleep 1
   done
-  if conversation_is_active "$provider" "$uuid"; then
+  if conversation_is_active "$provider" "$uuid" "$id"; then
     sk_die "the session was closed, but its conversation is still held by a live process; run 'sp recover' once it exits"
     return 1
   fi
-  restore_exact "$provider" "$uuid" "$cwd"
+  SESSION_KIT_ORIGIN=$origin restore_exact "$provider" "$uuid" "$cwd"
 }
 
 # Picker path: the displayed session could not be opened. Bound to the private
@@ -307,19 +431,24 @@ picker_recover() {
     sk_lock_release 9
     return 1
   }
-  sk_kill_status=0
-  sk_timeout 20 "$SK_SHPOOL" kill "$id" || sk_kill_status=$?
-  if (( sk_kill_status == 124 || sk_kill_status == 137 )); then
-    sk_die "the close did not confirm within 20s — the session may or may not have ended; refresh the list before acting again"
-    sk_lock_release 9 2>/dev/null
-    return 1
-  fi
-  if (( sk_kill_status != 0 )); then
+  local shell_outcome
+  if ! shell_outcome=$(sk_terminate_exact_shell \
+      "$SK_PROOF_DAEMON_PID" "$SK_PROOF_DAEMON_START" \
+      "$shell_pid" "$shell_start" 2>&1); then
+    sk_cleanup_dead_shpool_entry "$id" \
+      "$SK_PROOF_DAEMON_PID" "$SK_PROOF_DAEMON_START" \
+      "$shell_pid" "$shell_start" "$SK_PROOF_STARTED" || true
     sk_lock_release 9
-    sk_die "shpool refused to close the exact disconnected session; nothing changed"
+    sk_die "the exact disconnected shell was not terminated; nothing changed ($shell_outcome)"
     picker_action_event picker_recover failed
     return 1
   fi
+  sk_cleanup_dead_shpool_entry "$id" \
+    "$SK_PROOF_DAEMON_PID" "$SK_PROOF_DAEMON_START" \
+    "$shell_pid" "$shell_start" "$SK_PROOF_STARTED" || {
+      sk_lock_release 9
+      return 1
+    }
   sk_lock_release 9
   if finish_recovery_after_kill "$id" "$provider" "$uuid" "$cwd" \
     "$shell_pid" "$shell_start" "$provider_pid" "$provider_start"; then
@@ -327,6 +456,8 @@ picker_recover() {
     return 0
   fi
   picker_action_event picker_recover failed
+  echo "The original session was already closed. The conversation is intact on disk." >&2
+  echo "Retry with: sp restore-exact $provider $uuid $cwd" >&2
   return 1
 }
 
@@ -337,8 +468,8 @@ picker_history() {
 }
 
 account_switch_stable_snapshot() {
-  local snapshot_path=$1 id=$2 uuid=$3 provider=$4
-  python3 - "$snapshot_path" "$id" "$uuid" "$provider" <<'PY'
+  local snapshot_path=$1 id=$2 uuid=$3 provider=$4 expected_alias=${5:-}
+  python3 - "$snapshot_path" "$id" "$uuid" "$provider" "$expected_alias" <<'PY'
 import json
 import sys
 
@@ -354,6 +485,11 @@ if (
     or row.get("mutation_allowed") is not True
     or row.get("subagents")
     or int(row.get("active_subagent_count") or 0) != 0
+):
+    raise SystemExit(1)
+if sys.argv[5] and (
+    row.get("account_alias") != sys.argv[5]
+    or row.get("account_binding_mismatch") is True
 ):
     raise SystemExit(1)
 if str(row.get("agent_status") or "").casefold() not in {
@@ -417,6 +553,11 @@ for pid in seen:
         or (executable == "node" and ("/codex" in args or "playwright-mcp" in args))
         or (provider == "codex" and executable == "codex")
         or (executable in {"python", "python3"} and "provider_broker.py" in args)
+        # A provider's own hook children: Claude Code spawns a project's
+        # .claude/hooks/ scripts itself, so one of them running is the
+        # provider working, not an unrecognized background job. Refusing on
+        # them made a switch impossible in any project with a resident hook.
+        or (executable in {"python", "python3"} and "/.claude/hooks/" in args)
     )
     if not allowed:
         raise SystemExit(1)
@@ -430,17 +571,29 @@ PY
 
 account_switch_request() {
   local id=$1 action=$2 txid=$3 alias=$4 fallback=$5 uuid=$6
+  local started=$7 shell_pid=$8 shell_start=$9
+  local model=${10:-} provider=${11:-} validated=
   local directory="$SK_STATE_DIR/account-switch-requests"
   [[ $id =~ ^(main([1-9][0-9]*)?|s[0-9]{8}-[0-9]{6}-[1-9][0-9]*(-[1-9][0-9]*)?)$ &&
      $action =~ ^(apply|rollback)$ && $txid =~ ^[0-9a-f]{32}$ &&
      $alias =~ ^[a-z][a-z0-9_-]{0,11}$ &&
-     $fallback =~ ^[a-z][a-z0-9_-]{0,11}$ ]] || return 1
+     $fallback =~ ^[a-z][a-z0-9_-]{0,11}$ &&
+     $uuid =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ &&
+     $started =~ ^[1-9][0-9]*$ && $shell_pid =~ ^[1-9][0-9]*$ &&
+     $shell_start =~ ^[1-9][0-9]*$ && $provider =~ ^(claude|codex)$ &&
+     $model != *[$'\t\r\n\034']* ]] || return 1
+  if [[ -n $model ]]; then
+    validated=$(python3 "$INVENTORY_CORE" validate-worker-model \
+      "$provider" "$model" 2>/dev/null) || return 1
+    [[ $validated == "$model" ]] || return 1
+  fi
   umask 077
   mkdir -p -- "$directory" || return 1
   chmod 700 -- "$directory" || return 1
   local temporary="$directory/.${id}.$$"
-  printf '%s\t%s\t%s\t%s\t%s\n' \
-    "$action" "$txid" "$alias" "$fallback" "$uuid" > "$temporary" || return 1
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$action" "$txid" "$alias" "$fallback" "$uuid" "$started" \
+    "$shell_pid" "$shell_start" "$model" > "$temporary" || return 1
   chmod 600 -- "$temporary" || return 1
   mv -f -- "$temporary" "$directory/$id"
 }
@@ -490,21 +643,47 @@ PY
 
 account_switch_restore_source() {
   local id=$1 provider=$2 uuid=$3 source_alias=$4 target_alias=$5 txid=$6 cwd=$7
+  # `--no-recreate` stops before the destructive last resort below. A person
+  # driving the picker is present and wants the conversation back whatever it
+  # costs, so the default is unchanged; an unattended caller must not close a
+  # live session and hope the recreate lands, because the promise it is held
+  # to is that a failed handoff leaves the operator still working.
+  # The opt-out is read from anywhere in the argument list, never from one
+  # fixed position. Carrying the model added an argument in front of it, and a
+  # positional read would have turned that refactor into a silent re-arming of
+  # the kill below -- with every source-text test still green, because the flag
+  # is still written at the call site. Position is not what makes it safe.
+  local model=${8:-}
+  local SK_RESTORE_IGNORE_STALE_ID=
+  local allow_recreate=1 argument
+  for argument in "$@"; do
+    [[ $argument != --no-recreate ]] || allow_recreate=0
+  done
+  # An older caller that puts the flag where the model now goes must not have
+  # it forwarded onward as a model identifier.
+  [[ $model != --no-recreate ]] || model=
   local fresh current_alias current_pid current_start current_shell_pid current_shell_start
+  local current_started
+  local current_daemon_pid current_daemon_start
   fresh=$(mktemp "$SK_STATE_DIR/account-switch-rollback.XXXXXX") || return 1
   if sk_guard_snapshot_file "$fresh" 2>/dev/null && sk_resolve "$fresh" "$id" &&
      [[ $SK_PROVIDER == "$provider" && $SK_UUID == "$uuid" ]]; then
     current_alias=$SK_ACCOUNT_ALIAS
+    current_started=$SK_STARTED
     current_pid=$SK_PROVIDER_PID
     current_start=$SK_PROVIDER_START
     current_shell_pid=$SK_SHELL_PID
     current_shell_start=$SK_SHELL_START
+    current_daemon_pid=$SK_DAEMON_PID
+    current_daemon_start=$SK_DAEMON_START
     command rm -f -- "$fresh"
     if [[ $current_alias == "$source_alias" ]]; then
       return 0
     fi
     if [[ $current_alias == "$target_alias" ]] &&
-       account_switch_request "$id" rollback "$txid" "$source_alias" "$target_alias" "$uuid" &&
+       account_switch_request "$id" rollback "$txid" "$source_alias" \
+         "$target_alias" "$uuid" "$SK_STARTED" "$current_shell_pid" \
+         "$current_shell_start" "$model" "$provider" &&
        account_switch_signal "$provider" "$current_pid" "$current_start" \
          "$current_shell_pid" "$current_shell_start" &&
        account_switch_wait_alias "$id" "$provider" "$uuid" "$source_alias"; then
@@ -515,11 +694,19 @@ account_switch_restore_source() {
   fi
   # The managed provider did not survive long enough to consume a rollback
   # request. Recreate only this exact shell and conversation on the source.
-  "$SK_SHPOOL" kill "$id" >/dev/null 2>&1 || true
+  (( allow_recreate )) || return 1
+  [[ $current_shell_pid =~ ^[0-9]+$ && $current_shell_start =~ ^[0-9]+$ &&
+     $current_daemon_pid =~ ^[0-9]+$ && $current_daemon_start =~ ^[0-9]+$ ]] ||
+    return 1
+  sk_terminate_exact_shell "$current_daemon_pid" "$current_daemon_start" \
+    "$current_shell_pid" "$current_shell_start" >/dev/null 2>&1 || return 1
+  sk_cleanup_dead_shpool_entry "$id" "$current_daemon_pid" "$current_daemon_start" \
+    "$current_shell_pid" "$current_shell_start" "$current_started" || return 1
+  SK_RESTORE_IGNORE_STALE_ID=$id
   sk_reap_session_leftovers "${current_pid:-}" "${current_start:-}" \
     "${current_shell_pid:-}" "${current_shell_start:-}"
   python3 "$INVENTORY_CORE" account switch-rollback "$txid" >/dev/null 2>&1 || true
-  restore_exact "$provider" "$uuid" "$cwd" "$source_alias" >/dev/null 2>&1
+  restore_exact "$provider" "$uuid" "$cwd" "$source_alias" "$model" >/dev/null 2>&1
 }
 
 picker_account_switch() {
@@ -538,19 +725,11 @@ picker_account_switch() {
     sk_die "only an exact Claude or Codex conversation can change account"
     return "$PICKER_REFUSED_STATUS"
   }
-  local provider=$SK_PROVIDER uuid=$SK_UUID id=$SK_ID cwd=$SK_CWD
+  local provider=$SK_PROVIDER uuid=$SK_UUID id=$SK_ID cwd=$SK_CWD model=$SK_MODEL
+  local SK_RESTORE_IGNORE_STALE_ID=
   [[ $uuid =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || return "$PICKER_REFUSED_STATUS"
-  local supervisor_identity=
-  if [[ -f $SK_STATE_DIR/supervisor/identity && ! -L $SK_STATE_DIR/supervisor/identity ]]; then
-    supervisor_identity=$(command head -c 80 -- "$SK_STATE_DIR/supervisor/identity" 2>/dev/null)
-    supervisor_identity=${supervisor_identity//[$'\r\n']/}
-  fi
-  [[ $supervisor_identity != "$provider:$uuid" ]] || {
-    sk_die "Fleet Supervisor account switching needs a separate resident recreation; nothing changed"
-    return "$PICKER_REFUSED_STATUS"
-  }
   account_switch_stable_snapshot "$SNAPSHOT" "$id" "$uuid" "$provider" || {
-    sk_die "the thread is working, recently active, running a child agent, or its state is unproven; nothing changed"
+    sk_die "the conversation is working or its state is unproven; nothing changed"
     return "$PICKER_REFUSED_STATUS"
   }
   account_switch_safe_tree "$provider" "$SK_PROOF_SHELL_PID" "$SK_PROOF_SHELL_START" \
@@ -560,7 +739,7 @@ picker_account_switch() {
   }
   local source_json source_alias
   source_json=$(python3 "$INVENTORY_CORE" account source "$provider" "$uuid" 2>/dev/null) || {
-    sk_die "the thread's current account could not be uniquely proven; nothing changed"
+    sk_die "the conversation's current account could not be uniquely proven; nothing changed"
     return "$PICKER_REFUSED_STATUS"
   }
   source_alias=$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read()).get("alias", ""))' <<<"$source_json" 2>/dev/null) || return "$PICKER_REFUSED_STATUS"
@@ -568,14 +747,19 @@ picker_account_switch() {
     sk_die "the selected account is already active or the source changed; nothing changed"
     return "$PICKER_REFUSED_STATUS"
   }
+  local switch_error
+  switch_error=$(mktemp) || return "$PICKER_REFUSED_STATUS"
   python3 "$INVENTORY_CORE" account launch-profile "$provider" "$target_alias" \
-    >/dev/null 2>&1 || {
-    sk_die "the target account is unavailable or no longer matches its provider login; nothing changed"
+    >/dev/null 2>"$switch_error" || {
+    sk_die "$(grep -m1 . "$switch_error" 2>/dev/null ||
+      echo "the target account could not be prepared; nothing changed")"
+    command rm -f -- "$switch_error"
     return "$PICKER_REFUSED_STATUS"
   }
+  command rm -f -- "$switch_error"
   sk_confirm_exact "Change account from $source_alias to $target_alias" \
     "$id" "$SK_TITLE" "$provider" "${SK_NUMBER:-}" || {
-    echo "Account change cancelled."
+    echo "Nothing changed."
     return "$PICKER_REFUSED_STATUS"
   }
   picker_lock || return "$PICKER_REFUSED_STATUS"
@@ -584,7 +768,7 @@ picker_account_switch() {
      ! account_switch_safe_tree "$provider" "$SK_PROOF_SHELL_PID" "$SK_PROOF_SHELL_START" \
        "$SK_PROOF_PROVIDER_PID" "$SK_PROOF_PROVIDER_START"; then
     sk_lock_release 9
-    sk_die "the displayed thread changed while confirming; nothing changed"
+    sk_die "the displayed conversation changed; nothing changed"
     return "$PICKER_REFUSED_STATUS"
   fi
   local prepared txid
@@ -604,7 +788,9 @@ picker_account_switch() {
   local shell_pid=$SK_PROOF_SHELL_PID shell_start=$SK_PROOF_SHELL_START
   local provider_pid=$SK_PROOF_PROVIDER_PID provider_start=$SK_PROOF_PROVIDER_START
   if [[ $capable == true ]]; then
-    account_switch_request "$id" apply "$txid" "$target_alias" "$source_alias" "$uuid" || {
+    account_switch_request "$id" apply "$txid" "$target_alias" "$source_alias" \
+      "$uuid" "$SK_PROOF_STARTED" "$shell_pid" "$shell_start" "$model" \
+      "$provider" || {
       sk_lock_release 9
       python3 "$INVENTORY_CORE" account switch-rollback "$txid" >/dev/null 2>&1 || true
       sk_die "the account handoff request could not be written; nothing changed"
@@ -624,12 +810,12 @@ picker_account_switch() {
          "$target_alias" >/dev/null &&
        python3 "$INVENTORY_CORE" account switch-commit "$txid" >/dev/null; then
       picker_action_event account_switch committed
-      printf 'Changed terminal %s from %s to %s; the exact thread and shell were preserved.\n' \
+      printf 'Changed session %s from %s to %s. The conversation and shell were kept.\n' \
         "${SK_NUMBER:-$id}" "$source_alias" "$target_alias"
       return 0
     fi
     if account_switch_restore_source "$id" "$provider" "$uuid" "$source_alias" \
-         "$target_alias" "$txid" "$cwd"; then
+         "$target_alias" "$txid" "$cwd" "$model"; then
       sk_die "the target account did not prove itself; the original account was restored"
       picker_action_event account_switch rolled_back
     else
@@ -642,46 +828,82 @@ picker_account_switch() {
   # Legacy shells cannot reload a new profile in place. Their first switch is
   # the approved one-time recreation; the exact provider UUID keeps the same
   # terminal number, while the old window returns to Session Kit.
-  sk_kill_status=0
-  sk_timeout 20 "$SK_SHPOOL" kill "$id" || sk_kill_status=$?
-  sk_lock_release 9
-  if (( sk_kill_status != 0 )); then
+  #
+  # Read the model BEFORE the kill: it is on the live provider's command line,
+  # so it stops existing the moment the process does. A recreation that does
+  # not carry it hands the conversation back on the provider's own default,
+  # which is the kit changing a model by itself with nothing on screen.
+  local carried_model=
+  carried_model=$(sk_session_model "$SNAPSHOT" "$id") || carried_model=
+  # Two branches carried the model across this handoff and neither is
+  # redundant: `carried_model` is read from the live provider's own command
+  # line just above, which is the truthful answer, while `$model` is what the
+  # picker's row said on entry. Prefer the live reading and fall back to the
+  # row, so a failed read degrades to a worse answer rather than to none --
+  # silently starting a conversation on a different model is the trap this
+  # whole gate exists to close.
+  [[ -n $carried_model ]] || carried_model=$model
+  local shell_outcome
+  if ! shell_outcome=$(sk_terminate_exact_shell \
+      "$SK_PROOF_DAEMON_PID" "$SK_PROOF_DAEMON_START" \
+      "$shell_pid" "$shell_start" 2>&1); then
+    sk_cleanup_dead_shpool_entry "$id" \
+      "$SK_PROOF_DAEMON_PID" "$SK_PROOF_DAEMON_START" \
+      "$shell_pid" "$shell_start" "$SK_PROOF_STARTED" || true
+    sk_lock_release 9
     python3 "$INVENTORY_CORE" account switch-rollback "$txid" >/dev/null 2>&1 || true
-    sk_die "the legacy shell could not be closed safely; nothing changed"
+    sk_die "the legacy shell could not be closed safely; nothing changed ($shell_outcome)"
     return "$PICKER_REFUSED_STATUS"
   fi
+  sk_cleanup_dead_shpool_entry "$id" \
+    "$SK_PROOF_DAEMON_PID" "$SK_PROOF_DAEMON_START" \
+    "$shell_pid" "$shell_start" "$SK_PROOF_STARTED" || {
+      sk_lock_release 9
+      return "$PICKER_REFUSED_STATUS"
+    }
+  SK_RESTORE_IGNORE_STALE_ID=$id
+  sk_lock_release 9
   sk_reap_session_leftovers "$provider_pid" "$provider_start" "$shell_pid" "$shell_start"
   local attempt
   for attempt in {1..60}; do
-    conversation_is_active "$provider" "$uuid" || break
+    conversation_is_active "$provider" "$uuid" "$id" || break
     sleep 0.2
   done
-  if conversation_is_active "$provider" "$uuid" ||
+  if conversation_is_active "$provider" "$uuid" "$id" ||
      ! python3 "$INVENTORY_CORE" account switch-apply "$txid" >/dev/null 2>&1; then
     python3 "$INVENTORY_CORE" account switch-rollback "$txid" >/dev/null 2>&1 || true
-    restore_exact "$provider" "$uuid" "$cwd" "$source_alias" >/dev/null 2>&1 || true
+    restore_exact "$provider" "$uuid" "$cwd" "$source_alias" "$carried_model" \
+      >/dev/null 2>&1 || true
     sk_die "the legacy account handoff failed; Session Kit attempted to restore the original account"
     return 1
   fi
   local restored_id
-  restored_id=$(restore_exact "$provider" "$uuid" "$cwd" "$target_alias") || {
+  restored_id=$(restore_exact "$provider" "$uuid" "$cwd" "$target_alias" \
+    "$carried_model") || {
     python3 "$INVENTORY_CORE" account switch-rollback "$txid" >/dev/null 2>&1 || true
-    restore_exact "$provider" "$uuid" "$cwd" "$source_alias" >/dev/null 2>&1 || true
+    restore_exact "$provider" "$uuid" "$cwd" "$source_alias" "$carried_model" \
+      >/dev/null 2>&1 || true
     sk_die "the target account did not start; Session Kit attempted to restore the original account"
     return 1
   }
   if ! python3 "$INVENTORY_CORE" account sync-ui "$provider" "$uuid" \
        "$target_alias" >/dev/null ||
      ! python3 "$INVENTORY_CORE" account switch-commit "$txid" >/dev/null; then
-    "$SK_SHPOOL" kill "$restored_id" >/dev/null 2>&1 || true
-    python3 "$INVENTORY_CORE" account switch-rollback "$txid" >/dev/null 2>&1 || true
-    restore_exact "$provider" "$uuid" "$cwd" "$source_alias" >/dev/null 2>&1 || true
-    sk_die "the target account started but final verification failed; Session Kit attempted to restore the original account"
+    sk_die "the target account started but final verification failed; it and the pending checkpoint were left in place because no exact process proof was available for a safe rollback close"
     return 1
   fi
   picker_action_event account_switch committed_legacy
-  printf 'Changed terminal %s from %s to %s. Reopen the same number once in the original window.\n' \
+  printf 'Changed session %s from %s to %s. Reopen the same number once in the original window.\n' \
     "${SK_NUMBER:-$restored_id}" "$source_alias" "$target_alias"
+  # The model is part of what the operator is looking at. Say which one came
+  # back, and say it plainly when none could be carried, rather than leaving
+  # them to notice later that the session is answering differently.
+  if [[ -n $carried_model ]]; then
+    printf 'It comes back on %s, the model it was on.\n' "$carried_model"
+  else
+    printf 'It was not on a named model, so it comes back on %s'"'"'s own default.\n' \
+      "$provider"
+  fi
 }
 
 picker_alias() {
@@ -761,13 +983,15 @@ picker_fork() {
     sk_lock_release 9
     return 1
   }
-  if ! sk_timeout 30 "$SK_SHPOOL" attach --background --dir "$cwd" "$id"; then
+  if ! sk_attach_new_unique "$id" "$cwd"; then
+    id=$SK_ATTACHED_ID
     local quarantine
     quarantine=$(sk_quarantine_start_record "$id" attach-failed 2>/dev/null || true)
     sk_lock_release 9
     sk_die "shpool did not confirm fork shell creation; launch record quarantined at ${quarantine:-$SK_START_DIR/failed}"
     return 1
   fi
+  id=$SK_ATTACHED_ID
   if ! sk_capture_session_generation "$id" "$creation_floor_ms"; then
     local quarantine
     quarantine=$(sk_quarantine_start_record "$id" generation-unproven 2>/dev/null || true)
@@ -779,6 +1003,11 @@ picker_fork() {
   local created_boot_id=$SK_CREATED_BOOT_ID
   local created_shell_pid=$SK_CREATED_SHELL_PID created_shell_start=$SK_CREATED_SHELL_START
   local created_daemon_pid=$SK_CREATED_DAEMON_PID created_daemon_start=$SK_CREATED_DAEMON_START
+  # A fork is stamped only after its exact shell generation is captured. A
+  # momentarily unstamped row stays visible; a name-only stamp could hide a
+  # different session that later reuses this manager name.
+  sk_record_origin "$id" "$(sk_environment_origin)" "$created_started" \
+    "$created_shell_pid" "$created_shell_start"
   sk_write_generation_record "$id" "$provider" "$cwd" "$source_uuid" \
     "$created_boot_id" "$created_started" "$created_shell_pid" "$created_shell_start" \
     "$created_daemon_pid" "$created_daemon_start" fork || {

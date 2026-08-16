@@ -28,15 +28,16 @@ install -m 755 ~/shpool-build/shpool ~/.cargo/bin/shpool
 ~/.cargo/bin/shpool version   # -> shpool 0.11.0
 ```
 
-The shpool GitHub releases page does carry prebuilt static tarballs
-(x86_64/aarch64, gnu and musl), but they lag well behind — 0.6.3 at the time
-of writing against 0.11.0 on crates.io — and the kit's config is untested
-against them. Use one of the two routes above.
+The shpool GitHub releases page may carry prebuilt archives for several Linux
+architectures and C-library targets, but Session Kit accepts only shpool
+0.11.0. Use one of the two pinned routes above unless an official archive is
+that exact version and you verify it before installation.
 
 Podman works the same way: replace `docker run` with `podman run`. The build
 needs no privileges beyond running a container, and the container is discarded
 when it exits.
 
-Either route yields a static-pie executable (check with `file`) — it runs on
-any x86-64 Linux regardless of glibc version, which is why the kit keeps the
-binary at `~/.cargo/bin/shpool` and the systemd unit points there.
+The container route yields a static-pie executable for the container host's
+architecture (check with `file`), independent of the host's glibc version.
+Session Kit does not require `~/.cargo/bin/shpool`: installation records the
+absolute result of `command -v shpool` in the generated service definition.

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import errno
 from datetime import datetime
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -9,10 +10,13 @@ import pty
 import re
 import select
 import signal
+import struct
 import tempfile
+import termios
 import time
 import unicodedata
 import unittest
+from collections.abc import Callable
 
 from tests.support import REPO, run
 
@@ -21,14 +25,32 @@ LOGIN = REPO / "bin" / "shpool_login"
 SGR = re.compile(r"\x1b\[([0-9;]*)m")
 # Tab-title sequences render zero cells in a real terminal.
 OSC_TITLE = re.compile(r"\x1b\][0-9;]*[^\x07\x1b]*(?:\x07|\x1b\\)")
+# Cursor moves, erases, and synchronized-frame markers render zero cells too.
+# A capture keeps them inline, so a line that carries a screen clear is not
+# actually wider on the terminal that draws it.
+CSI = re.compile(r"\x1b\[[0-9;?]*[@-~]")
 
 
 def strip_sgr(text: str) -> str:
     return OSC_TITLE.sub("", SGR.sub("", text))
 
 
+# Every non-SGR sequence the picker is allowed to emit on a capable terminal,
+# enumerated so a test that forbids escapes forbids the ones that came from
+# session content. Screen clear and cursor home start a frame; bracketed paste
+# is armed around a prompt so a pasted block arrives as data (see
+# tests/test_picker_input_safety.py).
+PICKER_SCREEN_CONTROL = ("\x1b[2J", "\x1b[H", "\x1b[?2004h", "\x1b[?2004l")
+
+
+def strip_screen_control(text: str) -> str:
+    for sequence in PICKER_SCREEN_CONTROL:
+        text = text.replace(sequence, "")
+    return text
+
+
 def display_cells(text: str) -> int:
-    text = strip_sgr(text)
+    text = CSI.sub("", strip_sgr(text))
     return sum(
         0
         if unicodedata.combining(character)
@@ -117,30 +139,50 @@ def inventory(*rows: dict, stale: bool = False) -> dict:
     }
 
 
-def write_session_event(
-    fixture: "LoginFixture",
-    item: dict,
-    event: str,
-    timestamp_ms: int,
-) -> None:
-    event_root = fixture.state / "events"
-    event_root.mkdir(exist_ok=True)
-    identity = item.get("identity") or {}
-    key = f"{item.get('provider')}:{identity.get('uuid')}"
-    path = event_root / f"{key}.jsonl"
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(
-            json.dumps(
-                {
-                    "event": event,
-                    "question": None,
-                    "source": "hook" if item.get("provider") == "claude" else "synth",
-                    "ts_unix_ms": timestamp_ms,
-                },
-                separators=(",", ":"),
-            )
-            + "\n"
-        )
+def _recovery_rows(pending: dict | None) -> dict:
+    """Build what `--recovery-pending-list` returns, with the real projection.
+
+    A case writes the STORE it cares about -- a pending record, or a session
+    closed on purpose -- and the module both surfaces read turns it into the
+    payload. Hand-writing that payload is how a renamed timestamp field
+    reached the screen: the fixture went on describing a shape the emitter had
+    stopped producing, so the test for the picker's age line kept passing
+    against a record the emitter cannot make.
+    """
+    import sys as _sys
+
+    _sys.path.insert(0, os.fspath(REPO / "lib"))
+    from sessionkit_inventory import recovery_list
+
+    document = pending or {"schema_version": 1, "entries": []}
+    now_ms = int(time.time() * 1000)
+    closed_rows: list[dict] = []
+    pending_entries: list[dict] = []
+    numbers: dict[str, int] = {}
+    for index, row in enumerate(document.get("entries") or [], 1):
+        filled = dict(row)
+        # A case that says nothing about time still needs an order, and an age
+        # that reads like one rather than fifty years.
+        filled.setdefault("started_at_unix_ms", now_ms - index * 60_000)
+        # A case that does not say otherwise describes numbered rows, which is
+        # the normal shape: a conversation keeps its number across the close.
+        # `numbered: False` asks for the row whose number was retired.
+        uuid = str(filled.get("uuid") or "")
+        provider = str(filled.get("provider") or "")
+        if uuid and provider and filled.pop("numbered", True):
+            numbers[f"ai:{provider}:{uuid}"] = index
+        if filled.get("closed_at_unix_ms"):
+            filled.setdefault("restorable", True)
+            closed_rows.append(filled)
+        else:
+            filled.setdefault("actionable", True)
+            pending_entries.append(filled)
+    rows = recovery_list.recovery_rows(
+        closed_rows=closed_rows,
+        pending_entries=pending_entries,
+        numbers=numbers,
+    )
+    return {**document, "entries": rows}
 
 
 class LoginFixture:
@@ -183,7 +225,7 @@ class LoginFixture:
         self.snapshot_count = self.base / "snapshot-count"
         self.pending = self.base / "pending.json"
         self.pending.write_text(
-            json.dumps(pending or {"schema_version": 1, "entries": []}),
+            json.dumps(_recovery_rows(pending)),
             encoding="utf-8",
         )
         self.prompt_quarantine = self.base / "prompt-quarantine.json"
@@ -218,6 +260,11 @@ if args == ["--json"]:
     print(source.read_text(),end="")
 elif args == ["--recovery-pending-list"]:
     print(pathlib.Path(os.environ["LOGIN_PENDING"]).read_text(),end="")
+elif len(args) == 2 and args[0] == "--recovery-remember-printed":
+    # The real status command writes down what this screen is about to print,
+    # so `sp restore` can check a word typed later against it. It prints
+    # nothing to the screen; LOGIN_REMEMBER_EXIT makes it fail on purpose.
+    raise SystemExit(int(os.environ.get("LOGIN_REMEMBER_EXIT", "0")))
 elif len(args) == 4 and args[0] == "--recovery-pending-ack":
     print("{}")
     raise SystemExit(int(os.environ.get("LOGIN_ACK_EXIT", "0")))
@@ -235,24 +282,38 @@ if args == ["prompt-quarantine","list","--json"]:
     raise SystemExit(0)
 if len(args) == 3 and args[:2] == ["account","choices"]:
     provider=args[2]
+    second_ok=os.environ.get("LOGIN_ACCOUNT_SECOND_ELIGIBLE", "1") != "0"
     print(json.dumps({
         "provider":provider,
+        "roster_fresh":True,
+        "roster_state":"fresh",
+        "advice_fresh":True,
         "recommendation":None,
+        "recommendation_reason":"",
+        "recommendation_blocked":None,
         "choices":[
             {
-                "alias":"duck",
+                "alias":"wren",
                 "email":"account@example.com",
                 "plan":"subscription",
                 "eligible":True,
+                "state":"ready",
                 "health":"ok",
+                "serving":True,
+                "u5h":0.0,
+                "u7d":0.75,
                 "recommended":False,
             },
             {
                 "alias":"work",
                 "email":"work@example.com",
                 "plan":"subscription",
-                "eligible":os.environ.get("LOGIN_ACCOUNT_SECOND_ELIGIBLE", "1") != "0",
-                "health":"ok" if os.environ.get("LOGIN_ACCOUNT_SECOND_ELIGIBLE", "1") != "0" else "error",
+                "eligible":second_ok,
+                "state":"ready" if second_ok else "blocked: health error",
+                "health":"ok" if second_ok else "error",
+                "serving":False,
+                "u5h":0.34,
+                "u7d":0.36,
                 "recommended":False,
             },
         ],
@@ -260,6 +321,7 @@ if len(args) == 3 and args[:2] == ["account","choices"]:
     raise SystemExit(0)
 entry={"args":args}
 if args and args[0].startswith("picker-"):
+    entry["confirm_id"]=os.environ.get("SESSION_KIT_CONFIRM_ID","")
     proof=pathlib.Path(args[1])
     metadata=proof.lstat()
     entry["proof"]=json.loads(proof.read_text())
@@ -296,6 +358,12 @@ raise SystemExit(int(os.environ.get("LOGIN_SP_EXIT","0")))
                 "SESSION_KIT_SP_CMD": str(self.fake_sp),
                 "SESSION_KIT_NONINTERACTIVE": "0",
                 "SESSION_KIT_NO_COLOR": "1",
+                # The stub shpool here cannot carry an event stream, so every
+                # fixture that is not about events measures the timed poll --
+                # which is also what a machine without the events socket runs.
+                # tests/test_picker_events.py turns it back on with a stub that
+                # speaks the stream.
+                "SESSION_KIT_PICKER_EVENTS": "0",
                 "LOGIN_INVENTORY": str(self.inventory),
                 "LOGIN_REFRESHED_INVENTORY": str(self.refreshed_inventory),
                 "LOGIN_SNAPSHOT_COUNT": str(self.snapshot_count),
@@ -336,10 +404,16 @@ def run_pty(
     columns: int = 100,
     sp_exit: int = 0,
     send_signal: int | None = None,
+    signal_marker: str = "❯ ",
     post_signal_bytes: bytes = b"",
+    post_signal_marker: str | None = None,
     env_updates: dict[str, str | None] | None = None,
     deferred: tuple[str, bytes] | None = None,
     deferred_delay_seconds: float = 0,
+    deferred_action: Callable[[], None] | None = None,
+    deferred_check: Callable[[], None] | None = None,
+    followup: tuple[str, bytes, float] | None = None,
+    pty_winsize: tuple[int, int] | None = None,
 ) -> tuple[int, str]:
     environment = fixture.env(
         lines=lines, columns=columns, sp_exit=sp_exit
@@ -377,6 +451,17 @@ def run_pty(
         finally:
             os._exit(127)
 
+    if pty_winsize is not None:
+        # Give the slave a real window size so the ioctl path is exercised.
+        # The child spends tens of milliseconds sourcing modules before
+        # anything measures the terminal, so this lands well ahead of it.
+        winsize_rows, winsize_cols = pty_winsize
+        fcntl.ioctl(
+            descriptor,
+            termios.TIOCSWINSZ,
+            struct.pack("HHHH", winsize_rows, winsize_cols, 0, 0),
+        )
+
     output = bytearray()
     deadline = time.monotonic() + 10
     try:
@@ -407,11 +492,51 @@ def run_pty(
                     f"picker never rendered {marker!r} on its own; "
                     f"output={output.decode(errors='replace')!r}"
                 )
+            if deferred_action is not None:
+                deferred_action()
             if deferred_delay_seconds > 0:
                 time.sleep(deferred_delay_seconds)
+            if deferred_check is not None:
+                deferred_check()
             os.write(descriptor, payload)
+        if followup is not None:
+            # A second scripted beat for flows that hand the terminal to a
+            # NEW process mid-run (the upgrade handoff): wait for a marker
+            # only that successor can print, then type into it. The deadline
+            # is the followup's own — recovery spans exec boundaries and can
+            # honestly take longer than the marker wait above.
+            followup_marker, followup_payload, followup_wait = followup
+            followup_deadline = time.monotonic() + followup_wait
+            while (
+                followup_marker.encode() not in output
+                and time.monotonic() < followup_deadline
+            ):
+                ready, _, _ = select.select([descriptor], [], [], 0.05)
+                if not ready:
+                    continue
+                try:
+                    chunk = os.read(descriptor, 65536)
+                except OSError as exc:
+                    if exc.errno != errno.EIO:
+                        raise
+                    break
+                if not chunk:
+                    break
+                output.extend(chunk)
+            if followup_marker.encode() not in output:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+                raise AssertionError(
+                    f"picker never rendered {followup_marker!r} after the "
+                    f"deferred stage; output={output.decode(errors='replace')!r}"
+                )
+            deadline = max(deadline, time.monotonic() + 8)
+            os.write(descriptor, followup_payload)
         if send_signal is not None:
-            prompt = "❯ ".encode()
+            # Which prompt the signal is aimed at. A modal has to be on screen
+            # before an interrupt can be said to have cancelled it, and the
+            # home prompt is already there by then.
+            prompt = signal_marker.encode()
             signal_deadline = min(deadline, time.monotonic() + 5)
             while prompt not in output and time.monotonic() < signal_deadline:
                 ready, _, _ = select.select([descriptor], [], [], 0.05)
@@ -428,11 +553,39 @@ def run_pty(
                 output.extend(chunk)
             if prompt not in output:
                 raise AssertionError(
-                    "picker PTY did not render its prompt before the signal"
+                    f"picker PTY never rendered {signal_marker!r} before the signal; "
+                    f"output={output.decode(errors='replace')!r}"
                 )
             os.kill(pid, send_signal)
             if post_signal_bytes:
-                time.sleep(0.3)
+                if post_signal_marker is None:
+                    time.sleep(0.3)
+                else:
+                    # Type only once the picker has answered the signal. A
+                    # fixed sleep races the answer, and a keystroke that lands
+                    # first is consumed by the very prompt under test.
+                    answer = post_signal_marker.encode()
+                    answer_deadline = min(deadline, time.monotonic() + 5)
+                    while (
+                        answer not in output and time.monotonic() < answer_deadline
+                    ):
+                        ready, _, _ = select.select([descriptor], [], [], 0.05)
+                        if not ready:
+                            continue
+                        try:
+                            chunk = os.read(descriptor, 65536)
+                        except OSError as exc:
+                            if exc.errno != errno.EIO:
+                                raise
+                            break
+                        if not chunk:
+                            break
+                        output.extend(chunk)
+                    if answer not in output:
+                        raise AssertionError(
+                            f"picker never printed {post_signal_marker!r} after the "
+                            f"signal; output={output.decode(errors='replace')!r}"
+                        )
                 os.write(descriptor, post_signal_bytes)
         status = None
         while time.monotonic() < deadline:
@@ -477,38 +630,144 @@ def run_pty(
 
 
 class LoginPickerTests(unittest.TestCase):
-    def test_enter_and_eof_return_regular_shell_without_action(self) -> None:
+    def test_quit_and_eof_return_regular_shell_without_action(self) -> None:
         for label, payload in (
-            ("enter", b"\n"),
+            ("quit", b"q\n"),
             ("eof", b"\x04"),
         ):
             with self.subTest(label=label):
                 fixture = LoginFixture(inventory(row("ready", number=9)))
                 try:
                     code, _ = run_pty(fixture, payload)
-                    self.assertEqual(2, code)
+                    self.assertEqual(0, code)
                     self.assertEqual([], fixture.sp_entries())
                     self.assertEqual([], fixture.picker_temps())
                 finally:
                     fixture.close()
 
+    def test_enter_on_the_home_list_opens_the_top_row(self) -> None:
+        """Enter takes the most likely option: the row drawn first.
+
+        It used to drop the person into a bare shell, so the one key a menu
+        trains you to press was the one that left without doing anything.
+        """
+        fixture = LoginFixture(
+            inventory(
+                row("second", number=4),
+                row("top", number=9, needs_you=True),
+            )
+        )
+        try:
+            code, output = run_pty(fixture, b"\nq\n")
+            self.assertEqual(0, code)
+            # The footer promised the number, and the open used it.
+            self.assertIn("↵ open 9", output)
+            entries = fixture.sp_entries()
+            self.assertEqual(["picker-open"], [entry["args"][0] for entry in entries])
+            self.assertEqual("top", entries[0]["proof"]["shpool_id"])
+            # And the picker was still there afterwards: q is what ended it,
+            # so the list was drawn again after the open attempt returned.
+            self.assertGreaterEqual(output.count("↵ open 9"), 2)
+        finally:
+            fixture.close()
+
+    def test_enter_on_an_empty_list_opens_the_new_session_screen(self) -> None:
+        fixture = LoginFixture(inventory())
+        try:
+            code, output = run_pty(fixture, b"\nb\nq\n")
+            self.assertEqual(0, code)
+            self.assertIn("↵ new", output)
+            self.assertIn("New session", output)
+            self.assertIn("↵ Claude Code", output)
+            self.assertEqual([], fixture.sp_entries())
+        finally:
+            fixture.close()
+
+    def test_the_home_footer_names_the_row_enter_opens_and_the_way_out(self) -> None:
+        """The footer promises a number, and the dispatcher opens that one.
+
+        Both read the same page slice, so the promise and the action cannot
+        disagree -- and the door out is named for the keys that take it.
+        """
+        fixture = LoginFixture(
+            inventory(
+                row("second", number=2),
+                row("top", number=7, needs_you=True),
+            )
+        )
+        try:
+            code, output = run_pty(fixture, b"q\n", columns=120)
+            self.assertEqual(0, code)
+            footers = [
+                line
+                for line in strip_sgr(output).splitlines()
+                if line.strip().startswith("↵ open")
+            ]
+            self.assertTrue(footers, output)
+            self.assertTrue(
+                footers[-1].startswith("  ↵ open 7 · # · kill k #"), footers[-1]
+            )
+            self.assertIn("leave q or b", footers[-1])
+            self.assertNotIn("back ↵ or b", output)
+        finally:
+            fixture.close()
+
+    def test_the_home_footer_fits_every_width_and_keeps_the_enter_hint(self) -> None:
+        """The hint that names Enter is the last thing a narrow window loses.
+
+        The footer used to be four hand-sized width tiers, and the Enter hint
+        -- whose width follows the row number it names -- overflowed the
+        narrowest of them the day it landed.
+        """
+        document = inventory(
+            row("second", number=2),
+            row("top", number=7, needs_you=True),
+        )
+        for columns in (30, 40, 50, 60, 80, 120):
+            with self.subTest(columns=columns):
+                fixture = LoginFixture(document)
+                try:
+                    code, output = run_pty(fixture, b"q\n", columns=columns)
+                    self.assertEqual(0, code)
+                    footers = [
+                        line
+                        for line in strip_sgr(output).splitlines()
+                        if line.strip().startswith("↵ open")
+                    ]
+                    self.assertTrue(footers, output)
+                    for line in footers:
+                        self.assertLessEqual(display_cells(line), columns - 1, line)
+                    self.assertTrue(footers[-1].startswith("  ↵ open 7"), footers[-1])
+                    # Segments are ordered by what a person needs, so what a
+                    # narrow window drops is the luxury and not the door:
+                    # `more` reaches projects, closed sessions, and everything
+                    # outside the kit, and it survives where `history h #`
+                    # and the rest do not.
+                    if columns >= 50:
+                        self.assertIn("more m", footers[-1])
+                    if columns == 50:
+                        self.assertNotIn("needs you a", footers[-1])
+                        self.assertNotIn("history h #", footers[-1])
+                finally:
+                    fixture.close()
+
     def test_interrupt_redraws_menu_instead_of_exiting(self) -> None:
         # A stray Ctrl-C must never dump the human to a bare terminal: the
-        # picker redraws its menu and only a deliberate Enter/quit ends it.
+        # picker redraws its menu and only a deliberate quit ends it.
         fixture = LoginFixture(inventory(row("ready", number=9)))
         try:
             code, output = run_pty(
                 fixture,
                 b"",
                 send_signal=signal.SIGINT,
-                post_signal_bytes=b"\n",
+                post_signal_bytes=b"q\n",
             )
-            self.assertEqual(2, code)
+            self.assertEqual(0, code)
             # The exit reason proves the interrupt was absorbed: the picker
-            # ended through the deliberate Enter that followed, not the signal.
+            # ended through the deliberate q that followed, not the signal.
             log = fixture.state / "action-events.jsonl"
             events = log.read_text() if log.exists() else ""
-            self.assertIn("terminal_requested", events)
+            self.assertIn("quit", events)
             self.assertEqual([], fixture.sp_entries())
         finally:
             fixture.close()
@@ -540,21 +799,20 @@ class LoginPickerTests(unittest.TestCase):
             )
         )
         try:
-            code, output = run_pty(fixture, b"/codex10\n\n")
-            self.assertEqual(2, code)
+            code, output = run_pty(fixture, b"/codex10\nq\n")
+            self.assertEqual(0, code)
             self.assertIn(
-                "4 sessions · 3 ready here · 1 open elsewhere", output
+                "4 sessions · 3 ready · 1 open elsewhere", output
             )
-            self.assertIn("Ready to open", output)
+            self.assertIn("Ready", output)
             self.assertIn("Open elsewhere", output)
-            self.assertIn("status unavailable", output)
-            self.assertIn("| CDX | unknown | status unavailable", output)
+            self.assertIn("| CDX | pe… | pe… | pending", output)
             self.assertNotIn("state unavailable", output)
             self.assertLess(output.index("claude1"), output.index("claude2"))
             self.assertIn("1 match of 4 sessions", output)
             self.assertRegex(
                 output,
-                r"(?m)^\s+10\s+Searchable task\s+\| CDX \| unknown \| working\s+\| opened Nov 14, 2023$",
+                r"(?m)^\s+10\s+Searchable task \| CDX \| pe… \| pe… \| working \| last active pending$",
             )
             self.assertNotIn("[codex10]", output)
             self.assertEqual([], fixture.sp_entries())
@@ -578,11 +836,11 @@ class LoginPickerTests(unittest.TestCase):
             refreshed_document=inventory(after),
         )
         try:
-            code, output = run_pty(fixture, b"r\n7401\n\n\n")
-            self.assertEqual(2, code)
+            code, output = run_pty(fixture, b"r\n7401\nb\nq\n")
+            self.assertEqual(0, code)
             self.assertRegex(output, r"(?m)^\s+7401\s+Unknown transition")
             self.assertRegex(output, r"(?m)^\s+7401\s+Codex transition")
-            self.assertIn("Already open in another SSH window", output)
+            self.assertIn("Open elsewhere.", output)
             self.assertEqual([], fixture.sp_entries())
         finally:
             fixture.close()
@@ -598,21 +856,30 @@ class LoginPickerTests(unittest.TestCase):
         try:
             code, output = run_pty(
                 fixture,
-                f"{huge}\nnext\n{huge}\n\n".encode(),
+                f"{huge}\nnext\n{huge}\nq\n".encode(),
                 lines=24,
                 columns=60,
             )
-            self.assertEqual(2, code)
+            self.assertEqual(0, code)
             self.assertIn(
-                "Choose a number shown here. Nothing changed.",
+                "on this screen. Numbers shown here work.",
                 output,
             )
-            self.assertRegex(output, rf"(?m)^\s+{huge}\s+Codex s…")
+            # No longer truncated: the title column is sized against the pair
+            # rather than against the state word alone.
+            self.assertRegex(output, rf"(?m)^\s+{huge}\s+Codex s24")
             entries = fixture.sp_entries()
             self.assertEqual(["picker-open"], [entry["args"][0] for entry in entries])
             self.assertEqual("s24", entries[0]["proof"]["shpool_id"])
             self.assertLessEqual(
-                max(display_cells(line) for line in output.splitlines()[2:]),
+                max(
+                    display_cells(line)
+                    for line in output.splitlines()[2:]
+                    # The refusal names the number that was typed, and this one
+                    # is twenty digits long. The rule under test is that the
+                    # list frame fits the window.
+                    if "Numbers shown here work." not in line
+                ),
                 59,
             )
         finally:
@@ -621,19 +888,24 @@ class LoginPickerTests(unittest.TestCase):
     def test_missing_terminal_number_is_not_renumbered_or_actionable(self) -> None:
         unsafe = row("no-number", number=1)
         unsafe["terminal_number"] = None
+        unsafe["mutation_allowed"] = False
+        unsafe["mutation_rejection_reason"] = "missing-shell-generation"
         fixture = LoginFixture(inventory(unsafe))
         try:
-            code, output = run_pty(fixture, b"1\nm\n\n\n")
-            self.assertEqual(2, code)
+            code, output = run_pty(fixture, b"1\nm\n\nq\n")
+            self.assertEqual(0, code)
+            self.assertNotIn("Codex no-number", output)
+            self.assertIn("Sessions: none.", output)
+            self.assertNotIn("0 sessions", output)
+            self.assertIn("more m", output)
             self.assertIn(
-                "0 sessions · 0 ready here · 0 open elsewhere", output
-            )
-            self.assertIn("More m", output)
-            self.assertIn(
-                "Unavailable: 1 session record without a live shell (no actions",
+                "Unavailable: 1 session whose shell is gone",
                 output,
             )
-            self.assertIn("Choose a number shown here. Nothing changed.", output)
+            # The one thing the count never said: what clears it, and where to
+            # read the rest.
+            self.assertIn("sp help unavailable", output)
+            self.assertIn("on this screen. Numbers shown here work.", output)
             self.assertNotIn("[no-number]", output)
             self.assertEqual([], fixture.sp_entries())
         finally:
@@ -643,15 +915,17 @@ class LoginPickerTests(unittest.TestCase):
         exact = row("exact", number=9, availability="attached")
         unavailable = row("no-shell", number=2)
         unavailable["terminal_number"] = None
+        unavailable["mutation_allowed"] = False
+        unavailable["mutation_rejection_reason"] = "missing-shell-generation"
         fixture = LoginFixture(inventory(exact, unavailable))
         try:
-            code, output = run_pty(fixture, b"k 2\nk 9\nm\n\n\n")
-            self.assertEqual(2, code)
+            code, output = run_pty(fixture, b"k 2\nk 9\nm\n\nq\n")
+            self.assertEqual(0, code)
             self.assertIn(
-                "Unavailable: 1 session record without a live shell (no actions",
+                "Unavailable: 1 session whose shell is gone",
                 output,
             )
-            self.assertIn("2 is not shown here. Nothing changed.", output)
+            self.assertIn("There is no session 2 on this screen.", output)
             self.assertNotIn("[no-shell]", output)
             entries = fixture.sp_entries()
             self.assertEqual(1, len(entries))
@@ -664,9 +938,9 @@ class LoginPickerTests(unittest.TestCase):
         rows = tuple(row(f"s{number}", number=number) for number in range(1, 26))
         fixture = LoginFixture(inventory(*rows))
         try:
-            code, output = run_pty(fixture, b"17\nnext\n17\n\n", lines=24)
-            self.assertEqual(2, code)
-            self.assertIn("Choose a number shown here", output)
+            code, output = run_pty(fixture, b"17\nnext\n17\nq\n", lines=24)
+            self.assertEqual(0, code)
+            self.assertIn("on this screen. Numbers shown here work.", output)
             self.assertIn("Page 1/2 | next", output)
             self.assertIn("Page 2/2 | prev", output)
             entries = fixture.sp_entries()
@@ -695,6 +969,36 @@ class LoginPickerTests(unittest.TestCase):
             self.assertEqual("session-kit-picker-session-v1", proof["proof_type"])
             self.assertEqual("s17", proof["shpool_id"])
             self.assertEqual([], fixture.picker_temps())
+        finally:
+            fixture.close()
+
+    def test_rows_fit_the_real_pty_width_when_no_size_is_exported(self) -> None:
+        """Production exports no COLUMNS/LINES: with the frame captured to a
+        file, the picker must still measure the real terminal, not a probe
+        fallback, or every row lays out for a 100-column window."""
+        fixture = LoginFixture(
+            inventory(
+                row(
+                    "alpha-with-a-fairly-long-name-that-must-truncate-somewhere",
+                    number=3,
+                )
+            )
+        )
+        try:
+            code, output = run_pty(
+                fixture,
+                b"q\n",
+                env_updates={"COLUMNS": None, "LINES": None},
+                pty_winsize=(24, 40),
+            )
+            self.assertEqual(0, code)
+            self.assertRegex(output, r"\s3\s+\S")
+            for line in output.splitlines()[2:]:
+                self.assertLessEqual(
+                    display_cells(line),
+                    39,
+                    f"line wider than the 40-column terminal: {line!r}",
+                )
         finally:
             fixture.close()
 
@@ -756,9 +1060,9 @@ class LoginPickerTests(unittest.TestCase):
                     fixture = LoginFixture(document)
                     try:
                         code, output = run_pty(
-                            fixture, b"\n", lines=lines, columns=columns
+                            fixture, b"q\n", lines=lines, columns=columns
                         )
-                        self.assertEqual(2, code)
+                        self.assertEqual(0, code)
                         self.assertNotIn("  Page ", output)
                         rendered = output.splitlines()[2:]
                         self.assertLessEqual(
@@ -799,18 +1103,18 @@ class LoginPickerTests(unittest.TestCase):
         try:
             code, output = run_pty(
                 fixture,
-                b"next\nnext\nprev\n/d3\n\n",
+                b"next\nnext\nprev\n/d3\nq\n",
                 lines=24,
                 columns=80,
             )
-            self.assertEqual(2, code)
+            self.assertEqual(0, code)
             self.assertIn("Page 1/2 | next", output)
             self.assertIn("Page 2/2 | prev", output)
             self.assertIn("1 match of 31 sessions", output)
             self.assertNotIn("Page 1/1", output)
             self.assertRegex(
                 output,
-                r"(?m)^\s+11\s+Codex d3\s+\| CDX \| unknown \| working\s+\| opened Nov 14, 2023$",
+                r"(?m)^\s+11\s+Codex d3\s+\| CDX \| pe… \| pe… \| working \| last active pending$",
             )
             self.assertEqual([], fixture.sp_entries())
         finally:
@@ -845,16 +1149,20 @@ class LoginPickerTests(unittest.TestCase):
             )
         )
         try:
-            code, output = run_pty(fixture, b"\n", lines=30, columns=120)
-            self.assertEqual(2, code)
-            self.assertEqual(2, output.count("needs your reply"))
+            code, output = run_pty(fixture, b"q\n", lines=30, columns=120)
+            self.assertEqual(0, code)
+            # Three: the footer's "needs you a", and the two blocking rows'
+            # state slots — one word for one state since the needs-you rename.
+            self.assertEqual(3, output.count("needs you"))
             self.assertLess(output.index("reply-codex"), output.index("ready-claude"))
             self.assertLess(
                 output.index("reply-open-codex"), output.index("open-claude")
             )
             self.assertIn("optional", output)
-            self.assertIn("reply optional", output)
-            self.assertNotIn("! reply optional", output)
+            # "reply optional" is the collector's word for a session that is
+            # still working, and the screen speaks one vocabulary.
+            self.assertNotIn("reply optional", output)
+            self.assertEqual(3, output.count("| working"))
         finally:
             fixture.close()
 
@@ -871,13 +1179,13 @@ class LoginPickerTests(unittest.TestCase):
         )
         fixture = LoginFixture(inventory(pending, failed, blocking))
         try:
-            code, output = run_pty(fixture, b"\n", columns=120)
-            self.assertEqual(2, code)
+            code, output = run_pty(fixture, b"q\n", columns=120)
+            self.assertEqual(0, code)
             self.assertLess(output.index("blocking"), output.index("pending"))
             self.assertLess(output.index("blocking"), output.index("failed"))
-            self.assertRegex(output, r"working\s+\| opened .* \| name pending")
-            self.assertRegex(output, r"working\s+\| opened .* \| name failed")
-            self.assertEqual(1, output.count("needs your reply"))
+            self.assertIn("name pending", output)
+            self.assertIn("name failed", output)
+            self.assertEqual(1, output.count("| needs you |"))
         finally:
             fixture.close()
 
@@ -891,8 +1199,8 @@ class LoginPickerTests(unittest.TestCase):
         pending["provider_title_state"] = "pending"
         fixture = LoginFixture(inventory(pending))
         try:
-            code, output = run_pty(fixture, b"\n", columns=120)
-            self.assertEqual(2, code)
+            code, output = run_pty(fixture, b"q\n", columns=120)
+            self.assertEqual(0, code)
             self.assertIn("working", output)
             self.assertNotIn("title pending", output)
         finally:
@@ -908,10 +1216,51 @@ class LoginPickerTests(unittest.TestCase):
         deferred["provider_title_state"] = "deferred"
         fixture = LoginFixture(inventory(deferred))
         try:
-            code, output = run_pty(fixture, b"\n", columns=120)
-            self.assertEqual(2, code)
+            code, output = run_pty(fixture, b"q\n", columns=120)
+            self.assertEqual(0, code)
             self.assertNotIn("title pending", output)
             self.assertIn("working", output)
+        finally:
+            fixture.close()
+
+    def test_enter_on_the_open_elsewhere_panel_moves_the_session_here(self) -> None:
+        """Enter takes the most likely option on that panel.
+
+        A person who picked a session that is open elsewhere almost always
+        wants it here; Enter used to walk back out of the panel instead.
+        """
+        elsewhere = row(
+            "open-elsewhere",
+            number=6,
+            provider="codex",
+            availability="attached",
+        )
+        fixture = LoginFixture(inventory(elsewhere))
+        try:
+            code, output = run_pty(fixture, b"6\n\nq\n", columns=120)
+            self.assertEqual(0, code)
+            self.assertIn("↵ move it here · b back", output)
+            entries = fixture.sp_entries()
+            self.assertEqual(
+                ["picker-takeover"], [entry["args"][0] for entry in entries]
+            )
+            self.assertEqual("open-elsewhere", entries[0]["proof"]["shpool_id"])
+        finally:
+            fixture.close()
+
+    def test_b_on_the_open_elsewhere_panel_still_goes_back(self) -> None:
+        elsewhere = row(
+            "open-elsewhere",
+            number=6,
+            provider="codex",
+            availability="attached",
+        )
+        fixture = LoginFixture(inventory(elsewhere))
+        try:
+            code, output = run_pty(fixture, b"6\nb\nq\n", columns=120)
+            self.assertEqual(0, code)
+            self.assertIn("Open elsewhere.", output)
+            self.assertEqual([], fixture.sp_entries())
         finally:
             fixture.close()
 
@@ -925,8 +1274,8 @@ class LoginPickerTests(unittest.TestCase):
         pending["provider_title_state"] = "pending"
         fixture = LoginFixture(inventory(pending))
         try:
-            code, output = run_pty(fixture, b"6\n5\n\n", columns=120)
-            self.assertEqual(2, code)
+            code, output = run_pty(fixture, b"6\n5\nq\n", columns=120)
+            self.assertEqual(0, code)
             self.assertIn("Apply the pending title", output)
             entries = fixture.sp_entries()
             self.assertEqual(1, len(entries))
@@ -943,21 +1292,22 @@ class LoginPickerTests(unittest.TestCase):
             availability="attached",
         )
         waiting["agent_status"] = "idle"
-        waiting["account_alias"] = "duck"
+        waiting["account_alias"] = "wren"
         waiting["account_switch_capable"] = True
         fixture = LoginFixture(inventory(waiting))
         try:
             code, output = run_pty(
-                fixture, b"6\n4\n2\nswitch\n\n\n", columns=120
+                fixture, b"6\n4\n2\nq\n", columns=120
             )
-            self.assertEqual(2, code)
+            self.assertEqual(0, code)
             self.assertIn("Change subscription account", output)
-            self.assertIn("Type switch to confirm", output)
+            self.assertNotIn("[y/N]", output)
             entries = fixture.sp_entries()
             self.assertEqual(1, len(entries))
             self.assertEqual("picker-account-switch", entries[0]["args"][0])
             self.assertEqual("work", entries[0]["args"][2])
             self.assertEqual("account-change", entries[0]["proof"]["shpool_id"])
+            self.assertEqual("account-change", entries[0]["confirm_id"])
         finally:
             fixture.close()
 
@@ -969,18 +1319,23 @@ class LoginPickerTests(unittest.TestCase):
             availability="attached",
         )
         waiting["agent_status"] = "idle"
-        waiting["account_alias"] = "duck"
+        waiting["account_alias"] = "wren"
         waiting["account_switch_capable"] = True
         fixture = LoginFixture(inventory(waiting))
         try:
+            # One Enter to leave the account step the refusal kept open, one
+            # more to leave the picker.
             code, output = run_pty(
                 fixture,
-                b"6\n4\n2\n\n",
+                b"6\n4\n2\n\nq\n",
                 columns=120,
                 env_updates={"LOGIN_ACCOUNT_SECOND_ELIGIBLE": "0"},
             )
-            self.assertEqual(2, code)
-            self.assertIn("Choose a healthy account number", output)
+            self.assertEqual(0, code)
+            # The refusal quotes that row's own state, and the step stays open
+            # for another pick instead of unwinding to the dashboard.
+            self.assertIn("is not selectable: blocked: health error", output)
+            self.assertEqual(2, output.count("target account ❯"))
             self.assertEqual([], fixture.sp_entries())
         finally:
             fixture.close()
@@ -995,10 +1350,11 @@ class LoginPickerTests(unittest.TestCase):
         combined["display_title"] = "A Long Combined Attention And Naming State"
         fixture = LoginFixture(inventory(combined))
         try:
-            code, output = run_pty(fixture, b"\n", columns=60)
-            self.assertEqual(2, code)
-            self.assertIn("needs your reply", output)
-            self.assertIn("needs your reply", output)
+            code, output = run_pty(fixture, b"q\n", columns=60)
+            self.assertEqual(0, code)
+            # One phrase for the attention state on every surface (picker-rows
+            # ruling): the row says "needs you", never "needs you".
+            self.assertIn("needs you", output)
         finally:
             fixture.close()
 
@@ -1009,7 +1365,7 @@ class LoginPickerTests(unittest.TestCase):
         try:
             code, output = run_pty(
                 fixture,
-                b"\n",
+                b"q\n",
                 columns=100,
                 env_updates={
                     "NO_COLOR": None,
@@ -1017,7 +1373,7 @@ class LoginPickerTests(unittest.TestCase):
                     "TERM": "xterm-ghostty",
                 },
             )
-            self.assertEqual(2, code)
+            self.assertEqual(0, code)
             codes = set(SGR.findall(output))
             self.assertTrue(
                 {"0", "1", "32", "33", "38;2;64;216;209"}.issubset(
@@ -1036,10 +1392,10 @@ class LoginPickerTests(unittest.TestCase):
             # The startup screen clear (erase display + cursor home) is the
             # one approved non-SGR sequence on capable terminals; nothing
             # else may survive the strip.
-            plain = plain.replace("\x1b[2J", "").replace("\x1b[H", "")
+            plain = strip_screen_control(plain)
             self.assertNotIn("\x1b", plain)
             self.assertIn("Unsafe [31m title ]0;bad", plain)
-            self.assertIn("needs your reply", plain)
+            self.assertIn("needs you", plain)
             self.assertLessEqual(
                 max(display_cells(line) for line in output.splitlines()[2:]),
                 99,
@@ -1057,7 +1413,7 @@ class LoginPickerTests(unittest.TestCase):
         try:
             code, output = run_pty(
                 fixture,
-                b"\n",
+                b"q\n",
                 columns=120,
                 env_updates={
                     "NO_COLOR": None,
@@ -1065,7 +1421,7 @@ class LoginPickerTests(unittest.TestCase):
                     "TERM": "xterm-ghostty",
                 },
             )
-            self.assertEqual(2, code)
+            self.assertEqual(0, code)
             self.assertIn(
                 "\x1b[1m\x1b[38;2;249;215;108mCLD\x1b[0m",
                 output,
@@ -1073,6 +1429,30 @@ class LoginPickerTests(unittest.TestCase):
             self.assertIn(
                 "\x1b[1m\x1b[38;2;64;216;209mCDX\x1b[0m",
                 output,
+            )
+        finally:
+            fixture.close()
+
+    def test_unknown_provider_badge_is_neutral_not_claude_yellow(self) -> None:
+        unknown = row("unknown-color", number=4, provider="other")
+        fixture = LoginFixture(inventory(unknown))
+        try:
+            code, output = run_pty(
+                fixture,
+                b"q\n",
+                columns=120,
+                env_updates={
+                    "NO_COLOR": None,
+                    "SESSION_KIT_NO_COLOR": None,
+                    "TERM": "xterm-ghostty",
+                },
+            )
+            self.assertEqual(0, code)
+            self.assertIn(
+                "\x1b[1m\x1b[38;2;205;210;220mUNK\x1b[0m", output
+            )
+            self.assertNotIn(
+                "\x1b[1m\x1b[38;2;249;215;108mUNK\x1b[0m", output
             )
         finally:
             fixture.close()
@@ -1126,15 +1506,15 @@ class LoginPickerTests(unittest.TestCase):
                 )
                 try:
                     code, output = run_pty(
-                        fixture, b"\n", env_updates=updates
+                        fixture, b"q\n", env_updates=updates
                     )
-                    self.assertEqual(2, code)
+                    self.assertEqual(0, code)
                     if updates.get("TERM") in {"dumb", None}:
                         self.assertNotIn("\x1b", output)
                     else:
-                        plain = output.replace("\x1b[2J", "").replace("\x1b[H", "")
+                        plain = strip_screen_control(output)
                         self.assertNotIn("\x1b", plain)
-                    self.assertIn("needs your reply", output)
+                    self.assertIn("needs you", output)
                 finally:
                     fixture.close()
 
@@ -1148,12 +1528,12 @@ class LoginPickerTests(unittest.TestCase):
         quiet["recent_output_age_seconds"] = 2700
         fixture = LoginFixture(inventory(current, minute, forty_four, quiet))
         try:
-            code, output = run_pty(fixture, b"\n", columns=180)
-            self.assertEqual(2, code)
+            code, output = run_pty(fixture, b"q\n", columns=180)
+            self.assertEqual(0, code)
             self.assertNotIn("recent output", output)
             self.assertNotIn("last output now", output)
             self.assertNotIn("last output", output)
-            self.assertIn("| CDX | unknown | working", output)
+            self.assertIn("| CDX | pe… | pe… | working", output)
         finally:
             fixture.close()
 
@@ -1165,19 +1545,26 @@ class LoginPickerTests(unittest.TestCase):
         crowded["subagents"] = [{"status": "open"} for _ in range(20)]
         fixture = LoginFixture(inventory(crowded))
         try:
-            code, output = run_pty(fixture, b"\n", columns=60)
-            self.assertEqual(2, code)
+            code, output = run_pty(fixture, b"q\n", columns=60)
+            self.assertEqual(0, code)
             self.assertIn("| working", output)
             self.assertNotIn("last output 30m", output)
-            self.assertNotIn("20 subagents", output)
+            self.assertIn("working | 20 subagents | 30m", output)
         finally:
             fixture.close()
 
-    def test_main_rows_show_state_aware_response_waiting_and_opened_ages(self) -> None:
+    def test_main_rows_show_state_alias_and_opened_age_in_aligned_columns(self) -> None:
+        """Every row carries one labelled age, and the columns line up.
+
+        The response and waiting ages this row once showed came from the
+        retired attention queue; `opened` is the one age the collector still
+        records, so it is the one every row is checked against here.
+        """
         now_ms = int(time.time() * 1000)
         ready = row("recent-ready", number=2, provider="claude")
         ready["agent_status"] = "idle"
         ready["account_alias"] = "main"
+        ready["started_at_unix_ms"] = now_ms - 55 * 60 * 1000
         attached = row(
             "working-elsewhere",
             number=8,
@@ -1186,6 +1573,7 @@ class LoginPickerTests(unittest.TestCase):
         )
         attached["agent_status"] = "working"
         attached["account_alias"] = "backup"
+        attached["started_at_unix_ms"] = now_ms - 3 * 3600 * 1000
         waiting = row(
             "waiting-ready",
             number=9,
@@ -1193,32 +1581,31 @@ class LoginPickerTests(unittest.TestCase):
             needs_you=True,
         )
         waiting["account_alias"] = "spare"
+        waiting["started_at_unix_ms"] = now_ms - 12 * 3600 * 1000
         shell = row("plain-shell", number=10, provider="shell")
         shell["agent_status"] = "idle"
         shell["started_at_unix_ms"] = now_ms - 2 * 3600 * 1000
         fixture = LoginFixture(inventory(ready, attached, waiting, shell))
-        write_session_event(
-            fixture, ready, "turn_done", now_ms - 55 * 60 * 1000
-        )
-        write_session_event(
-            fixture, attached, "turn_done", now_ms - 3 * 3600 * 1000
-        )
-        write_session_event(
-            fixture, waiting, "needs_input", now_ms - 12 * 3600 * 1000
-        )
         try:
-            code, output = run_pty(fixture, b"\n", columns=200)
-            self.assertEqual(2, code)
-            self.assertIn("Ready to open", output)
+            code, output = run_pty(fixture, b"q\n", columns=200)
+            self.assertEqual(0, code)
+            self.assertIn("Ready", output)
             self.assertIn("Open elsewhere", output)
-            self.assertRegex(output, r"idle\s+\| 55 min ago")
-            self.assertRegex(output, r"working\s+\| 3 hr ago")
-            self.assertIn("needs your reply | waiting 12 hr", output)
-            self.assertRegex(output, r"idle\s+\| opened 2 hr ago")
-            self.assertIn("| CLD | main   | idle", output)
-            self.assertIn("| CDX | backup | working", output)
-            self.assertIn("| CLD | spare  | needs your reply", output)
-            self.assertRegex(output, r"\| SHL \|\s{8}\| idle")
+            self.assertRegex(output, r"needs you \| last active pending")
+            self.assertRegex(output, r"working\s+\| last active pending")
+            self.assertIn("| CLD | main   | pending  | needs you", output)
+            self.assertIn("| CDX | backup | pending  | working", output)
+            self.assertIn("| CLD | spare  | pending  | needs you", output)
+            self.assertRegex(output, r"\| SHL \| pendi… \| no model\s+\| needs you")
+            # One time phrase, one starting column, on every row.
+            rows_shown = [
+                line for line in strip_sgr(output).splitlines() if " | CLD | " in line
+                or " | CDX | " in line or " | SHL | " in line
+            ]
+            self.assertEqual(4, len(rows_shown), rows_shown)
+            self.assertEqual(
+                1, len({line.index("last active") for line in rows_shown}), rows_shown
+            )
             lines = {
                 name: next(line for line in output.splitlines() if name in line)
                 for name in (
@@ -1239,29 +1626,25 @@ class LoginPickerTests(unittest.TestCase):
                     }
                 ),
             )
+            # The state column starts at one place on every row -- and there
+            # are two words for it now, not three.
             self.assertEqual(
                 1,
                 len(
                     {
-                        lines["recent-ready"].index("idle"),
+                        lines["recent-ready"].index("needs you"),
                         lines["working-elsewhere"].index(
                             "working", lines["working-elsewhere"].index("CDX")
                         ),
-                        lines["waiting-ready"].index("needs your reply"),
-                        lines["plain-shell"].index("idle"),
+                        lines["waiting-ready"].index("needs you"),
+                        lines["plain-shell"].index("needs you"),
                     }
                 ),
             )
+            # So does the one time each row carries.
             self.assertEqual(
                 1,
-                len(
-                    {
-                        lines["recent-ready"].index("55 min ago"),
-                        lines["working-elsewhere"].index("3 hr ago"),
-                        lines["waiting-ready"].index("waiting 12 hr"),
-                        lines["plain-shell"].index("opened 2 hr ago"),
-                    }
-                ),
+                len({line.index("last active") for line in lines.values()}),
             )
         finally:
             fixture.close()
@@ -1270,45 +1653,47 @@ class LoginPickerTests(unittest.TestCase):
         now_ms = int(time.time() * 1000)
         item = row("narrow-age", number=8, provider="codex")
         item["display_title"] = "A useful descriptive title that should keep the available room"
+        item["started_at_unix_ms"] = now_ms - 30 * 60 * 1000
         fixture = LoginFixture(inventory(item))
-        write_session_event(
-            fixture, item, "turn_done", now_ms - 30 * 60 * 1000
-        )
         try:
-            code, output = run_pty(fixture, b"\n", columns=60)
-            self.assertEqual(2, code)
-            self.assertIn("A useful descript", output)
+            code, output = run_pty(fixture, b"q\n", columns=60)
+            self.assertEqual(0, code)
+            # The model column costs real width, so the title yields a little
+            # -- but never below the point where it names anything.
+            # One or two cells shorter than before: the state-and-time pair is
+            # reserved ahead of the title now, and at 60 columns the title sits
+            # on its floor.
+            self.assertIn("A useful de", output)
             self.assertIn("| working", output)
             self.assertNotIn("30 min ago", output)
+            self.assertNotIn("last active", output)
         finally:
             fixture.close()
 
-    def test_main_response_age_uses_readable_unit_and_date_boundaries(self) -> None:
+    def test_main_age_uses_readable_unit_and_date_boundaries(self) -> None:
         now_ms = int(time.time() * 1000)
         offsets = (5, 2 * 60, 2 * 3600, 2 * 86400, 31 * 86400)
         items = [
             row(f"age-{index}", number=index, provider="claude")
             for index in range(1, 6)
         ]
-        for item in items:
-            item["agent_status"] = "idle"
-        fixture = LoginFixture(inventory(*items))
         for item, seconds in zip(items, offsets, strict=True):
-            write_session_event(
-                fixture, item, "turn_done", now_ms - seconds * 1000
-            )
+            item["agent_status"] = "idle"
+            item["started_at_unix_ms"] = now_ms - seconds * 1000
+        fixture = LoginFixture(inventory(*items))
         old_local = datetime.fromtimestamp(
             (now_ms - offsets[-1] * 1000) / 1000
         ).astimezone()
         old_date = f"{old_local.strftime('%b')} {old_local.day}"
         try:
-            code, output = run_pty(fixture, b"\n", columns=220)
-            self.assertEqual(2, code)
-            self.assertIn("| just now", output)
-            self.assertIn("| 2 min ago", output)
-            self.assertIn("| 2 hr ago", output)
-            self.assertIn("| 2 days ago", output)
-            self.assertIn(f"| {old_date}", output)
+            code, output = run_pty(fixture, b"q\n", columns=220)
+            self.assertEqual(0, code)
+            # One phrase, one shape, whatever the span: this row used to
+            # switch between `just now`, `2 hr ago` and a bare date.
+            for line in strip_sgr(output).splitlines():
+                if " | CLD | " not in line:
+                    continue
+                self.assertIn("| last active ", line)
         finally:
             fixture.close()
 
@@ -1343,20 +1728,20 @@ class LoginPickerTests(unittest.TestCase):
         fixture = LoginFixture(document)
         try:
             code, output = run_pty(
-                fixture, b"\n", lines=24, columns=60
+                fixture, b"q\n", lines=24, columns=60
             )
-            self.assertEqual(2, code)
-            plain = output.replace("\x1b[2J", "").replace("\x1b[H", "")
+            self.assertEqual(0, code)
+            plain = strip_screen_control(output)
             self.assertNotIn("\x1b", plain)
-            self.assertIn("Open number · New n · Needs a (0) · More m · Help ?", output)
+            self.assertIn("↵ open 1 · # · kill k #", output)
             self.assertFalse(
                 any(
                     unicodedata.category(character).startswith("C")
                     for character in plain.replace("\n", "").replace("\r", "")
                 )
             )
-            self.assertIn("| UNK |", output)
-            self.assertIn("Warning: showing cached inventory", output)
+            self.assertIn("| pending | pending", output)
+            self.assertIn("Showing a cached list.", output)
             self.assertNotIn("[22222222]", output)
             self.assertLessEqual(
                 max(display_cells(line) for line in output.splitlines()[2:]),
@@ -1379,10 +1764,10 @@ class LoginPickerTests(unittest.TestCase):
         try:
             code, output = run_pty(
                 fixture,
-                b"9\n2\nx 9\nname 9\nBetter name\n\n",
+                b"9\n2\nk 9\nname 9\nBetter name\nq\n",
             )
-            self.assertEqual(2, code)
-            self.assertIn("Already open in another SSH window", output)
+            self.assertEqual(0, code)
+            self.assertIn("Open elsewhere.", output)
             entries = fixture.sp_entries()
             self.assertEqual(
                 ["picker-history", "picker-close", "picker-name"],
@@ -1395,8 +1780,8 @@ class LoginPickerTests(unittest.TestCase):
         finally:
             fixture.close()
 
-    def test_kill_shortcut_and_close_alias_are_proof_bound(self) -> None:
-        for command in ("k 9", "K 9", "x 9", "X 9"):
+    def test_the_close_key_is_proof_bound(self) -> None:
+        for command in ("k 9", "K 9", "k9", "K9"):
             with self.subTest(command=command):
                 fixture = LoginFixture(
                     inventory(
@@ -1409,16 +1794,16 @@ class LoginPickerTests(unittest.TestCase):
                     )
                 )
                 try:
-                    # Two Enters after a kill: the first is forgiven once (a
-                    # late confirm Enter must not silently end the picker),
-                    # the second deliberately exits.
+                    # The close, then q: nothing stands between the typed
+                    # number and the close, and leaving is its own key.
                     code, output = run_pty(
                         fixture,
-                        f"{command}\n\n\n".encode(),
+                        f"{command}\nq\n".encode(),
                     )
-                    self.assertEqual(2, code)
-                    self.assertNotIn("Unknown choice", output)
-                    self.assertIn("Enter again for a regular terminal", output)
+                    self.assertEqual(0, code)
+                    self.assertNotIn("There is no such key", output)
+                    self.assertNotIn("[y/N]", output)
+                    self.assertNotIn("↵ again leaves the picker.", output)
                     entries = fixture.sp_entries()
                     self.assertEqual(1, len(entries))
                     self.assertEqual("picker-close", entries[0]["args"][0])
@@ -1437,8 +1822,8 @@ class LoginPickerTests(unittest.TestCase):
             )
         )
         try:
-            code, output = run_pty(fixture, b"k 4, 6\n\n\n")
-            self.assertEqual(2, code)
+            code, output = run_pty(fixture, b"k 4, 6\nq\n")
+            self.assertEqual(0, code)
             entries = fixture.sp_entries()
             self.assertEqual(2, len(entries))
             self.assertEqual(
@@ -1458,9 +1843,9 @@ class LoginPickerTests(unittest.TestCase):
             )
         )
         try:
-            code, output = run_pty(fixture, b"k 4-9\nk 4-5\n\n\n")
-            self.assertEqual(2, code)
-            self.assertIn("not shown here", output)
+            code, output = run_pty(fixture, b"k 4-9\nk 4-5\nq\n")
+            self.assertEqual(0, code)
+            self.assertIn("There is no session 6 on this screen.", output)
             entries = fixture.sp_entries()
             self.assertEqual(2, len(entries))
             self.assertEqual(
@@ -1480,42 +1865,111 @@ class LoginPickerTests(unittest.TestCase):
             )
         )
         try:
-            code, output = run_pty(fixture, b"k all\n\n\n")
-            self.assertEqual(2, code)
+            code, output = run_pty(fixture, b"k all\nq\n")
+            self.assertEqual(0, code)
             self.assertEqual(
                 {"open1", "open2", "open3"},
                 {entry["proof"]["shpool_id"] for entry in fixture.sp_entries()},
             )
-            self.assertNotIn("Use k with visible numbers", output)
+            self.assertNotIn("There is no session number in that", output)
+        finally:
+            fixture.close()
+
+    def test_closing_asks_nothing_and_closes_exactly_the_number_typed(
+        self,
+    ) -> None:
+        """No confirmation, anywhere: the number was typed against the rows.
+
+        The close used to ask twice in two grammars -- here, and again inside
+        the proof-bound child -- while the screen promised the session was
+        restorable.
+        """
+        fixture = LoginFixture(
+            inventory(
+                row("open1", number=4, provider="codex"),
+                row("open2", number=5, provider="codex"),
+            )
+        )
+        try:
+            code, output = run_pty(fixture, b"k 4\nq\n")
+            self.assertEqual(0, code)
+            self.assertNotIn("[y/N]", output)
+            self.assertNotIn("cannot be undone", output)
+            self.assertNotIn("Nothing closed.", output)
+            entries = fixture.sp_entries()
+            self.assertEqual(
+                [("picker-close", "open1")],
+                [(entry["args"][0], entry["proof"]["shpool_id"]) for entry in entries],
+            )
+            # The child's guard is answered by naming the exact session, so a
+            # close behaves the same whether or not a terminal is attached.
+            self.assertEqual("open1", entries[0]["confirm_id"])
+        finally:
+            fixture.close()
+
+    def test_kill_all_refuses_a_page_that_moved_under_the_typing(self) -> None:
+        """`all` means the page that was read, not the page that arrived.
+
+        The background refresh re-sorts the list on its own, so a mass close
+        resolved at Enter could close a set nobody had seen -- and nothing
+        stands between that Enter and the kill.
+        """
+        first = row("alpha", number=1, provider="codex")
+        second = row("bravo", number=2, provider="codex")
+        fixture = LoginFixture(
+            inventory(first), refreshed_document=inventory(first, second)
+        )
+        try:
+            code, output = run_pty(
+                fixture,
+                b"k al",
+                env_updates={
+                    "SESSION_KIT_PICKER_REFRESH_SECONDS": "2",
+                    "SESSION_KIT_NO_COLOR": None,
+                    "SESSION_KIT_PICKER_FILTER_LIVE": "0",
+                },
+                deferred=("Codex bravo", b"l\nq\n"),
+            )
+            self.assertEqual(0, code)
+            self.assertIn("The list changed. Nothing changed.", output)
+            self.assertEqual([], fixture.sp_entries())
         finally:
             fixture.close()
 
     def test_kill_shortcut_refuses_invalid_or_unshown_numbers(self) -> None:
         fixture = LoginFixture(inventory(row("open1", number=9)))
         try:
-            code, output = run_pty(fixture, b"k nope\nk 99\n\n")
-            self.assertEqual(2, code)
+            code, output = run_pty(fixture, b"k nope\nk 99\nq\n")
+            self.assertEqual(0, code)
             self.assertIn(
-                "Use k with visible numbers (k 5, 6, 8). Nothing changed.",
+                "There is no session number in that. Numbers shown here work.",
                 output,
             )
-            self.assertIn("99 is not shown here. Nothing changed.", output)
+            self.assertIn(
+                "There is no session 99 on this screen. Numbers shown here work.",
+                output,
+            )
             self.assertEqual([], fixture.sp_entries())
         finally:
             fixture.close()
 
-    def test_help_presents_kill_shortcut_and_close_alias(self) -> None:
+    def test_help_presents_the_close_key_and_nothing_that_is_not_a_key(
+        self,
+    ) -> None:
         fixture = LoginFixture(inventory())
         try:
-            code, output = run_pty(fixture, b"?\n\n\n")
-            self.assertEqual(2, code)
+            code, output = run_pty(fixture, b"?\n\nq\n", columns=110)
+            self.assertEqual(0, code)
             self.assertIn(
-                "k <numbers>   Close displayed sessions: k 5 · k 5, 6, 8 · k 4-7",
+                "k numbers     Kill sessions: k 5 · k 5, 6, 8 · k 4-7 · k all",
                 output,
             )
-            self.assertIn("x <number>    Compatibility alias for k", output)
-            self.assertIn("action 4      Change the subscription account", output)
-            self.assertIn("action 5      Apply a pending Codex bar title", output)
+            # Rows of the open-session action menu are not list keys, and the
+            # x alias is gone: help names keys, and only keys.
+            self.assertNotIn("Compatibility alias", output)
+            self.assertNotIn("action 4", output)
+            self.assertNotIn("action 5", output)
+            self.assertNotIn("after confirming", output)
         finally:
             fixture.close()
 
@@ -1526,10 +1980,10 @@ class LoginPickerTests(unittest.TestCase):
         try:
             code, output = run_pty(
                 fixture,
-                b"name reset 88005553535\nfork 88005553535\n\n",
+                b"name reset 88005553535\nfork 88005553535\nq\n",
                 columns=80,
             )
-            self.assertEqual(2, code)
+            self.assertEqual(0, code)
             entries = fixture.sp_entries()
             self.assertEqual(
                 ["picker-name-reset", "picker-fork"],
@@ -1553,9 +2007,9 @@ class LoginPickerTests(unittest.TestCase):
         try:
             code, output = run_pty(
                 fixture,
-                b"/plain\nfork 91\nname reset 91\nfork 700\n\n",
+                b"/plain\nfork 91\nname reset 91\nfork 700\nq\n",
             )
-            self.assertEqual(2, code)
+            self.assertEqual(0, code)
             self.assertIn(
                 "Only exact Claude and Codex conversations can be forked.",
                 output,
@@ -1565,7 +2019,7 @@ class LoginPickerTests(unittest.TestCase):
                 output,
             )
             self.assertIn(
-                "Choose a number shown here. Nothing changed.",
+                "There is no session 700 on this screen. Numbers shown here work.",
                 output,
             )
             self.assertEqual([], fixture.sp_entries())
@@ -1583,10 +2037,11 @@ class LoginPickerTests(unittest.TestCase):
         stalled["recent_output_age_seconds"] = 28_170  # 7h 49m
         fixture = LoginFixture(inventory(stalled))
         try:
-            code, output = run_pty(fixture, b"\n", columns=200)
-            self.assertEqual(2, code)
-            self.assertIn("quiet 7h 49m", output)
+            code, output = run_pty(fixture, b"q\n", columns=200)
+            self.assertEqual(0, code)
+            self.assertIn("| needs you", output)
             self.assertNotIn("| running", output)
+            self.assertNotIn("| idle", output)
         finally:
             fixture.close()
 
@@ -1597,20 +2052,14 @@ class LoginPickerTests(unittest.TestCase):
         busy["recent_output_age_seconds"] = 1800  # 30m
         fixture = LoginFixture(inventory(busy))
         try:
-            code, output = run_pty(fixture, b"\n", columns=200)
-            self.assertEqual(2, code)
-            self.assertIn("running", output)
-            self.assertNotIn("quiet 7h", output)
+            code, output = run_pty(fixture, b"q\n", columns=200)
+            self.assertEqual(0, code)
+            self.assertIn("| working", output)
+            self.assertNotIn("| idle", output)
         finally:
             fixture.close()
 
-    def test_narrow_terminal_drops_subagents_before_staleness(self) -> None:
-        """How long a session has been quiet is never the field that is cut.
-
-        At a crowded width the picker used to drop "recent output 7h 52m ago"
-        and keep "20 subagents", hiding the only evidence that a session was
-        dead.
-        """
+    def test_narrow_terminal_keeps_subagents_and_staleness(self) -> None:
         stalled = row("ready1", number=1, recent_output_at_unix_ms=1)
         stalled["agent_status"] = "running"
         stalled["recent_output_age_seconds"] = 28_170
@@ -1622,18 +2071,19 @@ class LoginPickerTests(unittest.TestCase):
         stalled["native_title"] = stalled["title"]
         fixture = LoginFixture(inventory(stalled))
         try:
-            code, output = run_pty(fixture, b"\n", columns=80)
-            self.assertEqual(2, code)
-            self.assertIn("quiet 7h 49m", output)
-            self.assertNotIn("20 subagents", output)
+            code, output = run_pty(fixture, b"q\n", columns=80)
+            self.assertEqual(0, code)
+            self.assertIn("| needs you", output)
+            self.assertIn("20 subagents", output)
+            self.assertIn("7h 49m", output)
         finally:
             fixture.close()
 
     def test_refused_action_refreshes_instead_of_exiting_picker(self) -> None:
         fixture = LoginFixture(inventory(row("ready1", number=1)))
         try:
-            code, output = run_pty(fixture, b"1\n\n", sp_exit=74)
-            self.assertEqual(2, code)
+            code, output = run_pty(fixture, b"1\nq\n", sp_exit=74)
+            self.assertEqual(0, code)
             self.assertIn("changed or failed a safety check", output)
             self.assertNotIn("terminal died", output)
             snapshots = [
@@ -1646,10 +2096,11 @@ class LoginPickerTests(unittest.TestCase):
     def test_attach_failure_is_not_diagnosed_as_a_dead_terminal(self) -> None:
         fixture = LoginFixture(inventory(row("ready1", number=1)))
         try:
-            code, output = run_pty(fixture, b"1\n\n", sp_exit=75)
-            self.assertEqual(2, code)
-            self.assertIn("could not connect", output)
-            self.assertIn("does not prove the session is dead", output)
+            code, output = run_pty(fixture, b"1\nq\n", sp_exit=75)
+            self.assertEqual(0, code)
+            self.assertIn("Could not open session 1. It was left alone.", output)
+            # The picker never diagnoses a session it could not reach.
+            self.assertNotIn("dead", output)
             entries = fixture.sp_entries()
             commands = [entry["args"][0] for entry in entries]
             self.assertIn("picker-open", commands)
@@ -1664,9 +2115,9 @@ class LoginPickerTests(unittest.TestCase):
         unknown["setup_incomplete"] = True
         fixture = LoginFixture(inventory(unknown))
         try:
-            code, output = run_pty(fixture, b"4\n\n", sp_exit=7)
-            self.assertEqual(2, code)
-            self.assertIn("failed without a verified cause", output)
+            code, output = run_pty(fixture, b"4\nq\n", sp_exit=7)
+            self.assertEqual(0, code)
+            self.assertIn("Could not open session 4. It was left alone.", output)
             self.assertNotIn("terminal died", output)
             commands = [entry["args"][0] for entry in fixture.sp_entries()]
             self.assertNotIn("picker-recover", commands)
@@ -1676,9 +2127,9 @@ class LoginPickerTests(unittest.TestCase):
     def test_cached_row_selection_is_read_only_before_proof_or_sp(self) -> None:
         fixture = LoginFixture(inventory(row("ready1", number=1), stale=True))
         try:
-            code, output = run_pty(fixture, b"1\nk 1\n\n")
-            self.assertEqual(2, code)
-            self.assertIn("Cached rows are read-only", output)
+            code, output = run_pty(fixture, b"1\nk 1\nq\n")
+            self.assertEqual(0, code)
+            self.assertIn("Showing a cached list. Actions are off until it refreshes.", output)
             self.assertIn("Nothing changed", output)
             self.assertEqual([], fixture.sp_entries())
             self.assertNotIn("terminal died", output)
@@ -1691,8 +2142,8 @@ class LoginPickerTests(unittest.TestCase):
         hidden["display_title"] = "Picker safety work"
         fixture = LoginFixture(inventory(hidden))
         try:
-            code, output = run_pty(fixture, b"\n", columns=120)
-            self.assertEqual(2, code)
+            code, output = run_pty(fixture, b"q\n", columns=120)
+            self.assertEqual(0, code)
             self.assertIn("Picker safety work", output)
             self.assertNotIn("private-session-id", output)
         finally:
@@ -1701,82 +2152,34 @@ class LoginPickerTests(unittest.TestCase):
         fixture = LoginFixture(inventory(hidden))
         try:
             code, output = run_pty(
-                fixture, b"/private-session-id\n\n", columns=120
+                fixture, b"/private-session-id\nq\n", columns=120
             )
-            self.assertEqual(2, code)
+            self.assertEqual(0, code)
             self.assertIn("1 match of 1 session", output)
             self.assertIn("Picker safety work", output)
         finally:
             fixture.close()
 
-    def test_prompt_quarantine_is_a_selectable_needs_you_row_without_ids(self) -> None:
-        existing = row("private-existing-id", number=8)
-        existing["title"] = "User chosen session title"
-        existing["display_title"] = "User chosen session title"
-        fixture = LoginFixture(inventory(existing))
-        secret_key = "f9e8d7c6b5a4"
-        fixture.prompt_quarantine.write_text(
-            json.dumps(
-                {
-                    "items": [
-                        {
-                            "age_seconds": 185,
-                            "key": secret_key,
-                            "state": "intake_pending",
-                            "title": "Codex prompt intake pending",
-                        }
-                    ],
-                    "schema_version": 1,
-                }
-            ),
-            encoding="utf-8",
-        )
-        try:
-            code, output = run_pty(fixture, b"a\nq1\n1\n\n\n", columns=140)
-            self.assertEqual(2, code)
-            self.assertIn("Prompt delivery", output)
-            self.assertIn("q1", output)
-            self.assertIn("Codex prompt intake pending", output)
-            self.assertIn("3m old", output)
-            self.assertIn("User chosen session title", output)
-            self.assertIn("ingested without sending it to Codex again", output)
-            self.assertNotIn(secret_key, output)
-            self.assertNotIn("f9e8d7c6-b5a4", output)
-            actions = [entry["args"] for entry in fixture.sp_entries()]
-            self.assertIn(["prompt-quarantine", "ingest", secret_key], actions)
-        finally:
-            fixture.close()
+    def test_needs_you_opens_the_review_screen_and_its_back_key_goes_back(self) -> None:
+        """The screen advertises `Back: Enter or q`, and that must hold.
 
-    def test_prompt_resume_and_prune_capture_machine_output(self) -> None:
-        fixture = LoginFixture(inventory())
-        secret_key = "f9e8d7c6b5a4"
-        fixture.prompt_quarantine.write_text(
-            json.dumps(
-                {
-                    "items": [
-                        {
-                            "age_seconds": 1,
-                            "key": secret_key,
-                            "state": "intake_pending",
-                            "title": "Codex prompt intake pending",
-                        }
-                    ],
-                    "schema_version": 1,
-                }
-            ),
-            encoding="utf-8",
-        )
+        The Codex prompt-quarantine rows this screen once carried retired with
+        the intake surface; what survives is the review screen itself and the
+        promise that `a` reaches it and `q` returns to the list.
+        """
+        waiting = row("waits", number=6, needs_you=True)
+        waiting["title"] = "Deploy review"
+        waiting["agent_status"] = "needs your reply"
+        fixture = LoginFixture(inventory(waiting))
         try:
-            code, output = run_pty(fixture, b"a\nq1\n2\n\n\nqp\n\n", columns=140)
-            self.assertEqual(2, code)
-            self.assertIn("exact Codex conversation was resumed", output)
-            self.assertIn("Expired prompt recovery records were pruned", output)
-            self.assertNotIn(secret_key, output)
-            self.assertNotIn("s20260809-232323-9", output)
-            self.assertNotIn("f9e8d7c6-b5a4", output)
-            actions = [entry["args"][:2] for entry in fixture.sp_entries()]
-            self.assertIn(["prompt-quarantine", "resume"], actions)
-            self.assertIn(["prompt-quarantine", "prune"], actions)
+            code, output = run_pty(fixture, b"a\nq\nq\n", columns=140)
+            self.assertEqual(0, code)
+            self.assertIn("Deploy review", output)
+            self.assertIn("needs you:", output)
+            self.assertNotIn("Unknown choice", output)
+            # q returned to the list rather than dropping to a bare shell, so
+            # the q after it is what ends the picker.
+            self.assertIn("# · kill k #", output)
         finally:
             fixture.close()
 
@@ -1784,14 +2187,14 @@ class LoginPickerTests(unittest.TestCase):
         unknown = row("unknown1", number=4, provider="unknown")
         unknown["identity"]["uuid"] = None
         unknown["display_provider"] = "codex"
-        unknown["display_title"] = "Codex setup incomplete"
+        unknown["display_title"] = "Codex pending"
         unknown["setup_incomplete"] = True
         fixture = LoginFixture(inventory(unknown))
         try:
-            code, output = run_pty(fixture, b"4\n\n")
-            self.assertEqual(2, code)
-            self.assertIn("Codex setup incomplete", output)
-            self.assertIn("| CDX | unknown | setup incomplete", output)
+            code, output = run_pty(fixture, b"4\nq\n")
+            self.assertEqual(0, code)
+            self.assertIn("Codex pending", output)
+            self.assertIn("| CDX | pe… | pe… | pending", output)
             entries = fixture.sp_entries()
             self.assertEqual(1, len(entries))
             self.assertEqual("picker-open", entries[0]["args"][0])
@@ -1822,23 +2225,22 @@ class LoginPickerTests(unittest.TestCase):
         ]
         fixture = LoginFixture(document)
         try:
-            code, output = run_pty(fixture, b"o\n\n1\n\n")
-            self.assertEqual(2, code)
+            code, output = run_pty(fixture, b"o\n\n1\nq\n")
+            self.assertEqual(0, code)
+            self.assertIn("Sessions: none.", output)
+            self.assertNotIn("0 sessions", output)
+            self.assertIn("more m", output)
+            self.assertIn("Outside the kit", output)
             self.assertIn(
-                "0 sessions · 0 ready here · 0 open elsewhere", output
-            )
-            self.assertIn("More m", output)
-            self.assertIn("Other provider sessions", output)
-            self.assertIn(
-                "Detected live provider roots outside the session manager; they are not attachable here.",
+                "Live sessions outside the kit. Not openable here.",
                 output,
             )
             self.assertIn("Outside account project-alpha", output)
-            self.assertIn("project: project-alpha | not attachable here", output)
+            self.assertIn("project: project-alpha | not openable here", output)
             self.assertNotIn("/home/private-account", output)
             self.assertNotIn("private-account", output)
             self.assertNotIn("Page 1/", output)
-            self.assertIn("Choose a number shown here", output)
+            self.assertIn("on this screen. Numbers shown here work.", output)
             self.assertEqual([], fixture.sp_entries())
         finally:
             fixture.close()
@@ -1862,12 +2264,11 @@ class LoginPickerTests(unittest.TestCase):
         ]
         fixture = LoginFixture(document)
         try:
-            code, output = run_pty(fixture, b"\n", lines=12)
-            self.assertEqual(2, code)
-            self.assertIn(
-                "0 sessions · 0 ready here · 0 open elsewhere", output
-            )
-            self.assertIn("More m", output)
+            code, output = run_pty(fixture, b"q\n", lines=12)
+            self.assertEqual(0, code)
+            self.assertIn("Sessions: none.", output)
+            self.assertNotIn("0 sessions", output)
+            self.assertIn("more m", output)
             self.assertNotIn("Page 1/", output)
             self.assertNotIn("Outside provider 1", output)
             self.assertEqual([], fixture.sp_entries())
@@ -1878,16 +2279,47 @@ class LoginPickerTests(unittest.TestCase):
         fixture = LoginFixture(inventory())
         try:
             code, output = run_pty(fixture, b"n\n2\n1\n\nq\n")
-            self.assertEqual(2, code)
+            self.assertEqual(0, code)
             self.assertIn("New session", output)
-            self.assertIn("Use main:", output)
-            self.assertIn("use name <number>", output)
+            self.assertIn("use main:", output)
+            self.assertIn("Name it later with name number.", output)
             self.assertNotIn("Type yes to start", output)
             self.assertNotIn("New session cancelled", output)
             self.assertEqual(
-                [["new", "codex", "main", "--account", "duck"]],
+                [["new", "codex", "main", "--account", "wren"]],
                 [entry["args"] for entry in fixture.sp_entries()],
             )
+        finally:
+            fixture.close()
+
+    def test_guided_new_takes_claude_code_on_enter(self) -> None:
+        """Enter on the provider screen sent the most common act backwards.
+
+        It answered `back`, so the one key a menu trains you to press left
+        the New session screen without starting anything.
+        """
+        fixture = LoginFixture(inventory())
+        try:
+            code, output = run_pty(fixture, b"n\n\n1\n\nq\n")
+            self.assertEqual(0, code)
+            self.assertIn("↵ Claude Code · b back", output)
+            # Past the provider screen, not back out of it: the account step
+            # is what a Claude session asks next.
+            self.assertIn("account ❯", output)
+            self.assertEqual(
+                [["new", "claude", "main", "--account", "wren"]],
+                [entry["args"] for entry in fixture.sp_entries()],
+            )
+        finally:
+            fixture.close()
+
+    def test_guided_new_still_goes_back_on_b(self) -> None:
+        fixture = LoginFixture(inventory())
+        try:
+            code, output = run_pty(fixture, b"n\nb\nq\n")
+            self.assertEqual(0, code)
+            self.assertIn("New session", output)
+            self.assertEqual([], fixture.sp_entries())
         finally:
             fixture.close()
 
@@ -1903,12 +2335,12 @@ class LoginPickerTests(unittest.TestCase):
                 encoding="utf-8",
             )
             code, output = run_pty(fixture, b"n\n2\n1\n\nq\n")
-            self.assertEqual(2, code)
+            self.assertEqual(0, code)
             self.assertNotIn("main-codex:", output)
-            self.assertIn(f"   1  main: {fixture.primary_project}", output)
+            self.assertIn(f"   1  main:  {fixture.primary_project}", output)
             self.assertIn(f"   2  other: {fixture.other}", output)
             self.assertEqual(
-                [["new", "codex", "main", "--account", "duck"]],
+                [["new", "codex", "main", "--account", "wren"]],
                 [entry["args"] for entry in fixture.sp_entries()],
             )
         finally:
@@ -1920,37 +2352,61 @@ class LoginPickerTests(unittest.TestCase):
             target = fixture.base / "newsite"
             target.mkdir()
             # More, Projects, Add, the directory, accept the suggested short
-            # name and provider, back out, quit.
+            # name, back out, quit. There is no provider to accept: which one
+            # opens a directory is answered when a session starts.
             code, output = run_pty(
                 fixture,
-                f"m\np\na\n{target}\n\n\n\n\nq\n".encode(),
+                f"m\np\na\n{target}\n\n\n\nq\n".encode(),
                 env_updates={"SESSION_KIT_PICKER_REFRESH_SECONDS": "0"},
             )
-            self.assertEqual(2, code)
+            self.assertEqual(0, code)
             self.assertIn("Projects", output)
-            self.assertIn(f"main: {fixture.primary_project}", output)
+            self.assertIn(f"main:  {fixture.primary_project}", output)
             self.assertIn("Short name [newsite]", output)
-            self.assertIn(f"Added newsite: claude in {target}", output)
+            self.assertIn(f"Added newsite: {target}", output)
             self.assertIn(
-                f"newsite\tclaude\t{target}",
+                f"newsite\tany\t{target}",
                 fixture.projects.read_text(encoding="utf-8"),
             )
         finally:
             fixture.close()
+
+    # The undo-a-drop round trip lives in tests/test_picker_projects.py, on
+    # the confirmed-hide flow that superseded the immediate drop.
 
     def test_projects_screen_drops_a_directory_for_good(self) -> None:
         fixture = LoginFixture(inventory(row("alpha", number=1)))
         try:
             code, output = run_pty(
                 fixture,
-                b"m\np\nd 2\n\n\nq\n",
+                b"m\np\nd 2\ny\n\n\nq\n",
                 env_updates={"SESSION_KIT_PICKER_REFRESH_SECONDS": "0"},
             )
-            self.assertEqual(2, code)
+            self.assertEqual(0, code)
             self.assertIn("stays out of the project list", output)
             contents = fixture.projects.read_text(encoding="utf-8")
             self.assertIn(f"other\tignore\t{fixture.other}", contents)
             self.assertIn(f"main\tclaude\t{fixture.primary_project}", contents)
+        finally:
+            fixture.close()
+
+    def test_every_keystroke_draws_one_frame_instead_of_stacking_menus(self) -> None:
+        """The screen the picker leaves behind is the same every time.
+
+        The menu used to be appended below whatever was already there, while
+        the background repaint replaced the screen in place: the same key left
+        a different screen depending on when it was pressed."""
+        fixture = LoginFixture(inventory(row("one", number=1)))
+        try:
+            code, output = run_pty(fixture, b"c\nc\nq\n")
+            self.assertEqual(0, code)
+            # Startup, both compact toggles, and the q that leaves.
+            self.assertEqual(4, output.count("\033[2J"))
+            frame = output.rsplit("\033[2J", 2)[1]
+            self.assertIn("Compact rows off.", frame)
+            self.assertEqual(
+                1, frame.count("# · kill k # · new n · more m")
+            )
         finally:
             fixture.close()
 
@@ -1974,13 +2430,16 @@ class LoginPickerTests(unittest.TestCase):
             # No key was pressed until the second session appeared by itself.
             self.assertIn("Codex alpha", output)
             self.assertIn("Codex bravo", output)
-            self.assertEqual(2, code)
+            self.assertEqual(0, code)
             # The first draw clears once. The automatic replacement is a
-            # synchronized in-place frame and never exposes a blank screen.
+            # synchronized in-place frame whose content arrives WITH the
+            # cursor-home -- the screen is never erased ahead of the new
+            # frame, so a slow render cannot flash a blank screen.
             before_repaint = output.index("Codex bravo")
-            self.assertEqual(1, output.count("\033[2J"))
-            self.assertIn("\033[?2026h\033[H\033[J", output[:before_repaint])
-            self.assertIn("\033[?2026l", output[before_repaint:])
+            self.assertEqual(1, output[:before_repaint].count("\033[2J"))
+            self.assertIn("\033[?2026h\033[H  ", output[:before_repaint])
+            self.assertNotIn("\033[?2026h\033[H\033[J", output)
+            self.assertIn("\033[J\033[?2026l", output[before_repaint:])
             self.assertEqual(1, output.count("Codex bravo"))
         finally:
             fixture.close()
@@ -2011,8 +2470,12 @@ class LoginPickerTests(unittest.TestCase):
                 deferred=("Codex alpha", b"q\n"),
                 deferred_delay_seconds=3,
             )
-            self.assertEqual(2, code)
-            self.assertEqual(1, output.count("\033[2J"))
+            self.assertEqual(0, code)
+            # Nothing repainted: no synchronized in-place frame was drawn at
+            # all, and the screen cleared exactly twice -- once at startup and
+            # once for the keystroke that ended the picker.
+            self.assertNotIn("\033[?2026h", output)
+            self.assertEqual(2, output.count("\033[2J"))
             self.assertNotIn("Invisible outside process", output)
         finally:
             fixture.close()
@@ -2022,7 +2485,7 @@ class LoginPickerTests(unittest.TestCase):
         refreshed = inventory(
             row("alpha", number=1), row("bravo", number=2)
         )
-        for command, marker in ((b"?\n", "Session picker help"), (b"m\n", "  More")):
+        for command, marker in ((b"?\n", "Picker help"), (b"m\n", "  More")):
             with self.subTest(command=command):
                 fixture = LoginFixture(first, refreshed_document=refreshed)
                 try:
@@ -2036,7 +2499,7 @@ class LoginPickerTests(unittest.TestCase):
                         deferred=(marker, b"\nq\n"),
                         deferred_delay_seconds=3,
                     )
-                    self.assertEqual(2, code)
+                    self.assertEqual(0, code)
                     modal_start = output.index(marker)
                     modal_end = output.index("Codex alpha", modal_start)
                     modal = output[modal_start:modal_end]
@@ -2061,15 +2524,731 @@ class LoginPickerTests(unittest.TestCase):
                     offenders.append(f"{path.name}:{number}")
         self.assertEqual([], offenders)
 
-    def test_supervisor_pin_does_not_change_the_visible_fingerprint(self) -> None:
-        supervisor = row("supervisor", number=1, provider="claude")
-        other = row("other", number=2, provider="codex")
-        before = inventory(other, supervisor)
-        pinned_supervisor = dict(supervisor)
-        pinned_supervisor["_picker_supervisor_pin"] = True
-        after = inventory(pinned_supervisor, other)
+    def test_idle_picker_reexecs_the_release_selected_by_current(self) -> None:
+        rows = tuple(
+            row(f"session-{number}", number=number) for number in range(1, 51)
+        )
+        fixture = LoginFixture(
+            inventory(*rows)
+        )
+        release_id = "a1b2c3d4e5f6789012345678901234567890abcd"
+        install_root = fixture.base / "session-kit"
+        new_release = install_root / "releases" / release_id
+        launcher = new_release / "bin" / "shpool_login_launcher"
+        record = fixture.base / "upgraded-picker"
+        launcher.parent.mkdir(parents=True)
+        write_executable(
+            launcher,
+            "#!/usr/bin/env bash\n"
+            "printf '%s|%s|%s\\n' \"$SESSION_KIT_PICKER_RESUME_QUERY\" "
+            "\"$SESSION_KIT_PICKER_RESUME_PAGE\" "
+            "\"$SESSION_KIT_PICKER_COMPACT\" > \"$UPGRADE_RECORD\"\n"
+            "printf 'NEW RELEASE PICKER RAN\\n'\n"
+            # Outlive the handoff probation, or a truthful exit reads as a
+            # corpse and the wrapper reloads the old picker.
+            "sleep 1.5\n",
+        )
+        current = install_root / "current"
+        current.parent.mkdir(parents=True, exist_ok=True)
+        current.symlink_to(REPO)
+
+        def activate() -> None:
+            replacement = install_root / ".current-next"
+            replacement.symlink_to(new_release)
+            os.replace(replacement, current)
+
+        try:
+            code, output = run_pty(
+                fixture,
+                b"/session-\nnext\n",
+                env_updates={
+                    "SESSION_KIT_ROOT": os.fspath(install_root),
+                    "SESSION_KIT_PICKER_COMPACT": "1",
+                    "UPGRADE_RECORD": os.fspath(record),
+                    "SESSION_KIT_PICKER_HANDOFF_PROBATION_SECONDS": "1",
+                },
+                deferred=("Page 2/", b""),
+                deferred_action=activate,
+            )
+            self.assertEqual(0, code)
+            self.assertIn(
+                "Reloading the picker into release a1b2c3d4e5f6.",
+                output,
+            )
+            self.assertIn("NEW RELEASE PICKER RAN", output)
+            self.assertEqual("session-|2|1", record.read_text().strip())
+            events = (fixture.state / "action-events.jsonl").read_text()
+            self.assertIn("release_upgrade", events)
+        finally:
+            fixture.close()
+
+    def test_release_upgrade_waits_until_a_modal_prompt_closes(self) -> None:
+        fixture = LoginFixture(inventory(row("alpha", number=1)))
+        release_id = "b1c2d3e4f5a6789012345678901234567890abcd"
+        install_root = fixture.base / "session-kit"
+        new_release = install_root / "releases" / release_id
+        launcher = new_release / "bin" / "shpool_login_launcher"
+        record = fixture.base / "upgraded-picker"
+        launcher.parent.mkdir(parents=True)
+        write_executable(
+            launcher,
+            "#!/usr/bin/env bash\n"
+            ": > \"$UPGRADE_RECORD\"\n"
+            "printf 'NEW RELEASE PICKER RAN\\n'\n"
+            "sleep 1.5\n",
+        )
+        current = install_root / "current"
+        current.parent.mkdir(parents=True, exist_ok=True)
+        current.symlink_to(REPO)
+
+        def activate() -> None:
+            replacement = install_root / ".current-next"
+            replacement.symlink_to(new_release)
+            os.replace(replacement, current)
+
+        try:
+            code, output = run_pty(
+                fixture,
+                b"?\n",
+                env_updates={
+                    "SESSION_KIT_ROOT": os.fspath(install_root),
+                    "UPGRADE_RECORD": os.fspath(record),
+                    "SESSION_KIT_PICKER_HANDOFF_PROBATION_SECONDS": "1",
+                },
+                deferred=("Picker help", b"\n"),
+                deferred_action=activate,
+                deferred_delay_seconds=2,
+                deferred_check=lambda: self.assertFalse(record.exists()),
+            )
+            self.assertEqual(0, code)
+            self.assertTrue(record.exists())
+            self.assertLess(
+                output.index("Picker help"),
+                output.index("Reloading the picker into release b1c2d3e4f5a6"),
+            )
+        finally:
+            fixture.close()
+
+    def test_broken_current_release_warns_once_and_keeps_old_picker_alive(self) -> None:
+        fixture = LoginFixture(inventory(row("alpha", number=1)))
+        release_id = "c1d2e3f4a5b6789012345678901234567890abcd"
+        install_root = fixture.base / "session-kit"
+        broken_release = install_root / "releases" / release_id
+        broken_release.mkdir(parents=True)
+        current = install_root / "current"
+        current.parent.mkdir(parents=True, exist_ok=True)
+        current.symlink_to(REPO)
+
+        def activate() -> None:
+            replacement = install_root / ".current-next"
+            replacement.symlink_to(broken_release)
+            os.replace(replacement, current)
+
+        warning = (
+            "Release c1d2e3f4a5b6 is unavailable. Continuing with this picker."
+        )
+        try:
+            code, output = run_pty(
+                fixture,
+                env_updates={
+                    "SESSION_KIT_ROOT": os.fspath(install_root),
+                    "SESSION_KIT_PICKER_REFRESH_SECONDS": "0",
+                },
+                deferred=("Codex alpha", b"q\n"),
+                deferred_action=activate,
+                deferred_delay_seconds=2,
+            )
+            self.assertEqual(0, code)
+            self.assertEqual(1, output.count(warning))
+            events = (fixture.state / "action-events.jsonl").read_text()
+            self.assertIn("quit", events)
+            self.assertNotIn("release_upgrade", events)
+        finally:
+            fixture.close()
+
+    def test_unstartable_launcher_recovers_and_never_retries_the_same_target(self) -> None:
+        """No static probe proves a program will serve; the handoff does.
+
+        A launcher whose shebang names a missing interpreter — or whose env
+        command is absent — can pass every file check and die a beat after
+        exec. Review lanes rv-rn-2 and rv-rn2-* proved the two failure
+        shapes: a success line followed by a dead window, and a relaunch
+        storm retrying the same corpse every idle beat. The supervised
+        handoff runs the new picker as a foreground child: a quick abnormal
+        exit is announced as the failure it is, the window gets this
+        release's picker back, and the failed target is remembered across
+        the exec so it is warned about once, never retried."""
+        fixture = LoginFixture(inventory(row("alpha", number=1)))
+        release_id = "d1e2f3a4b5c6789012345678901234567890abcd"
+        install_root = fixture.base / "session-kit"
+        broken_release = install_root / "releases" / release_id
+        (broken_release / "bin").mkdir(parents=True)
+        launcher = broken_release / "bin" / "shpool_login_launcher"
+        launcher.write_text(
+            "#!/definitely/missing/interpreter\nexit 0\n", encoding="utf-8"
+        )
+        launcher.chmod(0o755)
+        current = install_root / "current"
+        current.parent.mkdir(parents=True, exist_ok=True)
+        current.symlink_to(REPO)
+
+        def activate() -> None:
+            replacement = install_root / ".current-next"
+            replacement.symlink_to(broken_release)
+            os.replace(replacement, current)
+
+        try:
+            code, output = run_pty(
+                fixture,
+                env_updates={
+                    "SESSION_KIT_ROOT": os.fspath(install_root),
+                    "SESSION_KIT_PICKER_REFRESH_SECONDS": "0",
+                },
+                deferred=("Codex alpha", b""),
+                deferred_action=activate,
+                deferred_delay_seconds=2,
+                # The recovered picker needs idle beats to prove it does NOT
+                # retry, then a quit typed into it proves it is serving.
+                followup=("Continuing with this picker", b"q\n", 6),
+            )
+            self.assertEqual(0, code)
+            self.assertIn(
+                "Reloading the picker into release d1e2f3a4b5c6.", output
+            )
+            self.assertIn("exited immediately (status", output)
+            self.assertEqual(
+                1,
+                output.count("Reloading the picker into release d1e2f3a4b5c6."),
+                "the failed target must never be retried",
+            )
+            self.assertEqual(
+                1,
+                output.count(
+                    "Release d1e2f3a4b5c6 could not serve this window."
+                    " Continuing with this picker."
+                ),
+            )
+            events = (fixture.state / "action-events.jsonl").read_text()
+            self.assertIn("release_upgrade_failed", events)
+            self.assertIn("quit", events)
+        finally:
+            fixture.close()
+
+    def test_zero_exit_corpse_inside_probation_recovers_the_picker(self) -> None:
+        """A corpse wearing a success code is still a corpse.
+
+        A launcher that exits 0 instantly used to read as the person leaving
+        the new picker, so the wrapper exited 0 and the window lost its list
+        with no refusal (review lane rv-rn3-2). A person cannot open and
+        leave a picker faster than it draws: any exit inside probation is a
+        failed handoff, whatever the status says."""
+        fixture = LoginFixture(inventory(row("alpha", number=1)))
+        release_id = "e2f3a4b5c6d7789012345678901234567890abcd"
+        install_root = fixture.base / "session-kit"
+        corpse_release = install_root / "releases" / release_id
+        (corpse_release / "bin").mkdir(parents=True)
+        write_executable(
+            corpse_release / "bin" / "shpool_login_launcher",
+            "#!/usr/bin/env bash\nexit 0\n",
+        )
+        current = install_root / "current"
+        current.parent.mkdir(parents=True, exist_ok=True)
+        current.symlink_to(REPO)
+
+        def activate() -> None:
+            replacement = install_root / ".current-next"
+            replacement.symlink_to(corpse_release)
+            os.replace(replacement, current)
+
+        try:
+            code, output = run_pty(
+                fixture,
+                env_updates={
+                    "SESSION_KIT_ROOT": os.fspath(install_root),
+                    "SESSION_KIT_PICKER_REFRESH_SECONDS": "0",
+                },
+                deferred=("Codex alpha", b""),
+                deferred_action=activate,
+                deferred_delay_seconds=2,
+                followup=("Continuing with this picker", b"q\n", 6),
+            )
+            self.assertEqual(0, code)
+            self.assertIn(
+                "The release e2f3a4b5c6d7 picker ended before it could serve.",
+                output,
+            )
+            self.assertEqual(
+                1,
+                output.count("Reloading the picker into release e2f3a4b5c6d7."),
+                "the failed target must never be retried",
+            )
+            events = (fixture.state / "action-events.jsonl").read_text()
+            self.assertIn("release_upgrade_failed", events)
+            self.assertIn("quit", events)
+        finally:
+            fixture.close()
+
+    def test_octal_looking_probation_neither_aborts_nor_serves_a_corpse(self) -> None:
+        """"08" is decimal eight here, not broken octal.
+
+        Bash arithmetic reads a leading zero as octal and aborts on "08" —
+        review round five drove the picker to die after the reload line with
+        no recovery. The value is forced to base ten; the corpse still
+        recovers under the eight-second probation it now means."""
+        fixture = LoginFixture(inventory(row("alpha", number=1)))
+        release_id = "b5c6d7e8f9a0789012345678901234567890abcd"
+        install_root = fixture.base / "session-kit"
+        corpse_release = install_root / "releases" / release_id
+        (corpse_release / "bin").mkdir(parents=True)
+        write_executable(
+            corpse_release / "bin" / "shpool_login_launcher",
+            "#!/usr/bin/env bash\nexit 0\n",
+        )
+        current = install_root / "current"
+        current.parent.mkdir(parents=True, exist_ok=True)
+        current.symlink_to(REPO)
+
+        def activate() -> None:
+            replacement = install_root / ".current-next"
+            replacement.symlink_to(corpse_release)
+            os.replace(replacement, current)
+
+        try:
+            code, output = run_pty(
+                fixture,
+                env_updates={
+                    "SESSION_KIT_ROOT": os.fspath(install_root),
+                    "SESSION_KIT_PICKER_REFRESH_SECONDS": "0",
+                    "SESSION_KIT_PICKER_HANDOFF_PROBATION_SECONDS": "08",
+                },
+                deferred=("Codex alpha", b""),
+                deferred_action=activate,
+                deferred_delay_seconds=2,
+                followup=("Continuing with this picker", b"q\n", 10),
+            )
+            self.assertEqual(0, code)
+            self.assertIn(
+                "The release b5c6d7e8f9a0 picker ended before it could serve.",
+                output,
+            )
+            events = (fixture.state / "action-events.jsonl").read_text()
+            self.assertIn("release_upgrade_failed", events)
+            self.assertIn("quit", events)
+        finally:
+            fixture.close()
+
+    def test_zero_probation_is_invalid_and_still_catches_the_corpse(self) -> None:
+        """A probation of zero is no probation at all, so it is invalid.
+
+        "0" passed the digit check, zeroed the window, and an instant
+        status-0 corpse was announced as served — the picker ended with no
+        refusal and no recovery (review lane rv-rn6-1). The window exists to
+        catch corpses; a value that cannot catch one falls back to the
+        default five seconds. "000000" reaches the same rejected-zero branch
+        after base-ten forcing."""
+        fixture = LoginFixture(inventory(row("alpha", number=1)))
+        release_id = "c6d7e8f9a0b1789012345678901234567890abcd"
+        install_root = fixture.base / "session-kit"
+        corpse_release = install_root / "releases" / release_id
+        (corpse_release / "bin").mkdir(parents=True)
+        write_executable(
+            corpse_release / "bin" / "shpool_login_launcher",
+            "#!/usr/bin/env bash\nexit 0\n",
+        )
+        current = install_root / "current"
+        current.parent.mkdir(parents=True, exist_ok=True)
+        current.symlink_to(REPO)
+
+        def activate() -> None:
+            replacement = install_root / ".current-next"
+            replacement.symlink_to(corpse_release)
+            os.replace(replacement, current)
+
+        try:
+            code, output = run_pty(
+                fixture,
+                env_updates={
+                    "SESSION_KIT_ROOT": os.fspath(install_root),
+                    "SESSION_KIT_PICKER_REFRESH_SECONDS": "0",
+                    "SESSION_KIT_PICKER_HANDOFF_PROBATION_SECONDS": "0",
+                },
+                deferred=("Codex alpha", b""),
+                deferred_action=activate,
+                deferred_delay_seconds=2,
+                followup=("Continuing with this picker", b"q\n", 10),
+            )
+            self.assertEqual(0, code)
+            self.assertIn(
+                "The release c6d7e8f9a0b1 picker ended before it could serve.",
+                output,
+            )
+            self.assertEqual(
+                1,
+                output.count("Reloading the picker into release c6d7e8f9a0b1."),
+                "the failed target must never be retried",
+            )
+            events = (fixture.state / "action-events.jsonl").read_text()
+            self.assertIn("release_upgrade_failed", events)
+            self.assertIn("quit", events)
+        finally:
+            fixture.close()
+
+    def test_missing_bash5_clock_still_catches_the_corpse(self) -> None:
+        """A shell without EPOCHREALTIME must not die reading it.
+
+        EPOCHREALTIME is a Bash 5.0 variable and the kit promises Bash 4:
+        under nounset the bare expansion aborted the picker right after the
+        reload line — no refusal, no recovery, the list gone (review lane
+        rv-rn6-2, reproduced by unsetting the variable through BASH_ENV on
+        the real production path). The guarded expansion now falls back to
+        builtin printf's %(%s)T system clock (never SECONDS — mutable shell
+        state, rv-rn7), and an instant status-0 corpse still recovers."""
+        fixture = LoginFixture(inventory(row("alpha", number=1)))
+        release_id = "d7e8f9a0b1c2789012345678901234567890abcd"
+        install_root = fixture.base / "session-kit"
+        corpse_release = install_root / "releases" / release_id
+        (corpse_release / "bin").mkdir(parents=True)
+        write_executable(
+            corpse_release / "bin" / "shpool_login_launcher",
+            "#!/usr/bin/env bash\nexit 0\n",
+        )
+        bash4_env = fixture.base / "bash4-env.sh"
+        bash4_env.write_text("unset EPOCHREALTIME\n", encoding="utf-8")
+        current = install_root / "current"
+        current.parent.mkdir(parents=True, exist_ok=True)
+        current.symlink_to(REPO)
+
+        def activate() -> None:
+            replacement = install_root / ".current-next"
+            replacement.symlink_to(corpse_release)
+            os.replace(replacement, current)
+
+        try:
+            code, output = run_pty(
+                fixture,
+                env_updates={
+                    "SESSION_KIT_ROOT": os.fspath(install_root),
+                    "SESSION_KIT_PICKER_REFRESH_SECONDS": "0",
+                    "BASH_ENV": os.fspath(bash4_env),
+                },
+                deferred=("Codex alpha", b""),
+                deferred_action=activate,
+                deferred_delay_seconds=2,
+                followup=("Continuing with this picker", b"q\n", 10),
+            )
+            self.assertEqual(0, code)
+            self.assertNotIn("unbound variable", output)
+            self.assertIn(
+                "The release d7e8f9a0b1c2 picker ended before it could serve.",
+                output,
+            )
+            self.assertEqual(
+                1,
+                output.count("Reloading the picker into release d7e8f9a0b1c2."),
+                "the failed target must never be retried",
+            )
+            events = (fixture.state / "action-events.jsonl").read_text()
+            self.assertIn("release_upgrade_failed", events)
+            self.assertIn("quit", events)
+        finally:
+            fixture.close()
+
+    def test_missing_bash5_clock_still_serves_a_real_picker(self) -> None:
+        """The seconds fallback must serve, not only recover.
+
+        If a Bash-4.2 shell treated every handoff as zero elapsed, a person
+        who used the new picker for an hour and quit would get the old
+        picker relaunched at them and the target falsely marked failed. The
+        %(%s)T fallback surrenders one whole second before comparing — the
+        rv-rn4-2 rounding credit cannot return — so the launcher here must
+        outlive probation by more than a full second to prove serving."""
+        fixture = LoginFixture(inventory(row("alpha", number=1)))
+        release_id = "e8f9a0b1c2d3789012345678901234567890abcd"
+        install_root = fixture.base / "session-kit"
+        new_release = install_root / "releases" / release_id
+        (new_release / "bin").mkdir(parents=True)
+        write_executable(
+            new_release / "bin" / "shpool_login_launcher",
+            "#!/usr/bin/env bash\n"
+            "printf 'NEW RELEASE PICKER RAN\\n'\n"
+            "sleep 3\n",
+        )
+        bash4_env = fixture.base / "bash4-env.sh"
+        bash4_env.write_text("unset EPOCHREALTIME\n", encoding="utf-8")
+        current = install_root / "current"
+        current.parent.mkdir(parents=True, exist_ok=True)
+        current.symlink_to(REPO)
+
+        def activate() -> None:
+            replacement = install_root / ".current-next"
+            replacement.symlink_to(new_release)
+            os.replace(replacement, current)
+
+        try:
+            code, output = run_pty(
+                fixture,
+                env_updates={
+                    "SESSION_KIT_ROOT": os.fspath(install_root),
+                    "SESSION_KIT_PICKER_REFRESH_SECONDS": "0",
+                    "SESSION_KIT_PICKER_HANDOFF_PROBATION_SECONDS": "1",
+                    "BASH_ENV": os.fspath(bash4_env),
+                },
+                deferred=("Codex alpha", b""),
+                deferred_action=activate,
+                deferred_delay_seconds=2,
+            )
+            self.assertEqual(0, code)
+            self.assertNotIn("unbound variable", output)
+            self.assertIn("NEW RELEASE PICKER RAN", output)
+            self.assertNotIn("ended before it could serve", output)
+            self.assertNotIn("Continuing with this picker", output)
+            self.assertEqual(
+                1,
+                output.count("Reloading the picker into release e8f9a0b1c2d3."),
+            )
+        finally:
+            fixture.close()
+
+    def test_tampered_seconds_variable_cannot_credit_a_corpse(self) -> None:
+        """The fallback clock is the system's, never mutable shell state.
+
+        Review lanes rv-rn7-1/2 turned SECONDS into a nameref to LINENO
+        through BASH_ENV: the source-line difference across the handoff read
+        as fifteen elapsed seconds and an instant status-0 corpse was
+        announced as served, ending the list with a lone release_upgrade
+        event. The fallback now reads builtin printf's %(%s)T strftime
+        clock, so no shell variable an adversary can retarget participates
+        in the serving decision, and this corpse recovers."""
+        fixture = LoginFixture(inventory(row("alpha", number=1)))
+        release_id = "f9a0b1c2d3e4789012345678901234567890abcd"
+        install_root = fixture.base / "session-kit"
+        corpse_release = install_root / "releases" / release_id
+        (corpse_release / "bin").mkdir(parents=True)
+        write_executable(
+            corpse_release / "bin" / "shpool_login_launcher",
+            "#!/usr/bin/env bash\nexit 0\n",
+        )
+        tampered_env = fixture.base / "tampered-env.sh"
+        tampered_env.write_text(
+            "unset EPOCHREALTIME SECONDS\ndeclare -n SECONDS=LINENO\n",
+            encoding="utf-8",
+        )
+        current = install_root / "current"
+        current.parent.mkdir(parents=True, exist_ok=True)
+        current.symlink_to(REPO)
+
+        def activate() -> None:
+            replacement = install_root / ".current-next"
+            replacement.symlink_to(corpse_release)
+            os.replace(replacement, current)
+
+        try:
+            code, output = run_pty(
+                fixture,
+                env_updates={
+                    "SESSION_KIT_ROOT": os.fspath(install_root),
+                    "SESSION_KIT_PICKER_REFRESH_SECONDS": "0",
+                    "BASH_ENV": os.fspath(tampered_env),
+                },
+                deferred=("Codex alpha", b""),
+                deferred_action=activate,
+                deferred_delay_seconds=2,
+                followup=("Continuing with this picker", b"q\n", 10),
+            )
+            self.assertEqual(0, code)
+            self.assertIn(
+                "The release f9a0b1c2d3e4 picker ended before it could serve.",
+                output,
+            )
+            self.assertEqual(
+                1,
+                output.count("Reloading the picker into release f9a0b1c2d3e4."),
+                "the failed target must never be retried",
+            )
+            events = (fixture.state / "action-events.jsonl").read_text()
+            self.assertIn("release_upgrade_failed", events)
+            self.assertIn("quit", events)
+        finally:
+            fixture.close()
+
+    def test_corpse_just_under_probation_is_not_rounded_into_service(self) -> None:
+        """Integer seconds rounded a 4.2-second corpse up to the probation.
+
+        Review lane rv-rn4-2 demonstrated it: SECONDS granularity credited a
+        status-0 exit at 4.201s with the full five-second probation and the
+        window lost its list. Elapsed time is measured in milliseconds now;
+        a corpse dying at eighty percent of probation recovers, every time."""
+        fixture = LoginFixture(inventory(row("alpha", number=1)))
+        release_id = "a4b5c6d7e8f9789012345678901234567890abcd"
+        install_root = fixture.base / "session-kit"
+        corpse_release = install_root / "releases" / release_id
+        (corpse_release / "bin").mkdir(parents=True)
+        write_executable(
+            corpse_release / "bin" / "shpool_login_launcher",
+            "#!/usr/bin/env bash\nsleep 1.6\nexit 0\n",
+        )
+        current = install_root / "current"
+        current.parent.mkdir(parents=True, exist_ok=True)
+        current.symlink_to(REPO)
+
+        def activate() -> None:
+            replacement = install_root / ".current-next"
+            replacement.symlink_to(corpse_release)
+            os.replace(replacement, current)
+
+        try:
+            code, output = run_pty(
+                fixture,
+                env_updates={
+                    "SESSION_KIT_ROOT": os.fspath(install_root),
+                    "SESSION_KIT_PICKER_REFRESH_SECONDS": "0",
+                    "SESSION_KIT_PICKER_HANDOFF_PROBATION_SECONDS": "2",
+                },
+                deferred=("Codex alpha", b""),
+                deferred_action=activate,
+                deferred_delay_seconds=2,
+                followup=("Continuing with this picker", b"q\n", 10),
+            )
+            self.assertEqual(0, code)
+            self.assertIn(
+                "The release a4b5c6d7e8f9 picker ended before it could serve.",
+                output,
+            )
+            events = (fixture.state / "action-events.jsonl").read_text()
+            self.assertIn("release_upgrade_failed", events)
+            self.assertIn("quit", events)
+        finally:
+            fixture.close()
+
+    def test_signal_death_after_probation_recovers_the_picker(self) -> None:
+        """Death by signal is never a served picker's own ending.
+
+        A launcher that hangs without serving survives probation; when the
+        person kills it, the old design propagated 128+N and the window lost
+        its list (review lane rv-rn3-2's non-serving hang). A real picker
+        handles its signals — so a signal exit takes the recovery path at
+        any age."""
+        fixture = LoginFixture(inventory(row("alpha", number=1)))
+        release_id = "f3a4b5c6d7e8789012345678901234567890abcd"
+        install_root = fixture.base / "session-kit"
+        hang_release = install_root / "releases" / release_id
+        (hang_release / "bin").mkdir(parents=True)
+        write_executable(
+            hang_release / "bin" / "shpool_login_launcher",
+            "#!/usr/bin/env bash\nsleep 1.5\nkill -TERM $$\n",
+        )
+        current = install_root / "current"
+        current.parent.mkdir(parents=True, exist_ok=True)
+        current.symlink_to(REPO)
+
+        def activate() -> None:
+            replacement = install_root / ".current-next"
+            replacement.symlink_to(hang_release)
+            os.replace(replacement, current)
+
+        try:
+            code, output = run_pty(
+                fixture,
+                env_updates={
+                    "SESSION_KIT_ROOT": os.fspath(install_root),
+                    "SESSION_KIT_PICKER_REFRESH_SECONDS": "0",
+                    "SESSION_KIT_PICKER_HANDOFF_PROBATION_SECONDS": "1",
+                },
+                deferred=("Codex alpha", b""),
+                deferred_action=activate,
+                deferred_delay_seconds=2,
+                followup=("Continuing with this picker", b"q\n", 8),
+            )
+            self.assertEqual(0, code)
+            self.assertIn("exited immediately (status 1", output)
+            events = (fixture.state / "action-events.jsonl").read_text()
+            self.assertIn("release_upgrade_failed", events)
+            self.assertIn("quit", events)
+        finally:
+            fixture.close()
+
+    def test_a_self_upgrade_ends_its_collector_and_frees_its_temps(self) -> None:
+        """`exec` keeps the process ID, so the child would outlive its parent.
+
+        An in-flight collector left running writes a state snapshot into a
+        file the exiting picker has just unlinked, and is then inherited,
+        unreaped, by the picker that replaced it.
+        """
+        with tempfile.TemporaryDirectory(prefix=".upgrade-", dir=REPO) as raw:
+            base = Path(raw)
+            live_file = base / "live.json"
+            live_done = base / "live.done"
+            live_file.write_text("{}", encoding="utf-8")
+            live_done.write_text("", encoding="utf-8")
+            pid_file = base / "collector.pid"
+            completed = run(
+                [
+                    "bash",
+                    "-c",
+                    'source "$LOGIN_LIVE_MODULE"; '
+                    "{ sleep 45 & echo $! > \"$COLLECTOR_PID\"; wait; } & "
+                    "LIVE_PID=$!; "
+                    "while [ ! -s \"$COLLECTOR_PID\" ]; do sleep 0.05; done; "
+                    "picker_live_stop; "
+                    'printf \'%s|%s\\n\' "${LIVE_PID:-gone}" "$(cat "$COLLECTOR_PID")"',
+                ],
+                env={
+                    "LOGIN_LIVE_MODULE": os.fspath(
+                        REPO / "lib" / "sh" / "shpool_login_live.sh"
+                    ),
+                    "LIVE_FILE": os.fspath(live_file),
+                    "LIVE_DONE": os.fspath(live_done),
+                    "COLLECTOR_PID": os.fspath(pid_file),
+                },
+            )
+            reported, collector = completed.stdout.strip().split("|")
+            self.assertEqual("gone", reported)
+            self.assertFalse(live_file.exists())
+            self.assertFalse(live_done.exists())
+            # The timed status run under the collector is ended too.
+            self.assertFalse(Path(f"/proc/{collector}").exists())
+
+    def test_the_view_a_person_set_up_survives_a_self_upgrade(self) -> None:
+        completed = run(
+            [
+                "bash",
+                "-c",
+                'source "$LOGIN_LIVE_MODULE"; '
+                "build_view() { return 0; }; "
+                "QUERY=''; PAGE=1; picker_resume_view; "
+                'printf \'%s|%s|%s|%s\\n\' "$QUERY" "$PAGE" '
+                '"${SESSION_KIT_PICKER_RESUME_QUERY-unset}" '
+                '"${SESSION_KIT_PICKER_RESUME_PAGE-unset}"',
+            ],
+            env={
+                "LOGIN_LIVE_MODULE": os.fspath(
+                    REPO / "lib" / "sh" / "shpool_login_live.sh"
+                ),
+                "SESSION_KIT_PICKER_RESUME_QUERY": "deploy",
+                "SESSION_KIT_PICKER_RESUME_PAGE": "3",
+            },
+        )
+        self.assertEqual(
+            "deploy|3|unset|unset",
+            completed.stdout.strip(),
+        )
+
+    def test_a_private_picker_key_does_not_change_the_visible_fingerprint(self) -> None:
+        """The fingerprint covers what is drawn, and only that.
+
+        Terminal 1 was once reserved for the retired Fleet Supervisor and the
+        fingerprint re-ordered rows to match the pinned screen. Nothing pins a
+        row now, so the invariant that remains is the narrower one: a private
+        `_picker_*` annotation is not visible content and must not repaint.
+        """
+        first = row("first", number=1, provider="claude")
+        second = row("second", number=2, provider="codex")
+        before = inventory(first, second)
+        annotated_first = dict(first)
+        annotated_first["_picker_private_annotation"] = True
+        after = inventory(annotated_first, second)
         fixture = LoginFixture(before)
-        pinned_path = fixture.base / "pinned.json"
+        pinned_path = fixture.base / "annotated.json"
         pinned_path.write_text(json.dumps(after), encoding="utf-8")
 
         def fingerprint(path: Path) -> str:
@@ -2159,7 +3338,7 @@ class LoginPickerTests(unittest.TestCase):
                 },
                 deferred=("Codex bravo", b"ha\nq\n"),
             )
-            self.assertEqual(2, code)
+            self.assertEqual(0, code)
             # A repaint clears the screen under the queued characters, but it
             # must never consume them: the finished search still runs on the
             # whole word and hides the row it excludes.
@@ -2188,7 +3367,7 @@ class LoginPickerTests(unittest.TestCase):
             )
             self.assertIn("Codex alpha", output)
             self.assertNotIn("Codex bravo", output)
-            self.assertEqual(2, code)
+            self.assertEqual(0, code)
         finally:
             fixture.close()
 
@@ -2206,7 +3385,7 @@ class LoginPickerTests(unittest.TestCase):
             )
             self.assertIn("Codex alpha", output)
             self.assertNotIn("Codex bravo", output)
-            self.assertEqual(2, code)
+            self.assertEqual(0, code)
         finally:
             fixture.close()
 
@@ -2219,11 +3398,11 @@ class LoginPickerTests(unittest.TestCase):
                 encoding="utf-8",
             )
             code, output = run_pty(fixture, b"n\n2\n1\n\nq\n")
-            self.assertEqual(2, code)
+            self.assertEqual(0, code)
             self.assertNotIn("other:", output)
             self.assertIn(f"   1  main: {fixture.primary_project}", output)
             self.assertEqual(
-                [["new", "codex", "main", "--account", "duck"]],
+                [["new", "codex", "main", "--account", "wren"]],
                 [entry["args"] for entry in fixture.sp_entries()],
             )
         finally:
@@ -2248,13 +3427,17 @@ class LoginPickerTests(unittest.TestCase):
         }
         fixture = LoginFixture(inventory(), pending=pending)
         try:
-            code, output = run_pty(fixture, b"u\n\n\n")
-            self.assertEqual(2, code)
-            self.assertIn("More m", output)
-            self.assertIn("[Claude] Recover me [logged in 2d 3h ago]", output)
+            code, output = run_pty(fixture, b"u\n\nq\n")
+            self.assertEqual(0, code)
+            self.assertIn("more m", output)
+            # The row's own event, in the words `sp recover` uses for it.
+            self.assertIn("[Claude] Recover me [lost 2 days ago]", output)
             self.assertNotIn("old1", output)
-            self.assertIn("1,3,5 or 2-4", output)
-            self.assertIn("all (or a)", output)
+            self.assertIn(
+                "restore numbers · one with no number goes by the selector"
+                " beside it · restore all a · ↵ back",
+                output,
+            )
             self.assertNotIn("Traceback", output)
             self.assertEqual([], fixture.sp_entries())
             self.assertFalse(
@@ -2264,6 +3447,85 @@ class LoginPickerTests(unittest.TestCase):
                 )
             )
             self.assertEqual([], fixture.picker_temps())
+        finally:
+            fixture.close()
+
+    def test_a_selection_the_screen_cannot_read_restores_nothing(self) -> None:
+        """A typo is not a command, on the real screen.
+
+        The parser's refusal was caught and then undone: every fragment that
+        happened to be a number was added back, so "1,garbage" restored
+        session 1 and "1,,2" restored two conversations.
+        """
+        pending = {
+            "schema_version": 1,
+            "entries": [
+                {
+                    "source_generation_key": "generation",
+                    "old_shpool_id": f"old-{index}",
+                    "provider": "claude",
+                    "uuid": f"1111111{index}-1111-4111-8111-111111111111",
+                    "cwd": "/srv/project",
+                    "title": f"Work {index}",
+                }
+                for index in (1, 2)
+            ],
+        }
+        for answer in (b"1,garbage", b"1,,2"):
+            fixture = LoginFixture(inventory(), pending=pending)
+            try:
+                code, output = run_pty(fixture, b"u\n" + answer + b"\nq\n")
+                self.assertEqual(0, code)
+                self.assertIn("There is no such closed session on this screen", output)
+                self.assertEqual([], fixture.sp_entries())
+                self.assertFalse(
+                    any(
+                        entry and entry[0] == "--recovery-pending-ack"
+                        for entry in fixture.status_entries()
+                    )
+                )
+            finally:
+                fixture.close()
+
+    def test_a_row_with_no_number_is_restored_by_the_name_it_shows(self) -> None:
+        """The screen printed a dash where the selector belongs.
+
+        The parser quietly accepted a short id the screen never showed, so the
+        only way to act on the row was to read the JSON behind it.
+        """
+        pending = {
+            "schema_version": 1,
+            "entries": [
+                {
+                    "source_generation_key": "generation",
+                    "old_shpool_id": "old-1",
+                    "provider": "claude",
+                    "uuid": "22222222-2222-4222-8222-222222222222",
+                    "cwd": "/srv/project",
+                    "title": "Older work",
+                    "numbered": False,
+                }
+            ],
+        }
+        fixture = LoginFixture(inventory(), pending=pending)
+        try:
+            code, output = run_pty(fixture, b"u\nolder work\nq\n", columns=120)
+            self.assertEqual(0, code)
+            self.assertIn("—  [Claude] Older work", output)
+            self.assertIn('Restored closed session "Older work".', output)
+            self.assertEqual(
+                [
+                    [
+                        "restore-exact",
+                        "claude",
+                        "22222222-2222-4222-8222-222222222222",
+                        "/srv/project",
+                    ]
+                ],
+                [entry["args"] for entry in fixture.sp_entries()],
+            )
+            # And no conversation identifier reached the screen to get there.
+            self.assertNotIn("22222222", output)
         finally:
             fixture.close()
 
@@ -2285,10 +3547,10 @@ class LoginPickerTests(unittest.TestCase):
         }
         fixture = LoginFixture(inventory(active), pending=pending)
         try:
-            code, output = run_pty(fixture, b"u\nall\n\n")
-            self.assertEqual(2, code)
+            code, output = run_pty(fixture, b"u\nall\nq\n")
+            self.assertEqual(0, code)
             self.assertIn(
-                "already active as session 4107; opening the existing session instead",
+                "Closed session 1 is already open as session 4107. Opening it.",
                 output,
             )
             self.assertIn(
@@ -2296,7 +3558,7 @@ class LoginPickerTests(unittest.TestCase):
                 output,
             )
             self.assertIn(
-                "Cleared the recovery record for exact active session 4107.",
+                "Confirmed session 4107 is open; its recovery evidence was retained.",
                 output,
             )
             self.assertIn(
@@ -2336,10 +3598,10 @@ class LoginPickerTests(unittest.TestCase):
         }
         fixture = LoginFixture(inventory(active), pending=pending, ack_exit=1)
         try:
-            code, output = run_pty(fixture, b"u\na\n\n")
-            self.assertEqual(2, code)
+            code, output = run_pty(fixture, b"u\na\nq\n")
+            self.assertEqual(0, code)
             self.assertIn(
-                "Exact active session 4107 was found, but its recovery record could not be cleared; the record was retained.",
+                "Session 4107 is open, but its live proof was incomplete. Its recovery evidence was retained.",
                 output,
             )
             self.assertIn(
@@ -2392,10 +3654,10 @@ class LoginPickerTests(unittest.TestCase):
         }
         fixture = LoginFixture(document, pending=pending)
         try:
-            code, output = run_pty(fixture, b"u\na\n\n")
-            self.assertEqual(2, code)
+            code, output = run_pty(fixture, b"u\na\nq\n")
+            self.assertEqual(0, code)
             self.assertIn(
-                "already active outside the session manager; no duplicate was started",
+                "Closed session 1 is already open outside the kit. Nothing changed.",
                 output,
             )
             self.assertEqual([], fixture.sp_entries())
@@ -2420,9 +3682,9 @@ class LoginPickerTests(unittest.TestCase):
         }
         fixture = LoginFixture(inventory(active), pending=pending)
         try:
-            code, output = run_pty(fixture, b"u\na\n\n")
-            self.assertEqual(2, code)
-            self.assertIn("Started recovery item 1.", output)
+            code, output = run_pty(fixture, b"u\na\nq\n")
+            self.assertEqual(0, code)
+            self.assertIn("Restored closed session 1.", output)
             self.assertNotIn("claude-old", output)
             entries = fixture.sp_entries()
             self.assertEqual(
@@ -2449,8 +3711,8 @@ class LoginPickerTests(unittest.TestCase):
             inventory(), pending={"schema_version": 1, "entries": entries}
         )
         try:
-            code, output = run_pty(fixture, b"u\n1,3\n\n")
-            self.assertEqual(2, code)
+            code, output = run_pty(fixture, b"u\n1,3\nq\n")
+            self.assertEqual(0, code)
             restores = [
                 entry["args"]
                 for entry in fixture.sp_entries()
@@ -2463,9 +3725,9 @@ class LoginPickerTests(unittest.TestCase):
                 ],
                 restores,
             )
-            self.assertIn("Started recovery item 1.", output)
-            self.assertIn("Started recovery item 3.", output)
-            self.assertNotIn("Started recovery item 2.", output)
+            self.assertIn("Restored closed session 1.", output)
+            self.assertIn("Restored closed session 3.", output)
+            self.assertNotIn("Restored closed session 2.", output)
             self.assertNotIn("old-1", output)
             self.assertNotIn("old-3", output)
         finally:
@@ -2488,9 +3750,9 @@ class LoginPickerTests(unittest.TestCase):
         }
         fixture = LoginFixture(inventory(), pending=pending)
         try:
-            code, output = run_pty(fixture, b"u\na\n\n")
-            self.assertEqual(2, code)
-            self.assertIn("Recovery record 1 is incomplete; it was retained.", output)
+            code, output = run_pty(fixture, b"u\na\nq\n")
+            self.assertEqual(0, code)
+            self.assertIn("Closed session 1 is incomplete. Nothing changed.", output)
             self.assertEqual([], fixture.sp_entries())
             self.assertFalse(
                 any(
@@ -2521,16 +3783,25 @@ class LoginPickerTests(unittest.TestCase):
         }
         fixture = LoginFixture(inventory(), pending=pending)
         try:
-            code, output = run_pty(fixture, b"u\na\n\n")
-            self.assertEqual(2, code)
+            code, output = run_pty(fixture, b"u\na\nq\n")
+            self.assertEqual(0, code)
             self.assertIn(
                 "review required: conflicting cwd, command", output
             )
+            # The sentence the list carries for this row, and the same one
+            # again when they act on it -- with the fields that disagree named.
             self.assertIn(
-                "Recovery record 1 has conflicting launch metadata "
-                "(cwd, command); it requires manual review and was retained.",
+                "its launch records disagree with each other, so it needs a"
+                " look by hand",
                 output,
             )
+            self.assertIn(
+                "Closed session 1: its launch records disagree with each"
+                " other, so it needs a look by hand (cwd, command)."
+                " Nothing changed.",
+                output,
+            )
+            self.assertNotIn("a plain shell", output)
             self.assertEqual([], fixture.sp_entries())
             self.assertFalse(
                 any(
@@ -2539,6 +3810,29 @@ class LoginPickerTests(unittest.TestCase):
                 )
             )
             self.assertEqual([], fixture.picker_temps())
+        finally:
+            fixture.close()
+
+    def test_closed_session_row_uses_its_recorded_close_age(self) -> None:
+        pending = {
+            "schema_version": 1,
+            "entries": [
+                {
+                    "source_generation_key": "generation",
+                    "old_shpool_id": "old1",
+                    "provider": "codex",
+                    "uuid": "11111111-1111-4111-8111-111111111111",
+                    "cwd": "/srv/project",
+                    "title": "Closed two hours",
+                    "closed_at_unix_ms": int(time.time() * 1000) - 2 * 3600 * 1000,
+                }
+            ],
+        }
+        fixture = LoginFixture(inventory(), pending=pending)
+        try:
+            code, output = run_pty(fixture, b"u\n\nq\n", columns=120)
+            self.assertEqual(0, code)
+            self.assertIn("Closed two hours [closed 2 hr ago]", output)
         finally:
             fixture.close()
 

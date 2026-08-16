@@ -1,0 +1,349 @@
+#!/usr/bin/env python3
+"""Who owns the terminal tab title in a Claude Code window?
+
+The kit and the provider both write OSC title sequences, and nobody had
+measured what happens when the vendor's documented off-switch
+(``CLAUDE_CODE_DISABLE_TERMINAL_TITLE``) is set while a kit hook is asking for
+a title of its own. Two answers are possible and they lead to opposite
+designs: if the switch silences only the provider's own writes, the kit turns
+it on and owns the tab outright; if it silences the hook's ``sessionTitle``
+too, the kit has to leave the switch alone and assert its title after the
+provider's.
+
+The drill answers that live, without touching anything the operator uses. It
+builds a throwaway HOME (credentials copied in read-only fashion from the real
+one so the window actually boots), registers a hook that asks for a marker
+title, runs a real Claude Code TUI on a pty, captures every byte the program
+writes, and quits. It never sends a prompt, so no model turn is spent.
+
+Usage::
+
+    tools/title-ownership-drill [--seconds 25] [--outdir DIR] [--keep]
+
+It prints one JSON object per variant plus a verdict line. Exit status is 0
+when both variants ran, 2 when the provider never booted far enough to write
+any title at all (an inconclusive drill, never a silent pass).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import pty
+import re
+import select
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+
+MARKER = "SKDRILLMARKER"
+# OSC 0 (icon + title) and OSC 2 (title), terminated by BEL or ST.
+OSC_TITLE = re.compile(rb"\x1b\](0|1|2);([^\x07\x1b]*)(?:\x07|\x1b\\)")
+
+HOOK = """#!/usr/bin/env bash
+# Throwaway drill hook: ask for a marker title on every event that can carry
+# one, and record what we were handed. Fails open like the real one.
+set -uo pipefail
+INPUT=$(cat 2>/dev/null) || exit 0
+EVENT=$(printf '%s' "$INPUT" | jq -r '.hook_event_name // ""' 2>/dev/null)
+printf '%s\\n' "$EVENT" >> "$DRILL_LOG" 2>/dev/null
+case "$EVENT" in
+  SessionStart|UserPromptSubmit) ;;
+  *) exit 0 ;;
+esac
+jq -nc --arg e "$EVENT" --arg t "$DRILL_TITLE" \\
+  '{hookSpecificOutput:{hookEventName:$e,sessionTitle:$t}}' 2>/dev/null
+exit 0
+"""
+
+HOOK_SEQUENCE = """#!/usr/bin/env bash
+# Same shape, but exercising the other documented lever: a raw terminal
+# sequence emitted by the hook rather than a sessionTitle field.
+set -uo pipefail
+INPUT=$(cat 2>/dev/null) || exit 0
+EVENT=$(printf '%s' "$INPUT" | jq -r '.hook_event_name // ""' 2>/dev/null)
+printf '%s\\n' "$EVENT" >> "$DRILL_LOG" 2>/dev/null
+case "$EVENT" in
+  SessionStart|UserPromptSubmit) ;;
+  *) exit 0 ;;
+esac
+jq -nc --arg e "$EVENT" --arg s "$(printf '\\033]0;%s\\007' "$DRILL_TITLE")" \\
+  '{hookSpecificOutput:{hookEventName:$e,terminalSequence:$s}}' 2>/dev/null
+exit 0
+"""
+
+
+def build_sandbox(root: Path, *, mode: str, title: str) -> Path:
+    """A throwaway HOME whose only borrowed file is the OAuth credential."""
+    home = root / f"home-{mode}"
+    config = home / ".claude"
+    (config / "hooks").mkdir(parents=True, exist_ok=True)
+    (home / "work").mkdir(parents=True, exist_ok=True)
+
+    real_credentials = Path.home() / ".claude" / ".credentials.json"
+    if real_credentials.is_file():
+        shutil.copyfile(real_credentials, config / ".credentials.json")
+        os.chmod(config / ".credentials.json", 0o600)
+
+    hook = config / "hooks" / "drill_title.sh"
+    hook.write_text(HOOK_SEQUENCE if mode.endswith("sequence") else HOOK)
+    os.chmod(hook, 0o700)
+
+    entry = [{"hooks": [{"type": "command", "command": os.fspath(hook)}]}]
+    (config / "settings.json").write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "SessionStart": entry,
+                    "UserPromptSubmit": entry,
+                }
+            },
+            indent=2,
+        )
+    )
+    (config / ".claude.json").write_text(
+        json.dumps(
+            {
+                "hasCompletedOnboarding": True,
+                "installMethod": "native",
+                "autoUpdates": False,
+                "theme": "dark",
+                "projects": {
+                    os.fspath(home / "work"): {
+                        "hasTrustDialogAccepted": True,
+                        "hasCompletedProjectOnboarding": True,
+                        "allowedTools": [],
+                        "history": [],
+                    }
+                },
+            },
+            indent=2,
+        )
+    )
+    return home
+
+
+def run_variant(
+    root: Path, *, mode: str, disable: bool, seconds: float, claude: str
+) -> dict:
+    title = f"{MARKER}-{mode}"
+    home = build_sandbox(root, mode=mode, title=title)
+    log = root / f"hookevents-{mode}.txt"
+    capture = root / f"pty-{mode}.bin"
+
+    env = {
+        "HOME": os.fspath(home),
+        "CLAUDE_CONFIG_DIR": os.fspath(home / ".claude"),
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "TERM": "xterm-256color",
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+        "DRILL_TITLE": title,
+        "DRILL_LOG": os.fspath(log),
+        "SHELL": "/bin/bash",
+    }
+    if disable:
+        env["CLAUDE_CODE_DISABLE_TERMINAL_TITLE"] = "1"
+
+    # The sandbox borrows the real OAuth credential to boot a window. Whatever
+    # happens next -- a crash, an interrupt, a pty that never opens -- that copy
+    # is deleted before this function returns, so a second copy of a secret is
+    # never left in a scratch directory somebody will move around.
+    borrowed = home / ".claude" / ".credentials.json"
+    try:
+        return _run_variant_inner(
+            home, log, capture, env, mode=mode, disable=disable, seconds=seconds,
+            claude=claude,
+        )
+    finally:
+        try:
+            borrowed.unlink()
+        except OSError:
+            pass
+
+
+def _run_variant_inner(
+    home: Path,
+    log: Path,
+    capture: Path,
+    env: dict,
+    *,
+    mode: str,
+    disable: bool,
+    seconds: float,
+    claude: str,
+) -> dict:
+    parent, child = pty.openpty()
+    process = subprocess.Popen(
+        [claude],
+        stdin=child,
+        stdout=child,
+        stderr=child,
+        cwd=os.fspath(home / "work"),
+        env=env,
+        preexec_fn=os.setsid,
+    )
+    os.close(child)
+    data = bytearray()
+    deadline = time.time() + seconds
+    quit_sent = False
+    try:
+        while time.time() < deadline:
+            ready, _, _ = select.select([parent], [], [], 0.25)
+            if ready:
+                try:
+                    chunk = os.read(parent, 65536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                data.extend(chunk)
+            if not quit_sent and time.time() > deadline - seconds / 2:
+                # Leave without a prompt: no model turn is spent.
+                os.write(parent, b"/quit\r")
+                quit_sent = True
+            if process.poll() is not None:
+                # Drain whatever is left, then stop.
+                while True:
+                    ready, _, _ = select.select([parent], [], [], 0.2)
+                    if not ready:
+                        break
+                    try:
+                        chunk = os.read(parent, 65536)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    data.extend(chunk)
+                break
+    finally:
+        if process.poll() is None:
+            with open(os.devnull):
+                pass
+            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                process.wait(timeout=10)
+        os.close(parent)
+
+    capture.write_bytes(bytes(data))
+    titles = [match.group(2).decode("utf-8", "replace") for match in OSC_TITLE.finditer(bytes(data))]
+    events = log.read_text().split() if log.is_file() else []
+    return {
+        "mode": mode,
+        "disable_env": disable,
+        "hook_events_seen": events,
+        "titles_written": titles,
+        "marker_present": any(MARKER in one for one in titles),
+        "vendor_titles": [one for one in titles if MARKER not in one],
+        "capture": os.fspath(capture),
+        "capture_bytes": len(data),
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--seconds", type=float, default=25.0)
+    parser.add_argument("--outdir", default="")
+    parser.add_argument("--keep", action="store_true")
+    parser.add_argument("--claude", default=shutil.which("claude") or "claude")
+    arguments = parser.parse_args()
+
+    root = Path(arguments.outdir) if arguments.outdir else Path(
+        tempfile.mkdtemp(prefix="sk-title-drill.")
+    )
+    root.mkdir(parents=True, exist_ok=True)
+
+    results = []
+    for mode, disable in (
+        ("title-on", False),
+        ("title-off", True),
+        ("sequence-on", False),
+        ("sequence-off", True),
+    ):
+        result = run_variant(
+            root,
+            mode=mode,
+            disable=disable,
+            seconds=arguments.seconds,
+            claude=arguments.claude,
+        )
+        results.append(result)
+        print(json.dumps(result, indent=2))
+
+    (root / "results.json").write_text(json.dumps(results, indent=2))
+    return report(results, root)
+
+
+def report(results: list, root: Path) -> int:
+    """Say what each run measured, from that run's own capture.
+
+    Every line below names the run it came from. An earlier version read the
+    terminalSequence verdict out of the switch-UNSET run and printed the
+    opposite of what the switch-set run had recorded -- the drill exists to be
+    re-run after a vendor upgrade, so a summary line that does not match its own
+    evidence is worse than no summary at all.
+    """
+    by_mode = {item["mode"]: item for item in results}
+    missing = {"title-on", "title-off", "sequence-on", "sequence-off"} - set(by_mode)
+    if missing:
+        print(f"VERDICT: inconclusive — runs missing: {', '.join(sorted(missing))}")
+        return 2
+    for mode in ("title-on", "sequence-on"):
+        if not by_mode[mode]["marker_present"]:
+            print(
+                f"VERDICT: inconclusive — the control run {mode} wrote no kit "
+                "title, so the switch-set runs prove nothing"
+            )
+            return 2
+    for mechanism, control, switched in (
+        ("sessionTitle", "title-on", "title-off"),
+        ("terminalSequence", "sequence-on", "sequence-off"),
+    ):
+        survives = by_mode[switched]["marker_present"]
+        print(
+            f"{mechanism}: control {control} wrote "
+            f"{len(by_mode[control]['titles_written'])} title(s) including the "
+            f"marker; with the switch set, {switched} wrote "
+            f"{len(by_mode[switched]['titles_written'])} — "
+            + ("marker survives" if survives else "marker suppressed")
+        )
+    both_suppressed = not by_mode["title-off"]["marker_present"] and not (
+        by_mode["sequence-off"]["marker_present"]
+    )
+    if both_suppressed:
+        verdict = (
+            "CLAUDE_CODE_DISABLE_TERMINAL_TITLE suppresses the kit hook title too "
+            "(both mechanisms); the kit must never set it"
+        )
+    elif by_mode["title-off"]["marker_present"] and by_mode["sequence-off"][
+        "marker_present"
+    ]:
+        verdict = "the switch suppresses ONLY vendor titles; both kit mechanisms survive"
+    else:
+        surviving = [
+            name
+            for name, mode in (
+                ("sessionTitle", "title-off"),
+                ("terminalSequence", "sequence-off"),
+            )
+            if by_mode[mode]["marker_present"]
+        ]
+        verdict = (
+            "the switch suppresses some kit titles but not all; surviving: "
+            + ", ".join(surviving)
+        )
+    print(f"VERDICT: {verdict}")
+    print(f"evidence: {root}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

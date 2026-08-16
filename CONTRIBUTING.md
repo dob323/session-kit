@@ -44,7 +44,19 @@ cd session-kit
 tests/run
 ```
 
-The tests use temporary fixtures and do not contact a live shpool daemon.
+The tests use temporary fixtures and do not contact a live shpool daemon. That
+includes the operator drill, which `tests/run` exercises and you can also run
+on its own:
+
+```bash
+tools/operator-drill          # every step, against this checkout
+tools/operator-drill --json   # the same, machine-readable
+```
+
+It drives the real launch path inside a pty against a stub `shpool` in a
+throwaway sandbox. It has no live mode: a real fixture daemon can answer the
+fixture client and make its session names look authoritative; mixing those
+names with another daemon's process tree can hide or misidentify live sessions.
 
 For shell changes:
 
@@ -97,6 +109,35 @@ installations on a persistent Mac account.
 - Name roles, never people: no personal names in shipped files (see
   [No personal names in shipped files](#no-personal-names-in-shipped-files)).
 
+## Shell review rules
+
+**Any `IFS=$'\t' read` on a record that can carry an empty field is the husk
+bug again.** Tab is IFS whitespace, so a run of tabs collapses to one
+separator and every empty field between them disappears; the fields after it
+shift one place left and a record written perfectly is read as garbage. This
+cost the project three launches in one night — every `sp new --model` without
+`--launch-key` wrote an empty launch key, the generation fields shifted, and
+the session came up as a shell with no provider.
+
+Use the `\034` translation idiom instead: turn the tabs into a non-whitespace
+delimiter, then split on that.
+
+```bash
+IFS= read -r line < "$record"
+line=${line//$'\t'/$'\034'}
+IFS=$'\034' read -r provider cwd model launch_key <<<"$line"
+```
+
+The pattern sites are in `bashrc/shpool.bashrc` — the start record, the
+sidecar, and the launch record all read this way, each with a Python shape
+check above it that refuses a record containing `\034` in the first place.
+
+`tests/test_tab_ifs_rule.py` enforces the rule: it finds every
+`IFS=$'\t' read` in shell code and fails on any site that is not listed with
+the reason it is safe. A trailing field that can be empty is safe; an empty
+field with another field after it is not. `tools/operator-drill` carries the
+original failure as a standing regression, on a stub that starts no daemon.
+
 A change that moves code between modules must not change behavior in the same
 commit, and every symbol an existing test patches on `lib/session_inventory.py`
 must stay reachable through it. See
@@ -147,7 +188,5 @@ copyright holder's name stays exactly as the licence requires.
 
 By contributing, you agree that your contribution is licensed under the
 [MIT License](LICENSE). Changes to the shpool-derived patches remain under
-[Apache License 2.0](LICENSES/Apache-2.0.txt), and changes to the vendored
-Maniple code under
-[its MIT licence](lib/sessionkit_supervisor/vendor/LICENSE). Third-party
+[Apache License 2.0](LICENSES/Apache-2.0.txt). Third-party
 attribution lives in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).

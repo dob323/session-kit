@@ -24,114 +24,16 @@ from .validation import _missing_shell_generation_is_quarantinable
 TERMINAL_NUMBER_QUARANTINE_SECONDS = 7 * 86400
 
 
-class _TerminalRegistryContext(dict[str, Any]):
-    """Registry plus transient supervisor identities, never written to disk."""
-
-    def __init__(
-        self,
-        registry: Mapping[str, Any],
-        *,
-        supervisor_key: str | None,
-        previous_supervisor_key: str | None,
-    ) -> None:
-        super().__init__(registry)
-        self.supervisor_key = supervisor_key
-        self.previous_supervisor_key = previous_supervisor_key
-
-
-def _supervisor_identity(marker: Path) -> str | None:
-    """Read one exact supervisor thread key from its private marker.
-
-    The marker is advisory: a missing, malformed, or insecure file must not
-    make the whole inventory unavailable.  ``bin/supervisor`` publishes it
-    before the first allocating snapshot of a newly created supervisor.
-    """
-    try:
-        raw = _read_bounded_owner_file(
-            marker,
-            label="supervisor identity marker",
-            max_bytes=128,
-            exact_mode=0o600,
-            allow_missing=True,
-        )
-    except CollectionError:
-        return None
-    if raw is None:
-        return None
-    try:
-        value = raw.decode("utf-8").strip()
-    except UnicodeDecodeError:
-        return None
-    if "\n" in value or ":" not in value:
-        return None
-    provider, uuid_text = value.split(":", 1)
-    uuid = valid_uuid(uuid_text)
-    if provider not in PROVIDERS or uuid is None:
-        return None
-    return f"ai:{provider}:{uuid}"
-
-
 def _with_supervisor_identities(
-    registry: Mapping[str, Any], supervisor_dir: Path
-) -> _TerminalRegistryContext:
-    """Attach identities resolved from an explicit state path to one read."""
-    return _TerminalRegistryContext(
-        registry,
-        supervisor_key=_supervisor_identity(supervisor_dir / "identity"),
-        previous_supervisor_key=_supervisor_identity(
-            supervisor_dir / "previous-identity"
-        ),
-    )
+    registry: Mapping[str, Any], supervisor_dir: Path | None = None
+) -> dict[str, Any]:
+    """Compatibility shim: the supervisor role is retired.
 
-
-def _reserve_supervisor_number(
-    inventory: Mapping[str, Any],
-    bindings: dict[str, int],
-    next_number: int,
-    *,
-    boot_id: str,
-    allocate: bool,
-    supervisor_key: str | None,
-    previous_supervisor_key: str | None,
-) -> tuple[int, bool]:
-    """Make terminal 1 supervisor-only and migrate legacy assignments."""
-    if not allocate:
-        return next_number, False
-    supervisor_present = (
-        any(
-            isinstance(item, Mapping) and _terminal_ai_key(item) == supervisor_key
-            for item in inventory.get("sessions", ())
-        )
-        if supervisor_key is not None
-        else False
-    )
-
-    # Terminal 1 is a role address, not an ordinary allocation. Remove every
-    # legacy binding to it before numbering this snapshot. A live ordinary
-    # session that inherited 1 from an older release receives the lowest free
-    # ordinary number below; no future allocation can take the reserved slot.
-    for key, number in tuple(bindings.items()):
-        if number == 1:
-            del bindings[key]
-
-    if not supervisor_present:
-        # Missing, dead, or unreadable supervisor state never makes terminal 1
-        # available to an ordinary session.
-        return next_number, True
-
-    assert supervisor_key is not None
-    # A refresh proves the prior resident closed before publishing the new
-    # identity. Remove its old number bindings; the caller's pre-change binding
-    # set keeps that number in the normal retirement quarantine.
-    previous_key = previous_supervisor_key
-    if previous_key is not None and previous_key in bindings:
-        previous_number = bindings[previous_key]
-        for key, number in tuple(bindings.items()):
-            if number == previous_number:
-                del bindings[key]
-
-    bindings[supervisor_key] = 1
-    return max(next_number, 2), False
+    Terminal 1 is an ordinary allocation again, so a registry read carries no
+    extra identities. The facade still routes reads through this name; it now
+    hands the registry back unchanged.
+    """
+    return dict(registry)
 
 
 def _terminal_ai_key(item: Mapping[str, Any]) -> str | None:
@@ -223,20 +125,16 @@ def apply_terminal_numbers(
     schema_version: int,
     quarantine_seconds: float,
 ) -> dict[str, Any]:
-    """Apply boot-stable selectors without changing contiguous internal rows."""
+    """Apply boot-stable selectors without changing contiguous internal rows.
+
+    ``supervisor_key``/``previous_supervisor_key`` are accepted and ignored:
+    the supervisor role is retired and terminal 1 is an ordinary number.
+    """
+    del supervisor_key, previous_supervisor_key
     checked = validate_registry(registry, boot_id)
     bindings: dict[str, int] = dict(checked["bindings"])
     previously_bound = set(bindings.values())
     next_number = checked["next_number"]
-    next_number, reserve_supervisor_one = _reserve_supervisor_number(
-        inventory,
-        bindings,
-        next_number,
-        boot_id=boot_id,
-        allocate=allocate,
-        supervisor_key=supervisor_key,
-        previous_supervisor_key=previous_supervisor_key,
-    )
     recycle = allocate and retired is not None
     now = current_time if current_time is not None else time.time()
     if recycle:
@@ -254,10 +152,6 @@ def apply_terminal_numbers(
             for expired_number in expired:
                 retired.pop(expired_number, None)
     reserved_numbers: set[int] = set(bindings.values())
-    if reserve_supervisor_one:
-        # Terminal 1 is permanently held for Fleet Supervisor, including when
-        # no readable marker or live supervisor exists.
-        reserved_numbers.add(1)
     active_numbers: set[int] = set()
     for item in inventory.get("sessions", ()):
         if not isinstance(item, dict):
@@ -272,9 +166,19 @@ def apply_terminal_numbers(
                 item.pop("_terminal_identity_hint", None)
                 continue
             if allocate:
-                raise CollectionError(
-                    "managed session lacks an exact generation for numbering"
-                )
+                # One row that cannot be numbered used to refuse the WHOLE
+                # collection. That took the machine read-only: every close,
+                # switch and repair goes through the guard snapshot, and
+                # arming a launch needs one that is live, fresh and
+                # warning-free — so a single unprovable session stopped every
+                # session on the box, with a message that named none of them.
+                # Quarantine the row that cannot be proven, name it, and let
+                # the rest of the estate work.
+                item["terminal_number"] = None
+                item["mutation_allowed"] = False
+                item["mutation_rejection_reason"] = "unprovable-generation"
+                item.pop("_terminal_identity_hint", None)
+                continue
         ai_number = bindings.get(ai_key) if ai_key else None
         generation_number = bindings.get(generation_key) if generation_key else None
         generation_ai_key = (
@@ -347,8 +251,8 @@ def apply_terminal_numbers(
         # Stamp newly dead numbers; clear stamps on anything alive again
         # (an exact recovery inside the quarantine window).
         bound = set(bindings.values())
-        # Include bindings removed by the supervisor-only migration so their
-        # old ordinary or supervisor numbers receive the normal quarantine.
+        # Include bindings dropped during this pass so their old numbers
+        # receive the normal quarantine.
         for number in (bound | previously_bound) - active_numbers:
             retired.setdefault(number, now)
         for number in active_numbers:

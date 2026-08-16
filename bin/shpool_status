@@ -10,16 +10,25 @@ CORE=${SESSION_KIT_INVENTORY_CORE:-"$SCRIPT_DIR/../lib/session_inventory.py"}
 # it runs on every login picker and every `sp` render, so it sets it here too.
 export PYTHONDONTWRITEBYTECODE=1
 
+# Title reconciliation mutates private provider/name state and therefore runs
+# only on refresh paths already documented as state-building. Human listing
+# remains observation-only.
+fill_pending_titles() {
+  python3 "$CORE" automatic-title claude-pending >/dev/null 2>&1 || true
+  python3 "$CORE" automatic-title codex-pending >/dev/null 2>&1 || true
+}
+
 # Which modes touch state and which do not is the question a person actually
-# has here: several of these look like reads and are not. A mode that builds a
-# fresh inventory writes the cached snapshot, and the four human render modes
-# additionally fill in provider titles that were still pending. The replay and
-# probe modes are the only genuinely read-only ones.
+# has here. Listing is observation: it neither fills titles nor writes the
+# cached snapshot. Explicit machine refresh modes retain their documented
+# cache behaviour.
 status_usage() {
   cat <<'USAGE'
 usage: shpool_status [mode]
 
 Read-only modes -- nothing on disk changes:
+  (no mode)                            the dashboard
+  --rows                               dashboard rows only
   --strict-json                        live snapshot, strict identity, no write
   --guard-json                         live snapshot for mutation guards, no write
   --render-file <snapshot.json> [--rows]
@@ -31,16 +40,16 @@ Read-only modes -- nothing on disk changes:
 Modes that refresh the cached inventory as they run:
   --waiting-count                      how many sessions are waiting for you
   --detail <session-number>            one session in full, for a person
-
-Modes that refresh the cache and fill pending provider titles:
-  (no mode)                            the dashboard
-  --rows                               dashboard rows only
   --json                               the whole snapshot as JSON
   --lookup <row|shpool-id>             resolve one selector to its record
 
-Mode that changes recovery state:
+Modes that change recovery state:
   --recovery-pending-ack <source-generation-key> <old-shpool-id> <uuid>
                                        acknowledge one pending recovery record
+  --recovery-remember-printed <recovery-list.json>
+                                       record what a recovery screen printed
+                                       beside each row, so a word typed later
+                                       can be checked against it
 
 --json, --strict-json, --guard-json, --lookup, and --lookup-file are the
 machine channels and carry identifiers. The dashboard, --rows, and --detail are
@@ -51,27 +60,14 @@ USAGE
 }
 
 case "${1:-}" in
-  ""|--rows|--json|--lookup)
-    # Claude stores auto-titles separately from the prompt-bar name. Fill the
-    # absent native record before a human-facing inventory, without replacing
-    # an explicit /rename or /color choice.
-    python3 "$CORE" automatic-title claude-pending >/dev/null 2>&1 || true
-    # Codex has no title hook, so pending threads are titled before every
-    # fresh HUMAN-FACING inventory build — menu, tab, and bounce all see a
-    # real name on the human's first look after an answer. Fail-open and
-    # cheap (a no-op read once every recent thread carries an index entry).
-    # Strict/guard snapshots and --waiting-count are safety probes and
-    # prompt-time polls: those stay genuinely read-only, and replay paths
-    # (--render-file/--lookup-file) never build fresh state.
-    python3 "$CORE" automatic-title codex-pending >/dev/null 2>&1 || true
-    ;;
-esac
-
-case "${1:-}" in
   "") exec python3 "$CORE" render ;;
   --rows) exec python3 "$CORE" render --rows ;;
   --waiting-count) exec python3 "$CORE" waiting-count ;;
-  --json) exec python3 "$CORE" snapshot ;;
+  --json)
+    [[ -z ${2:-} ]] || { status_usage >&2; exit 2; }
+    fill_pending_titles
+    exec python3 "$CORE" snapshot
+    ;;
   --strict-json) exec python3 "$CORE" snapshot --strict-live --no-write ;;
   --guard-json) exec python3 "$CORE" snapshot --guard-live --no-write ;;
   --lookup)
@@ -79,6 +75,7 @@ case "${1:-}" in
       status_usage >&2
       exit 2
     }
+    fill_pending_titles
     exec python3 "$CORE" lookup "$2"
     ;;
   --detail)
@@ -111,6 +108,13 @@ case "${1:-}" in
       exit 2
     }
     exec python3 "$CORE" recovery-pending list
+    ;;
+  --recovery-remember-printed)
+    [[ -n ${2:-} && -z ${3:-} ]] || {
+      status_usage >&2
+      exit 2
+    }
+    exec python3 "$CORE" recovery-selectors remember --payload "$2"
     ;;
   --recovery-pending-ack)
     [[ -n ${2:-} && -n ${3:-} && -n ${4:-} && -z ${5:-} ]] || {
