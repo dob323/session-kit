@@ -134,12 +134,8 @@ class ReleaseArtifactTests(unittest.TestCase):
                     f"{basename}/extras/statusline-quota-refresh.example", names
                 )
                 self.assertNotIn(f"{basename}/LICENSES/MIT-maniple.txt", names)
-                self.assertNotIn(
-                    f"{basename}/docs/build-tracks-2026-08-12.md", names
-                )
-                self.assertNotIn(
-                    f"{basename}/tools/reset-collection-order.py", names
-                )
+                self.assertNotIn(f"{basename}/docs/build-tracks-2026-08-12.md", names)
+                self.assertNotIn(f"{basename}/tools/reset-collection-order.py", names)
                 self.assertTrue(all(not name.startswith("/") for name in names))
                 self.assertTrue(
                     all(".." not in Path(name).parts for name in names),

@@ -277,7 +277,13 @@ render_main() {
   # page_size() subtracts the same line, so the two stay in step.
   [[ ${PICKER_COMPACT:-0} == 1 ]] || echo
   local cols=${COLUMNS:-}
-  [[ $cols =~ ^[0-9]+$ ]] || cols=$(tput cols 2>/dev/null || printf '80')
+  if ! [[ $cols =~ ^[0-9]+$ ]]; then
+    cols=$(tput cols 2>/dev/null) && [[ $cols =~ ^[0-9]+$ ]] || cols=
+    if ! [[ $cols =~ ^[0-9]+$ ]]; then
+      cols=$(command stty size <&2 2>/dev/null) && cols=${cols##* } || cols=
+    fi
+    [[ $cols =~ ^[0-9]+$ ]] || cols=80
+  fi
   [[ $cols =~ ^[0-9]+$ ]] || cols=80
   # One footer, one shape, at every width: verb first, lowercase, middot
   # separated. A narrow window drops items off the end; it never rewrites the

@@ -1152,6 +1152,12 @@ picker_redraw_home() {
     # each frame, which is also what keeps a resize honest.
     cols=$(tput cols 2>/dev/null) && [[ $cols =~ ^[0-9]+$ ]] || cols=
     rows=$(tput lines 2>/dev/null) && [[ $rows =~ ^[0-9]+$ ]] || rows=
+    if ! [[ ${cols:-${COLUMNS:-}} =~ ^[0-9]+$ ]]; then
+      __sk_size=$(command stty size <&2 2>/dev/null) || __sk_size=
+      cols=${__sk_size##* }; rows=${__sk_size%% *}
+      [[ $cols =~ ^[0-9]+$ ]] || cols=
+      [[ $rows =~ ^[0-9]+$ ]] || rows=
+    fi
     { COLUMNS=${cols:-${COLUMNS:-}} LINES=${rows:-${LINES:-}} render_main
       printf '%s%s' "$prompt" "$buffer"; } > "$PICKER_FRAME_FILE"
     picker_frame_emit_file "$PICKER_FRAME_FILE" home

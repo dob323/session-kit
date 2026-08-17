@@ -13,9 +13,7 @@ from tests.support import REPO
 class PublicExportTests(unittest.TestCase):
     def test_third_party_notice_names_every_shipped_shpool_patch(self) -> None:
         notice = (REPO / "THIRD_PARTY_NOTICES").read_text(encoding="utf-8")
-        patches = sorted(
-            (REPO / "shpool-patch").glob("[0-9][0-9][0-9][0-9]-*.patch")
-        )
+        patches = sorted((REPO / "shpool-patch").glob("[0-9][0-9][0-9][0-9]-*.patch"))
         self.assertEqual(6, len(patches))
         for patch in patches:
             self.assertIn(f"shpool-patch/{patch.name}", notice)

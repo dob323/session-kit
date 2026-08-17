@@ -22,7 +22,10 @@ import re
 import shutil
 import subprocess
 import tempfile
-import tomllib
+try:
+    import tomllib
+except ImportError:  # Python 3.10 is supported and has no tomllib.
+    tomllib = None  # type: ignore[assignment]
 import unittest
 
 from tests.support import REPO
@@ -519,6 +522,7 @@ class TabTitleSurfaceTests(unittest.TestCase):
         for rejected in CODEX_TITLE_ITEMS_REJECTED:
             self.assertNotIn(rejected, shipped_items)
 
+    @unittest.skipIf(tomllib is None, "tomllib arrived in Python 3.11")
     def test_deployed_template_names_only_items_codex_accepts(self) -> None:
         template = REPO / "config" / "codex" / "terminal-title.toml"
         parsed = tomllib.loads(template.read_text(encoding="utf-8"))
@@ -582,6 +586,7 @@ class TabTitleSurfaceTests(unittest.TestCase):
         self.assertIn("session-kit/terminal-title.toml", bashrc)
         self.assertIn("import tomllib", bashrc)
 
+    @unittest.skipIf(tomllib is None, "tomllib arrived in Python 3.11")
     def test_installer_deploys_the_template_without_touching_config_toml(self) -> None:
         with tempfile.TemporaryDirectory(prefix=".tab-install-", dir=REPO) as raw:
             base = Path(raw)

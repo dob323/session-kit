@@ -225,6 +225,14 @@ while true; do
     # fallback terminal. tput reads the real size from stderr.
     __sk_cols=$(tput cols 2>/dev/null) && [[ $__sk_cols =~ ^[0-9]+$ ]] || __sk_cols=
     __sk_rows=$(tput lines 2>/dev/null) && [[ $__sk_rows =~ ^[0-9]+$ ]] || __sk_rows=
+    # No terminfo and no exported size (a stock macOS runner): the kernel
+    # still knows the winsize; stty is the last resort, never an override.
+    if ! [[ ${__sk_cols:-${COLUMNS:-}} =~ ^[0-9]+$ ]]; then
+      __sk_size=$(command stty size <&2 2>/dev/null) || __sk_size=
+      __sk_cols=${__sk_size##* }; __sk_rows=${__sk_size%% *}
+      [[ $__sk_cols =~ ^[0-9]+$ ]] || __sk_cols=
+      [[ $__sk_rows =~ ^[0-9]+$ ]] || __sk_rows=
+    fi
     COLUMNS=${__sk_cols:-${COLUMNS:-}} LINES=${__sk_rows:-${LINES:-}} \
       render_main > "$PICKER_FRAME_FILE"
     picker_frame_emit_file "$PICKER_FRAME_FILE" append

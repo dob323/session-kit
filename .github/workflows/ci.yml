@@ -25,7 +25,11 @@ jobs:
         python:
           - "3.10"
           - "3.11"
-          - "3.12"
+          # 3.12 is pinned to an exact patch: the hosted toolcache's 3.12.13
+          # ships a _curses extension built against a newer CPython
+          # (undefined symbol _PySys_GetOptionalAttrString), which kills
+          # every TUI test. Unpin when the toolcache build is repaired.
+          - "3.12.11"
           - "3.13"
     runs-on: ${{ matrix.os }}
     steps:
