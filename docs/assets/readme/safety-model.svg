@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="760" viewBox="0 0 1600 760">
+<rect width="1600" height="760" fill="#0d1117"/>
+<defs>
+  <style>
+    .title { font:700 52px Inter,Arial,sans-serif; fill:#f0f6fc; }
+    .sub { font:400 22px Inter,Arial,sans-serif; fill:#8b949e; }
+    .h { font:600 23px Inter,Arial,sans-serif; fill:#f0f6fc; }
+    .p { font:400 17px Inter,Arial,sans-serif; fill:#8b949e; }
+    .mono { font:500 17px "DejaVu Sans Mono",monospace; fill:#f0f6fc; }
+    .good { font:600 20px Inter,Arial,sans-serif; fill:#9ece6a; }
+    .bad { font:600 20px Inter,Arial,sans-serif; fill:#f7768e; }
+  </style>
+  <marker id="a" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#2ac3de"/></marker>
+</defs>
+<text x="70" y="82" class="title">The safety model</text>
+<text x="70" y="124" class="sub">Display text helps you choose. Exact live evidence decides whether Session Kit is allowed to act.</text>
+
+<rect x="70" y="205" rx="18" width="315" height="245" fill="#161b22" stroke="#30363d" stroke-width="2"/>
+<text x="100" y="248" class="h">1 · Frozen snapshot</text>
+<text x="100" y="292" class="p">The picker presents a stable view</text>
+<text x="100" y="320" class="p">of the current inventory.</text>
+<text x="100" y="372" class="mono">number · title · directory</text>
+<text x="100" y="402" class="p">Useful context, not identity.</text>
+
+<rect x="445" y="205" rx="18" width="315" height="245" fill="#161b22" stroke="#2ac3de" stroke-width="2"/>
+<text x="475" y="248" class="h">2 · Bind action proof</text>
+<text x="475" y="292" class="p">The selected session is bound to</text>
+<text x="475" y="320" class="p">the snapshot and exact process data.</text>
+<text x="475" y="372" class="mono">provider UUID + generation</text>
+<text x="475" y="402" class="p">Owner-only and short-lived.</text>
+
+<rect x="820" y="205" rx="18" width="315" height="245" fill="#161b22" stroke="#e0af68" stroke-width="2"/>
+<text x="850" y="248" class="h">3 · Recheck live identity</text>
+<text x="850" y="292" class="p">Immediately before a mutation,</text>
+<text x="850" y="320" class="p">Session Kit rechecks the live chain.</text>
+<text x="850" y="364" class="p">Manager · terminal · shell · provider</text>
+<text x="850" y="392" class="p" style="font-size:15px">process generations and UUID evidence.</text>
+
+<rect x="1195" y="205" rx="18" width="335" height="245" fill="#161b22" stroke="#9ece6a" stroke-width="2"/>
+<text x="1225" y="248" class="h">4 · Act or refuse</text>
+<text x="1225" y="300" class="good">Evidence still exact -&gt; act</text>
+<text x="1225" y="350" class="bad" style="font-size:17px">Missing / stale / conflicting -&gt; refuse</text>
+<text x="1225" y="400" class="p">A refusal changes nothing.</text>
+
+<line x1="385" y1="330" x2="438" y2="330" stroke="#2ac3de" stroke-width="4" marker-end="url(#a)"/>
+<line x1="760" y1="330" x2="813" y2="330" stroke="#2ac3de" stroke-width="4" marker-end="url(#a)"/>
+<line x1="1135" y1="330" x2="1188" y2="330" stroke="#2ac3de" stroke-width="4" marker-end="url(#a)"/>
+
+<rect x="170" y="520" rx="18" width="1260" height="150" fill="#21262d" stroke="#30363d"/>
+<text x="205" y="562" class="h">Trust boundary</text>
+<text x="205" y="601" class="p">Session Kit is designed for one cooperative Unix account. These checks prevent stale or ambiguous picker state from acting on the wrong session.</text>
+<text x="205" y="633" class="p">They are not isolation from a hostile process already running with the same Unix-user privileges.</text>
+</svg>

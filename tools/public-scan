@@ -74,6 +74,32 @@ APPROVED_BINARY_SHA256 = {
     "docs/assets/session-kit-dashboard.png": (
         "b14518a8a78aa077be5ee7d21bdc76929b43e1f035420a1519df8965cf94e3db",
     ),
+    # README redesign, 2026-08-17. Every terminal region in these four is the
+    # deterministic tools/render-readme-picker output, whose demo data is
+    # neutral by construction: aliases "personal" and "work", demo session
+    # ids, and a "session kit" title bar rather than a real user@host. An
+    # earlier cut of this artwork composited a live capture and carried a
+    # real account alias, host name, and personal name; it was rejected and
+    # never entered the tree. Reviewed at 3x zoom before approval: nothing
+    # private in any of the four.
+    "docs/assets/readme/hero.png": (
+        "e5a5031889808fce8269ac21e254e7c92003bb4951075ae6ecac602bf0869a2b",
+    ),
+    # Callout leader lines stop at the capture edge; an earlier cut drew them
+    # across it and struck out the labels they pointed at.
+    "docs/assets/readme/picker-anatomy.png": (
+        "a25a27a9b35b9d7c2d130f1fc5f52f3afe487024409229e93d61e42c7756a59f",
+    ),
+    # The bare picker render, identical to the docs/assets/session-kit-picker
+    # blob above because both come from the same deterministic tool.
+    "docs/assets/readme/picker-home.png": (
+        "5cb56b210644526e5cc54534248a922ae2e2dca36c0ef717c211caa9f5a83ca8",
+    ),
+    # GitHub social preview: 1280x640, uploaded through repository settings,
+    # versioned here so the share artwork travels with the rest.
+    "docs/assets/readme/social-preview.png": (
+        "562bf99a1b7728b670092b7a6d0bd26016d28c4ecba07f3bc8ea18d0538e3349",
+    ),
 }
 
 
