@@ -89,6 +89,11 @@ APPROVED_BINARY_SHA256 = {
     # across it and struck out the labels they pointed at.
     "docs/assets/readme/picker-anatomy.png": (
         "a25a27a9b35b9d7c2d130f1fc5f52f3afe487024409229e93d61e42c7756a59f",
+        # 2026-08-17 recomposition: leader lines dropped entirely for a labelled
+        # row strip and four panels, so nothing has to reach into the capture at
+        # all. The picker render is pasted unscaled-in-aspect and verified
+        # pixel-identical to tools/render-readme-picker output before approval.
+        "2819ce4a9fc8a8d6ecace378d9f7dbbc24dfb3d3074118f6a836cf3d174f95b6",
     ),
     # The bare picker render, identical to the docs/assets/session-kit-picker
     # blob above because both come from the same deterministic tool.
