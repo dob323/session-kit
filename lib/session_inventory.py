@@ -1947,6 +1947,26 @@ def _push_codex_live_rename(
 DEFAULT_CODEX_TITLE_ITEMS = '["activity", "thread"]'
 
 
+def _title_template_value(raw: str):
+    """One quoted string or one flat array of them; anything else refuses."""
+    raw = raw.strip()
+    if raw.startswith("[") and raw.endswith("]"):
+        inner = raw[1:-1].strip()
+        if not inner:
+            return []
+        items = []
+        for part in inner.split(","):
+            part = part.strip()
+            if len(part) >= 2 and part[0] == part[-1] and part[0] in "\"'":
+                items.append(part[1:-1])
+            else:
+                raise ValueError("shape")
+        return items
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'":
+        return raw[1:-1]
+    raise ValueError("shape")
+
+
 def _parse_title_template(text: str):
     """tomllib when it exists; else a strict reader of the template's own tiny
     dialect (one [table] level, JSON-compatible string and string-array
@@ -1973,11 +1993,11 @@ def _parse_title_template(text: str):
             if not isinstance(current, dict):
                 return None
             continue
-        pair = re.fullmatch(r"([A-Za-z0-9_-]+)\s*=\s*(\".*\"|\[.*\])", line)
+        pair = re.fullmatch(r"([A-Za-z0-9_-]+)\s*=\s*(.+)", line)
         if not pair:
             return None
         try:
-            value = json.loads(pair.group(2))
+            value = _title_template_value(pair.group(2))
         except ValueError:
             return None
         (current if current is not None else parsed)[pair.group(1)] = value

@@ -832,7 +832,6 @@ PY
                   # `session-kit doctor`.
                   __sk_codex_title_deployed=$(
                     python3 - "$__sk_codex_title_file" <<'SKTITLE' 2>/dev/null
-import json
 import re
 import sys
 
@@ -840,6 +839,24 @@ try:
     import tomllib
 except ImportError:  # Python 3.10 has no parser; read the kit's own dialect.
     tomllib = None
+
+def _value(raw):
+    raw = raw.strip()
+    if raw.startswith("[") and raw.endswith("]"):
+        inner = raw[1:-1].strip()
+        if not inner:
+            return []
+        items = []
+        for part in inner.split(","):
+            part = part.strip()
+            if len(part) >= 2 and part[0] == part[-1] and part[0] in "\"'":
+                items.append(part[1:-1])
+            else:
+                raise ValueError("shape")
+        return items
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'":
+        return raw[1:-1]
+    raise ValueError("shape")
 
 def parse(text):
     if tomllib is not None:
@@ -856,10 +873,10 @@ def parse(text):
             if not isinstance(current, dict):
                 raise ValueError("shape")
             continue
-        pair = re.fullmatch(r"([A-Za-z0-9_-]+)\s*=\s*(\".*\"|\[.*\])", line)
+        pair = re.fullmatch(r"([A-Za-z0-9_-]+)\s*=\s*(.+)", line)
         if not pair:
             raise ValueError("shape")
-        (current if current is not None else parsed)[pair.group(1)] = json.loads(
+        (current if current is not None else parsed)[pair.group(1)] = _value(
             pair.group(2)
         )
     tui = parsed.get("tui")
@@ -1627,7 +1644,7 @@ kit() {
 
 # SSH lands in a regular shell; one dim static hint, no inventory cost.
 if [[ $- == *i* && -n ${SSH_CONNECTION:-} && -z ${SHPOOL_SESSION_NAME:-} && -t 0 ]]; then
-  printf '  kit: the picker\n'
+  printf '  kit: session kit\n'
 fi
 
 # ---- end session-kit shpool integration -------------------------------------

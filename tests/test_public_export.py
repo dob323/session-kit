@@ -88,6 +88,7 @@ class PublicExportTests(unittest.TestCase):
 
     def test_export_contains_runtime_release_and_provenance_inputs(self) -> None:
         with tempfile.TemporaryDirectory(
+            ignore_cleanup_errors=True,
             prefix="session-kit-public-export.",
             dir=REPO.parent,
         ) as temporary:
@@ -136,6 +137,7 @@ class PublicExportTests(unittest.TestCase):
 
     def test_exported_tree_can_export_itself(self) -> None:
         with tempfile.TemporaryDirectory(
+            ignore_cleanup_errors=True,
             prefix="session-kit-public-export.",
             dir=REPO.parent,
         ) as temporary:
@@ -202,6 +204,7 @@ class PublicExportTests(unittest.TestCase):
 
     def test_export_uses_manifest_from_requested_commit(self) -> None:
         with tempfile.TemporaryDirectory(
+            ignore_cleanup_errors=True,
             prefix="session-kit-public-export.",
             dir=REPO.parent,
         ) as temporary:
@@ -218,6 +221,7 @@ class PublicExportTests(unittest.TestCase):
 
     def test_export_rejects_partial_inventory_package(self) -> None:
         with tempfile.TemporaryDirectory(
+            ignore_cleanup_errors=True,
             prefix="session-kit-public-export.",
             dir=REPO.parent,
         ) as temporary:
@@ -243,6 +247,7 @@ class PublicExportTests(unittest.TestCase):
 
     def test_export_rejects_manifest_pattern_that_matches_nothing(self) -> None:
         with tempfile.TemporaryDirectory(
+            ignore_cleanup_errors=True,
             prefix="session-kit-public-export.",
             dir=REPO.parent,
         ) as temporary:
@@ -261,6 +266,7 @@ class PublicExportTests(unittest.TestCase):
 
     def test_export_rejects_private_marker_without_echoing_it(self) -> None:
         with tempfile.TemporaryDirectory(
+            ignore_cleanup_errors=True,
             prefix="session-kit-public-export.",
             dir=REPO.parent,
         ) as temporary:

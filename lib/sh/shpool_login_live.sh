@@ -1150,13 +1150,17 @@ picker_redraw_home() {
     # their fallback and rows lay out for the wrong terminal. tput still
     # reads the real size from stderr, so pin it for the capture — freshly
     # each frame, which is also what keeps a resize honest.
-    cols=$(tput cols 2>/dev/null) && [[ $cols =~ ^[0-9]+$ ]] || cols=
-    rows=$(tput lines 2>/dev/null) && [[ $rows =~ ^[0-9]+$ ]] || rows=
-    if ! [[ ${cols:-${COLUMNS:-}} =~ ^[0-9]+$ ]]; then
-      __sk_size=$(command stty size <&2 2>/dev/null) || __sk_size=
-      cols=${__sk_size##* }; rows=${__sk_size%% *}
-      [[ $cols =~ ^[0-9]+$ ]] || cols=
-      [[ $rows =~ ^[0-9]+$ ]] || rows=
+    # Kernel winsize first (0 means never sized), tput second, exported
+    # size last — same chain and reasons as the picker's own frame capture.
+    __sk_size=$(command stty size <&2 2>/dev/null) || __sk_size=
+    cols=${__sk_size##* }; rows=${__sk_size%% *}
+    [[ $cols =~ ^[0-9]+$ && $cols -gt 0 ]] || cols=
+    [[ $rows =~ ^[0-9]+$ && $rows -gt 0 ]] || rows=
+    if [[ -z $cols ]]; then
+      cols=$(tput cols 2>/dev/null) && [[ $cols =~ ^[0-9]+$ ]] || cols=
+    fi
+    if [[ -z $rows ]]; then
+      rows=$(tput lines 2>/dev/null) && [[ $rows =~ ^[0-9]+$ ]] || rows=
     fi
     { COLUMNS=${cols:-${COLUMNS:-}} LINES=${rows:-${LINES:-}} render_main
       printf '%s%s' "$prompt" "$buffer"; } > "$PICKER_FRAME_FILE"

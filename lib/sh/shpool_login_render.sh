@@ -278,10 +278,10 @@ render_main() {
   [[ ${PICKER_COMPACT:-0} == 1 ]] || echo
   local cols=${COLUMNS:-}
   if ! [[ $cols =~ ^[0-9]+$ ]]; then
-    cols=$(tput cols 2>/dev/null) && [[ $cols =~ ^[0-9]+$ ]] || cols=
-    if ! [[ $cols =~ ^[0-9]+$ ]]; then
-      cols=$(command stty size <&2 2>/dev/null) && cols=${cols##* } || cols=
-    fi
+    cols=$(command stty size <&2 2>/dev/null) && cols=${cols##* } || cols=
+    [[ $cols =~ ^[0-9]+$ && ${cols:-0} -gt 0 ]] || {
+      cols=$(tput cols 2>/dev/null) && [[ $cols =~ ^[0-9]+$ ]] || cols=
+    }
     [[ $cols =~ ^[0-9]+$ ]] || cols=80
   fi
   [[ $cols =~ ^[0-9]+$ ]] || cols=80

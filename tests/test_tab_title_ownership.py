@@ -22,6 +22,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+
 try:
     import tomllib
 except ImportError:  # Python 3.10 is supported and has no tomllib.
@@ -264,7 +265,11 @@ class TabTitleOwnershipTests(unittest.TestCase):
 
     def test_tab_title_stays_silent_without_a_terminal(self) -> None:
         result = subprocess.run(
-            ["bash", "-c", f'source "{REPO}/bin/session_kit_common"; sk_tab_title "Name"'],
+            [
+                "bash",
+                "-c",
+                f'source "{REPO}/bin/session_kit_common"; sk_tab_title "Name"',
+            ],
             capture_output=True,
         )
         self.assertEqual(result.stdout, b"")
@@ -331,15 +336,13 @@ class TabTitleSurfaceTests(unittest.TestCase):
             f'source "{REPO}/lib/sh/sp_picker.sh"\n'
             f'SK_TITLE="{title}"; SK_PROVIDER="{provider}"; SK_NUMBER="{number}"\n'
             f'SK_PROOF_PROVIDER="{provider}"; SK_PROOF_UUID=""\n'
-            f'{function} drill-session /tmp\n'
+            f"{function} drill-session /tmp\n"
         )
 
     def run_surface(self, **kwargs) -> list[bytes]:
         env = kwargs.pop("env", None)
         with tempfile.TemporaryDirectory(prefix=".tab-surface-", dir=REPO) as raw:
-            written = run_on_pty(
-                self.surface_script(Path(raw), **kwargs), env=env
-            )
+            written = run_on_pty(self.surface_script(Path(raw), **kwargs), env=env)
         return OSC_TITLE.findall(written)
 
     def test_open_and_attach_write_the_name_on_both_providers(self) -> None:
@@ -554,7 +557,7 @@ class TabTitleSurfaceTests(unittest.TestCase):
             'terminal_title = ["thread]\n',
             '[tui]\nterminal_title = ["thread]\n',
             '[tui]\nterminal_title = "thread"\n',
-            '[tui]\nterminal_title = []\n',
+            "[tui]\nterminal_title = []\n",
             '[tui]\nterminal_title = ["thread", 7]\n',
             '[tui]\nterminal_title = ["thread; rm -rf /"]\n',
             '[tui]\nterminal_title = ["THREAD"]\n',

@@ -1051,12 +1051,26 @@ elif codex_home_info is not None and stat.S_ISDIR(codex_home_info.st_mode):
                 if not isinstance(current, dict):
                     return None
                 continue
-            pair = _re.fullmatch(r"([A-Za-z0-9_-]+)\s*=\s*(\".*\"|\[.*\])", line)
+            pair = _re.fullmatch(r"([A-Za-z0-9_-]+)\s*=\s*(.+)", line)
             if not pair:
                 return None
-            try:
-                value = _json.loads(pair.group(2))
-            except ValueError:
+            raw = pair.group(2).strip()
+            if raw.startswith("[") and raw.endswith("]"):
+                inner = raw[1:-1].strip()
+                value = []
+                for part in inner.split(",") if inner else []:
+                    part = part.strip()
+                    quoted = (
+                        len(part) >= 2
+                        and part[0] == part[-1]
+                        and part[0] in "\"'"
+                    )
+                    if not quoted:
+                        return None
+                    value.append(part[1:-1])
+            elif len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'":
+                value = raw[1:-1]
+            else:
                 return None
             (current if current is not None else parsed)[pair.group(1)] = value
         return parsed

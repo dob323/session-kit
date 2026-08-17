@@ -51,15 +51,20 @@ PRIVATE_TOKEN_DIGESTS = frozenset(
         "9244bfa2efb5ae19b6f84f62dc79582ad52a25a14f7e904e9c39e739360a7cff",
     }
 )
+# Every digest a path has ever legitimately shipped with: the working tree
+# must match one, and superseded versions stay reachable in public history.
 APPROVED_BINARY_SHA256 = {
     "docs/assets/session-kit-picker.png": (
-        "6885c0c477fac8b1811c5a29f1f70063b5f6333cfb3c8d3c96b62dc82c0d7d0b"
+        # v0.4.0 render, superseded 2026-08-17.
+        "6885c0c477fac8b1811c5a29f1f70063b5f6333cfb3c8d3c96b62dc82c0d7d0b",
+        # 2026-08-17 render: live states, accounts, and models in the demo.
+        "2e1e5693c15bea25fa27ddd0b07fe4329cabb75c2831a21d38cea36216cdffe2",
     ),
     # Shipped publicly with v0.4.0, later trimmed from the tree; the blob
     # stays reachable in public history. Reviewed 2026-08-17: a dashboard
     # screenshot, nothing private.
     "docs/assets/session-kit-dashboard.png": (
-        "b14518a8a78aa077be5ee7d21bdc76929b43e1f035420a1519df8965cf94e3db"
+        "b14518a8a78aa077be5ee7d21bdc76929b43e1f035420a1519df8965cf94e3db",
     ),
 }
 
@@ -104,10 +109,10 @@ def scan_payload(
     *,
     private_markers: bool,
 ) -> list[str]:
-    expected_digest = APPROVED_BINARY_SHA256.get(path)
-    if expected_digest is not None:
+    expected_digests = APPROVED_BINARY_SHA256.get(path)
+    if expected_digests is not None:
         actual_digest = hashlib.sha256(payload).hexdigest()
-        if actual_digest != expected_digest:
+        if actual_digest not in expected_digests:
             return [f"{label}: approved binary digest mismatch"]
         return []
     return scan_text(label, payload, patterns, private_markers=private_markers)

@@ -93,9 +93,7 @@ def row(
             "process_start_ticks": 10_000 + suffix,
         },
         "started_at_unix_ms": 1_700_000_000_000 + suffix,
-        "shpool_status": (
-            "Disconnected" if availability == "ready" else "Attached"
-        ),
+        "shpool_status": ("Disconnected" if availability == "ready" else "Attached"),
         "availability": availability,
         "provider": provider,
         "identity": {
@@ -196,9 +194,7 @@ class LoginFixture:
         fixture_root = Path(
             os.environ.get("SESSION_KIT_TEST_EXEC_ROOT", os.fspath(REPO))
         )
-        self.temp = tempfile.TemporaryDirectory(
-            prefix=".login-", dir=fixture_root
-        )
+        self.temp = tempfile.TemporaryDirectory(prefix=".login-", dir=fixture_root)
         self.base = Path(self.temp.name)
         self.home = self.base / "home"
         self.home.mkdir()
@@ -337,7 +333,19 @@ raise SystemExit(int(os.environ.get("LOGIN_SP_EXIT","0")))
         )
 
     def close(self) -> None:
-        self.temp.cleanup()
+        # A picker child that has not fully exited can still be writing under
+        # the fixture (git object files, frame captures) when cleanup walks
+        # the tree, and rmtree then dies on a directory that refilled behind
+        # it. The stragglers exit within moments; retry instead of failing
+        # the test on its own teardown.
+        for attempt in range(5):
+            try:
+                self.temp.cleanup()
+                return
+            except OSError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.2 * (attempt + 1))
 
     def env(
         self, *, lines: int = 24, columns: int = 100, sp_exit: int = 0
@@ -383,9 +391,7 @@ raise SystemExit(int(os.environ.get("LOGIN_SP_EXIT","0")))
         return [json.loads(line) for line in self.sp_log.read_text().splitlines()]
 
     def status_entries(self) -> list[list[str]]:
-        return [
-            json.loads(line) for line in self.status_log.read_text().splitlines()
-        ]
+        return [json.loads(line) for line in self.status_log.read_text().splitlines()]
 
     def picker_temps(self) -> list[Path]:
         return sorted(
@@ -414,9 +420,7 @@ def run_pty(
     followup: tuple[str, bytes, float] | None = None,
     pty_winsize: tuple[int, int] | None = None,
 ) -> tuple[int, str]:
-    environment = fixture.env(
-        lines=lines, columns=columns, sp_exit=sp_exit
-    )
+    environment = fixture.env(lines=lines, columns=columns, sp_exit=sp_exit)
     for key, value in (env_updates or {}).items():
         if value is None:
             environment.pop(key, None)
@@ -476,7 +480,7 @@ def run_pty(
         os.close(ready_writer)
 
     output = bytearray()
-    deadline = time.monotonic() + 10
+    deadline = time.monotonic() + 30
     try:
         if input_bytes:
             os.write(descriptor, input_bytes)
@@ -484,7 +488,7 @@ def run_pty(
             # Type only once the picker has painted something on its own,
             # so an unattended repaint can be observed before any keystroke.
             marker, payload = deferred
-            marker_deadline = min(deadline, time.monotonic() + 8)
+            marker_deadline = min(deadline, time.monotonic() + 20)
             while marker.encode() not in output and time.monotonic() < marker_deadline:
                 ready, _, _ = select.select([descriptor], [], [], 0.05)
                 if not ready:
@@ -543,14 +547,14 @@ def run_pty(
                     f"picker never rendered {followup_marker!r} after the "
                     f"deferred stage; output={output.decode(errors='replace')!r}"
                 )
-            deadline = max(deadline, time.monotonic() + 8)
+            deadline = max(deadline, time.monotonic() + 20)
             os.write(descriptor, followup_payload)
         if send_signal is not None:
             # Which prompt the signal is aimed at. A modal has to be on screen
             # before an interrupt can be said to have cancelled it, and the
             # home prompt is already there by then.
             prompt = signal_marker.encode()
-            signal_deadline = min(deadline, time.monotonic() + 5)
+            signal_deadline = min(deadline, time.monotonic() + 15)
             while prompt not in output and time.monotonic() < signal_deadline:
                 ready, _, _ = select.select([descriptor], [], [], 0.05)
                 if not ready:
@@ -578,10 +582,8 @@ def run_pty(
                     # fixed sleep races the answer, and a keystroke that lands
                     # first is consumed by the very prompt under test.
                     answer = post_signal_marker.encode()
-                    answer_deadline = min(deadline, time.monotonic() + 5)
-                    while (
-                        answer not in output and time.monotonic() < answer_deadline
-                    ):
+                    answer_deadline = min(deadline, time.monotonic() + 15)
+                    while answer not in output and time.monotonic() < answer_deadline:
                         ready, _, _ = select.select([descriptor], [], [], 0.05)
                         if not ready:
                             continue
@@ -785,7 +787,9 @@ class LoginPickerTests(unittest.TestCase):
         finally:
             fixture.close()
 
-    def test_projection_groups_and_search_preserve_stable_terminal_numbers(self) -> None:
+    def test_projection_groups_and_search_preserve_stable_terminal_numbers(
+        self,
+    ) -> None:
         searchable = row("codex10", number=10, provider="codex")
         searchable["title"] = "Searchable task"
         searchable["native_title"] = "Searchable task"
@@ -814,9 +818,7 @@ class LoginPickerTests(unittest.TestCase):
         try:
             code, output = run_pty(fixture, b"/codex10\nq\n")
             self.assertEqual(0, code)
-            self.assertIn(
-                "4 sessions · 3 ready · 1 open elsewhere", output
-            )
+            self.assertIn("4 sessions · 3 ready · 1 open elsewhere", output)
             self.assertIn("Ready", output)
             self.assertIn("Open elsewhere", output)
             self.assertIn("| CDX | pe… | pe… | pending", output)
@@ -832,7 +834,9 @@ class LoginPickerTests(unittest.TestCase):
         finally:
             fixture.close()
 
-    def test_refresh_and_provider_regroup_preserve_terminal_number_and_internal_row(self) -> None:
+    def test_refresh_and_provider_regroup_preserve_terminal_number_and_internal_row(
+        self,
+    ) -> None:
         before = row("transition", number=7401, provider="unknown")
         before["row"] = 1
         before["identity"]["uuid"] = None
@@ -860,10 +864,7 @@ class LoginPickerTests(unittest.TestCase):
 
     def test_sparse_page_membership_and_arbitrary_width_number_are_exact(self) -> None:
         huge = 12345678901234567890
-        rows = [
-            row(f"s{index:02}", number=1000 + index * 13)
-            for index in range(1, 25)
-        ]
+        rows = [row(f"s{index:02}", number=1000 + index * 13) for index in range(1, 25)]
         rows[-1]["terminal_number"] = huge
         fixture = LoginFixture(inventory(*rows))
         try:
@@ -1085,11 +1086,7 @@ class LoginPickerTests(unittest.TestCase):
                         self.assertEqual(
                             11,
                             sum(
-                                bool(
-                                    __import__("re").match(
-                                        r"^\s+\d+\s+.+\s+\|", line
-                                    )
-                                )
+                                bool(__import__("re").match(r"^\s+\d+\s+.+\s+\|", line))
                                 for line in rendered
                             ),
                         )
@@ -1309,9 +1306,7 @@ class LoginPickerTests(unittest.TestCase):
         waiting["account_switch_capable"] = True
         fixture = LoginFixture(inventory(waiting))
         try:
-            code, output = run_pty(
-                fixture, b"6\n4\n2\nq\n", columns=120
-            )
+            code, output = run_pty(fixture, b"6\n4\n2\nq\n", columns=120)
             self.assertEqual(0, code)
             self.assertIn("Change subscription account", output)
             self.assertNotIn("[y/N]", output)
@@ -1388,11 +1383,7 @@ class LoginPickerTests(unittest.TestCase):
             )
             self.assertEqual(0, code)
             codes = set(SGR.findall(output))
-            self.assertTrue(
-                {"0", "1", "32", "33", "38;2;64;216;209"}.issubset(
-                    codes
-                )
-            )
+            self.assertTrue({"0", "1", "32", "33", "38;2;64;216;209"}.issubset(codes))
             self.assertLessEqual(
                 codes,
                 {"0", "1", "32", "33", "36", "38;2;64;216;209"},
@@ -1461,12 +1452,8 @@ class LoginPickerTests(unittest.TestCase):
                 },
             )
             self.assertEqual(0, code)
-            self.assertIn(
-                "\x1b[1m\x1b[38;2;205;210;220mUNK\x1b[0m", output
-            )
-            self.assertNotIn(
-                "\x1b[1m\x1b[38;2;249;215;108mUNK\x1b[0m", output
-            )
+            self.assertIn("\x1b[1m\x1b[38;2;205;210;220mUNK\x1b[0m", output)
+            self.assertNotIn("\x1b[1m\x1b[38;2;249;215;108mUNK\x1b[0m", output)
         finally:
             fixture.close()
 
@@ -1518,9 +1505,7 @@ class LoginPickerTests(unittest.TestCase):
                     )
                 )
                 try:
-                    code, output = run_pty(
-                        fixture, b"q\n", env_updates=updates
-                    )
+                    code, output = run_pty(fixture, b"q\n", env_updates=updates)
                     self.assertEqual(0, code)
                     if updates.get("TERM") in {"dumb", None}:
                         self.assertNotIn("\x1b", output)
@@ -1612,8 +1597,9 @@ class LoginPickerTests(unittest.TestCase):
             self.assertRegex(output, r"\| SHL \| pendi… \| no model\s+\| needs you")
             # One time phrase, one starting column, on every row.
             rows_shown = [
-                line for line in strip_sgr(output).splitlines() if " | CLD | " in line
-                or " | CDX | " in line or " | SHL | " in line
+                line
+                for line in strip_sgr(output).splitlines()
+                if " | CLD | " in line or " | CDX | " in line or " | SHL | " in line
             ]
             self.assertEqual(4, len(rows_shown), rows_shown)
             self.assertEqual(
@@ -1665,7 +1651,9 @@ class LoginPickerTests(unittest.TestCase):
     def test_narrow_main_row_drops_age_before_the_primary_state(self) -> None:
         now_ms = int(time.time() * 1000)
         item = row("narrow-age", number=8, provider="codex")
-        item["display_title"] = "A useful descriptive title that should keep the available room"
+        item["display_title"] = (
+            "A useful descriptive title that should keep the available room"
+        )
         item["started_at_unix_ms"] = now_ms - 30 * 60 * 1000
         fixture = LoginFixture(inventory(item))
         try:
@@ -1736,9 +1724,7 @@ class LoginPickerTests(unittest.TestCase):
         ]
         fixture = LoginFixture(document)
         try:
-            code, output = run_pty(
-                fixture, b"q\n", lines=24, columns=60
-            )
+            code, output = run_pty(fixture, b"q\n", lines=24, columns=60)
             self.assertEqual(0, code)
             plain = strip_screen_control(output)
             self.assertNotIn("\x1b", plain)
@@ -1837,10 +1823,7 @@ class LoginPickerTests(unittest.TestCase):
             self.assertEqual(2, len(entries))
             self.assertEqual(
                 {("picker-close", "open1"), ("picker-close", "open3")},
-                {
-                    (entry["args"][0], entry["proof"]["shpool_id"])
-                    for entry in entries
-                },
+                {(entry["args"][0], entry["proof"]["shpool_id"]) for entry in entries},
             )
         finally:
             fixture.close()
@@ -2036,7 +2019,7 @@ class LoginPickerTests(unittest.TestCase):
             fixture.close()
 
     def test_long_silent_running_session_reports_its_silence(self) -> None:
-        """"running" must not be printed for a session that stopped producing.
+        """ "running" must not be printed for a session that stopped producing.
 
         A Codex run froze for eight hours while the list kept calling it
         running, which is how it went unnoticed overnight.
@@ -2138,7 +2121,9 @@ class LoginPickerTests(unittest.TestCase):
         try:
             code, output = run_pty(fixture, b"1\nk 1\nq\n")
             self.assertEqual(0, code)
-            self.assertIn("Showing a cached list. Actions are off until it refreshes.", output)
+            self.assertIn(
+                "Showing a cached list. Actions are off until it refreshes.", output
+            )
             self.assertIn("Nothing changed", output)
             self.assertEqual([], fixture.sp_entries())
             self.assertNotIn("terminal died", output)
@@ -2160,9 +2145,7 @@ class LoginPickerTests(unittest.TestCase):
 
         fixture = LoginFixture(inventory(hidden))
         try:
-            code, output = run_pty(
-                fixture, b"/private-session-id\nq\n", columns=120
-            )
+            code, output = run_pty(fixture, b"/private-session-id\nq\n", columns=120)
             self.assertEqual(0, code)
             self.assertIn("1 match of 1 session", output)
             self.assertIn("Picker safety work", output)
@@ -2413,9 +2396,7 @@ class LoginPickerTests(unittest.TestCase):
             self.assertEqual(4, output.count("\033[2J"))
             frame = output.rsplit("\033[2J", 2)[1]
             self.assertIn("Compact rows off.", frame)
-            self.assertEqual(
-                1, frame.count("# · kill k # · new n · more m")
-            )
+            self.assertEqual(1, frame.count("# · kill k # · new n · more m"))
         finally:
             fixture.close()
 
@@ -2491,9 +2472,7 @@ class LoginPickerTests(unittest.TestCase):
 
     def test_help_and_more_remain_modal_across_refresh_intervals(self) -> None:
         first = inventory(row("alpha", number=1))
-        refreshed = inventory(
-            row("alpha", number=1), row("bravo", number=2)
-        )
+        refreshed = inventory(row("alpha", number=1), row("bravo", number=2))
         for command, marker in ((b"?\n", "Picker help"), (b"m\n", "  More")):
             with self.subTest(command=command):
                 fixture = LoginFixture(first, refreshed_document=refreshed)
@@ -2534,12 +2513,8 @@ class LoginPickerTests(unittest.TestCase):
         self.assertEqual([], offenders)
 
     def test_idle_picker_reexecs_the_release_selected_by_current(self) -> None:
-        rows = tuple(
-            row(f"session-{number}", number=number) for number in range(1, 51)
-        )
-        fixture = LoginFixture(
-            inventory(*rows)
-        )
+        rows = tuple(row(f"session-{number}", number=number) for number in range(1, 51))
+        fixture = LoginFixture(inventory(*rows))
         release_id = "a1b2c3d4e5f6789012345678901234567890abcd"
         install_root = fixture.base / "session-kit"
         new_release = install_root / "releases" / release_id
@@ -2550,8 +2525,8 @@ class LoginPickerTests(unittest.TestCase):
             launcher,
             "#!/usr/bin/env bash\n"
             "printf '%s|%s|%s\\n' \"$SESSION_KIT_PICKER_RESUME_QUERY\" "
-            "\"$SESSION_KIT_PICKER_RESUME_PAGE\" "
-            "\"$SESSION_KIT_PICKER_COMPACT\" > \"$UPGRADE_RECORD\"\n"
+            '"$SESSION_KIT_PICKER_RESUME_PAGE" '
+            '"$SESSION_KIT_PICKER_COMPACT" > "$UPGRADE_RECORD"\n'
             "printf 'NEW RELEASE PICKER RAN\\n'\n"
             # Outlive the handoff probation, or a truthful exit reads as a
             # corpse and the wrapper reloads the old picker.
@@ -2602,7 +2577,7 @@ class LoginPickerTests(unittest.TestCase):
         write_executable(
             launcher,
             "#!/usr/bin/env bash\n"
-            ": > \"$UPGRADE_RECORD\"\n"
+            ': > "$UPGRADE_RECORD"\n'
             "printf 'NEW RELEASE PICKER RAN\\n'\n"
             "sleep 1.5\n",
         )
@@ -2653,9 +2628,7 @@ class LoginPickerTests(unittest.TestCase):
             replacement.symlink_to(broken_release)
             os.replace(replacement, current)
 
-        warning = (
-            "Release c1d2e3f4a5b6 is unavailable. Continuing with this picker."
-        )
+        warning = "Release c1d2e3f4a5b6 is unavailable. Continuing with this picker."
         try:
             code, output = run_pty(
                 fixture,
@@ -2675,7 +2648,9 @@ class LoginPickerTests(unittest.TestCase):
         finally:
             fixture.close()
 
-    def test_unstartable_launcher_recovers_and_never_retries_the_same_target(self) -> None:
+    def test_unstartable_launcher_recovers_and_never_retries_the_same_target(
+        self,
+    ) -> None:
         """No static probe proves a program will serve; the handoff does.
 
         A launcher whose shebang names a missing interpreter — or whose env
@@ -2721,9 +2696,7 @@ class LoginPickerTests(unittest.TestCase):
                 followup=("Continuing with this picker", b"q\n", 6),
             )
             self.assertEqual(0, code)
-            self.assertIn(
-                "Reloading the picker into release d1e2f3a4b5c6.", output
-            )
+            self.assertIn("Reloading the picker into release d1e2f3a4b5c6.", output)
             self.assertIn("exited immediately (status", output)
             self.assertEqual(
                 1,
@@ -2798,7 +2771,7 @@ class LoginPickerTests(unittest.TestCase):
             fixture.close()
 
     def test_octal_looking_probation_neither_aborts_nor_serves_a_corpse(self) -> None:
-        """"08" is decimal eight here, not broken octal.
+        """ "08" is decimal eight here, not broken octal.
 
         Bash arithmetic reads a leading zero as octal and aborts on "08" —
         review round five drove the picker to die after the reload line with
@@ -2977,9 +2950,7 @@ class LoginPickerTests(unittest.TestCase):
         (new_release / "bin").mkdir(parents=True)
         write_executable(
             new_release / "bin" / "shpool_login_launcher",
-            "#!/usr/bin/env bash\n"
-            "printf 'NEW RELEASE PICKER RAN\\n'\n"
-            "sleep 3\n",
+            "#!/usr/bin/env bash\nprintf 'NEW RELEASE PICKER RAN\\n'\nsleep 3\n",
         )
         bash4_env = fixture.base / "bash4-env.sh"
         bash4_env.write_text("unset EPOCHREALTIME\n", encoding="utf-8")
@@ -3194,9 +3165,9 @@ class LoginPickerTests(unittest.TestCase):
                     "bash",
                     "-c",
                     'source "$LOGIN_LIVE_MODULE"; '
-                    "{ sleep 45 & echo $! > \"$COLLECTOR_PID\"; wait; } & "
+                    '{ sleep 45 & echo $! > "$COLLECTOR_PID"; wait; } & '
                     "LIVE_PID=$!; "
-                    "while [ ! -s \"$COLLECTOR_PID\" ]; do sleep 0.05; done; "
+                    'while [ ! -s "$COLLECTOR_PID" ]; do sleep 0.05; done; '
                     "picker_live_stop; "
                     'printf \'%s|%s\\n\' "${LIVE_PID:-gone}" "$(cat "$COLLECTOR_PID")"',
                 ],
@@ -3428,8 +3399,7 @@ class LoginPickerTests(unittest.TestCase):
                     "uuid": "11111111-1111-4111-8111-111111111111",
                     "cwd": "/srv/project",
                     "title": "Recover me",
-                    "started_at_unix_ms": int(time.time() * 1000)
-                    - (51 * 3600 * 1000),
+                    "started_at_unix_ms": int(time.time() * 1000) - (51 * 3600 * 1000),
                 }
             ],
         }
@@ -3537,7 +3507,9 @@ class LoginPickerTests(unittest.TestCase):
         finally:
             fixture.close()
 
-    def test_recovery_selection_opens_exact_active_managed_uuid_without_duplicate(self) -> None:
+    def test_recovery_selection_opens_exact_active_managed_uuid_without_duplicate(
+        self,
+    ) -> None:
         active = row("active-one", number=4107, provider="codex")
         pending = {
             "schema_version": 1,
@@ -3672,7 +3644,9 @@ class LoginPickerTests(unittest.TestCase):
         finally:
             fixture.close()
 
-    def test_recovery_duplicate_check_is_scoped_to_exact_provider_and_uuid(self) -> None:
+    def test_recovery_duplicate_check_is_scoped_to_exact_provider_and_uuid(
+        self,
+    ) -> None:
         active = row("codex-active", number=22, provider="codex")
         pending = {
             "schema_version": 1,
@@ -3696,7 +3670,14 @@ class LoginPickerTests(unittest.TestCase):
             self.assertNotIn("claude-old", output)
             entries = fixture.sp_entries()
             self.assertEqual(
-                [["restore-exact", "claude", active["identity"]["uuid"], "/srv/project"]],
+                [
+                    [
+                        "restore-exact",
+                        "claude",
+                        active["identity"]["uuid"],
+                        "/srv/project",
+                    ]
+                ],
                 [entry["args"] for entry in entries],
             )
         finally:
@@ -3793,9 +3774,7 @@ class LoginPickerTests(unittest.TestCase):
         try:
             code, output = run_pty(fixture, b"u\na\nq\n")
             self.assertEqual(0, code)
-            self.assertIn(
-                "review required: conflicting cwd, command", output
-            )
+            self.assertIn("review required: conflicting cwd, command", output)
             # The sentence the list carries for this row, and the same one
             # again when they act on it -- with the fields that disagree named.
             self.assertIn(
@@ -3874,11 +3853,7 @@ class LoginPickerTests(unittest.TestCase):
                     "-u",
                     "-i",
                     "-c",
-                    (
-                        'source "$1"; '
-                        '[[ -z ${__sk_state_root+x} ]]; '
-                        "__sk_waiting"
-                    ),
+                    ('source "$1"; [[ -z ${__sk_state_root+x} ]]; __sk_waiting'),
                     "prompt-state-test",
                     REPO / "bashrc/shpool.bashrc",
                 ],

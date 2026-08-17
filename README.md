@@ -4,10 +4,13 @@
 [![Latest release](https://img.shields.io/github/v/release/dob323/session-kit?include_prereleases)](https://github.com/dob323/session-kit/releases)
 [![License](https://img.shields.io/github/license/dob323/session-kit)](LICENSE)
 
-Session Kit is a local status and safety layer for shpool sessions running
-Claude Code, Codex, or shells over SSH. It gives every session a stable place
-in one picker, then proves live identity again before it opens, moves, closes,
-or restores anything.
+Session Kit keeps your terminal AI sessions safe, named, and one keypress
+away. It is a local status and safety layer for shpool sessions running
+Claude Code, Codex, or shells over SSH: every session gets a stable place in
+one picker, and the kit proves live identity again before it opens, moves,
+closes, or restores anything. Drop your connection mid-answer, SSH back in,
+press Enter — the same session is still going. That is the whole pitch;
+everything else is guardrails around it.
 
 ![The Session Kit picker showing ready and open sessions grouped by provider](docs/assets/session-kit-picker.png)
 
@@ -94,6 +97,28 @@ cd session-kit-*/
 session-kit doctor
 session-kit services enable
 ```
+
+### Install with an AI assistant
+
+If an AI agent (Claude Code, Codex, or similar) runs your terminal, you can
+hand it the whole job. Paste it this brief:
+
+> Install Session Kit from https://github.com/dob323/session-kit. Download the
+> latest release archive with its `.sha256` and `.provenance.json` files,
+> verify the checksum, extract, and run `./install.sh --check` first — fix
+> anything it names before running `./install.sh`. Then run
+> `session-kit doctor`, then `session-kit services enable`, then
+> `session-kit doctor` again, and show me the final doctor output. Never work
+> around a refused step: a refusal prints its exact remedy, and
+> `docs/install.md` and `docs/troubleshooting.md` inside the archive answer
+> the rest. Finish by telling me to type `kit`.
+
+This is safe to delegate because every gate fails closed: the preflight is
+read-only, a refused step names its remedy instead of guessing, and the
+install either lands a complete immutable release or stops with the reason.
+An agent cannot leave the machine half-installed.
+
+### What lands on disk
 
 The archive contains the complete public source, documentation, tools, and
 tests. Installation copies the runtime subset — `bin`, `lib`, `bashrc`,
