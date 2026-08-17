@@ -201,7 +201,7 @@ def main() -> int:
             sync_directory(root)
             sync_directory(pending)
 
-        stamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
+        stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         archive = root / f"collection-order-reset-{stamp}"
         if entry_exists(archive):
             refuse(f"archive path already exists: {archive}")

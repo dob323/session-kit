@@ -1947,6 +1947,43 @@ def _push_codex_live_rename(
 DEFAULT_CODEX_TITLE_ITEMS = '["activity", "thread"]'
 
 
+def _parse_title_template(text: str):
+    """tomllib when it exists; else a strict reader of the template's own tiny
+    dialect (one [table] level, JSON-compatible string and string-array
+    values). Python 3.10 ships no tomllib, and the deployed template is
+    kit-authored, so the dialect is the contract, not a guess."""
+    try:
+        import tomllib
+    except ImportError:
+        tomllib = None  # type: ignore[assignment]
+    if tomllib is not None:
+        try:
+            return tomllib.loads(text)
+        except Exception:
+            return None
+    parsed: dict = {}
+    current = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        header = re.fullmatch(r"\[([A-Za-z0-9_-]+)\]", line)
+        if header:
+            current = parsed.setdefault(header.group(1), {})
+            if not isinstance(current, dict):
+                return None
+            continue
+        pair = re.fullmatch(r"([A-Za-z0-9_-]+)\s*=\s*(\".*\"|\[.*\])", line)
+        if not pair:
+            return None
+        try:
+            value = json.loads(pair.group(2))
+        except ValueError:
+            return None
+        (current if current is not None else parsed)[pair.group(1)] = value
+    return parsed
+
+
 def _codex_title_items(environ: Mapping[str, str]) -> str:
     """The tab-title items a kit Codex launch passes, or "" when it passes none.
 
@@ -1961,14 +1998,9 @@ def _codex_title_items(environ: Mapping[str, str]) -> str:
     try:
         if template.is_symlink():
             raise OSError("refusing a symlinked template")
-        import tomllib
-
-        value = (
-            tomllib.loads(template.read_text(encoding="utf-8"))
-            .get("tui", {})
-            .get("terminal_title")
-        )
-    except (OSError, ValueError, ImportError, AttributeError):
+        parsed = _parse_title_template(template.read_text(encoding="utf-8"))
+        value = (parsed or {}).get("tui", {}).get("terminal_title")
+    except (OSError, ValueError, AttributeError):
         return DEFAULT_CODEX_TITLE_ITEMS
     if not isinstance(value, list) or not value or len(value) > 12:
         return DEFAULT_CODEX_TITLE_ITEMS

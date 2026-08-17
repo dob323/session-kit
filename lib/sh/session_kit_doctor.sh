@@ -1025,15 +1025,49 @@ elif codex_home_info is not None and stat.S_ISDIR(codex_home_info.st_mode):
     # Parsed, not pattern-matched: this is the exact file the launcher reads,
     # and it decides between the kit's items and the built-in fallback.
     parsed = None
+    def _sk_parse_title_template(text):
+        # tomllib when it exists; else the template's own tiny dialect
+        # (one [table] level, JSON-compatible values). Python 3.10 has no tomllib.
+        try:
+            import tomllib
+        except ImportError:
+            tomllib = None
+        if tomllib is not None:
+            try:
+                return tomllib.loads(text)
+            except Exception:
+                return None
+        import json as _json
+        import re as _re
+        parsed = {}
+        current = None
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            header = _re.fullmatch(r"\[([A-Za-z0-9_-]+)\]", line)
+            if header:
+                current = parsed.setdefault(header.group(1), {})
+                if not isinstance(current, dict):
+                    return None
+                continue
+            pair = _re.fullmatch(r"([A-Za-z0-9_-]+)\s*=\s*(\".*\"|\[.*\])", line)
+            if not pair:
+                return None
+            try:
+                value = _json.loads(pair.group(2))
+            except ValueError:
+                return None
+            (current if current is not None else parsed)[pair.group(1)] = value
+        return parsed
+
     try:
         template_bytes = codex_template.read_bytes()
     except OSError:
         template_bytes = b""
     if template_bytes:
         try:
-            import tomllib
-
-            parsed = tomllib.loads(template_bytes.decode("utf-8"))
+            parsed = _sk_parse_title_template(template_bytes.decode("utf-8"))
         except Exception:
             parsed = None
     if not template_bytes:

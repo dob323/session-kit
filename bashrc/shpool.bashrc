@@ -832,18 +832,43 @@ PY
                   # `session-kit doctor`.
                   __sk_codex_title_deployed=$(
                     python3 - "$__sk_codex_title_file" <<'SKTITLE' 2>/dev/null
+import json
 import re
 import sys
 
 try:
     import tomllib
-except ImportError:  # Python older than 3.11 has no parser; use the default.
-    raise SystemExit(1)
+except ImportError:  # Python 3.10 has no parser; read the kit's own dialect.
+    tomllib = None
+
+def parse(text):
+    if tomllib is not None:
+        return tomllib.loads(text).get("tui", {}).get("terminal_title")
+    parsed = {}
+    current = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        header = re.fullmatch(r"\[([A-Za-z0-9_-]+)\]", line)
+        if header:
+            current = parsed.setdefault(header.group(1), {})
+            if not isinstance(current, dict):
+                raise ValueError("shape")
+            continue
+        pair = re.fullmatch(r"([A-Za-z0-9_-]+)\s*=\s*(\".*\"|\[.*\])", line)
+        if not pair:
+            raise ValueError("shape")
+        (current if current is not None else parsed)[pair.group(1)] = json.loads(
+            pair.group(2)
+        )
+    tui = parsed.get("tui")
+    return tui.get("terminal_title") if isinstance(tui, dict) else None
 
 try:
-    with open(sys.argv[1], "rb") as handle:
-        value = tomllib.load(handle).get("tui", {}).get("terminal_title")
-except (OSError, ValueError, tomllib.TOMLDecodeError):
+    with open(sys.argv[1], "r", encoding="utf-8") as handle:
+        value = parse(handle.read())
+except Exception:
     raise SystemExit(1)
 if not isinstance(value, list) or not value or len(value) > 12:
     raise SystemExit(1)

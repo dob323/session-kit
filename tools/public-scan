@@ -55,6 +55,12 @@ APPROVED_BINARY_SHA256 = {
     "docs/assets/session-kit-picker.png": (
         "6885c0c477fac8b1811c5a29f1f70063b5f6333cfb3c8d3c96b62dc82c0d7d0b"
     ),
+    # Shipped publicly with v0.4.0, later trimmed from the tree; the blob
+    # stays reachable in public history. Reviewed 2026-08-17: a dashboard
+    # screenshot, nothing private.
+    "docs/assets/session-kit-dashboard.png": (
+        "b14518a8a78aa077be5ee7d21bdc76929b43e1f035420a1519df8965cf94e3db"
+    ),
 }
 
 
