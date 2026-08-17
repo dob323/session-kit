@@ -17,10 +17,10 @@ everything else is guardrails around it.
 ## What it is
 
 Every session gets a number, a useful name, a colour, a model, a state, and an
-exact provider identity. One list holds all of them. Nothing asks for
-confirmation: guards run first, the action is refused when the evidence is not
-good enough, and a completed action says what happened. A close is recoverable
-from Closed sessions.
+exact provider identity. One list holds all of them. Guards run before every
+action: anything without good enough evidence is refused with the reason, and
+a completed action says what happened. A close is recoverable from Closed
+sessions.
 
 Session Kit also supplies guarded account and model changes, optional local
 history, per-session colours, project shortcuts, health checks, immutable local
@@ -36,8 +36,9 @@ update beacon, or telemetry.
 ## The picker
 
 Type `kit` from an ordinary shell. Ready sessions appear before sessions that
-are open elsewhere; attention decides the order inside each group. Machine
-sessions such as drills and workers stay behind one counted row.
+are open elsewhere, and sessions waiting on you sort first inside each group.
+Machine-started sessions (background workers and health checks) stay behind
+one counted row.
 
 Enter takes the most likely option on every screen:
 
@@ -62,9 +63,9 @@ use the same state words and safety checks.
 | `idle` | A needs-you transcript has not moved for the configured window, 30 minutes by default. |
 | `pending` | The kit cannot currently read the value; this is a placeholder, not a state. |
 
-An unreadable `<state>/session-idle-minutes` file disables the `idle` label
-instead of guessing. `sp detail` also shows live child shells and workers that
-are at least an hour old, with their age.
+An unreadable idle-window setting disables the `idle` label instead of
+guessing. `sp detail` also shows live child shells and workers that are at
+least an hour old, with their age.
 
 A picker already running during an upgrade reloads itself from the new release
 at a safe refresh point and keeps its view. If the new launcher cannot start,
@@ -132,10 +133,9 @@ re-enables a timer you disabled and never restarts the session manager. On
 macOS it refreshes an already loaded kit watchdog. `session-kit services
 enable` starts the full reviewed set.
 
-Install and upgrade also seed the collection-order floor when an older
-installation has none. The seed is copied exactly from trusted current state;
-if that state cannot be proved, activation refuses and prints the exact
-installed recovery command instead of inventing a value.
+Upgrading an older installation repairs its internal ordering state
+automatically. When that state cannot be proved, activation refuses and
+prints the exact recovery command instead of inventing a value.
 
 For requirements, manual downloads, shell integration, and activation checks,
 read [Install Session Kit](docs/install.md).
@@ -169,7 +169,7 @@ The display has four distinct pieces:
 Claude quota-refresher contract, Codex behaviour, title ownership, palettes,
 and terminal fallback in full.
 
-## Day 2
+## Maintenance
 
 The maintenance surface stays small:
 

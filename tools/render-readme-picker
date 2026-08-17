@@ -243,21 +243,30 @@ def svg_document(frame: str) -> str:
             'font-size="14" fill="#8b949e">session kit</text>'
         ),
     ]
+    # Every run is pinned to the character grid with an explicit x and a
+    # forced textLength. Letting the renderer flow tspans instead lets a bold
+    # face (or a substituted one, when the named fonts are absent) advance a
+    # hair differently per glyph, and the columns the picker aligned by cell
+    # drift apart in the picture while lining up perfectly in a terminal.
+    cell = font_size * 0.6
     for line_number, line in enumerate(lines):
-        x = left
         y = top + line_number * line_height
-        output.append(
-            f'<text x="{x}" y="{y}" xml:space="preserve" '
-            'font-family="Nimbus Mono PS,DejaVu Sans Mono,monospace" '
-            f'font-size="{font_size}">'
-        )
+        column = 0
         for text, style in styled_runs(line):
+            if not text:
+                continue
             weight = "700" if style.bold else "400"
+            x = left + column * cell
+            run_width = len(text) * cell
             output.append(
-                f'<tspan fill="{style.color}" font-weight="{weight}">'
-                f'{html.escape(text)}</tspan>'
+                f'<text x="{x:.2f}" y="{y}" xml:space="preserve" '
+                'font-family="Nimbus Mono PS,DejaVu Sans Mono,monospace" '
+                f'font-size="{font_size}" fill="{style.color}" '
+                f'font-weight="{weight}" textLength="{run_width:.2f}" '
+                'lengthAdjust="spacingAndGlyphs">'
+                f"{html.escape(text)}</text>"
             )
-        output.append("</text>")
+            column += len(text)
     output.append("</svg>")
     return "\n".join(output) + "\n"
 

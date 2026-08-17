@@ -47,8 +47,8 @@ secondary view, and finally leaves when nothing remains to clear or back out
 of. `q` leaves from an unfiltered home screen, and `Ctrl-D` leaves from
 anywhere.
 
-Nothing asks for confirmation. Guards run before the action, and the next line
-says what happened. A refusal changes nothing.
+Guards run before the action, and the next line says what happened. A refusal
+changes nothing.
 
 ## The key-driven picker
 

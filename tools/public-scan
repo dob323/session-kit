@@ -59,6 +59,9 @@ APPROVED_BINARY_SHA256 = {
         "6885c0c477fac8b1811c5a29f1f70063b5f6333cfb3c8d3c96b62dc82c0d7d0b",
         # 2026-08-17 render: live states, accounts, and models in the demo.
         "2e1e5693c15bea25fa27ddd0b07fe4329cabb75c2831a21d38cea36216cdffe2",
+        # 2026-08-17 second render: every run pinned to the character grid so
+        # bold glyphs cannot drift the columns.
+        "5cb56b210644526e5cc54534248a922ae2e2dca36c0ef717c211caa9f5a83ca8",
     ),
     # Shipped publicly with v0.4.0, later trimmed from the tree; the blob
     # stays reachable in public history. Reviewed 2026-08-17: a dashboard
