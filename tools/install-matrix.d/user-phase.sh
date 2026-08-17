@@ -52,7 +52,7 @@ id
 printf 'bash %s\n' "$BASH_VERSION"
 python3 --version
 uname -srm
-cat /etc/os-release | sed -n '1,3p'
+sed -n '1,3p' /etc/os-release
 printf 'XDG_RUNTIME_DIR=%s\n' "$XDG_RUNTIME_DIR"
 
 # A real machine reaches this point with a login session; the container gets

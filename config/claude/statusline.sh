@@ -96,7 +96,7 @@ QDIR="$HOME/.claude/cache/session-kit-quota/${qalias}-${qsum:-0}"
 QCACHE="$QDIR/quota_headers"
 QSTAMP="$QDIR/refresh-requested"
 QREFRESH="$HOME/.claude/statusline-quota-refresh.sh"
-mkdir -p "$QDIR" 2>/dev/null && chmod 700 "$QDIR" 2>/dev/null || true
+if mkdir -p "$QDIR" 2>/dev/null; then chmod 700 "$QDIR" 2>/dev/null || true; fi
 qacct=$(awk -F': ' '$1=="x-probe-account"{print $2}' "$QCACHE" 2>/dev/null)
 qmtime=$(stat -c %Y "$QCACHE" 2>/dev/null || echo 0)
 if [ $((now - qmtime)) -ge $QTTL ] || [ "$qacct" != "$acct" ]; then
