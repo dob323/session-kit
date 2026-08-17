@@ -21,10 +21,9 @@ import json
 import os
 from pathlib import Path
 import subprocess
+from tests.test_lifecycle_shell import CORE, ProviderExitShellHarness, UUID
 
 REPO = Path(__file__).resolve().parents[1]
-
-from tests.test_lifecycle_shell import CORE, ProviderExitShellHarness, UUID
 
 
 TREE_WRAPPER = '''#!/usr/bin/env python3

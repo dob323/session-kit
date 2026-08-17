@@ -21,10 +21,9 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from tests.test_lifecycle_shell import ProviderExitShellHarness, UUID
 
 REPO = Path(__file__).resolve().parents[1]
-
-from tests.test_lifecycle_shell import ProviderExitShellHarness, UUID
 
 
 class CleanExitClosesTests(ProviderExitShellHarness):

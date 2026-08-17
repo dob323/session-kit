@@ -592,15 +592,21 @@ def preflight_collection_documents(
     """Compare one incoming reading with every incumbent before any mutation."""
     refused: list[str] = []
     diagnostics: list[str] = []
-    incoming_valid = (
-        not isinstance(sequence, bool) and isinstance(sequence, int) and sequence > 0
+    incoming_sequence = (
+        sequence
+        if not isinstance(sequence, bool)
+        and isinstance(sequence, int)
+        and sequence > 0
+        else None
     )
     for key in document_keys:
         path = paths[key]
         marker = read_collection_marker(paths, path)
         witness = _read_collection_witness(paths, path)
         exists = path.exists() or path.is_symlink()
-        if witness is not None and (not incoming_valid or witness > sequence):
+        if witness is not None and (
+            incoming_sequence is None or witness > incoming_sequence
+        ):
             refused.append(path.name)
         elif exists and marker is None and witness is None:
             diagnostics.append(

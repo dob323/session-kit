@@ -37,12 +37,16 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: Check Bash syntax
         run: |
-          bash -n install.sh
-          bash -n bin/*
-          bash -n lib/sh/*
-          bash -n bashrc/shpool.bashrc
-          bash -n deploy/session-kit-launcher
-          bash -n tests/run
+          mapfile -d '' shell_scripts < <(
+            while IFS= read -r -d '' path; do
+              if head -n 1 "$path" | grep -Eq \
+                  '^#![[:space:]]*(/usr/bin/env[[:space:]]+)?(/[^[:space:]]*/)?(ba|da|k)?sh([[:space:]]|$)'; then
+                printf '%s\0' "$path"
+              fi
+            done < <(git ls-files -z)
+          )
+          # This sourced Bash startup file deliberately has no shebang.
+          bash -n "${shell_scripts[@]}" bashrc/shpool.bashrc
       - name: Check scripts embedded in heredocs
         run: tools/check-embedded-scripts
       - name: Check public working tree
@@ -94,12 +98,16 @@ jobs:
           '
       - name: Check supported Bash syntax
         run: |
-          "$SESSION_KIT_TEST_BASH" -n install.sh
-          "$SESSION_KIT_TEST_BASH" -n bin/*
-          "$SESSION_KIT_TEST_BASH" -n lib/sh/*
-          "$SESSION_KIT_TEST_BASH" -n bashrc/shpool.bashrc
-          "$SESSION_KIT_TEST_BASH" -n deploy/session-kit-launcher
-          "$SESSION_KIT_TEST_BASH" -n tests/run
+          mapfile -d '' shell_scripts < <(
+            while IFS= read -r -d '' path; do
+              if head -n 1 "$path" | grep -Eq \
+                  '^#![[:space:]]*(/usr/bin/env[[:space:]]+)?(/[^[:space:]]*/)?(ba|da|k)?sh([[:space:]]|$)'; then
+                printf '%s\0' "$path"
+              fi
+            done < <(git ls-files -z)
+          )
+          # This sourced Bash startup file deliberately has no shebang.
+          "$SESSION_KIT_TEST_BASH" -n "${shell_scripts[@]}" bashrc/shpool.bashrc
       - name: Check scripts embedded in heredocs
         run: tools/check-embedded-scripts
       - name: Run native and fixture-only macOS tests
@@ -139,8 +147,16 @@ jobs:
           python -m pip install --requirement requirements-dev.txt
       - name: Check shell
         run: |
-          shellcheck install.sh bin/* lib/sh/* bashrc/shpool.bashrc \
-            deploy/session-kit-launcher tests/run extras/notify-desktop
+          mapfile -d '' shell_scripts < <(
+            while IFS= read -r -d '' path; do
+              if head -n 1 "$path" | grep -Eq \
+                  '^#![[:space:]]*(/usr/bin/env[[:space:]]+)?(/[^[:space:]]*/)?(ba|da|k)?sh([[:space:]]|$)'; then
+                printf '%s\0' "$path"
+              fi
+            done < <(git ls-files -z)
+          )
+          # This sourced Bash startup file deliberately has no shebang.
+          shellcheck "${shell_scripts[@]}" bashrc/shpool.bashrc
       - name: Check Python
         env:
           RUFF_CACHE_DIR: ${{ runner.temp }}/ruff-cache
@@ -205,7 +221,7 @@ jobs:
         run: |
           mypy --ignore-missing-imports \
             lib/session_inventory.py lib/sessionkit_inventory \
-            lib/sessionkit_projects extras/hooks
+            lib/sessionkit_projects
           # Extensionless scripts have no module name to infer, so they need
           # --scripts-are-modules. tools/render-readme-picker is excluded:
           # it imports the login test fixture, which pulls the whole test tree

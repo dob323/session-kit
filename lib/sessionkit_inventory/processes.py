@@ -609,9 +609,7 @@ def _listening_inodes(path: str, proc_root: Path) -> set[int] | None:
     """
     inodes: set[int] = set()
     try:
-        raw = (proc_root / "net" / "unix").read_text(
-            encoding="utf-8", errors="replace"
-        )
+        raw = (proc_root / "net" / "unix").read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
     # proc's sequence-file records are newline terminated. An unterminated
@@ -647,9 +645,7 @@ class _SocketHolding(Enum):
     UNKNOWN = "unknown"
 
 
-def _holds_any_socket(
-    pid: int, inodes: set[int], proc_root: Path
-) -> _SocketHolding:
+def _holds_any_socket(pid: int, inodes: set[int], proc_root: Path) -> _SocketHolding:
     targets = {f"socket:[{inode}]" for inode in inodes}
     try:
         entries = list((proc_root / str(pid) / "fd").iterdir())
@@ -662,11 +658,7 @@ def _holds_any_socket(
                 return _SocketHolding.HOLDS
         except OSError:
             unreadable = True
-    return (
-        _SocketHolding.UNKNOWN
-        if unreadable
-        else _SocketHolding.DOES_NOT_HOLD
-    )
+    return _SocketHolding.UNKNOWN if unreadable else _SocketHolding.DOES_NOT_HOLD
 
 
 def _kit_daemons(
@@ -747,9 +739,7 @@ def _kit_daemons(
     # uniqueness has not been established.
     if _SocketHolding.UNKNOWN in holding.values():
         return [] if require_socket_holder else daemons
-    holders = [
-        pid for pid, state in holding.items() if state is _SocketHolding.HOLDS
-    ]
+    holders = [pid for pid, state in holding.items() if state is _SocketHolding.HOLDS]
     # More than one daemon holding a listener on our path is a real state -- an
     # old daemon whose socket file was replaced, or one that inherited the
     # descriptor -- and there is no way to tell from here which one answered us.

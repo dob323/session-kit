@@ -452,10 +452,13 @@ def _run_codex_account_read(profile_dir: Path) -> dict[str, Any]:
         raise CollectionError("Codex account identity probe did not complete") from exc
     reply: Mapping[str, Any] | None = None
     timed_out = False
+    stdin = process.stdin
+    stdout = process.stdout
+    assert stdin is not None and stdout is not None
     try:
         try:
-            process.stdin.write(requests)
-            process.stdin.flush()
+            stdin.write(requests)
+            stdin.flush()
         except OSError as exc:
             raise CollectionError(
                 "Codex account identity probe did not complete"
@@ -466,11 +469,11 @@ def _run_codex_account_read(profile_dir: Path) -> dict[str, Any]:
             if remaining <= 0:
                 timed_out = True
                 break
-            ready, _, _ = select.select([process.stdout], [], [], remaining)
+            ready, _, _ = select.select([stdout], [], [], remaining)
             if not ready:
                 timed_out = True
                 break
-            line = process.stdout.readline()
+            line = stdout.readline()
             if not line:
                 break
             try:

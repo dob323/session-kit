@@ -27,12 +27,15 @@ REQUIRED_SYMBOLS = {
     "LIFECYCLE_REOPENED_PROVIDER_CRASHED",
     "MAX_CODEX_SESSION_INDEX_BYTES",
     "ROLLOUT_TAIL_BYTES",
+    "SCHEMA_VERSION",
     "SESSION_COLORS",
+    "StateLock",
     "TERMINAL_NUMBER_QUARANTINE_SECONDS",
     "_DarwinBsdInfo",
     "_adopt_launch_colors",
     "_alias_command",
     "_color_command",
+    "_cold_inventory",
     "_display_width",
     "_empty_terminal_registry",
     "_json_bytes",
@@ -51,7 +54,9 @@ REQUIRED_SYMBOLS = {
     "_provider_title_info",
     "_read_terminal_registry",
     "_read_terminal_retirements",
+    "_read_state_json",
     "_reconcile_pending_provider_titles",
+    "_quarantine_orphaned_provider_untitled_markers",
     "_release_sha",
     "_require_supported_platform",
     "_rollout_turn_state",
@@ -76,6 +81,8 @@ REQUIRED_SYMBOLS = {
     "canonical_automatic_titles",
     "canonical_colors",
     "canonical_name_ownership",
+    "capture_provider_untitled_generations",
+    "capture_session_color_generations",
     "claim_automatic_name",
     "claude_bounce_prepare",
     "claude_pending_native_hydrations",
@@ -111,6 +118,7 @@ REQUIRED_SYMBOLS = {
     "prove_self_name_caller",
     "prune_automatic_titles",
     "publish_legacy_migration_plan",
+    "publish_session_colors",
     "read_claude_ai_title",
     "read_claude_transcript_signals",
     "read_codex_db",
@@ -120,6 +128,7 @@ REQUIRED_SYMBOLS = {
     "reconcile_session_colors",
     "record_launch_color",
     "recovery_manifest",
+    "recovery_list_payload",
     "recovery_spec",
     "release_automatic_name_claim",
     "render_inventory",
@@ -259,7 +268,7 @@ class TestSuiteReachabilityTests(unittest.TestCase):
 
 class InventoryFacadeTests(unittest.TestCase):
     def test_contract_matches_every_current_test_reference(self) -> None:
-        self.assertEqual(len(REQUIRED_SYMBOLS), 120)
+        self.assertEqual(len(REQUIRED_SYMBOLS), 129)
         self.assertEqual(REQUIRED_SYMBOLS, referenced_facade_symbols())
 
     def test_current_tested_symbols_remain_available(self) -> None:

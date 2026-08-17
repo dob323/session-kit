@@ -34,7 +34,7 @@ import json
 import os
 from pathlib import Path
 import time
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 from .common import clean_text, valid_uuid
 
@@ -182,7 +182,9 @@ def read_record(state_dir: Path, uuid: str) -> dict[str, Any] | None:
     }
 
 
-def read_all(state_dir: Path, uuids: object) -> dict[str, dict[str, Any]]:
+def read_all(
+    state_dir: Path, uuids: Iterable[object] | None
+) -> dict[str, dict[str, Any]]:
     """Hook records for exactly the sessions asked about."""
     records: dict[str, dict[str, Any]] = {}
     for uuid in uuids or ():

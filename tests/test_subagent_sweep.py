@@ -166,6 +166,164 @@ def output_state(proc: Path, cmdline: list[str]) -> dict[str, object]:
     }
 
 
+def write_terminal_process(
+    proc: Path,
+    pid: int,
+    cmdline: list[str],
+    *,
+    ppid: int,
+    pgid: int,
+    session_id: int,
+    tty: int,
+    tpgid: int,
+    start: int,
+    own_cpu: int = 0,
+    exe: str | None = None,
+) -> None:
+    """Write the exact /proc stat terminal fields the shell pass consumes."""
+    home = proc / str(pid)
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "cmdline").write_bytes("\0".join(cmdline).encode() + b"\0")
+    fields = [
+        "S",
+        str(ppid),
+        str(pgid),
+        str(session_id),
+        str(tty),
+        str(tpgid),
+        *(["0"] * 13),
+        str(start),
+    ]
+    fields[11] = str(own_cpu)
+    (home / "stat").write_text(
+        f"{pid} (bash fixture) {' '.join(fields)}\n", encoding="utf-8"
+    )
+    if exe is not None:
+        exe_link = home / "exe"
+        if exe_link.exists() or exe_link.is_symlink():
+            exe_link.unlink()
+        exe_link.symlink_to(exe)
+    task = home / "task" / str(pid)
+    task.mkdir(parents=True, exist_ok=True)
+    children = task / "children"
+    if not children.exists():
+        children.write_text("", encoding="ascii")
+    parent_children = proc / str(ppid) / "task" / str(ppid) / "children"
+    if parent_children.exists():
+        values = {int(word) for word in parent_children.read_text().split()}
+        values.add(pid)
+        parent_children.write_text(
+            " ".join(str(value) for value in sorted(values)), encoding="ascii"
+        )
+
+
+def rewrite_terminal_stat(
+    proc: Path,
+    pid: int,
+    *,
+    state: str | None = None,
+    tpgid: int | None = None,
+    own_cpu: int | None = None,
+    start_ticks: int | None = None,
+) -> None:
+    """Change selected fake-proc fields without disturbing its identity."""
+    path = proc / str(pid) / "stat"
+    head, tail = path.read_text(encoding="utf-8").rsplit(")", 1)
+    fields = tail.split()
+    if state is not None:
+        fields[0] = state
+    if tpgid is not None:
+        fields[5] = str(tpgid)
+    if own_cpu is not None:
+        fields[11] = str(own_cpu)
+        fields[12] = "0"
+    if start_ticks is not None:
+        fields[19] = str(start_ticks)
+    path.write_text(f"{head}) {' '.join(fields)}\n", encoding="utf-8")
+
+
+def write_background_shell(
+    proc: Path,
+    output: Path,
+    *,
+    fingerprint: bool = True,
+    foreground: bool = False,
+    output_target: str | None = None,
+    shell_cmdline: list[str] | None = None,
+    tpgid: int | None = None,
+    provider_pid: int = 400,
+    shell_pid: int = 500,
+    provider_start: int = 4000,
+    shell_start: int = 5000,
+) -> None:
+    """A provider root and its direct Claude background-task harness shell."""
+    tty = 34816
+    foreground_pgid = (
+        tpgid if tpgid is not None else (shell_pid if foreground else provider_pid)
+    )
+    write_terminal_process(
+        proc,
+        provider_pid,
+        [CLAUDE],
+        ppid=1,
+        pgid=provider_pid,
+        session_id=provider_pid,
+        tty=tty,
+        tpgid=foreground_pgid,
+        start=provider_start,
+    )
+    snapshot = (
+        "/home/user/.claude/shell-snapshots/"
+        "snapshot-bash-1786911563763-zf9x5o.sh"
+        if fingerprint
+        else "/home/user/task.sh"
+    )
+    write_terminal_process(
+        proc,
+        shell_pid,
+        shell_cmdline or ["/bin/bash", "-l", snapshot],
+        ppid=provider_pid,
+        pgid=shell_pid,
+        session_id=provider_pid,
+        tty=tty,
+        tpgid=foreground_pgid,
+        start=shell_start,
+        exe="/bin/bash",
+    )
+    fd_dir = proc / str(shell_pid) / "fd"
+    fd_dir.mkdir(exist_ok=True)
+    fd1 = fd_dir / "1"
+    if fd1.exists() or fd1.is_symlink():
+        fd1.unlink()
+    fd1.symlink_to(output_target or os.fspath(output))
+
+
+def write_shell_child(
+    proc: Path,
+    *,
+    pid: int = 600,
+    ppid: int = 500,
+    pgid: int = 500,
+    session_id: int = 400,
+    tty: int = 0,
+    tpgid: int = -1,
+    start: int = 6000,
+    own_cpu: int = 0,
+) -> None:
+    write_terminal_process(
+        proc,
+        pid,
+        ["/usr/bin/python3", "active-task.py"],
+        ppid=ppid,
+        pgid=pgid,
+        session_id=session_id,
+        tty=tty,
+        tpgid=tpgid,
+        start=start,
+        own_cpu=own_cpu,
+    )
+
+
 class SweepHarness(unittest.TestCase):
     def setUp(self) -> None:
         scratch = tempfile.TemporaryDirectory()
@@ -183,6 +341,10 @@ class SweepHarness(unittest.TestCase):
 
     def kill(self, pid: int, signum: int) -> None:
         self.kills.append((pid, signum))
+        if signum == signal.SIGSTOP:
+            rewrite_terminal_stat(self.proc, pid, state="T")
+        elif signum == signal.SIGCONT:
+            rewrite_terminal_stat(self.proc, pid, state="S")
 
     def run_sweep(self, now: float, environ: dict[str, str] | None = None, **kw):
         self.clock = max(self.clock, now)
@@ -227,6 +389,494 @@ class SweepHarness(unittest.TestCase):
 MINUTE = 60.0
 CURRENT_SESSION = "12345678-1234-4234-8234-123456789abc"
 OTHER_SESSION = "abcdef01-abcd-4abc-8abc-abcdef012345"
+
+
+class TheBackgroundShellLaw(SweepHarness):
+    def setUp(self) -> None:
+        super().setUp()
+        self.output = self.home / "background-task.out"
+        self.output.write_text("finished output\n", encoding="utf-8")
+
+    def run_frozen_overdue(
+        self,
+        *,
+        on_stop=None,
+        publish_stopped: bool = True,
+        fail_signal: int | None = None,
+        vanish_after_signal: int | None = None,
+        now: float = 15 * MINUTE,
+    ):
+        """Exercise the public production pidfd path against fake procfs."""
+        descriptor = os.open("/dev/null", os.O_RDONLY)
+        sent: list[int] = []
+
+        def pidfd_send(pidfd: int, signum: int) -> None:
+            self.assertEqual(descriptor, pidfd)
+            sent.append(signum)
+            if signum == signal.SIGSTOP:
+                if publish_stopped:
+                    rewrite_terminal_stat(self.proc, 500, state="T")
+                if on_stop is not None:
+                    on_stop()
+            elif signum == vanish_after_signal:
+                shutil.rmtree(self.proc / "500")
+            elif signum == signal.SIGCONT and (self.proc / "500" / "stat").exists():
+                rewrite_terminal_stat(self.proc, 500, state="S")
+            elif signum == signal.SIGCONT and vanish_after_signal is not None:
+                raise ProcessLookupError(3, "No such process")
+            if signum == fail_signal:
+                raise OSError("synthetic pidfd signal failure")
+
+        with (
+            unittest.mock.patch.object(subagent_sweep, "_HAS_PIDFD", True),
+            unittest.mock.patch.object(
+                subagent_sweep.os, "pidfd_open", return_value=descriptor
+            ),
+            unittest.mock.patch.object(
+                subagent_sweep.signal,
+                "pidfd_send_signal",
+                side_effect=pidfd_send,
+            ),
+        ):
+            actions = subagent_sweep.sweep(
+                proc=self.proc,
+                state_dir=self.state_dir,
+                environ={"HOME": os.fspath(self.home)},
+                now=now,
+                kill=None,
+            )
+        return actions, sent
+
+    def test_fingerprinted_regular_output_quiet_fifteen_minutes_gets_term(
+        self,
+    ) -> None:
+        write_background_shell(self.proc, self.output)
+        self.assertEqual([], self.run_sweep(now=0.0))
+
+        actions = self.run_sweep(now=15 * MINUTE)
+
+        self.assertEqual(
+            [
+                (500, signal.SIGSTOP),
+                (500, signal.SIGTERM),
+                (500, signal.SIGCONT),
+            ],
+            self.kills,
+        )
+        self.assertEqual(["SIGTERM"], [item["signal"] for item in actions])
+        self.assertEqual(["background-shell"], [item["kind"] for item in actions])
+
+    def test_output_growth_at_minute_ten_resets_the_clock(self) -> None:
+        write_background_shell(self.proc, self.output)
+        self.run_sweep(now=0.0)
+        with self.output.open("a", encoding="utf-8") as handle:
+            handle.write("child still writing\n")
+
+        self.assertEqual([], self.run_sweep(now=10 * MINUTE))
+        self.assertEqual([], self.run_sweep(now=15 * MINUTE))
+        actions = self.run_sweep(now=25 * MINUTE)
+
+        self.assertEqual(["SIGTERM"], [item["signal"] for item in actions])
+        self.assertEqual(
+            [signal.SIGSTOP, signal.SIGTERM, signal.SIGCONT],
+            [signum for _pid, signum in self.kills],
+        )
+
+    def test_pipe_fd1_refuses_and_never_signals(self) -> None:
+        write_background_shell(
+            self.proc,
+            self.output,
+            output_target="pipe:[12345]",
+        )
+
+        self.run_sweep(now=0.0)
+        self.run_sweep(now=15 * MINUTE)
+
+        self.assertEqual([], self.kills)
+        records = [
+            json.loads(line)
+            for line in (self.state_dir / "subagent-sweep.log")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        self.assertTrue(records)
+        self.assertTrue(all(item["kind"] == "background-shell" for item in records))
+        self.assertTrue(all(item["decision"] == "refused-output" for item in records))
+
+    def test_foreground_shell_is_never_a_candidate(self) -> None:
+        write_background_shell(self.proc, self.output, foreground=True)
+
+        self.assertEqual(
+            [500],
+            [item["pid"] for item in subagent_sweep.find_background_shells(self.proc)],
+        )
+        self.run_sweep(now=0.0)
+        self.run_sweep(now=15 * MINUTE)
+
+        self.assertEqual([], self.kills)
+        refusal = json.loads(
+            (self.state_dir / "subagent-sweep.log").read_text().splitlines()[-1]
+        )
+        self.assertIn("foreground pgid 500", refusal["reason"])
+
+    def test_bash_without_snapshot_fingerprint_is_never_a_candidate(self) -> None:
+        write_background_shell(self.proc, self.output, fingerprint=False)
+
+        self.assertEqual([], subagent_sweep.find_background_shells(self.proc))
+        self.run_sweep(now=0.0)
+        self.run_sweep(now=15 * MINUTE)
+
+        self.assertEqual([], self.kills)
+
+    def test_output_change_inside_signal_window_vetoes_and_rearms(self) -> None:
+        write_background_shell(self.proc, self.output)
+        self.run_sweep(now=0.0)
+        original = subagent_sweep._background_shell_output_snapshot
+        calls = 0
+
+        def move_before_delivery(shell, proc):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                with self.output.open("a", encoding="utf-8") as handle:
+                    handle.write("last instant output\n")
+            return original(shell, proc)
+
+        with unittest.mock.patch.object(
+            subagent_sweep,
+            "_background_shell_output_snapshot",
+            side_effect=move_before_delivery,
+        ):
+            actions = self.run_sweep(now=15 * MINUTE)
+
+        self.assertEqual([], actions)
+        self.assertEqual(
+            [(500, signal.SIGSTOP), (500, signal.SIGCONT)], self.kills
+        )
+        later = self.run_sweep(now=30 * MINUTE)
+        self.assertEqual(["SIGTERM"], [item["signal"] for item in later])
+
+    def test_waiting_child_zero_cpu_refuses_and_names_youngest_descendant(
+        self,
+    ) -> None:
+        write_background_shell(self.proc, self.output)
+        write_shell_child(self.proc, pid=600, start=9000, own_cpu=0)
+        write_shell_child(self.proc, pid=601, start=8000, own_cpu=0)
+        for minute in (0, 5, 10, 15, 20):
+            self.assertEqual([], self.run_sweep(now=minute * MINUTE))
+        self.assertEqual([], self.kills)
+        payload = json.loads(
+            (self.state_dir / "subagent-sweep.state.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertFalse(
+            any(key.startswith("background-shell:") for key in payload["tracked"])
+        )
+        refusals = [
+            json.loads(line)
+            for line in (self.state_dir / "subagent-sweep.log").read_text().splitlines()
+        ]
+        self.assertTrue(refusals)
+        self.assertTrue(
+            all("youngest live descendant 600" in item["reason"] for item in refusals)
+        )
+
+    def test_descendant_foreground_pgid_is_never_a_candidate(self) -> None:
+        write_background_shell(self.proc, self.output, tpgid=600)
+        write_shell_child(
+            self.proc,
+            pgid=600,
+            tty=34816,
+            tpgid=600,
+        )
+
+        self.assertEqual(
+            [500],
+            [item["pid"] for item in subagent_sweep.find_background_shells(self.proc)],
+        )
+        self.run_sweep(now=0.0)
+        self.run_sweep(now=15 * MINUTE)
+        self.assertEqual([], self.kills)
+
+    def test_unrelated_foreground_pgid_stays_eligible(self) -> None:
+        write_background_shell(self.proc, self.output, tpgid=700)
+
+        self.assertEqual(
+            [500],
+            [item["pid"] for item in subagent_sweep.find_background_shells(self.proc)],
+        )
+        self.run_sweep(now=0.0)
+        actions = self.run_sweep(now=15 * MINUTE)
+        self.assertEqual(["SIGTERM"], [item["signal"] for item in actions])
+
+    def test_snapshot_fingerprint_is_structural_not_a_substring(self) -> None:
+        spoof = [
+            "/bin/bash",
+            "-c",
+            "while valuable_work; do :; done # "
+            "shell-snapshots/snapshot-bash-spoof",
+        ]
+        write_background_shell(self.proc, self.output, shell_cmdline=spoof)
+        self.assertEqual([], subagent_sweep.find_background_shells(self.proc))
+
+        observed = [
+            "/bin/bash",
+            "-c",
+            "source /home/user/.local/share/session-kit/accounts/claude/duck/"
+            "shell-snapshots/snapshot-bash-1786911563763-zf9x5o.sh "
+            "2>/dev/null || true && printf done",
+        ]
+        write_background_shell(self.proc, self.output, shell_cmdline=observed)
+        self.assertEqual(
+            [500],
+            [item["pid"] for item in subagent_sweep.find_background_shells(self.proc)],
+        )
+
+        exact_path = [
+            "/bin/bash",
+            "-l",
+            "/home/user/.claude/shell-snapshots/"
+            "snapshot-bash-1786911563763-zf9x5o.sh",
+        ]
+        write_background_shell(self.proc, self.output, shell_cmdline=exact_path)
+        self.assertEqual(
+            [500],
+            [item["pid"] for item in subagent_sweep.find_background_shells(self.proc)],
+        )
+
+    def test_stop_window_foreground_flip_continues_without_term(
+        self,
+    ) -> None:
+        write_background_shell(self.proc, self.output)
+        self.run_sweep(now=0.0)
+
+        def take_foreground() -> None:
+            rewrite_terminal_stat(self.proc, 400, tpgid=500)
+            rewrite_terminal_stat(self.proc, 500, state="T", tpgid=500)
+
+        actions, sent = self.run_frozen_overdue(on_stop=take_foreground)
+        self.assertEqual([], actions)
+        self.assertEqual([signal.SIGSTOP, signal.SIGCONT], sent)
+
+    def test_stop_window_fd1_rebind_continues_without_term(self) -> None:
+        write_background_shell(self.proc, self.output)
+        self.run_sweep(now=0.0)
+        rebound = self.home / "rebound.out"
+        rebound.write_text("different file\n", encoding="utf-8")
+
+        def rebind() -> None:
+            fd1 = self.proc / "500" / "fd" / "1"
+            fd1.unlink()
+            fd1.symlink_to(rebound)
+
+        actions, sent = self.run_frozen_overdue(on_stop=rebind)
+        self.assertEqual([], actions)
+        self.assertEqual([signal.SIGSTOP, signal.SIGCONT], sent)
+        records = [
+            json.loads(line)
+            for line in (self.state_dir / "subagent-sweep.log")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        self.assertIn("refused-final-proof", [item["decision"] for item in records])
+
+    def test_new_descendant_mid_window_refuses_for_as_long_as_it_lives(self) -> None:
+        write_background_shell(self.proc, self.output)
+        self.run_sweep(now=0.0)
+        write_shell_child(self.proc, own_cpu=10)
+
+        self.assertEqual([], self.run_sweep(now=5 * MINUTE))
+        self.assertEqual([], self.run_sweep(now=15 * MINUTE))
+        self.assertEqual([], self.run_sweep(now=20 * MINUTE))
+        self.assertEqual([], self.run_sweep(now=60 * MINUTE))
+        self.assertEqual([], self.kills)
+
+    def test_shell_own_cpu_change_between_passes_rearms(self) -> None:
+        write_background_shell(self.proc, self.output)
+        self.run_sweep(now=0.0)
+        rewrite_terminal_stat(self.proc, 500, own_cpu=1)
+
+        self.assertEqual([], self.run_sweep(now=15 * MINUTE))
+        actions = self.run_sweep(now=30 * MINUTE)
+
+        self.assertEqual(["SIGTERM"], [item["signal"] for item in actions])
+        self.assertEqual(
+            [signal.SIGSTOP, signal.SIGTERM, signal.SIGCONT],
+            [signum for _pid, signum in self.kills],
+        )
+
+    def test_successful_frozen_delivery_is_stop_term_cont(self) -> None:
+        write_background_shell(self.proc, self.output)
+        self.run_sweep(now=0.0)
+
+        actions, sent = self.run_frozen_overdue()
+
+        self.assertEqual(["SIGTERM"], [item["signal"] for item in actions])
+        self.assertEqual(
+            [signal.SIGSTOP, signal.SIGTERM, signal.SIGCONT], sent
+        )
+
+    def test_stopped_state_verification_failure_continues_without_term(self) -> None:
+        write_background_shell(self.proc, self.output)
+        self.run_sweep(now=0.0)
+
+        actions, sent = self.run_frozen_overdue(publish_stopped=False)
+
+        self.assertEqual([], actions)
+        self.assertEqual([signal.SIGSTOP, signal.SIGCONT], sent)
+
+    def test_stop_window_new_descendant_continues_without_term(self) -> None:
+        write_background_shell(self.proc, self.output)
+        self.run_sweep(now=0.0)
+
+        actions, sent = self.run_frozen_overdue(
+            on_stop=lambda: write_shell_child(self.proc, own_cpu=0)
+        )
+
+        self.assertEqual([], actions)
+        self.assertEqual([signal.SIGSTOP, signal.SIGCONT], sent)
+
+    def test_stop_window_own_cpu_change_continues_without_term(self) -> None:
+        write_background_shell(self.proc, self.output)
+        self.run_sweep(now=0.0)
+
+        actions, sent = self.run_frozen_overdue(
+            on_stop=lambda: rewrite_terminal_stat(self.proc, 500, own_cpu=1)
+        )
+
+        self.assertEqual([], actions)
+        self.assertEqual([signal.SIGSTOP, signal.SIGCONT], sent)
+
+    def test_stop_window_identity_change_continues_without_term(self) -> None:
+        write_background_shell(self.proc, self.output)
+        self.run_sweep(now=0.0)
+
+        actions, sent = self.run_frozen_overdue(
+            on_stop=lambda: rewrite_terminal_stat(
+                self.proc, 500, state="T", start_ticks=9999
+            )
+        )
+
+        self.assertEqual([], actions)
+        self.assertEqual([signal.SIGSTOP, signal.SIGCONT], sent)
+
+    def test_stop_window_unreadable_proof_continues_without_term(self) -> None:
+        write_background_shell(self.proc, self.output)
+        self.run_sweep(now=0.0)
+
+        def break_children_read() -> None:
+            path = self.proc / "500" / "task" / "500" / "children"
+            path.unlink()
+            path.mkdir()
+
+        actions, sent = self.run_frozen_overdue(on_stop=break_children_read)
+
+        self.assertEqual([], actions)
+        self.assertEqual([signal.SIGSTOP, signal.SIGCONT], sent)
+
+    def test_term_delivery_error_still_continues_the_stopped_shell(self) -> None:
+        write_background_shell(self.proc, self.output)
+        self.run_sweep(now=0.0)
+
+        actions, sent = self.run_frozen_overdue(fail_signal=signal.SIGTERM)
+
+        self.assertEqual([], actions)
+        self.assertEqual(
+            [signal.SIGSTOP, signal.SIGTERM, signal.SIGCONT], sent
+        )
+        records = [
+            json.loads(line)
+            for line in (self.state_dir / "subagent-sweep.log")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        self.assertFalse(any(item.get("signal") == "SIGTERM" for item in records))
+
+    def test_kill_reaped_before_cont_is_logged_as_delivered_kill(self) -> None:
+        write_background_shell(self.proc, self.output)
+        self.run_sweep(now=0.0)
+        self.assertEqual(
+            ["SIGTERM"],
+            [item["signal"] for item in self.run_sweep(now=15 * MINUTE)],
+        )
+
+        actions, sent = self.run_frozen_overdue(
+            vanish_after_signal=signal.SIGKILL,
+            now=20 * MINUTE,
+        )
+
+        self.assertEqual(
+            [signal.SIGSTOP, signal.SIGKILL, signal.SIGCONT], sent
+        )
+        self.assertEqual(["SIGKILL"], [item["signal"] for item in actions])
+        self.assertTrue(actions[0]["target_reaped_before_cont"])
+        records = [
+            json.loads(line)
+            for line in (self.state_dir / "subagent-sweep.log")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        self.assertEqual("SIGKILL", records[-1]["signal"])
+        self.assertTrue(records[-1]["target_reaped_before_cont"])
+        self.assertNotEqual("refused-final-proof", records[-1].get("decision"))
+
+    def test_unreadable_descendant_refuses_only_its_candidate(self) -> None:
+        write_background_shell(self.proc, self.output)
+        write_shell_child(self.proc, own_cpu=0)
+        unreadable = self.proc / "600" / "stat"
+        unreadable.unlink()
+        unreadable.mkdir()
+        other_output = self.home / "other-background-task.out"
+        other_output.write_text("other finished output\n", encoding="utf-8")
+        write_background_shell(
+            self.proc,
+            other_output,
+            provider_pid=700,
+            shell_pid=800,
+            provider_start=7000,
+            shell_start=8000,
+        )
+
+        self.assertEqual([], self.run_sweep(now=0.0))
+        actions = self.run_sweep(now=15 * MINUTE)
+
+        self.assertEqual([800], [item["pid"] for item in actions])
+        self.assertEqual(
+            [
+                (800, signal.SIGSTOP),
+                (800, signal.SIGTERM),
+                (800, signal.SIGCONT),
+            ],
+            self.kills,
+        )
+        records = [
+            json.loads(line)
+            for line in (self.state_dir / "subagent-sweep.log").read_text().splitlines()
+        ]
+        refused = [item for item in records if item.get("decision") == "refused-output"]
+        self.assertTrue(refused)
+        self.assertTrue(all(item["pid"] == 500 for item in refused))
+        self.assertTrue(any("descendant 600" in item["reason"] for item in refused))
+
+    def test_pidfd_unavailable_refuses_without_kill_fallback(self) -> None:
+        write_background_shell(self.proc, self.output)
+        self.run_sweep(now=0.0)
+
+        with (
+            unittest.mock.patch.object(subagent_sweep, "_HAS_PIDFD", False),
+            unittest.mock.patch.object(subagent_sweep.os, "kill") as pid_kill,
+        ):
+            actions = subagent_sweep.sweep(
+                proc=self.proc,
+                state_dir=self.state_dir,
+                environ={"HOME": os.fspath(self.home)},
+                now=15 * MINUTE,
+                kill=None,
+            )
+
+        self.assertEqual([], actions)
+        pid_kill.assert_not_called()
 
 
 class TheWorkerOutputBinding(SweepHarness):
@@ -667,12 +1317,55 @@ class TheRegistrylessWorkerOutputBinding(SweepHarness):
             b"\n".join(json.dumps(record).encode() for record in records) + b"\n"
         )
 
+        stat_result = transcript.stat()
+        long_after_the_husk = stat_result.st_mtime_ns + 10**13
+
         member, reason = subagent_sweep._content_transcript_member(
-            transcript, "boundary", "session-933f74c7"
+            transcript,
+            "boundary",
+            "session-933f74c7",
+            worker_started_ns=long_after_the_husk,
         )
 
         self.assertFalse(member)
         self.assertEqual("", reason)
+
+    def test_an_identityless_transcript_as_new_as_the_worker_refuses(
+        self,
+    ) -> None:
+        """A fresh worker's transcript wears the husk's face for a moment.
+
+        Review lanes rv-c10b-1/2 killed a live worker whose just-born
+        transcript held only setup records: the complete-scan rule dismissed
+        it and a quiet decoy became the whole copy set. Age is the exact
+        discriminator — a transcript cannot predate its worker — so a
+        setup-only file as recent as the worker refuses the whole answer,
+        and an unreadable worker start refuses too."""
+        transcript = standalone_transcript(self.proc, CURRENT_SESSION)
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        records = [
+            {"type": "agent-setting", "sessionId": CURRENT_SESSION},
+            {"type": "mode", "mode": "normal", "sessionId": CURRENT_SESSION},
+        ]
+        transcript.write_bytes(
+            b"\n".join(json.dumps(record).encode() for record in records) + b"\n"
+        )
+        long_before_the_file = transcript.stat().st_mtime_ns - 10**12
+
+        member, reason = subagent_sweep._content_transcript_member(
+            transcript,
+            "boundary",
+            "session-933f74c7",
+            worker_started_ns=long_before_the_file,
+        )
+        self.assertFalse(member)
+        self.assertIn("identityless but as recent as the worker", reason)
+
+        member, reason = subagent_sweep._content_transcript_member(
+            transcript, "boundary", "session-933f74c7"
+        )
+        self.assertFalse(member)
+        self.assertIn("worker start time is unreadable", reason)
 
     def test_new_registry_record_without_its_transcript_refuses_old_content(
         self,
@@ -1491,6 +2184,134 @@ class TheSwitches(SweepHarness):
 
 
 class TheSignalPath(SweepHarness):
+    def test_sigcont_is_delivered_on_every_refusal_path_after_stop(self) -> None:
+        deliver = getattr(subagent_sweep, "_deliver_background_shell", None)
+        evidence_snapshot = getattr(
+            subagent_sweep, "_background_shell_evidence_snapshot", None
+        )
+        if not callable(deliver) or not callable(evidence_snapshot):
+            self.skipTest("round-2 pidfd helper API is absent (regression guard)")
+        output = self.home / "background-task.out"
+        output.write_text("finished output\n", encoding="utf-8")
+        write_background_shell(self.proc, output)
+        shell = subagent_sweep.find_background_shells(self.proc)[0]
+        armed, error = evidence_snapshot(shell, self.proc)
+        self.assertEqual("", error)
+        assert armed is not None
+
+        for path in ("stopped-state", "frozen-reproof"):
+            with self.subTest(path=path):
+                rewrite_terminal_stat(self.proc, 500, state="S")
+                sent: list[int] = []
+
+                def send(_pid: int, signum: int) -> None:
+                    sent.append(signum)
+                    if signum == signal.SIGSTOP and path != "stopped-state":
+                        rewrite_terminal_stat(self.proc, 500, state="T")
+                    elif signum == signal.SIGCONT:
+                        rewrite_terminal_stat(self.proc, 500, state="S")
+
+                proof_patch = (
+                    unittest.mock.patch.object(
+                        subagent_sweep,
+                        "_background_shell_final_proof",
+                        return_value=(None, "synthetic frozen refusal"),
+                    )
+                    if path == "frozen-reproof"
+                    else contextlib.nullcontext()
+                )
+                with proof_patch:
+                    delivered, proof, refusal = deliver(
+                        self.proc,
+                        shell,
+                        armed,
+                        signal.SIGTERM,
+                        send_signal=send,
+                    )
+
+                self.assertFalse(delivered)
+                self.assertIsNone(proof)
+                self.assertTrue(refusal)
+                self.assertEqual([signal.SIGSTOP, signal.SIGCONT], sent)
+
+    def test_background_shell_pidfd_helper_orders_freeze_proof_close_resume(
+        self,
+    ) -> None:
+        deliver = getattr(subagent_sweep, "_deliver_background_shell", None)
+        evidence_snapshot = getattr(
+            subagent_sweep, "_background_shell_evidence_snapshot", None
+        )
+        final_proof = getattr(subagent_sweep, "_background_shell_final_proof", None)
+        if (
+            not callable(deliver)
+            or not callable(evidence_snapshot)
+            or not callable(final_proof)
+        ):
+            self.skipTest("round-2 pidfd helper API is absent (regression guard)")
+        output = self.home / "background-task.out"
+        output.write_text("finished output\n", encoding="utf-8")
+        write_background_shell(self.proc, output)
+        shell = subagent_sweep.find_background_shells(self.proc)[0]
+        armed, error = evidence_snapshot(shell, self.proc)
+        self.assertEqual("", error)
+        assert armed is not None
+        events: list[str] = []
+        original_proof = final_proof
+        descriptor = os.open("/dev/null", os.O_RDONLY)
+
+        def open_pidfd(pid: int) -> int:
+            self.assertEqual(500, pid)
+            events.append("pidfd-open")
+            return descriptor
+
+        def prove(*args, **kwargs):
+            events.append("final-proof")
+            return original_proof(*args, **kwargs)
+
+        def send(pidfd: int, signum: int) -> None:
+            self.assertEqual(descriptor, pidfd)
+            if signum == signal.SIGSTOP:
+                events.append("pidfd-stop")
+                rewrite_terminal_stat(self.proc, 500, state="T")
+            elif signum == signal.SIGTERM:
+                events.append("pidfd-term")
+            elif signum == signal.SIGCONT:
+                events.append("pidfd-cont")
+                rewrite_terminal_stat(self.proc, 500, state="S")
+
+        with (
+            unittest.mock.patch.object(subagent_sweep, "_HAS_PIDFD", True),
+            unittest.mock.patch.object(
+                subagent_sweep.os, "pidfd_open", side_effect=open_pidfd
+            ),
+            unittest.mock.patch.object(
+                subagent_sweep,
+                "_background_shell_final_proof",
+                side_effect=prove,
+            ),
+            unittest.mock.patch.object(
+                subagent_sweep.signal,
+                "pidfd_send_signal",
+                side_effect=send,
+            ),
+        ):
+            delivered, proof, refusal = (
+                deliver(
+                    self.proc,
+                    shell,
+                    armed,
+                    signal.SIGTERM,
+                )
+            )
+
+        self.assertTrue(delivered)
+        self.assertIsNotNone(proof)
+        self.assertEqual("", refusal)
+        self.assertEqual(
+            ["pidfd-open", "pidfd-stop", "final-proof", "pidfd-term", "pidfd-cont"],
+            events,
+        )
+
     def test_exact_process_delivery_accepts_a_shell_and_uses_pidfd(self) -> None:
         write_process(self.proc, 501, ["bash"], own=1, start=2000)
         with (

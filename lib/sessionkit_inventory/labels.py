@@ -25,7 +25,8 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Mapping
 
-from .common import STALL_DEFAULT_SECONDS, clean_text
+from .common import STALL_DEFAULT_SECONDS as STALL_DEFAULT_SECONDS
+from .common import clean_text
 
 
 # --------------------------------------------------------------- placeholders

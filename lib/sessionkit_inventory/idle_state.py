@@ -12,7 +12,7 @@ import math
 from pathlib import Path
 import stat
 import time
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, cast
 
 from .common import stall_threshold_seconds, valid_uuid
 from . import labels
@@ -167,7 +167,7 @@ def apply_idle_evidence(
                 and moment - prior_observed <= window_ms
             )
             if comparable:
-                last_moved = prior_last_moved
+                last_moved = cast(int, prior_last_moved)
         evidence = {
             **current,
             "last_moved_at_unix_ms": last_moved,

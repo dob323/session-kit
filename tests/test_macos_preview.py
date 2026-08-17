@@ -112,7 +112,16 @@ class DarwinParserTests(unittest.TestCase):
             bsd_reader=lambda _pid: next(sequence),
             args_reader=lambda _pid: procargs("/opt/homebrew/bin/codex"),
         )
-        self.assertEqual(table, {})
+        # The changing generation cannot be published as process identity, but
+        # the process must remain in its known parent tree as unreadable.  A
+        # missing row would let a reader mistake churn for proof of absence.
+        self.assertEqual({30}, set(table))
+        self.assertEqual(30, table[30]["pid"])
+        self.assertEqual(20, table[30]["ppid"])
+        self.assertEqual(-1, table[30]["start_ticks"])
+        self.assertEqual([], table[30]["cmdline"])
+        self.assertTrue(table[30]["argv_unreadable"])
+        self.assertTrue(table[30]["environ_unreadable"])
 
     def test_codex_uuid_comes_only_from_exact_process_environment(self) -> None:
         uuid = "00000000-0000-4000-8000-000000000018"

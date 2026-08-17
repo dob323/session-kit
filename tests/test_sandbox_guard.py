@@ -98,6 +98,10 @@ class RealSessionManagerIsOutOfReachTests(ProviderExitShellHarness):
         in tests/test_lifecycle_shell.py -- the one path that reaches
         ``__sk_detach_to_picker`` -- with the shpool call read back afterwards.
         """
+        # This differential predates the older lifecycle harness's private
+        # recording stub. Remove that fixture-local first choice so this test
+        # reaches the global refusing guard it exists to prove.
+        (self.bin / "shpool").unlink()
         log = sandbox_guard.refusal_log()
         before = log.stat().st_size if log.exists() else 0
 
@@ -336,19 +340,39 @@ class PrivateDaemonOptOutTests(unittest.TestCase):
             self.assertNotIn(name, source)
 
     def test_the_only_marker_the_guard_reads_can_only_remove_access(self) -> None:
+        import tempfile
+        from unittest import mock
+
         markers = [
             name
             for name in dir(sandbox_guard)
             if name.endswith("_MARKER") and not name.startswith("_")
         ]
         self.assertEqual(["ABSENT_MARKER"], markers)
-        real_dir = os.path.dirname(
-            shutil.which("shpool", path=sandbox_guard.INHERITED_PATH) or "/nowhere"
-        )
-        guarded = sandbox_guard.guarded_environment(
-            sandbox_guard.without_shpool({"PATH": f"{real_dir}:/usr/bin:/bin"})
-        )
-        self.assertNotIn(real_dir, guarded["PATH"].split(os.pathsep))
+        with tempfile.TemporaryDirectory() as raw:
+            real_dir = os.path.realpath(raw)
+            fake_real = Path(real_dir) / "shpool"
+            fake_real.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            fake_real.chmod(0o755)
+            sandbox_guard._holder_cache.pop(real_dir, None)
+            try:
+                # Temporary directories are normally fixture-owned sandboxes.
+                # For this property test, this one stands in for a host PATH
+                # directory so the removal proof does not depend on the host
+                # having shpool installed.
+                with mock.patch.object(
+                    sandbox_guard,
+                    "_sandbox_roots",
+                    return_value=(os.path.realpath(os.fspath(REPO)),),
+                ):
+                    guarded = sandbox_guard.guarded_environment(
+                        sandbox_guard.without_shpool(
+                            {"PATH": f"{real_dir}:/usr/bin:/bin"}
+                        )
+                    )
+                self.assertNotIn(real_dir, guarded["PATH"].split(os.pathsep))
+            finally:
+                sandbox_guard._holder_cache.pop(real_dir, None)
 
 
 if __name__ == "__main__":  # pragma: no cover

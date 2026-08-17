@@ -1,6 +1,21 @@
 #!/usr/bin/env python3
 """Close completed sub-agent processes that their owners never closed.
 
+The same timer also runs an independent background-shell pass.  It recognizes
+only a real bash carrying Claude's anchored snapshot-script argv shape whose
+exact direct parent is a live managed provider root.  Its idle evidence is the
+regular file currently bound to fd/1, snapshotted through one no-follow
+descriptor with path, device, inode, size, mtime, and ctime.  A shell with any
+live descendant is never eligible.  For a childless shell, fd/1 movement or a
+change in that shell's own utime+stime resets the fifteen-minute clock.  A
+pipe, socket, tty, missing file, unreadable candidate-local proc entry, or a
+shell-owned foreground terminal is a refusal.  Delivery pins and stops the
+shell through a pidfd, verifies the stopped state, re-proves zero descendants,
+identity, own CPU, terminal state, and fd/1, then sends the closing signal and
+attempts to resume a surviving shell.  A target that exits or is reaped before
+that resume is still logged as receiving the closing signal.  Shell records are
+tagged ``kind=background-shell`` in the shared decision log.
+
 Completion means closure (operator ruling X20, 2026-08-14). A provider
 sub-agent -- a Claude worker process carrying ``--parent-session-id`` -- keeps
 running after its task ends so its owner can continue it; when the owner never
@@ -124,6 +139,7 @@ stdlib only; /proc only; no provider APIs.
 from __future__ import annotations
 
 import argparse
+import errno
 import fcntl
 import json
 import os
@@ -133,7 +149,7 @@ import signal
 import stat
 import sys
 import time
-from typing import Callable
+from typing import Callable, cast
 
 from .common import valid_uuid
 from .transcripts import claude_roots
@@ -152,6 +168,14 @@ _ID_FLAG = "--agent-id"
 _NAME_FLAG = "--agent-name"
 _TEAM_FLAG = "--team-name"
 _TYPE_FLAG = "--agent-type"
+_SHELL_SNAPSHOT_PATH_RE = re.compile(
+    r"^/.*/(?:\.claude|accounts/claude/[^/]+)/shell-snapshots/"
+    r"snapshot-bash-[0-9]+-[A-Za-z0-9]+\.sh$"
+)
+_SHELL_SOURCE_PREFIX_RE = re.compile(
+    r"^source (?P<path>/.*/(?:\.claude|accounts/claude/[^/]+)/shell-snapshots/"
+    r"snapshot-bash-[0-9]+-[A-Za-z0-9]+\.sh)(?:\s|$)"
+)
 _MAX_SESSION_RECORD_BYTES = 1024 * 1024
 _MAX_TRANSCRIPT_PROBE_BYTES = 256 * 1024
 # The provider names its version directories `2.1.233`, and that directory IS
@@ -160,6 +184,7 @@ _MAX_TRANSCRIPT_PROBE_BYTES = 256 * 1024
 _VERSION_RE = re.compile(r"\d+(\.\d+)+([-+][0-9A-Za-z.\-]+)?")
 
 _HAS_PIDFD = hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal")
+SignalSender = Callable[[int, int], None]
 
 
 def _finite_non_negative(raw: str) -> float | None:
@@ -289,6 +314,79 @@ def _stat_numbers(proc: Path, pid: int) -> tuple[str, int, int, int, int] | None
     return fields[0], ppid, own, reaped, start_ticks
 
 
+def _shell_stat(
+    proc: Path, pid: int
+) -> tuple[str, int, int, int, int, int, int] | None:
+    """The process/terminal identity needed by the background-shell pass.
+
+    Returns ``(state, ppid, pgid, session, tty, tpgid, start_ticks)``.  This is
+    deliberately separate from :func:`_stat_numbers`: the worker pass keeps
+    reading exactly the fields it always has, while this independent pass
+    refuses unless every terminal field it relies on is parseable.
+    """
+    try:
+        raw = (proc / str(pid) / "stat").read_text(
+            encoding="utf-8", errors="replace"
+        )
+    except OSError:
+        return None
+    tail = raw.rsplit(")", 1)
+    if len(tail) != 2:
+        return None
+    fields = tail[1].split()
+    # tail fields: state=0, ppid=1, pgrp=2, session=3, tty_nr=4,
+    # tpgid=5, ... starttime=19.
+    if len(fields) < 20:
+        return None
+    try:
+        return (
+            fields[0],
+            int(fields[1]),
+            int(fields[2]),
+            int(fields[3]),
+            int(fields[4]),
+            int(fields[5]),
+            int(fields[19]),
+        )
+    except ValueError:
+        return None
+
+
+def _background_shell_stat(
+    proc: Path, pid: int
+) -> tuple[tuple[str, int, int, int, int, int, int, int] | None, str]:
+    """Read one proc stat without confusing disappearance with unreadability."""
+    path = proc / str(pid) / "stat"
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        return None, ""
+    except OSError as error:
+        return None, f"cannot read process stat {pid}: {error}"
+    tail = raw.rsplit(")", 1)
+    if len(tail) != 2:
+        return None, f"cannot parse process stat {pid}"
+    fields = tail[1].split()
+    if len(fields) < 20:
+        return None, f"cannot parse process stat {pid}"
+    try:
+        return (
+            (
+                fields[0],
+                int(fields[1]),
+                int(fields[2]),
+                int(fields[3]),
+                int(fields[4]),
+                int(fields[5]),
+                int(fields[19]),
+                int(fields[11]) + int(fields[12]),
+            ),
+            "",
+        )
+    except ValueError:
+        return None, f"cannot parse process stat {pid}"
+
+
 def _flag_value(cmdline: list[str], flag: str) -> str:
     """The value following an exact-element flag; the ``=`` form is refused."""
     for index, part in enumerate(cmdline[:-1]):
@@ -357,6 +455,65 @@ def _is_worker(cmdline: list[str]) -> bool:
             return False
         executable = PurePath(cmdline[1])
     return _is_provider_binary(executable)
+
+
+def _provider_executable(cmdline: list[str]) -> PurePath | None:
+    """The provider executable named by argv, including the Node wrapper."""
+    if not cmdline:
+        return None
+    executable = PurePath(cmdline[0])
+    if executable.name in ("node", "nodejs"):
+        if len(cmdline) < 2:
+            return None
+        executable = PurePath(cmdline[1])
+    return executable
+
+
+def _is_provider_root(cmdline: list[str]) -> bool:
+    """A managed Claude/Codex root, never one of its machine children.
+
+    Claude reuses the exact packaging identity already settled for workers,
+    with the worker/fork flags excluded.  Codex roots use its native launcher;
+    non-interactive/server subcommands are machine children, not a person's
+    root provider.  The shell fingerprint remains Claude-specific today, but
+    retaining the managed Codex root shape costs no breadth: every shell still
+    has to satisfy the independent exact fingerprint and terminal guards.
+    """
+    executable = _provider_executable(cmdline)
+    if executable is None:
+        return False
+    if _is_provider_binary(executable):
+        return not any(
+            flag in cmdline
+            for flag in (_AGENT_FLAG, "--fork-session")
+        )
+    if executable.name != "codex" or PurePath(cmdline[0]).name != "codex":
+        return False
+    return not any(
+        command in cmdline[1:]
+        for command in ("exec", "review", "app-server", "mcp-server")
+    )
+
+
+def _is_background_shell_cmdline(cmdline: list[str]) -> bool:
+    """The narrow harness argv fingerprint; ordinary bash never qualifies."""
+    if not cmdline or PurePath(cmdline[0]).name != "bash":
+        return False
+    if any(_SHELL_SNAPSHOT_PATH_RE.fullmatch(argument) for argument in cmdline[1:]):
+        return True
+    for index, argument in enumerate(cmdline[:-1]):
+        if argument == "-c" and _SHELL_SOURCE_PREFIX_RE.match(cmdline[index + 1]):
+            return True
+    return False
+
+
+def _exe_is_bash(proc: Path, pid: int) -> bool:
+    """Bind bash argv to the executable procfs says is actually running."""
+    try:
+        target = os.readlink(proc / str(pid) / "exe")
+    except OSError:
+        return False
+    return PurePath(target).name == "bash"
 
 
 def _plain_component(value: object) -> str:
@@ -454,9 +611,9 @@ def _worker_session_identity_details(
         except OSError as error:
             return "", f"cannot inspect exact worker session record: {error}", True
         saw_record = True
-        record, error = _stable_session_record(candidate)
-        if error:
-            return "", error, True
+        record, record_error = _stable_session_record(candidate)
+        if record_error:
+            return "", record_error, True
         assert record is not None
         record_pid = record.get("pid")
         if (
@@ -596,7 +753,10 @@ def _window_membership_decision(
 
 
 def _content_transcript_probe(
-    candidate: Path, agent_name: str, team_name: str
+    candidate: Path,
+    agent_name: str,
+    team_name: str,
+    worker_started_ns: int | None = None,
 ) -> tuple[bool, dict[str, object] | None, str]:
     """Decide standalone membership and snapshot it through one descriptor."""
     try:
@@ -653,11 +813,30 @@ def _content_transcript_probe(
         if before.st_size <= head_size:
             # The whole file fit inside the head window, so every complete
             # record has been seen and none carried the agent identity
-            # fields: this is provably not an agent transcript (an aborted
-            # session leaves exactly this setup-records-only shape behind,
-            # and a live estate always has some). A complete scan decides
-            # non-member; only a file too large to see end to end may stay
-            # undecidable.
+            # fields. That is TWO real shapes wearing one face: the husk an
+            # aborted session left behind days ago, and a LIVE worker's
+            # transcript in its first moments, before the first user record
+            # brings the identity fields (review lanes rv-c10b-1/2 killed a
+            # live worker through exactly this confusion). Age tells them
+            # apart exactly: a worker's transcript cannot predate the worker
+            # process. Older than the worker (with an hour of clock slack)
+            # decides non-member; as new as the worker or newer REFUSES the
+            # whole answer — the no-close direction.
+            if worker_started_ns is None:
+                return (
+                    False,
+                    None,
+                    "worker start time is unreadable for transcript "
+                    f"attribution: {candidate}",
+                )
+            newest_ns = max(before.st_mtime_ns, before.st_ctime_ns)
+            if newest_ns >= worker_started_ns - _ATTRIBUTION_SLACK_NS:
+                return (
+                    False,
+                    None,
+                    "worker transcript is identityless but as recent as the "
+                    f"worker itself: {candidate}",
+                )
             return False, snapshot, ""
         if valid_uuid(candidate.stem) is not None:
             return (
@@ -670,17 +849,53 @@ def _content_transcript_probe(
 
 
 def _content_transcript_member(
-    candidate: Path, agent_name: str, team_name: str
+    candidate: Path,
+    agent_name: str,
+    team_name: str,
+    worker_started_ns: int | None = None,
 ) -> tuple[bool, str]:
     """Compatibility wrapper for direct membership callers."""
     member, _snapshot, error = _content_transcript_probe(
-        candidate, agent_name, team_name
+        candidate, agent_name, team_name, worker_started_ns
     )
     return member, error
 
 
+_ATTRIBUTION_SLACK_NS = 3600 * 1_000_000_000
+
+
+def _worker_started_wallclock_ns(proc: Path, start_ticks: object) -> int | None:
+    """The worker's start as wallclock nanoseconds, from boot time + ticks.
+
+    Unreadable pieces return None — the caller must treat that as refusal
+    territory, never as permission to dismiss a candidate transcript."""
+    if not isinstance(start_ticks, int) or isinstance(start_ticks, bool):
+        return None
+    try:
+        stat_text = (proc / "stat").read_text(encoding="ascii")
+    except (OSError, UnicodeDecodeError):
+        return None
+    btime = None
+    for line in stat_text.splitlines():
+        fields = line.split()
+        if len(fields) == 2 and fields[0] == "btime" and fields[1].isdecimal():
+            btime = int(fields[1])
+            break
+    if btime is None:
+        return None
+    try:
+        hertz = os.sysconf("SC_CLK_TCK")
+    except (ValueError, OSError):
+        return None
+    if hertz <= 0:
+        return None
+    return btime * 1_000_000_000 + (start_ticks * 1_000_000_000) // hertz
+
+
 def _content_bound_candidates(
-    projects: list[Path], agent_id: str
+    projects: list[Path],
+    agent_id: str,
+    worker_started_ns: int | None = None,
 ) -> tuple[list[Path] | None, dict[str, dict[str, object]], str]:
     """Every standalone transcript declaring NAME@TEAM from exact argv."""
     agent_name, separator, team_name = agent_id.rpartition("@")
@@ -704,11 +919,11 @@ def _content_bound_candidates(
             if path in seen:
                 continue
             seen.add(path)
-            member, snapshot, error = _content_transcript_probe(
-                candidate, agent_name, team_name
+            member, snapshot, probe_error = _content_transcript_probe(
+                candidate, agent_name, team_name, worker_started_ns
             )
-            if error:
-                return None, {}, error
+            if probe_error:
+                return None, {}, probe_error
             if snapshot is not None:
                 probed[path] = snapshot
             if member:
@@ -737,6 +952,221 @@ def _candidate_snapshot(candidate: Path) -> tuple[dict[str, object] | None, str]
     if _stat_quintuple(before) != _stat_quintuple(after):
         return None, f"worker output transcript changed while being read: {candidate}"
     return _copy_evidence(candidate, after), ""
+
+
+def _background_shell_tree_snapshot(
+    shell: dict[str, object], proc: Path, *, required_state: str | None = None
+) -> tuple[dict[str, object] | None, str]:
+    """Walk only this shell's descendants and snapshot its own CPU.
+
+    Linux exposes each task's direct children below that process.  Walking
+    those files keeps an unreadable candidate local to that candidate instead
+    of making an unrelated numeric proc entry retire the whole shell pass.
+    """
+    shell_pid = shell.get("pid")
+    shell_start = shell.get("start_ticks")
+    shell_session = shell.get("session_id")
+    if any(
+        not isinstance(value, int) or isinstance(value, bool)
+        for value in (shell_pid, shell_start, shell_session)
+    ):
+        return None, "background shell identity is missing pid, start, or session"
+    assert isinstance(shell_pid, int)
+    assert isinstance(shell_start, int)
+    assert isinstance(shell_session, int)
+    shell_identity, error = _background_shell_stat(proc, shell_pid)
+    if (
+        shell_identity is None
+        or shell_identity[0] == "Z"
+        or (required_state is not None and shell_identity[0] != required_state)
+        or shell_identity[6] != shell_start
+        or shell_identity[3] != shell_session
+    ):
+        return None, error or "background shell identity changed during descendant scan"
+
+    def direct_children(pid: int) -> tuple[list[int] | None, str]:
+        task = proc / str(pid) / "task"
+        try:
+            tids = sorted(
+                int(name)
+                for name in os.listdir(task)
+                if re.fullmatch(r"\d+", name)
+            )
+        except FileNotFoundError:
+            return None, ""
+        except OSError as task_error:
+            return None, f"cannot enumerate process tasks for {pid}: {task_error}"
+        if not tids:
+            return None, f"process {pid} has no readable tasks"
+        children: set[int] = set()
+        for tid in tids:
+            path = task / str(tid) / "children"
+            try:
+                raw = path.read_text(encoding="ascii", errors="strict")
+            except FileNotFoundError:
+                # A non-leader thread may vanish while tasks are enumerated.
+                if not (task / str(tid)).exists():
+                    continue
+                return None, f"cannot read process children for {pid} task {tid}"
+            except (OSError, UnicodeError) as child_error:
+                return None, (
+                    f"cannot read process children for {pid} task {tid}: "
+                    f"{child_error}"
+                )
+            for word in raw.split():
+                if not re.fullmatch(r"\d+", word):
+                    return None, f"cannot parse process children for {pid} task {tid}"
+                children.add(int(word))
+        return sorted(children), ""
+
+    initial, error = direct_children(shell_pid)
+    if initial is None:
+        return None, error or "background shell vanished during descendant scan"
+    pending = list(initial)
+    seen: set[int] = set()
+    descendants: list[list[int]] = []
+    while pending:
+        pid = pending.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        identity, error = _background_shell_stat(proc, pid)
+        if identity is None:
+            if error:
+                return None, f"cannot read descendant {pid}: {error}"
+            continue
+        if identity[0] == "Z":
+            continue
+        children, error = direct_children(pid)
+        if children is None:
+            if error:
+                return None, f"cannot walk descendant {pid}: {error}"
+            continue
+        pending.extend(children)
+        (
+            _state,
+            _ppid,
+            _pgid,
+            session_id,
+            tty_nr,
+            _tpgid,
+            start_ticks,
+            _own_cpu,
+        ) = identity
+        if tty_nr != 0 and session_id != shell_session:
+            return None, (
+                f"descendant {pid} owns a tty in a different process session"
+            )
+        descendants.append([pid, start_ticks])
+    descendants.sort(key=lambda item: (item[1], item[0]))
+    shell_after, error = _background_shell_stat(proc, shell_pid)
+    if (
+        shell_after is None
+        or shell_after[1:] != shell_identity[1:]
+        or (required_state is not None and shell_after[0] != required_state)
+    ):
+        return None, error or "background shell changed during descendant scan"
+    return (
+        {
+            "descendant_identities": descendants,
+            "shell_cpu_ticks": shell_identity[7],
+            "shell_identity": list(shell_identity[:7]),
+        },
+        "",
+    )
+
+
+def _background_shell_foreground_refusal(
+    tree: dict[str, object],
+) -> str:
+    """Refuse when this childless shell owns its terminal foreground."""
+    identity = tree.get("shell_identity")
+    if (
+        not isinstance(identity, list)
+        or len(identity) != 7
+        or not isinstance(identity[2], int)
+        or isinstance(identity[2], bool)
+        or not isinstance(identity[4], int)
+        or isinstance(identity[4], bool)
+        or not isinstance(identity[5], int)
+        or isinstance(identity[5], bool)
+    ):
+        return "background shell tpgid is unreadable"
+    pgid = identity[2]
+    tty_nr = identity[4]
+    tpgid = identity[5]
+    if tty_nr != 0 and tpgid == pgid:
+        return f"terminal foreground pgid {tpgid} belongs to the background shell"
+    return ""
+
+
+def _background_shell_own_snapshot(
+    shell: dict[str, object], proc: Path
+) -> tuple[dict[str, object] | None, str]:
+    tree, error = _background_shell_tree_snapshot(shell, proc)
+    if tree is None:
+        return None, error
+    descendants = tree.get("descendant_identities")
+    if isinstance(descendants, list) and descendants:
+        youngest = descendants[-1]
+        return None, (
+            f"youngest live descendant {youngest[0]} "
+            f"(start ticks {youngest[1]}) prevents background shell closure"
+        )
+    foreground_error = _background_shell_foreground_refusal(tree)
+    if foreground_error:
+        return None, foreground_error
+    return {"shell_cpu_ticks": tree["shell_cpu_ticks"]}, ""
+
+
+def _background_shell_output_snapshot(
+    shell: dict[str, object], proc: Path
+) -> tuple[dict[str, object] | None, str]:
+    """Snapshot the shell's exact fd/1 regular file as its idle evidence."""
+    pid = shell.get("pid")
+    if not isinstance(pid, int) or isinstance(pid, bool):
+        return None, "background shell identity is missing pid"
+    fd_path = proc / str(pid) / "fd" / "1"
+    try:
+        target = os.readlink(fd_path)
+    except OSError as error:
+        return None, f"cannot resolve background shell fd/1: {error}"
+    # Linux renders non-files as names such as pipe:[123], socket:[123], and
+    # /dev/pts/4.  They have no stable regular-file tuple and are refusals.
+    if re.match(r"^(?:pipe|socket|anon_inode):\[", target):
+        return None, f"background shell fd/1 is not a regular file: {target}"
+    candidate = Path(target)
+    if not candidate.is_absolute():
+        candidate = fd_path.parent / candidate
+    try:
+        fd_before = os.stat(fd_path)
+    except OSError as error:
+        return None, f"cannot inspect background shell fd/1: {error}"
+    try:
+        descriptor = os.open(candidate, _candidate_open_flags())
+    except OSError as error:
+        return None, f"cannot read background shell output {candidate}: {error}"
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or not stat.S_ISREG(fd_before.st_mode):
+            return None, f"background shell fd/1 is not a regular file: {target}"
+        os.read(descriptor, 1)
+        after = os.fstat(descriptor)
+        fd_after = os.stat(fd_path)
+        target_after = os.readlink(fd_path)
+    except OSError as error:
+        return None, f"cannot read background shell output {candidate}: {error}"
+    finally:
+        os.close(descriptor)
+    if (
+        _stat_quintuple(before) != _stat_quintuple(after)
+        or (fd_before.st_dev, fd_before.st_ino)
+        != (after.st_dev, after.st_ino)
+        or _stat_quintuple(fd_after) != _stat_quintuple(after)
+        or target_after != target
+    ):
+        return None, f"background shell output changed while being read: {candidate}"
+    return {"output_copies": [_copy_evidence(candidate, after)]}, ""
 
 
 def _candidate_copy_set(
@@ -824,11 +1254,18 @@ def _output_snapshot(
         identity_error = refreshed_error
         session_id = valid_uuid(refreshed_id)
     if record_exists is False and current_shape:
-        content_candidates, probed, error = _content_bound_candidates(
-            projects_found, agent_id
+        worker_started_ns = agent.get("start_wallclock_ns")
+        if not isinstance(worker_started_ns, int) or isinstance(
+            worker_started_ns, bool
+        ):
+            worker_started_ns = None
+        content_candidates, probed, candidate_error = _content_bound_candidates(
+            projects_found,
+            agent_id,
+            worker_started_ns,
         )
-        if error:
-            return None, error
+        if candidate_error:
+            return None, candidate_error
         assert content_candidates is not None
         candidates.extend(content_candidates)
 
@@ -849,9 +1286,9 @@ def _output_snapshot(
                 }
     if not identity_error and session_id is not None:
         candidates.extend(project / f"{session_id}.jsonl" for project in projects_found)
-    copies, error = _candidate_copy_set(candidates, probed)
-    if error:
-        return None, error
+    copies, copy_error = _candidate_copy_set(candidates, probed)
+    if copy_error:
+        return None, copy_error
     assert copies is not None
     if required_registry_paths and not any(
         copy["path"] in required_registry_paths for copy in copies
@@ -905,6 +1342,9 @@ def find_subagents(
             "current_worker_shape": bool(_flag_value(cmdline, _NAME_FLAG))
             and bool(_flag_value(cmdline, _TEAM_FLAG))
             and bool(_flag_value(cmdline, _TYPE_FLAG)),
+            "start_wallclock_ns": _worker_started_wallclock_ns(
+                proc, start_ticks
+            ),
         }
         session_id, session_identity_error, session_record_exists = (
             _worker_session_identity_details(agent, values)
@@ -928,6 +1368,68 @@ def find_subagents(
     return found
 
 
+def find_background_shells(proc: Path) -> list[dict[str, object]]:
+    """Every exact harness shell directly owned by a live provider root."""
+    found: list[dict[str, object]] = []
+    try:
+        entries = sorted(
+            int(name) for name in os.listdir(proc) if re.fullmatch(r"\d+", name)
+        )
+    except OSError:
+        return found
+    own_uid = os.geteuid()
+    for pid in entries:
+        cmdline = _read_cmdline(proc, pid)
+        if not _is_background_shell_cmdline(cmdline):
+            continue
+        before = _shell_stat(proc, pid)
+        if before is None or before[0] == "Z" or not _exe_is_bash(proc, pid):
+            continue
+        _state, ppid, pgid, session_id, tty_nr, tpgid, start_ticks = before
+        parent_before = _shell_stat(proc, ppid)
+        if parent_before is None or parent_before[0] == "Z":
+            continue
+        parent_cmdline = _read_cmdline(proc, ppid)
+        if not _is_provider_root(parent_cmdline):
+            continue
+        parent_tty = parent_before[4]
+        if tty_nr not in (0, parent_tty):
+            continue
+        try:
+            if (
+                (proc / str(pid)).stat().st_uid != own_uid
+                or (proc / str(ppid)).stat().st_uid != own_uid
+            ):
+                continue
+        except OSError:
+            continue
+        # Bind both generations and every identity-bearing field around the
+        # scan. CPU and scheduling state are intentionally irrelevant.
+        after = _shell_stat(proc, pid)
+        parent_after = _shell_stat(proc, ppid)
+        if (
+            after is None
+            or after[0] == "Z"
+            or after[1:] != before[1:]
+            or _read_cmdline(proc, pid) != cmdline
+            or not _exe_is_bash(proc, pid)
+            or parent_after is None
+            or parent_after[0] == "Z"
+            or parent_after[1:] != parent_before[1:]
+            or _read_cmdline(proc, ppid) != parent_cmdline
+        ):
+            continue
+        shell = {
+            "pid": pid,
+            "start_ticks": start_ticks,
+            "provider_pid": ppid,
+            "provider_start_ticks": parent_before[6],
+            "session_id": session_id,
+        }
+        found.append(cast(dict[str, object], shell))
+    return found
+
+
 def _still_the_process(proc: Path, pid: int, start_ticks: int) -> bool:
     """The recorded process generation is live at this instant.
 
@@ -944,6 +1446,218 @@ def _still_the_worker(proc: Path, pid: int, start_ticks: int) -> bool:
     if not _still_the_process(proc, pid, start_ticks):
         return False
     return _is_worker(_read_cmdline(proc, pid))
+
+
+def _background_shell_identity_snapshot(
+    proc: Path,
+    pid: int,
+    start_ticks: int,
+    shell: dict[str, object],
+) -> tuple[dict[str, object] | None, str]:
+    """Re-derive the shell and parent identity without making a tty decision."""
+    identity = _shell_stat(proc, pid)
+    provider_pid = shell.get("provider_pid")
+    provider_start = shell.get("provider_start_ticks")
+    if (
+        identity is None
+        or identity[0] == "Z"
+        or identity[6] != start_ticks
+        or not isinstance(provider_pid, int)
+        or isinstance(provider_pid, bool)
+        or not isinstance(provider_start, int)
+        or isinstance(provider_start, bool)
+        or identity[1] != provider_pid
+        or identity[3] != shell.get("session_id")
+        or not _is_background_shell_cmdline(_read_cmdline(proc, pid))
+        or not _exe_is_bash(proc, pid)
+    ):
+        return None, "background shell identity changed before delivery"
+    _state, _ppid, _pgid, _session, tty_nr, _tpgid, _start = identity
+    parent = _shell_stat(proc, provider_pid)
+    if (
+        parent is None
+        or parent[0] == "Z"
+        or parent[6] != provider_start
+        or not _is_provider_root(_read_cmdline(proc, provider_pid))
+        or tty_nr not in (0, parent[4])
+    ):
+        return None, "background shell provider identity changed before delivery"
+    return {
+        "shell_identity": list(identity[1:]),
+        "provider_identity": list(parent[1:]),
+    }, ""
+
+
+def _background_shell_evidence_snapshot(
+    shell: dict[str, object], proc: Path
+) -> tuple[dict[str, object] | None, str]:
+    """The per-pass childless-shell own-CPU and output proof."""
+    own, error = _background_shell_own_snapshot(shell, proc)
+    if own is None:
+        return None, error
+    output, error = _background_shell_output_snapshot(shell, proc)
+    if output is None:
+        return None, error
+    return {**own, **output}, ""
+
+
+def _background_shell_own_cpu_moved(
+    previous: dict[str, object], current: dict[str, object]
+) -> bool:
+    """Only strict equality of the shell's own CPU permits closure."""
+    previous_cpu = previous.get("shell_cpu_ticks")
+    current_cpu = current.get("shell_cpu_ticks")
+    return (
+        not isinstance(previous_cpu, int)
+        or isinstance(previous_cpu, bool)
+        or not isinstance(current_cpu, int)
+        or isinstance(current_cpu, bool)
+        or current_cpu != previous_cpu
+    )
+
+
+def _background_shell_final_proof(
+    proc: Path,
+    shell: dict[str, object],
+    armed: dict[str, object],
+) -> tuple[dict[str, object] | None, str]:
+    """Full proof while the pinned shell is frozen in state T."""
+    pid = int(cast(int, shell["pid"]))
+    start_ticks = int(cast(int, shell["start_ticks"]))
+    identity, error = _background_shell_identity_snapshot(
+        proc, pid, start_ticks, shell
+    )
+    if identity is None:
+        return None, error
+    stopped = _shell_stat(proc, pid)
+    if stopped is None or stopped[0] != "T":
+        return None, "background shell did not remain stopped in state T"
+    tree, error = _background_shell_tree_snapshot(shell, proc, required_state="T")
+    if tree is None:
+        return None, error
+    descendants = tree.get("descendant_identities")
+    if isinstance(descendants, list) and descendants:
+        youngest = descendants[-1]
+        return None, (
+            f"youngest live descendant {youngest[0]} "
+            f"(start ticks {youngest[1]}) prevents background shell closure"
+        )
+    own = {"shell_cpu_ticks": tree["shell_cpu_ticks"]}
+    if _background_shell_own_cpu_moved(armed, own):
+        return None, "background shell own CPU moved before delivery"
+    foreground_error = _background_shell_foreground_refusal(tree)
+    if foreground_error:
+        return None, foreground_error
+    # fd/1 equality is deliberately the last proof before the signal syscall.
+    output, error = _background_shell_output_snapshot(shell, proc)
+    if output is None:
+        return None, error
+    if output.get("output_copies") != armed.get("output_copies"):
+        return None, "background shell fd/1 tuple moved before delivery"
+    return {**identity, **own, **output}, ""
+
+
+def _background_shell_wait_stopped(
+    proc: Path, pid: int, start_ticks: int
+) -> bool:
+    """Wait briefly for the asynchronous SIGSTOP state to appear in procfs."""
+    for attempt in range(20):
+        identity = _shell_stat(proc, pid)
+        if identity is None or identity[6] != start_ticks:
+            return False
+        if identity[0] == "T":
+            return True
+        if attempt != 19:
+            time.sleep(0.005)
+    return False
+
+
+def _deliver_background_shell(
+    proc: Path,
+    shell: dict[str, object],
+    armed: dict[str, object],
+    signum: int,
+    *,
+    send_signal: Callable[[int, int], None] | None = None,
+) -> tuple[bool, dict[str, object] | None, str]:
+    """Pin, freeze, re-prove, close, and resume one exact shell.
+
+    ``send_signal`` is the synthetic-proc test seam and represents pidfd signal
+    delivery. Production refuses when pidfds are unavailable and never falls
+    back to a PID-only shell kill.
+    """
+    pid = int(cast(int, shell["pid"]))
+    if send_signal is None and not _HAS_PIDFD:
+        return False, None, "pidfd delivery is unavailable for background shell"
+    descriptor = os.pidfd_open(pid) if send_signal is None else None
+    stopped = False
+    delivered = False
+    proof: dict[str, object] | None = None
+    error = ""
+    target_exited_before_cont = False
+    target_reaped_before_cont = False
+
+    def send(pidfd_signum: int) -> None:
+        if send_signal is not None:
+            send_signal(pid, pidfd_signum)
+        else:
+            assert descriptor is not None
+            signal.pidfd_send_signal(descriptor, pidfd_signum)
+
+    try:
+        send(signal.SIGSTOP)
+        stopped = True
+        if not _background_shell_wait_stopped(
+            proc, pid, int(cast(int, shell["start_ticks"]))
+        ):
+            error = "background shell did not enter stopped state T"
+        else:
+            proof, error = _background_shell_final_proof(proc, shell, armed)
+            if proof is not None:
+                send(signum)
+                delivered = True
+                after_signal = _shell_stat(proc, pid)
+                if (
+                    after_signal is None
+                    or after_signal[6] != int(cast(int, shell["start_ticks"]))
+                ):
+                    target_exited_before_cont = True
+                    target_reaped_before_cont = True
+                elif after_signal[0] in {"X", "Z"}:
+                    target_exited_before_cont = True
+    finally:
+        try:
+            if stopped:
+                try:
+                    send(signal.SIGCONT)
+                except OSError as resume_error:
+                    if not delivered:
+                        raise
+                    if resume_error.errno == errno.ESRCH:
+                        target_exited_before_cont = True
+                        target_reaped_before_cont = True
+                    else:
+                        error = (
+                            "background shell closing signal was delivered; "
+                            f"SIGCONT failed: {resume_error}"
+                        )
+        finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError as close_error:
+                    if not delivered:
+                        raise
+                    error = (
+                        "background shell closing signal was delivered; "
+                        f"pidfd close failed: {close_error}"
+                    )
+    if delivered and proof is not None:
+        if target_exited_before_cont:
+            proof["target_exited_before_cont"] = True
+        if target_reaped_before_cont:
+            proof["target_reaped_before_cont"] = True
+    return delivered, proof, error
 
 
 def _deliver_exact_process(
@@ -1077,7 +1791,7 @@ def sweep(
     state_dir: Path,
     environ: dict[str, str],
     now: float,
-    kill: object = None,
+    kill: SignalSender | None = None,
     dry_run: bool = False,
 ) -> list[dict[str, object]]:
     """One pass. Returns the action records it produced.
@@ -1136,6 +1850,123 @@ def sweep(
         os.close(lock_handle)
 
 
+def _sweep_background_shells(
+    *,
+    proc: Path,
+    tracked: dict[str, object],
+    next_tracked: dict[str, dict[str, object]],
+    boot_id: str,
+    now: float,
+    idle_seconds_required: float,
+    kill: SignalSender | None,
+    dry_run: bool,
+    log_path: Path,
+) -> list[dict[str, object]]:
+    """Independent childless-shell pass with own-CPU and fd/1 evidence."""
+    actions: list[dict[str, object]] = []
+    for shell in find_background_shells(proc):
+        pid = int(cast(int, shell["pid"]))
+        start_ticks = int(cast(int, shell["start_ticks"]))
+        key = f"background-shell:{boot_id}:{pid}:{start_ticks}"
+        prior = tracked.get(key)
+        evidence, evidence_error = _background_shell_evidence_snapshot(shell, proc)
+        if evidence is None:
+            refusal = {
+                "at": now,
+                "kind": "background-shell",
+                "pid": pid,
+                "start_ticks": start_ticks,
+                "provider_pid": shell["provider_pid"],
+                "decision": "refused-output",
+                "reason": evidence_error,
+            }
+            if not dry_run:
+                _log(log_path, refusal)
+            continue
+        record: dict[str, object] = {
+            **evidence,
+            "last_active": now,
+            "term_sent": False,
+        }
+        if isinstance(prior, dict):
+            evidence_unchanged = (
+                prior.get("output_copies") == evidence.get("output_copies")
+                and not _background_shell_own_cpu_moved(prior, evidence)
+            )
+            if evidence_unchanged:
+                record["last_active"] = prior.get("last_active", now)
+                record["term_sent"] = bool(prior.get("term_sent"))
+        idle_seconds = now - float(cast(float, record["last_active"]))
+        overdue = idle_seconds >= idle_seconds_required
+        if bool(record["term_sent"]) or overdue:
+            escalate = bool(record["term_sent"])
+            signum = signal.SIGKILL if escalate else signal.SIGTERM
+            action = {
+                "at": now,
+                "kind": "background-shell",
+                "pid": pid,
+                "start_ticks": start_ticks,
+                "provider_pid": shell["provider_pid"],
+                "idle_seconds": int(idle_seconds),
+                "signal": "SIGKILL" if escalate else "SIGTERM",
+                "moved_after_term": False,
+                "dry_run": dry_run,
+            }
+            if not dry_run:
+                try:
+                    delivered, final_proof, delivery_error = (
+                        _deliver_background_shell(
+                            proc,
+                            shell,
+                            record,
+                            signum,
+                            send_signal=kill if kill is not None else None,
+                        )
+                    )
+                except (ProcessLookupError, OSError) as error:
+                    delivered = False
+                    final_proof = None
+                    delivery_error = f"background shell delivery failed: {error}"
+                if not delivered:
+                    _log(
+                        log_path,
+                        {
+                            "at": now,
+                            "kind": "background-shell",
+                            "pid": pid,
+                            "start_ticks": start_ticks,
+                            "provider_pid": shell["provider_pid"],
+                            "decision": "refused-final-proof",
+                            "reason": delivery_error,
+                        },
+                    )
+                    # A refusal never inherits a TERM commitment. A later
+                    # readable/stable pass must arm a fresh full window.
+                    refreshed, _refresh_error = _background_shell_evidence_snapshot(
+                        shell, proc
+                    )
+                    if refreshed is not None:
+                        next_tracked[key] = {
+                            **refreshed,
+                            "last_active": now,
+                            "term_sent": False,
+                        }
+                    continue
+                if not escalate:
+                    record["term_sent"] = True
+                if isinstance(final_proof, dict):
+                    if final_proof.get("target_exited_before_cont") is True:
+                        action["target_exited_before_cont"] = True
+                    if final_proof.get("target_reaped_before_cont") is True:
+                        action["target_reaped_before_cont"] = True
+                _log(log_path, action)
+                actions.append(action)
+            else:
+                actions.append(action)
+        next_tracked[key] = record
+    return actions
+
+
 def _locked_sweep(
     *,
     proc: Path,
@@ -1143,7 +1974,7 @@ def _locked_sweep(
     environ: dict[str, str],
     now: float,
     idle_hours: float,
-    kill: object,
+    kill: SignalSender | None,
     dry_run: bool,
 ) -> list[dict[str, object]]:
     state_path = state_dir / "subagent-sweep.state.json"
@@ -1235,8 +2066,8 @@ def _locked_sweep(
     actions: list[dict[str, object]] = []
     next_tracked: dict[str, dict[str, object]] = {}
     for agent in live:
-        pid = int(agent["pid"])
-        start_ticks = int(agent["start_ticks"])
+        pid = int(cast(int, agent["pid"]))
+        start_ticks = int(cast(int, agent["start_ticks"]))
         # The boot is part of the identity, not just part of the document.
         # Start ticks are counted FROM BOOT, so `pid:start_ticks` names a
         # different process on the other side of one -- and a persisted
@@ -1290,7 +2121,7 @@ def _locked_sweep(
                 if output is None:
                     if "output_copies" in prior:
                         record["output_copies"] = prior["output_copies"]
-        idle_seconds = now - float(record["last_active"])
+        idle_seconds = now - float(cast(float, record["last_active"]))
         overdue = idle_seconds >= idle_hours * 3600
         if bool(record["term_sent"]) or overdue:
             escalate = bool(record["term_sent"])
@@ -1386,6 +2217,19 @@ def _locked_sweep(
                 _log(log_path, action)
             actions.append(action)
         next_tracked[key] = record
+    actions.extend(
+        _sweep_background_shells(
+            proc=proc,
+            tracked=tracked,
+            next_tracked=next_tracked,
+            boot_id=boot_id,
+            now=now,
+            idle_seconds_required=window_seconds,
+            kill=kill,
+            dry_run=dry_run,
+            log_path=log_path,
+        )
+    )
     if not dry_run:
         _save_state(
             state_path,

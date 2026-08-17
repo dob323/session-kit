@@ -24,9 +24,19 @@ from __future__ import annotations
 
 import inspect
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterable, Mapping, Protocol
 
 from .common import CollectionError, _utc_now, clean_text
+
+
+class ProviderUntitledQuarantine(Protocol):
+    def __call__(
+        self,
+        config: Mapping[str, Any],
+        inventory: Mapping[str, Any],
+        *,
+        retire_generations: Iterable[tuple[str, str]] = (),
+    ) -> list[dict[str, str]]: ...
 
 
 def _cold_inventory(error: str, *, schema_version: int) -> dict[str, Any]:
@@ -78,33 +88,25 @@ def snapshot(
     apply_terminal_numbers: Callable[..., dict[str, Any]],
     terminal_retirement_payload: Callable[[Mapping[int, float], str], dict[str, Any]],
     atomic_write_json: Callable[[Path, Any], None],
-    quarantine_orphaned_provider_untitled_markers: Callable[
-        [Mapping[str, Any], Mapping[str, Any]], list[dict[str, Any]]
-    ],
+    quarantine_orphaned_provider_untitled_markers: ProviderUntitledQuarantine,
     update_recovery_state: Callable[[Mapping[str, Path], Mapping[str, Any]], None],
     enqueue_lost_conversations: Callable[..., list[str]],
     apply_session_origins: Callable[..., None],
     capture_bounce_receipts: Callable[[Path], frozenset[str]],
-    capture_bounce_cleanup_generations: Callable[
-        [Path], frozenset[tuple[str, str]]
-    ],
+    capture_bounce_cleanup_generations: Callable[[Path], frozenset[tuple[str, str]]],
     capture_lifecycle_generations: Callable[[Path], frozenset[tuple[str, str]]],
     capture_origin_generations: Callable[[Path], frozenset[tuple[str, str]]],
-    capture_provider_untitled_generations: Callable[
-        [Path], frozenset[tuple[str, str]]
-    ],
-    capture_session_color_generations: Callable[
-        [Path], frozenset[tuple[str, str]]
-    ],
+    capture_provider_untitled_generations: Callable[[Path], frozenset[tuple[str, str]]],
+    capture_session_color_generations: Callable[[Path], frozenset[tuple[str, str]]],
     prune_origins: Callable[..., int],
     publish_session_colors: Callable[..., int],
     cold_inventory: Callable[[str], dict[str, Any]],
-    allocate_collection_start: Callable[
-        [Mapping[str, Path]], tuple[int, str | None]
-    ] | None = None,
+    allocate_collection_start: Callable[[Mapping[str, Path]], tuple[int, str | None]]
+    | None = None,
     preflight_collection_documents: Callable[
         [Mapping[str, Path], tuple[str, ...], int | None], tuple[list[str], list[str]]
-    ] | None = None,
+    ]
+    | None = None,
     write_collection_json: Callable[..., None] | None = None,
     prove_pending_losses: Callable[[Any, tuple[str, ...]], None] | None = None,
     # Optional: a caller assembled before the model cache existed still works,
@@ -126,8 +128,7 @@ def snapshot(
             allocate_collection_start or state_io.allocate_collection_start
         )
         preflight_collection_documents = (
-            preflight_collection_documents
-            or state_io.preflight_collection_documents
+            preflight_collection_documents or state_io.preflight_collection_documents
         )
         write_collection_json = write_collection_json or state_io.write_collection_json
     if prove_pending_losses is None:
@@ -139,11 +140,13 @@ def snapshot(
                 expected,
                 schema_version=schema_version,
             )
+
     settings = config or load_config()
     paths = state_paths(settings)
     collection_start: int | None = None
     collection_diagnostic: str | None = None
     publish_state = write_state
+
     # The inventory cache is a comparison input and display fallback; nothing
     # overwrites recovery evidence based on it, so a corrupt cache reads as
     # absent here and the refresh proceeds to the allocation refusal instead
@@ -182,14 +185,10 @@ def snapshot(
         else frozenset()
     )
     lifecycle_generations = (
-        capture_lifecycle_generations(paths["root"])
-        if publish_state
-        else frozenset()
+        capture_lifecycle_generations(paths["root"]) if publish_state else frozenset()
     )
     origin_generations = (
-        capture_origin_generations(paths["root"])
-        if publish_state
-        else frozenset()
+        capture_origin_generations(paths["root"]) if publish_state else frozenset()
     )
     provider_untitled_generations = (
         capture_provider_untitled_generations(paths["root"])
@@ -338,10 +337,8 @@ def snapshot(
                     # write in this transaction carries the same allocated
                     # collection sequence, so ordering the pending write first
                     # changes nothing the sequence records prove.
-                    enqueue_keywords = {"boot_id": boot_id}
-                    if _accepts_keyword(
-                        enqueue_lost_conversations, "collection_start"
-                    ):
+                    enqueue_keywords: dict[str, Any] = {"boot_id": boot_id}
+                    if _accepts_keyword(enqueue_lost_conversations, "collection_start"):
                         enqueue_keywords["collection_start"] = collection_start
                     queued_losses = enqueue_lost_conversations(
                         paths,
@@ -359,9 +356,7 @@ def snapshot(
                                 f"manifest advance; expected {expected}; found unreadable "
                                 f"{paths['pending'].name}: {exc}"
                             ) from exc
-                        prove_pending_losses(
-                            pending_at_advance, tuple(queued_losses)
-                        )
+                        prove_pending_losses(pending_at_advance, tuple(queued_losses))
                     write_collection_json(
                         paths,
                         paths["inventory"],
@@ -370,9 +365,7 @@ def snapshot(
                     )
                     recovery_keywords = (
                         {"collection_start": collection_start}
-                        if _accepts_keyword(
-                            update_recovery_state, "collection_start"
-                        )
+                        if _accepts_keyword(update_recovery_state, "collection_start")
                         else {}
                     )
                     update_recovery_state(paths, result, **recovery_keywords)

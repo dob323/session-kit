@@ -291,7 +291,8 @@ def origin_for(shpool_id: Any, origins: Mapping[str, Any] | None) -> str:
     entry = (origins.get("sessions") or {}).get(shpool_id)
     if not isinstance(entry, Mapping):
         return HUMAN
-    return entry.get("origin") if entry.get("origin") in ORIGINS else HUMAN
+    origin = entry.get("origin")
+    return origin if isinstance(origin, str) and origin in ORIGINS else HUMAN
 
 
 def recorded_origin(shpool_id: Any, origins: Mapping[str, Any] | None) -> str | None:
@@ -454,9 +455,7 @@ def capture_origin_generations(state_dir: Path) -> frozenset[tuple[str, str]]:
                 (key, generation)
                 for key, entry in document["sessions"].items()
                 if isinstance(entry, Mapping)
-                and isinstance(
-                    generation := entry.get("record_generation"), str
-                )
+                and isinstance(generation := entry.get("record_generation"), str)
                 and bool(_ORIGIN_GENERATION_RE.fullmatch(generation))
             )
     except (CollectionError, OSError):
@@ -561,9 +560,7 @@ def _bounce_cleanup_generation(
 ) -> tuple[str, str] | None:
     name = marker.name if original_name is None else original_name
     session_id = _bounce_session_id(name, generated_only=True)
-    if session_id is not None or name.startswith(
-        BOUNCE_GENERATION_RESERVATION_PREFIX
-    ):
+    if session_id is not None or name.startswith(BOUNCE_GENERATION_RESERVATION_PREFIX):
         return (name, name)
     if _bounce_session_id(name) != name:
         # Reusable legacy receipts and temporary files have no safe generation.
@@ -681,9 +678,10 @@ def clear_settled_bounce_markers(
             # An exact generated name, captured before the sighting.  The
             # provider never reuses it, so unlinking this path cannot reach a
             # receipt installed by a later bounce.
-            if not name.startswith(prefix) or _bounce_session_id(
-                name, generated_only=True
-            ) != shpool_id:
+            if (
+                not name.startswith(prefix)
+                or _bounce_session_id(name, generated_only=True) != shpool_id
+            ):
                 continue
             marker = state_dir / "provider-bounce" / name
             try:

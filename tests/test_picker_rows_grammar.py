@@ -33,8 +33,10 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unicodedata
 import unittest
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, os.fspath(REPO / "lib"))
@@ -394,7 +396,7 @@ class OneTimeColumnTests(unittest.TestCase):
                         *self.operator_shape(), columns=columns, compact=compact
                     )
                     self.assertEqual(4, len(lines))
-                    missing = [l for l in lines if not self.has_time(l)]
+                    missing = [line for line in lines if not self.has_time(line)]
                     self.assertEqual([], missing, "\n".join(lines))
 
     def test_the_widest_row_costs_its_own_tail_and_not_the_column(self) -> None:
@@ -407,7 +409,7 @@ class OneTimeColumnTests(unittest.TestCase):
                                display_model="GPT-5.6-Sol-Preview")
                 lines = picker_lines(*items, columns=120)
                 self.assertTrue(
-                    all(self.has_time(l) for l in lines), "\n".join(lines)
+                    all(self.has_time(line) for line in lines), "\n".join(lines)
                 )
 
     def test_every_width_60_to_200_keeps_a_time_on_both_pickers(self) -> None:
@@ -430,7 +432,7 @@ class OneTimeColumnTests(unittest.TestCase):
                 lines = picker_lines(
                     *self.operator_shape(), columns=columns, compact=compact
                 )
-                if lines and all(self.has_time(l) for l in lines):
+                if lines and all(self.has_time(line) for line in lines):
                     return columns
             raise AssertionError("no width shows the time")
 
@@ -658,13 +660,27 @@ class ModelTruthTests(unittest.TestCase):
         )
 
     def test_a_transcript_replaced_at_the_same_path_is_re_read(self) -> None:
-        """An inode is reused after unlink+create on this filesystem, so it is
-        not an identity on its own; the cache answered from the file that had
-        been deleted."""
+        """An inode can be reused after unlink+create, so it is not an identity
+        on its own; the cache must not answer from the deleted file.
+
+        Filesystems are free not to reuse the inode immediately.  Pin that
+        input here so this exercises the same-inode case on every runner.
+        """
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             cache = root / "cache"
             transcript = root / "t.jsonl"
+            real_fstat = os.fstat
+            generation = 1
+
+            def pinned_fstat(descriptor: int) -> SimpleNamespace:
+                info = real_fstat(descriptor)
+                return SimpleNamespace(
+                    st_ino=12345,
+                    st_dev=info.st_dev,
+                    st_ctime_ns=generation,
+                    st_size=info.st_size,
+                )
 
             def write(model: str) -> None:
                 transcript.write_text(
@@ -675,23 +691,23 @@ class ModelTruthTests(unittest.TestCase):
                     encoding="utf-8",
                 )
 
-            write("claude-fable-5")
-            first = os.stat(transcript).st_ino
-            self.assertEqual(
-                "claude-fable-5",
-                session_model.current_model(
-                    "claude", key="k", locate=lambda: transcript, cache_dir=cache
-                )[0],
-            )
-            os.unlink(transcript)
-            write("claude-sonnet-4-5-20250929")
-            self.assertEqual(first, os.stat(transcript).st_ino, "inode was not reused")
-            self.assertEqual(
-                "claude-sonnet-4-5-20250929",
-                session_model.current_model(
-                    "claude", key="k", locate=lambda: transcript, cache_dir=cache
-                )[0],
-            )
+            with mock.patch.object(session_model.os, "fstat", side_effect=pinned_fstat):
+                write("claude-fable-5")
+                self.assertEqual(
+                    "claude-fable-5",
+                    session_model.current_model(
+                        "claude", key="k", locate=lambda: transcript, cache_dir=cache
+                    )[0],
+                )
+                os.unlink(transcript)
+                write("claude-sonnet-4-5-20250929")
+                generation = 2
+                self.assertEqual(
+                    "claude-sonnet-4-5-20250929",
+                    session_model.current_model(
+                        "claude", key="k", locate=lambda: transcript, cache_dir=cache
+                    )[0],
+                )
 
     def test_a_first_record_caught_mid_write_is_read_once_it_completes(self) -> None:
         """The cache claimed the file size as scanned when nothing complete had

@@ -191,6 +191,7 @@ ABSENT_ALIAS_CONFIG_BACKUP = b"session-kit-alias-config-absent-v1\n"
 LIFECYCLE_REOPENED_PROVIDER_CRASHED = 76
 Runner = Callable[[Sequence[str], float], str]
 
+
 def _runtime_platform() -> str:
     """Return the real platform, with a test-only override for Linux fixtures."""
     return _processes._runtime_platform(
@@ -246,9 +247,7 @@ def _scoped_config_path(environ: Mapping[str, str] | None) -> Path | None:
     return _common.config_path(
         environ=env,
         home=lambda: _common._home(environ=env, home_factory=Path.home),
-        xdg_path=lambda name, fallback: _common._xdg_path(
-            name, fallback, environ=env
-        ),
+        xdg_path=lambda name, fallback: _common._xdg_path(name, fallback, environ=env),
     )
 
 
@@ -258,9 +257,7 @@ def _scoped_state_config(environ: Mapping[str, str] | None) -> dict[str, Any] | 
         return load_config()
     env = dict(environ)
     if not (
-        env.get("SESSION_KIT_STATE_DIR")
-        or env.get("XDG_STATE_HOME")
-        or env.get("HOME")
+        env.get("SESSION_KIT_STATE_DIR") or env.get("XDG_STATE_HOME") or env.get("HOME")
     ):
         return None
     return {
@@ -276,7 +273,14 @@ def _scoped_state_config(environ: Mapping[str, str] | None) -> dict[str, Any] | 
 
 
 def record_pushed_title(
-    provider: str, uuid: str, title: str, *, environ: Mapping[str, str] | None = None
+    provider: str,
+    uuid: str,
+    title: str,
+    *,
+    previous_native_title: str | None = None,
+    previous_native_name_since: Any = None,
+    previous_native_name_source: str = "",
+    environ: Mapping[str, str] | None = None,
 ) -> None:
     """Remember what the kit just wrote into a provider's own store.
 
@@ -293,6 +297,9 @@ def record_pushed_title(
             provider,
             uuid,
             title,
+            previous_native_title=previous_native_title,
+            previous_native_name_since=previous_native_name_since,
+            previous_native_name_source=previous_native_name_source,
             atomic_write_json=atomic_write_json,
             config_path=lambda: path,
             private_alias_document=_private_alias_document,
@@ -307,6 +314,8 @@ def adopt_native_rename(
     uuid: str,
     native_title: str,
     *,
+    native_name_source: str = "",
+    native_name_since: Any = None,
     environ: Mapping[str, str] | None = None,
 ) -> str:
     """Take a provider-native rename as the permanent human-owned name."""
@@ -320,6 +329,8 @@ def adopt_native_rename(
             provider,
             uuid,
             native_title,
+            native_name_source=native_name_source,
+            native_name_since=native_name_since,
             atomic_write_json=atomic_write_json,
             config_path=lambda: path,
             private_alias_document=_private_alias_document,
@@ -486,6 +497,9 @@ def load_config() -> dict[str, Any]:
     config["pushed_titles"] = _common._valid_pushed_titles(
         raw.get("pushed_titles") if isinstance(raw, Mapping) else None
     )
+    config["pending_native_titles"] = _common._valid_pending_native_titles(
+        raw.get("pending_native_titles") if isinstance(raw, Mapping) else None
+    )
     config["name_ownership"] = _common._valid_name_ownership(
         raw.get("name_ownership") if isinstance(raw, Mapping) else None
     )
@@ -529,11 +543,7 @@ def _parse_claude_payload(payload: Any) -> list[dict[str, Any]]:
         state_dir = _attention.default_state_dir(os.environ, Path.home())
         records = _attention.read_all(
             state_dir,
-            [
-                item.get("sessionId")
-                for item in payload
-                if isinstance(item, Mapping)
-            ],
+            [item.get("sessionId") for item in payload if isinstance(item, Mapping)],
         )
     return _providers_claude._parse_claude_payload(
         payload,
@@ -578,6 +588,7 @@ def _enrich_claude_payload(payload: Any) -> Any:
 
 def scan_process_table(proc_root: Path, max_nodes: int) -> dict[int, dict[str, Any]]:
     """Read one bounded process-table view from proc_root."""
+
     def inventory_environ(path: Path) -> dict[str, str]:
         values = _proc_environ(path)
         return {
@@ -662,7 +673,7 @@ def shpool_roots(
 
 
 def daemon_generation(
-    process_table: Mapping[int, Mapping[str, Any]]
+    process_table: Mapping[int, Mapping[str, Any]],
 ) -> dict[str, int] | None:
     return _processes.daemon_generation(
         process_table,
@@ -882,7 +893,10 @@ def _provider_title(
     automatic_titles: Mapping[str, str] | None = None,
     *,
     provider_title_is_explicit: bool = True,
+    native_name_source: str = "",
+    native_name_since: Any = None,
     pushed_titles: Mapping[str, str] | None = None,
+    pending_native_titles: Mapping[str, Mapping[str, Any]] | None = None,
     name_ownership: Mapping[str, Mapping[str, str]] | None = None,
 ) -> str:
     return _model._provider_title(
@@ -894,8 +908,11 @@ def _provider_title(
         started_at_unix_ms,
         automatic_titles,
         provider_title_is_explicit=provider_title_is_explicit,
+        native_name_source=native_name_source,
+        native_name_since=native_name_since,
         provider_title_info=_provider_title_info,
         pushed_titles=pushed_titles,
+        pending_native_titles=pending_native_titles,
         name_ownership=name_ownership,
     )
 
@@ -910,7 +927,10 @@ def _provider_title_info(
     automatic_titles: Mapping[str, str] | None = None,
     *,
     provider_title_is_explicit: bool = True,
+    native_name_source: str = "",
+    native_name_since: Any = None,
     pushed_titles: Mapping[str, str] | None = None,
+    pending_native_titles: Mapping[str, Mapping[str, Any]] | None = None,
     name_ownership: Mapping[str, Mapping[str, str]] | None = None,
 ) -> tuple[str, str]:
     return _model._provider_title_info(
@@ -922,15 +942,16 @@ def _provider_title_info(
         started_at_unix_ms,
         automatic_titles,
         provider_title_is_explicit=provider_title_is_explicit,
+        native_name_source=native_name_source,
+        native_name_since=native_name_since,
         context_title=_context_title,
         pushed_titles=pushed_titles,
+        pending_native_titles=pending_native_titles,
         name_ownership=name_ownership,
     )
 
 
-def _context_title(
-    provider: str, cwd: str, started_at_unix_ms: int | None
-) -> str:
+def _context_title(provider: str, cwd: str, started_at_unix_ms: int | None) -> str:
     """Return a deterministic project hint without exposing a full path."""
     return _model._context_title(
         provider,
@@ -1017,13 +1038,9 @@ def build_inventory(
     # multi-daemon fixture without payload provenance is deliberately refused.
     binding_refused = False
     if daemon_binding is _DAEMON_BINDING_UNSET:
-        observed = tuple(
-            _processes._kit_daemons(process_table, _is_shpool_daemon)
-        )
+        observed = tuple(_processes._kit_daemons(process_table, _is_shpool_daemon))
         definite = tuple(
-            pid
-            for pid, process in process_table.items()
-            if _is_shpool_daemon(process)
+            pid for pid, process in process_table.items() if _is_shpool_daemon(process)
         )
         unknown = tuple(
             pid
@@ -1129,9 +1146,7 @@ def build_inventory(
         for candidate_pid in candidate_pids:
             candidate = process_table.get(candidate_pid, {})
             model = candidate.get("requested_model")
-            launch_key = _exact_launch_key(
-                candidate.get("launch_idempotency_key")
-            )
+            launch_key = _exact_launch_key(candidate.get("launch_idempotency_key"))
             argv = candidate.get("cmdline")
             command_model = (
                 _arg_value(argv, "--model") if isinstance(argv, list) else ""
@@ -1157,9 +1172,7 @@ def build_inventory(
         # source (picker-rows ruling): a launch argument is not what a session
         # runs. Handoff capability still comes from the process evidence.
         item.update(_live_model_fields(item, process_table, model_cache_dir))
-        item["model_handoff_capable"] = _model_handoff_capable(
-            item, process_table
-        )
+        item["model_handoff_capable"] = _model_handoff_capable(item, process_table)
     return inventory
 
 
@@ -1224,7 +1237,9 @@ def _live_model_fields(
         "model_source": "",
         "launch_model": _session_model(item, process_table),
         "model_state": (
-            _labels.MODEL_STATE_NO_REPLY_YET if found else _labels.MODEL_STATE_UNREADABLE
+            _labels.MODEL_STATE_NO_REPLY_YET
+            if found
+            else _labels.MODEL_STATE_UNREADABLE
         ),
     }
 
@@ -1286,11 +1301,11 @@ def apply_provider_title_states(
             item["provider_title_state"] = "ready"
             continue
         pending = statmod.S_ISREG(marker_stat.st_mode) and not marker.is_symlink()
-        busy_or_attached = (
-            str(item.get("availability") or "").casefold() == "attached"
-            or str(item.get("agent_status") or "").casefold()
-            in {"running", "working", "needs your reply", "reply optional"}
-        )
+        busy_or_attached = str(
+            item.get("availability") or ""
+        ).casefold() == "attached" or str(
+            item.get("agent_status") or ""
+        ).casefold() in {"running", "working", "needs your reply", "reply optional"}
         if pending and busy_or_attached:
             item["provider_title_state"] = "deferred"
         elif pending:
@@ -1441,6 +1456,7 @@ def collect_live(
         default_max_proc_nodes=DEFAULT_MAX_PROC_NODES,
         enrich_claude_payload=_enrich_claude_payload,
         parse_claude_payload=_parse_claude_payload,
+        observe_claude_name=adopt_native_rename,
         codex_paths=_codex_paths,
         index_codex_processes=index_codex_processes,
         read_codex_session_index=read_codex_session_index,
@@ -1679,6 +1695,7 @@ def propagate_provider_title(
         title,
         environ=environ,
         codex_home=_codex_home,
+        claude_pre_push_title=_claude_pre_push_title,
         push_claude_title=_push_claude_title,
         push_codex_title=_push_codex_title,
         session_kit_state_dir=_session_kit_state_dir,
@@ -1757,11 +1774,32 @@ def claude_pending_native_hydrations(
     )
 
 
-def _push_claude_title(home: Path, uuid: str, title: str) -> tuple[list[str], list[str]]:
+def _claude_pre_push_title(
+    home: Path,
+    uuid: str,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> Mapping[str, Any] | None:
+    return _names_push._claude_pre_push_title(
+        home,
+        uuid,
+        environ=environ,
+        max_session_records=MAX_CLAUDE_SESSION_RECORDS,
+    )
+
+
+def _push_claude_title(
+    home: Path,
+    uuid: str,
+    title: str,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> tuple[list[str], list[str]]:
     return _names_push._push_claude_title(
         home,
         uuid,
         title,
+        environ=environ,
         atomic_write_json=atomic_write_json,
         max_session_records=MAX_CLAUDE_SESSION_RECORDS,
     )
@@ -1925,8 +1963,10 @@ def _codex_title_items(environ: Mapping[str, str]) -> str:
             raise OSError("refusing a symlinked template")
         import tomllib
 
-        value = tomllib.loads(template.read_text(encoding="utf-8")).get("tui", {}).get(
-            "terminal_title"
+        value = (
+            tomllib.loads(template.read_text(encoding="utf-8"))
+            .get("tui", {})
+            .get("terminal_title")
         )
     except (OSError, ValueError, ImportError, AttributeError):
         return DEFAULT_CODEX_TITLE_ITEMS
@@ -2303,9 +2343,7 @@ def _release_sha(value: Any) -> str:
     )
 
 
-def _daemon_start_epoch(
-    proc_root: Path, generation: Mapping[str, Any]
-) -> float:
+def _daemon_start_epoch(proc_root: Path, generation: Mapping[str, Any]) -> float:
     return _migration._daemon_start_epoch(
         proc_root,
         generation,
@@ -2751,8 +2789,7 @@ def _atomic_write_private_bytes(path: Path, content: bytes) -> None:
 
 def _json_bytes(value: Any) -> bytes:
     return (
-        json.dumps(value, indent=2, sort_keys=True, separators=(",", ": "))
-        + "\n"
+        json.dumps(value, indent=2, sort_keys=True, separators=(",", ": ")) + "\n"
     ).encode("utf-8")
 
 
@@ -2830,9 +2867,7 @@ def update_recovery_state(
             atomic_write_json=locked_atomic_write,
             collection_start=collection_start,
             write_collection_json=(
-                locked_collection_write
-                if collection_start is not None
-                else None
+                locked_collection_write if collection_start is not None else None
             ),
         )
 
@@ -2891,9 +2926,7 @@ def enqueue_lost_conversations(
             now_unix_ms=int(time.time() * 1000),
             collection_start=collection_start,
             write_collection_json=(
-                locked_collection_write
-                if collection_start is not None
-                else None
+                locked_collection_write if collection_start is not None else None
             ),
         )
     for diagnostic in diagnostics:
@@ -2944,7 +2977,9 @@ def _append_action_record(
         os.fchmod(descriptor, 0o600)
         fcntl.flock(descriptor, fcntl.LOCK_EX)
         with open(path, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
+            handle.write(
+                json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+            )
         os.chmod(path, 0o600)
     finally:
         os.close(descriptor)
@@ -3125,9 +3160,7 @@ def recovery_list_payload(
             )
 
     paths = _state_paths(config)
-    pending_payload = list_pending(
-        config, closed_ledger_keys=closed_ledger_keys
-    )
+    pending_payload = list_pending(config, closed_ledger_keys=closed_ledger_keys)
     pending = pending_payload.get("entries") or []
     manifest = _read_state_json(paths["manifest"])
     manifest_sessions = (
@@ -3182,8 +3215,7 @@ def recovery_list_payload(
             "live": [
                 [row.get("provider"), (row.get("identity") or {}).get("uuid")]
                 for row in live_sessions
-                if isinstance(row, Mapping)
-                and isinstance(row.get("identity"), Mapping)
+                if isinstance(row, Mapping) and isinstance(row.get("identity"), Mapping)
             ],
         }
     return payload
@@ -3226,6 +3258,7 @@ def _printed_rows_from(payload: str, *, json_lines: bool = False) -> Iterable[An
     rebuild here would record a list nobody has seen and call it the screen.
     """
     if json_lines:
+
         def rows() -> Iterator[Any]:
             handle = (
                 Path(payload).open(encoding="utf-8")
@@ -3249,11 +3282,7 @@ def _printed_rows_from(payload: str, *, json_lines: bool = False) -> Iterable[An
                     yield row
 
         return rows()
-    text = (
-        Path(payload).read_text(encoding="utf-8")
-        if payload
-        else sys.stdin.read()
-    )
+    text = Path(payload).read_text(encoding="utf-8") if payload else sys.stdin.read()
     if not text.strip():
         return []
     document = json.loads(text)
@@ -3394,8 +3423,8 @@ def _apply_session_idle_states(
         current,
         previous,
         state_dir=state_dir,
-        transcript_snapshot=lambda provider, uuid: (
-            _transcripts.transcript_snapshot(provider, uuid)
+        transcript_snapshot=lambda provider, uuid: _transcripts.transcript_snapshot(
+            provider, uuid
         ),
     )
     sessions = current.get("sessions")
@@ -3407,9 +3436,7 @@ def _apply_session_idle_states(
                 # differential transcript overlay. Refresh the published
                 # machine field as well as the render-time answer so every
                 # consumer receives the new idle verdict.
-                row["state"] = _labels.session_state(
-                    row, stall_seconds=stall_seconds
-                )
+                row["state"] = _labels.session_state(row, stall_seconds=stall_seconds)
         sessions.sort(key=_model.canonical_session_order_key)
         for index, row in enumerate(sessions, start=1):
             if isinstance(row, dict):
@@ -3417,7 +3444,9 @@ def _apply_session_idle_states(
     return current
 
 
-def snapshot(*, write_state: bool = True, config: dict[str, Any] | None = None) -> dict[str, Any]:
+def snapshot(
+    *, write_state: bool = True, config: dict[str, Any] | None = None
+) -> dict[str, Any]:
     settings = config if config is not None else load_config()
     inventory = _snapshot.snapshot(
         write_state=write_state,
@@ -3436,13 +3465,9 @@ def snapshot(*, write_state: bool = True, config: dict[str, Any] | None = None) 
         capture_bounce_cleanup_generations=(
             _origins.capture_bounce_cleanup_generations
         ),
-        capture_lifecycle_generations=(
-            _lifecycle.capture_lifecycle_generations
-        ),
+        capture_lifecycle_generations=(_lifecycle.capture_lifecycle_generations),
         capture_origin_generations=_origins.capture_origin_generations,
-        capture_provider_untitled_generations=(
-            capture_provider_untitled_generations
-        ),
+        capture_provider_untitled_generations=(capture_provider_untitled_generations),
         capture_session_color_generations=capture_session_color_generations,
         prune_origins=_origins.prune_origins,
         publish_session_colors=publish_session_colors,
@@ -3467,8 +3492,6 @@ def snapshot(*, write_state: bool = True, config: dict[str, Any] | None = None) 
     return inventory
 
 
-
-
 def _transcript_reachability(config: Mapping[str, Any]) -> dict[str, Any]:
     """How many recorded conversations this machine can still read.
 
@@ -3491,8 +3514,7 @@ def _transcript_reachability(config: Mapping[str, Any]) -> dict[str, Any]:
             "checked": 0,
             "unreadable": [],
             "detail": (
-                f"no readable session list at {snapshot_path}, so nothing was"
-                " checked"
+                f"no readable session list at {snapshot_path}, so nothing was checked"
             ),
         }
     recorded = str(payload.get("generated_at") or "an unknown time")
@@ -3502,7 +3524,9 @@ def _transcript_reachability(config: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(row, Mapping) or row.get("provider") not in PROVIDERS:
             continue
         identity = row.get("identity")
-        uuid = valid_uuid(identity.get("uuid")) if isinstance(identity, Mapping) else None
+        uuid = (
+            valid_uuid(identity.get("uuid")) if isinstance(identity, Mapping) else None
+        )
         if not uuid:
             continue
         checked += 1
@@ -3734,16 +3758,6 @@ def _short_path(path: str) -> str:
     return _render._short_path(path, home_factory=_home)
 
 
-
-
-
-
-
-
-
-
-
-
 def render_inventory(inventory: Mapping[str, Any], rows_only: bool = False) -> str:
     return _render.render_inventory(
         inventory,
@@ -3771,8 +3785,6 @@ def render_detail(
         activity=None,
         now_ms=int(time.time() * 1000),
     )
-
-
 
 
 # The fleet flagger writes one file; these are the same bounds the picker reads
@@ -3891,8 +3903,10 @@ def publish_view_fields(
     if not isinstance(sessions, list):
         return inventory
     flags = read_fleet_stalls() if stalls is None else stalls
-    as_of = now_ms if isinstance(now_ms, int) and not isinstance(now_ms, bool) else int(
-        time.time() * 1000
+    as_of = (
+        now_ms
+        if isinstance(now_ms, int) and not isinstance(now_ms, bool)
+        else int(time.time() * 1000)
     )
     stall_seconds = _render.stall_threshold_seconds()
     for row in sessions:
@@ -4067,9 +4081,7 @@ def _write_closed_sessions(
                 json.dump(row, sys.stdout, ensure_ascii=False, sort_keys=True)
                 sys.stdout.write("\n")
             return
-        sys.stdout.write(
-            '{"schema_version":' + str(SCHEMA_VERSION) + ',"closed":['
-        )
+        sys.stdout.write('{"schema_version":' + str(SCHEMA_VERSION) + ',"closed":[')
         separator = ""
         for row in rows:
             sys.stdout.write(separator)
@@ -4121,9 +4133,7 @@ def _platform_command(args: argparse.Namespace) -> int:
         # process name as socket authorship.
         if platform == DARWIN_PLATFORM:
             raise CollectionError("exact shpool socket holder is unavailable on Darwin")
-        table = platform_process_table(
-            _common.proc_root(), DEFAULT_MAX_PROC_NODES
-        )
+        table = platform_process_table(_common.proc_root(), DEFAULT_MAX_PROC_NODES)
         identity = _payload_daemon_identity(table)
         # Synthetic command fixtures cannot own a real Unix listener. Their
         # existing daemon-PID seam is accepted only behind the testing gate,
@@ -4134,12 +4144,9 @@ def _platform_command(args: argparse.Namespace) -> int:
             if fixture_pid.isdigit():
                 pid = int(fixture_pid)
                 process = table.get(pid)
-                if (
-                    isinstance(process, Mapping)
-                    and (
-                        _is_shpool_daemon(process)
-                        or clean_text(process.get("comm"), 128) == "shpool"
-                    )
+                if isinstance(process, Mapping) and (
+                    _is_shpool_daemon(process)
+                    or clean_text(process.get("comm"), 128) == "shpool"
                 ):
                     start = process.get("start_ticks")
                     if isinstance(start, int) and not isinstance(start, bool):
@@ -4150,7 +4157,9 @@ def _platform_command(args: argparse.Namespace) -> int:
         return 0
     if args.platform_action == "terminate-exact-process":
         if platform == DARWIN_PLATFORM:
-            raise CollectionError("pidfd-pinned exact termination is unavailable on Darwin")
+            raise CollectionError(
+                "pidfd-pinned exact termination is unavailable on Darwin"
+            )
         print(_terminate_exact_process(args.pid, args.process_generation))
         return 0
     if args.platform_action == "exact-shell-gone":
@@ -4160,7 +4169,9 @@ def _platform_command(args: argparse.Namespace) -> int:
         # unchanged. PID reuse is a successful disappearance of the old
         # generation; unreadable evidence refuses.
         if platform == DARWIN_PLATFORM:
-            raise CollectionError("exact post-close shell proof is unavailable on Darwin")
+            raise CollectionError(
+                "exact post-close shell proof is unavailable on Darwin"
+            )
         root = _common.proc_root()
 
         def exact_stat(pid: int) -> tuple[int, int, int] | None:
@@ -4183,7 +4194,9 @@ def _platform_command(args: argparse.Namespace) -> int:
         shell = exact_stat(args.shell_pid)
         daemon_after = exact_stat(args.daemon_pid)
         if daemon_after != daemon_before:
-            raise CollectionError("bound shpool daemon generation changed during close proof")
+            raise CollectionError(
+                "bound shpool daemon generation changed during close proof"
+            )
         if shell is not None and shell[2] == args.shell_generation:
             raise CollectionError(
                 f"verified shell PID {args.shell_pid} start {args.shell_generation} survives"
@@ -4225,7 +4238,10 @@ def _platform_command(args: argparse.Namespace) -> int:
     if args.platform_action == "process-is":
         argv = process.get("cmdline") or []
         executable = Path(str(argv[0])).name if argv else str(process.get("comm", ""))
-        if process.get("start_ticks") != args.generation or executable != args.executable:
+        if (
+            process.get("start_ticks") != args.generation
+            or executable != args.executable
+        ):
             raise CollectionError("process executable or generation changed")
         return 0
     if process.get("start_ticks") != args.generation:
@@ -4266,46 +4282,48 @@ def _alias_command(args: argparse.Namespace, config: dict[str, Any]) -> int:
         # picker still shows the name. Restore calls this so the name is in
         # place before the provider reads it.
         key = f"{args.provider}:{str(args.uuid).lower()}"
-        title = canonical_aliases(config).get(key) or ""
-        if not title:
+        push_title = canonical_aliases(config).get(key) or ""
+        if not push_title:
             # The alias tier is the name a person gave this session, so it is
             # always safe to re-assert. The automatic tier is not: if somebody
             # renamed the conversation in the window and no inventory build has
             # adopted it yet, pushing the kit's derived title would overwrite
             # the person's name in the provider's own store -- and the evidence
             # adoption needs to recover it goes with it. Ownership decides.
-            owner = (
-                canonical_name_ownership(config).get(key, {}).get("owner") or ""
-            )
+            owner = canonical_name_ownership(config).get(key, {}).get("owner") or ""
             if owner != "human":
-                title = canonical_automatic_titles(config).get(key) or ""
-        payload = {"schema_version": SCHEMA_VERSION, "title": title}
-        if not title:
+                push_title = canonical_automatic_titles(config).get(key) or ""
+        push_payload = {"schema_version": SCHEMA_VERSION, "title": push_title}
+        if not push_title:
             # Nothing named this conversation, so nothing is missing from the
             # provider store either. Silence here is the truth.
-            payload.update({"provider_title_pushes": [], "provider_title_warnings": []})
-            _json_print(payload)
+            push_payload.update(
+                {"provider_title_pushes": [], "provider_title_warnings": []}
+            )
+            _json_print(push_payload)
             return 0
-        payload.update(propagate_provider_title(args.provider, args.uuid, title))
-        _json_print(payload)
+        push_payload.update(
+            propagate_provider_title(args.provider, args.uuid, push_title)
+        )
+        _json_print(push_payload)
         # Three outcomes, told apart because the caller says something
         # different about each. Nothing landed: the window comes back nameless.
         # Something landed and something did not -- Codex writes an index entry
         # and a database title, and the status bar reads the database one, so a
         # half-push leaves the name on one surface and not the one people see.
-        if not payload.get("provider_title_pushes"):
+        if not push_payload.get("provider_title_pushes"):
             return 1
-        if payload.get("provider_title_warnings"):
+        if push_payload.get("provider_title_warnings"):
             return 3
         return 0
-    title = str(args.title) if args.alias_action == "set" else None
-    aliases = mutate_canonical_alias(config, args.provider, args.uuid, title)
+    alias_title = str(args.title) if args.alias_action == "set" else None
+    aliases = mutate_canonical_alias(config, args.provider, args.uuid, alias_title)
     payload: dict[str, Any] = {"schema_version": SCHEMA_VERSION, "aliases": aliases}
     if args.alias_action == "set":
-        assert title is not None
+        assert alias_title is not None
         # Explicit assignment pushes once into the provider's own surfaces;
         # deletion only clears the local alias and leaves provider titles alone.
-        payload.update(propagate_provider_title(args.provider, args.uuid, title))
+        payload.update(propagate_provider_title(args.provider, args.uuid, alias_title))
         effective_color = session_color(
             args.provider, args.uuid, canonical_colors(config)
         )
@@ -4359,7 +4377,9 @@ def _private_app_server_dir(state_root: Path, session_id: str) -> Path:
                 or metadata.st_uid != os.geteuid()
                 or statmod.S_IMODE(metadata.st_mode) != 0o700
             ):
-                raise CollectionError("App Server directory chain must be owner mode-0700")
+                raise CollectionError(
+                    "App Server directory chain must be owner mode-0700"
+                )
             current /= component
         return current
     finally:
@@ -4444,15 +4464,11 @@ def _color_command(args: argparse.Namespace, config: dict[str, Any]) -> int:
         occupied = occupied_live_colors()
         if occupied is None:
             return 1
-        color = _reserve_conversation_color(
-            config, args.provider, args.uuid, occupied
-        )
+        color = _reserve_conversation_color(config, args.provider, args.uuid, occupied)
         _json_print({"schema_version": SCHEMA_VERSION, "color": color})
         return 0
     if args.color_action == "propagate":
-        effective = session_color(
-            args.provider, args.uuid, canonical_colors(config)
-        )
+        effective = session_color(args.provider, args.uuid, canonical_colors(config))
         if not effective:
             return 1
         _json_print(
@@ -4473,9 +4489,7 @@ def _color_command(args: argparse.Namespace, config: dict[str, Any]) -> int:
         # for Codex, the theme file the launcher passes on the command line.
         # Without it the restart costs the person their window and changes
         # nothing.
-        effective = session_color(
-            args.provider, args.uuid, canonical_colors(config)
-        )
+        effective = session_color(args.provider, args.uuid, canonical_colors(config))
         if not effective:
             return 1
         exact = valid_uuid(args.uuid)
@@ -4522,9 +4536,7 @@ def _color_command(args: argparse.Namespace, config: dict[str, Any]) -> int:
         print(effective)
         return 0
     if args.color_action == "effective":
-        effective = session_color(
-            args.provider, args.uuid, canonical_colors(config)
-        )
+        effective = session_color(args.provider, args.uuid, canonical_colors(config))
         if not effective:
             return 1
         print(effective)
@@ -4549,9 +4561,7 @@ def _color_command(args: argparse.Namespace, config: dict[str, Any]) -> int:
     return 0
 
 
-def _automatic_title_command(
-    args: argparse.Namespace, config: dict[str, Any]
-) -> int:
+def _automatic_title_command(args: argparse.Namespace, config: dict[str, Any]) -> int:
     if args.automatic_title_action == "list":
         document = _private_alias_document(config_path(), allow_missing=True)
         _json_print(
@@ -4581,9 +4591,7 @@ def _automatic_title_command(
         return 0
     if args.automatic_title_action == "reset":
         _json_print(
-            mutate_canonical_automatic_title(
-                config, args.provider, args.uuid, None
-            )
+            mutate_canonical_automatic_title(config, args.provider, args.uuid, None)
         )
         return 0
     live = snapshot(write_state=False, config=config)
@@ -4591,9 +4599,7 @@ def _automatic_title_command(
         _json_print(audit_automatic_titles(config, live))
         return 0
     if live.get("source") != "live" or live.get("stale") is not False:
-        raise CollectionError(
-            "automatic title prune requires a fresh live inventory"
-        )
+        raise CollectionError("automatic title prune requires a fresh live inventory")
 
     def revalidate_inventory() -> Mapping[str, Any]:
         current = snapshot(write_state=False, config=config)
@@ -4700,14 +4706,10 @@ def _account_command(args: argparse.Namespace, config: dict[str, Any]) -> int:
         )
     elif action == "adopt-default":
         _json_print(
-            _accounts.adopt_default(
-                config, args.provider, args.alias, args.email
-            )
+            _accounts.adopt_default(config, args.provider, args.alias, args.email)
         )
     elif action == "enroll":
-        _json_print(
-            _accounts.enroll(config, args.provider, args.alias, args.email)
-        )
+        _json_print(_accounts.enroll(config, args.provider, args.alias, args.email))
     elif action == "verify":
         _json_print(_accounts.verify_profile(config, args.provider, args.alias))
     elif action == "binding":
@@ -5092,9 +5094,7 @@ def _parser() -> argparse.ArgumentParser:
     alias_delete.add_argument("provider", choices=PROVIDERS)
     alias_delete.add_argument("uuid")
     color_parser = subparsers.add_parser("color")
-    color_subparsers = color_parser.add_subparsers(
-        dest="color_action", required=True
-    )
+    color_subparsers = color_parser.add_subparsers(dest="color_action", required=True)
     color_subparsers.add_parser("list")
     color_subparsers.add_parser("reconcile")
     color_set = color_subparsers.add_parser("set")
@@ -5143,7 +5143,9 @@ def _parser() -> argparse.ArgumentParser:
         dest="account_action", required=True
     )
     account_list = account_subparsers.add_parser("list")
-    account_list.add_argument("provider", nargs="?", choices=sorted(_accounts.PROVIDERS))
+    account_list.add_argument(
+        "provider", nargs="?", choices=sorted(_accounts.PROVIDERS)
+    )
     account_list.add_argument("--json", dest="account_json", action="store_true")
     account_choices = account_subparsers.add_parser("choices")
     account_choices.add_argument("provider", choices=sorted(_accounts.PROVIDERS))
@@ -5294,7 +5296,9 @@ def _parser() -> argparse.ArgumentParser:
     closed_list.add_argument("--limit", type=int, default=_closed_sessions.MAX_ENTRIES)
     closed_list.add_argument("--allow-large-ledger", action="store_true")
     closed_stream = closed_subparsers.add_parser("stream")
-    closed_stream.add_argument("--limit", type=int, default=_closed_sessions.MAX_ENTRIES)
+    closed_stream.add_argument(
+        "--limit", type=int, default=_closed_sessions.MAX_ENTRIES
+    )
     closed_stream.add_argument("--allow-large-ledger", action="store_true")
     closed_forget = closed_subparsers.add_parser("forget")
     closed_forget.add_argument("provider", choices=("claude", "codex"))
@@ -5346,9 +5350,7 @@ def _parser() -> argparse.ArgumentParser:
     # is a single decision — close and keep the conversation, or change
     # nothing at all — so the caller can keep a session it must not lose
     # without the asking itself leaving a record behind.
-    lifecycle_closed.add_argument(
-        "--only-with-conversation", action="store_true"
-    )
+    lifecycle_closed.add_argument("--only-with-conversation", action="store_true")
     lifecycle_keep = lifecycle_subparsers.add_parser("keep")
     lifecycle_keep.add_argument("choice", choices=("on", "off"))
     worktree_parser = subparsers.add_parser("worktree")
@@ -5420,9 +5422,7 @@ def _parser() -> argparse.ArgumentParser:
     worktree_teardown.add_argument("--path")
     worktree_teardown.add_argument("--repo")
     worktree_teardown.add_argument("--branch")
-    worktree_teardown.add_argument(
-        "--merged-into", dest="merged_into", default="HEAD"
-    )
+    worktree_teardown.add_argument("--merged-into", dest="merged_into", default="HEAD")
     worktree_teardown.add_argument("--force", action="store_true")
     return parser
 
@@ -5433,9 +5433,7 @@ def _lifecycle_environment() -> tuple[Path, str, str, int, int]:
     boot_id = os.environ.get("SESSION_KIT_LIFECYCLE_BOOT_ID", "")
     try:
         shell_pid = int(os.environ.get("SESSION_KIT_LIFECYCLE_SHELL_PID", ""))
-        shell_start = int(
-            os.environ.get("SESSION_KIT_LIFECYCLE_SHELL_START_TICKS", "")
-        )
+        shell_start = int(os.environ.get("SESSION_KIT_LIFECYCLE_SHELL_START_TICKS", ""))
     except ValueError as exc:
         raise CollectionError("lifecycle shell generation is invalid") from exc
     return state_dir, session_id, boot_id, shell_pid, shell_start
@@ -5483,9 +5481,7 @@ def _prove_unchanged_daemon_generation(live: Mapping[str, Any]) -> None:
         or current.get("pid") != expected.get("pid")
         or current.get("process_start_ticks") != expected.get("process_start_ticks")
     ):
-        raise CollectionError(
-            "the shpool daemon generation changed; nothing reopened"
-        )
+        raise CollectionError("the shpool daemon generation changed; nothing reopened")
 
 
 def _lifecycle_committed_conversation(
@@ -5517,7 +5513,9 @@ def _lifecycle_committed_conversation(
         or not parts[3].isdigit()
         or int(parts[3]) <= 0
     ):
-        raise CollectionError("lifecycle intake commit generation does not match the shell")
+        raise CollectionError(
+            "lifecycle intake commit generation does not match the shell"
+        )
     marker = Path(marker_raw)
     if not marker.is_absolute() or not marker.name.endswith(".intake_committed"):
         raise CollectionError("lifecycle intake commit path is invalid")
@@ -5539,7 +5537,9 @@ def _lifecycle_committed_conversation(
         or info.st_size > 8192
         or not isinstance(value, Mapping)
     ):
-        raise CollectionError("lifecycle intake commit marker does not match the provider generation")
+        raise CollectionError(
+            "lifecycle intake commit marker does not match the provider generation"
+        )
     # Read the three numeric fields once. Repeating `value.get(...)` inside the
     # chain re-reads the mapping after its own type test, which is both slower
     # and unprovable.
@@ -5561,11 +5561,15 @@ def _lifecycle_committed_conversation(
         or not re.fullmatch(r"[0-9a-f]{8}", str(value.get("intake_msg_id") or ""))
         or not isinstance(revision, int)
         or revision < 0
-        or not re.fullmatch(r"[0-9a-f]{64}", str(value.get("requirements_digest") or ""))
+        or not re.fullmatch(
+            r"[0-9a-f]{64}", str(value.get("requirements_digest") or "")
+        )
         or not isinstance(committed, int)
         or committed <= 0
     ):
-        raise CollectionError("lifecycle intake commit marker does not match the provider generation")
+        raise CollectionError(
+            "lifecycle intake commit marker does not match the provider generation"
+        )
     return exact
 
 
@@ -5639,16 +5643,12 @@ def _release_session_worktree(state_dir: Path, session_id: str) -> dict[str, Any
 
 
 def _lifecycle_command(args: argparse.Namespace) -> int:
-    state_dir, session_id, boot_id, shell_pid, shell_start = (
-        _lifecycle_environment()
-    )
+    state_dir, session_id, boot_id, shell_pid, shell_start = _lifecycle_environment()
     _prove_lifecycle_caller(session_id, shell_pid, shell_start)
     if args.lifecycle_action == "provider-exited":
         provider = os.environ.get("SESSION_KIT_LIFECYCLE_PROVIDER", "")
         try:
-            exit_code = int(
-                os.environ.get("SESSION_KIT_LIFECYCLE_EXIT_CODE", "")
-            )
+            exit_code = int(os.environ.get("SESSION_KIT_LIFECYCLE_EXIT_CODE", ""))
         except ValueError as exc:
             raise CollectionError("lifecycle provider exit code is invalid") from exc
         value = _lifecycle.record_provider_exit(
@@ -5689,7 +5689,8 @@ def _lifecycle_command(args: argparse.Namespace) -> int:
             or state.get("shell_start_ticks") != shell_start
         ):
             state = None
-        provider = (state or {}).get("provider")
+        raw_provider = (state or {}).get("provider")
+        provider = raw_provider if isinstance(raw_provider, str) else ""
         conversation = valid_uuid((state or {}).get("conversation_uuid"))
         if args.only_with_conversation and (state or {}).get("keep"):
             # `keep_session` says "automatic cleanup is off for this session",
@@ -5854,8 +5855,7 @@ def _lifecycle_command(args: argparse.Namespace) -> int:
             )
         if item is None:
             raise CollectionError(
-                "this terminal is no longer in the live session list;"
-                " nothing reopened"
+                "this terminal is no longer in the live session list; nothing reopened"
             )
         if item.get("provider") != "shell":
             raise CollectionError(
@@ -5873,8 +5873,7 @@ def _lifecycle_command(args: argparse.Namespace) -> int:
             or shell.get("process_start_ticks") != shell_start
         ):
             raise CollectionError(
-                "this shell is not the one that recorded the exit;"
-                " nothing reopened"
+                "this shell is not the one that recorded the exit; nothing reopened"
             )
         recovery = item.get("recovery")
         if not isinstance(recovery, Mapping):
@@ -5885,8 +5884,7 @@ def _lifecycle_command(args: argparse.Namespace) -> int:
         uuid = valid_uuid(recovery.get("uuid"))
         if recovery.get("provider") != provider:
             raise CollectionError(
-                f"the recorded conversation is not a {provider} one;"
-                " nothing reopened"
+                f"the recorded conversation is not a {provider} one; nothing reopened"
             )
         if not uuid:
             raise CollectionError(
@@ -5894,18 +5892,14 @@ def _lifecycle_command(args: argparse.Namespace) -> int:
             )
         expected = recovery_spec(provider, uuid, recovery.get("cwd"))
         if recovery.get("argv") != expected["argv"]:
-            raise CollectionError(
-                "provider recovery command changed; nothing reopened"
-            )
+            raise CollectionError("provider recovery command changed; nothing reopened")
         argv = list(expected["argv"])
         if provider == "codex":
             argv[1:1] = ["-c", "check_for_update_on_startup=false"]
             # The session's theme rides on the launch command everywhere
             # else; a reopen without it came back in the stock theme and
             # lost the window's color identity.
-            theme_color = session_color(
-                "codex", uuid, canonical_colors(load_config())
-            )
+            theme_color = session_color("codex", uuid, canonical_colors(load_config()))
             if theme_color:
                 argv[1:1] = ["-c", f'tui.theme="sk-{theme_color}"']
             # And the same for the tab name (K3). Without it, a crash-reopen
@@ -6041,9 +6035,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 _json_print(
                     _printed.remember_printed(
                         state_dir,
-                        _printed_rows_from(
-                            args.payload, json_lines=args.json_lines
-                        ),
+                        _printed_rows_from(args.payload, json_lines=args.json_lines),
                     )
                 )
                 return 0
@@ -6105,11 +6097,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 0
             if args.closed_action == "forget":
                 _json_print(
-                    {
-                        "forgotten": _closed_sessions.forget(
-                            args.provider, args.uuid
-                        )
-                    }
+                    {"forgotten": _closed_sessions.forget(args.provider, args.uuid)}
                 )
                 return 0
             row = _record_closed_session(
@@ -6159,9 +6147,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             # No row means no tombstone and no close: the crash queue keeps
             # offering the conversation, which is the one remaining way back
             # to it (found in review, 2026-08-15).
-            row = _record_closed_session(
-                config, provider=args.provider, uuid=args.uuid
-            )
+            row = _record_closed_session(config, provider=args.provider, uuid=args.uuid)
             if isinstance(row, Mapping) and row.get("recorded") is False:
                 # Non-zero on purpose. Both callers branch on the exit status,
                 # and this is the status that makes them say so out loud.
@@ -6204,14 +6190,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.continuity_evidence,
                     args.release_sha,
                 )
-                _json_print(
-                    publish_legacy_migration_plan(config, args.output, plan)
-                )
+                _json_print(publish_legacy_migration_plan(config, args.output, plan))
             elif args.manifest_action == "apply-legacy":
                 _json_print(
-                    apply_legacy_recovery_manifest(
-                        config, args.plan, args.release_sha
-                    )
+                    apply_legacy_recovery_manifest(config, args.plan, args.release_sha)
                 )
             else:
                 _json_print(
@@ -6268,7 +6250,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "lookup":
             item = lookup(inventory, args.selector)
             if item is None:
-                print(f"no unique shpool session matches {args.selector!r}", file=sys.stderr)
+                print(
+                    f"no unique shpool session matches {args.selector!r}",
+                    file=sys.stderr,
+                )
                 return 2
             _json_print(item)
         elif args.command == "detail":

@@ -23,6 +23,8 @@ from .common import (
     _valid_automatic_title_failures,
     _valid_automatic_titles,
     _valid_name_ownership,
+    _pending_native_title_matches,
+    _valid_pending_native_titles,
     _valid_pushed_titles,
     automatic_naming_enabled,
     clean_text,
@@ -133,15 +135,12 @@ def _attach_aged_workers(
         existing = row.get("aged_children")
         aged = (
             [dict(item) for item in existing if isinstance(item, Mapping)]
-            if isinstance(existing, Sequence)
-            and not isinstance(existing, (str, bytes))
+            if isinstance(existing, Sequence) and not isinstance(existing, (str, bytes))
             else []
         )
         seen: set[tuple[str, object]] = set()
         subagents = row.get("subagents")
-        if isinstance(subagents, Sequence) and not isinstance(
-            subagents, (str, bytes)
-        ):
+        if isinstance(subagents, Sequence) and not isinstance(subagents, (str, bytes)):
             for raw_child in subagents:
                 if not isinstance(raw_child, Mapping):
                     continue
@@ -195,6 +194,7 @@ def _attach_aged_workers(
             )
         )
         row["aged_children"] = aged
+
 
 # Value-taking global options printed by the installed CLI's `codex help`.
 # Keep this synchronized with that grammar so option values cannot be mistaken
@@ -304,11 +304,7 @@ def _codex_first_positional(exact_argv: Sequence[Any]) -> str | None:
             if index + 1 >= len(exact_argv):
                 return None
             value = exact_argv[index + 1]
-            if (
-                not isinstance(value, str)
-                or not value
-                or value.startswith("-")
-            ):
+            if not isinstance(value, str) or not value or value.startswith("-"):
                 return None
             index += 2
             if argument in CODEX_VARIADIC_GLOBAL_OPTIONS:
@@ -854,8 +850,7 @@ def _lineage_owner(
     owner = roots[0]
     workers = [claim for claim in claims if claim != owner]
     if not all(
-        worker_pid != owner[1]
-        and _proven_ancestor(owner[1], worker_pid, process_table)
+        worker_pid != owner[1] and _proven_ancestor(owner[1], worker_pid, process_table)
         for _, worker_pid, _ in workers
     ):
         return None
@@ -905,6 +900,9 @@ def build_inventory(
     aliases = _valid_aliases(config.get("aliases"))
     automatic_titles = _valid_automatic_titles(config.get("automatic_titles"))
     pushed_titles = _valid_pushed_titles(config.get("pushed_titles"))
+    pending_native_titles = _valid_pending_native_titles(
+        config.get("pending_native_titles")
+    )
     name_ownership = _valid_name_ownership(config.get("name_ownership"))
     automatic_failures = _valid_automatic_title_failures(
         config.get("automatic_title_failures")
@@ -1039,22 +1037,28 @@ def build_inventory(
             if worker_kind == "codex":
                 worker_threads, _ = codex_rows_for_pid(worker_pid)
                 worker_thread = worker_threads.get(worker_uuid, {})
-                worker_title = clean_text(
-                    worker_thread.get("session_index_name")
-                    or worker_thread.get("name")
-                    or worker_thread.get("title"),
-                    120,
-                ) or f"PID {worker_pid}"
+                worker_title = (
+                    clean_text(
+                        worker_thread.get("session_index_name")
+                        or worker_thread.get("name")
+                        or worker_thread.get("title"),
+                        120,
+                    )
+                    or f"PID {worker_pid}"
+                )
                 worker_status = _codex_turn_state(
                     codex_index.get(worker_pid, ()), worker_uuid
                 )
                 mapped_codex.add(worker_pid)
             elif worker_kind == "claude-agent":
                 worker_agent = claude_by_pid[worker_pid]
-                worker_title = clean_text(
-                    worker_agent.get("agent_name") or worker_agent.get("title"),
-                    120,
-                ) or f"PID {worker_pid}"
+                worker_title = (
+                    clean_text(
+                        worker_agent.get("agent_name") or worker_agent.get("title"),
+                        120,
+                    )
+                    or f"PID {worker_pid}"
+                )
                 worker_status = clean_text(worker_agent.get("status"), 60) or "unknown"
                 mapped_claude.add(worker_pid)
             else:
@@ -1062,9 +1066,7 @@ def build_inventory(
                 worker_status = "running"
             lineage_subagents.append(
                 {
-                    "provider": (
-                        "codex" if worker_kind == "codex" else "claude"
-                    ),
+                    "provider": ("codex" if worker_kind == "codex" else "claude"),
                     "uuid": worker_uuid,
                     "pid": worker_pid,
                     "title": worker_title,
@@ -1082,9 +1084,7 @@ def build_inventory(
         def include_lineage_subagents(
             existing: Sequence[Any],
         ) -> list[dict[str, Any]]:
-            combined = [
-                dict(item) for item in existing if isinstance(item, Mapping)
-            ]
+            combined = [dict(item) for item in existing if isinstance(item, Mapping)]
             for worker in lineage_subagents:
                 if any(
                     item.get("pid") == worker["pid"]
@@ -1105,6 +1105,8 @@ def build_inventory(
         uuid: str | None
         starting_provider = None
         provider_title_is_explicit = True
+        native_name_source = ""
+        native_name_since: Any = None
         provider_title_state = "ready"
         claude_color_evidence = ""
         if owner_claim and owner_claim[0] == "claude-agent":
@@ -1112,6 +1114,8 @@ def build_inventory(
             agent = claude_by_pid[pid]
             uuid = agent["uuid"]
             native_title = agent["title"]
+            native_name_source = agent.get("name_source") or ""
+            native_name_since = agent.get("name_since")
             claude_color_evidence = agent.get("agent_color") or ""
             # Claude persists its conversation auto-title as a transcript
             # ai-title record while the session record keeps a derived window
@@ -1119,8 +1123,10 @@ def build_inventory(
             # label; any explicit rename keeps outranking both.
             if agent.get("agent_name"):
                 native_title = agent["agent_name"]
-            elif agent.get("ai_title") and agent.get("name_source") == "derived":
-                native_title = agent["ai_title"]
+                native_name_source = ""
+            elif agent.get("name_source") == "derived":
+                if agent.get("ai_title"):
+                    native_title = agent["ai_title"]
                 # Transcript hydration prepares the next start, but only the
                 # live structured agent name proves this process rendered it.
                 # External writes cannot repaint an already-running TUI.
@@ -1138,9 +1144,7 @@ def build_inventory(
                 provenance="claude agents --json",
                 confidence="exact",
             )
-            subagents = include_lineage_subagents(
-                claude_subagents(uuid, process_table)
-            )
+            subagents = include_lineage_subagents(claude_subagents(uuid, process_table))
             recovery = recovery_spec(provider, uuid, cwd or None)
             mapped_claude.add(pid)
             agent_status = agent["status"]
@@ -1158,9 +1162,7 @@ def build_inventory(
                 provenance="native Claude CLI session argument",
                 confidence="exact",
             )
-            subagents = include_lineage_subagents(
-                claude_subagents(uuid, process_table)
-            )
+            subagents = include_lineage_subagents(claude_subagents(uuid, process_table))
             recovery = recovery_spec(provider, uuid, cwd or None)
             mapped_claude.add(pid)
             agent_status = "running"
@@ -1308,9 +1310,10 @@ def build_inventory(
             parent_uuid = valid_uuid(raw_parent)
             if parent_uuid:
                 claude_parent_ids.add(parent_uuid)
-        headless_codex_machine = provider == "codex" and _codex_first_positional(
-            exact_argv
-        ) in CODEX_MACHINE_SUBCOMMANDS
+        headless_codex_machine = (
+            provider == "codex"
+            and _codex_first_positional(exact_argv) in CODEX_MACHINE_SUBCOMMANDS
+        )
         codex_app_server_driver = (
             _codex_app_server_driver(
                 pid,
@@ -1323,6 +1326,21 @@ def build_inventory(
             else "unknown"
         )
 
+        title_key = f"{provider}:{uuid}" if uuid else ""
+        if (
+            provider == "claude"
+            and title_key
+            and native_title
+            and _pending_native_title_matches(
+                pending_native_titles.get(title_key),
+                native_title,
+                native_name_since,
+                native_name_source,
+            )
+            and pushed_titles.get(title_key)
+        ):
+            provider_title_state = "pending"
+
         title, title_source = provider_title_info(
             provider,
             uuid,
@@ -1332,7 +1350,10 @@ def build_inventory(
             shpool["started_at_unix_ms"],
             automatic_titles,
             provider_title_is_explicit=provider_title_is_explicit,
+            native_name_source=native_name_source,
+            native_name_since=native_name_since,
             pushed_titles=pushed_titles,
+            pending_native_titles=pending_native_titles,
             name_ownership=name_ownership,
         )
         recent_output_at = recent_outputs.get(name)
@@ -1483,15 +1504,24 @@ def build_inventory(
             continue
         uuid = agent["uuid"]
         recovery = recovery_spec("claude", uuid, agent["cwd"] or None)
+        outside_native_title = agent["title"]
+        outside_name_source = agent.get("name_source") or ""
+        if agent.get("agent_name"):
+            outside_native_title = agent["agent_name"]
+            outside_name_source = ""
+        elif agent.get("ai_title") and outside_name_source == "derived":
+            outside_native_title = agent["ai_title"]
         outside_title, outside_title_source = provider_title_info(
             "claude",
             uuid,
-            agent["title"],
+            outside_native_title,
             aliases,
             agent["cwd"],
             agent["started_at_unix_ms"],
             automatic_titles,
+            native_name_source=outside_name_source,
             pushed_titles=pushed_titles,
+            pending_native_titles=pending_native_titles,
             name_ownership=name_ownership,
         )
         outside_agents.append(
@@ -1511,7 +1541,7 @@ def build_inventory(
                 ),
                 title=outside_title,
                 title_source=outside_title_source,
-                native_title=agent["title"],
+                native_title=outside_native_title,
                 cwd=agent["cwd"],
                 started_at_unix_ms=agent["started_at_unix_ms"],
                 process_age_seconds=_process_age(
@@ -1617,8 +1647,7 @@ def build_inventory(
     # question states plus "state unavailable" err VISIBLE rather than hide
     # a pending reply or an unreadable rollout (the X16/X17 lesson).
     live_thread_uuids = {
-        (item.get("identity") or {}).get("uuid")
-        for item in sessions + outside_agents
+        (item.get("identity") or {}).get("uuid") for item in sessions + outside_agents
     }
     live_thread_uuids.discard(None)
     for item in sessions + outside_agents:
@@ -1691,6 +1720,7 @@ def collect_live(
     default_max_proc_nodes: int,
     enrich_claude_payload: Callable[[Any], Any],
     parse_claude_payload: Callable[[Any], list[dict[str, Any]]],
+    observe_claude_name: Callable[..., str],
     codex_paths: Callable[[], tuple[Path, Path]],
     index_codex_processes: Callable[
         [Mapping[int, Mapping[str, Any]], Path, Path],
@@ -1703,9 +1733,7 @@ def collect_live(
     ],
     recent_output_times: Callable[..., dict[str, int]],
     build_inventory: Callable[..., dict[str, Any]],
-    daemon_identity: Callable[
-        [Mapping[int, Mapping[str, Any]]], dict[str, int] | None
-    ],
+    daemon_identity: Callable[[Mapping[int, Mapping[str, Any]]], dict[str, int] | None],
     apply_provider_title_states: Callable[[dict[str, Any], Mapping[str, Any]], Any],
     apply_retained_setup_attributions: Callable[[dict[str, Any]], Any],
 ) -> dict[str, Any]:
@@ -1818,7 +1846,19 @@ def collect_live(
         warnings.append("Claude inventory unavailable: invalid live profile path")
     try:
         claude_payload = enrich_claude_payload(claude_payload)
-        parse_claude_payload(claude_payload)
+        parsed_claude = parse_claude_payload(claude_payload)
+        for agent in parsed_claude:
+            # This is the PID registry observation itself. Agreement retires
+            # a lag exception; changed nameSince makes divergence a later
+            # human act even when the person reused the exact pre-push text.
+            observe_claude_name(
+                "claude",
+                agent["uuid"],
+                agent["title"],
+                native_name_source=agent.get("name_source") or "",
+                native_name_since=agent.get("name_since"),
+                environ=environ,
+            )
     except (OSError, ValueError, subprocess.SubprocessError, CollectionError) as exc:
         claude_payload = []
         failed_claude_profiles.update(ordered_claude_profiles)

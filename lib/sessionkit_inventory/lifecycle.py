@@ -623,9 +623,7 @@ def _validated_last_exact(
         return None
     schema_version = value.get("schema_version")
     expected_fields = (
-        legacy_fields | {"record_generation"}
-        if schema_version == 2
-        else legacy_fields
+        legacy_fields | {"record_generation"} if schema_version == 2 else legacy_fields
     )
     if schema_version not in {1, 2} or set(value) != expected_fields:
         return None
@@ -671,8 +669,7 @@ def persist_last_exact(
                 if isinstance(previous_inventory, Mapping)
                 else ()
             )
-            if isinstance(item, Mapping)
-            and isinstance(item.get("shpool_id_raw"), str)
+            if isinstance(item, Mapping) and isinstance(item.get("shpool_id_raw"), str)
         }
         for item in inventory.get("sessions", ()):
             if not isinstance(item, Mapping):
@@ -739,9 +736,8 @@ def _capturable_generation(path: Path) -> LifecycleGeneration | None:
     if not isinstance(value, Mapping):
         return None
     generation = value.get("record_generation")
-    if (
-        not isinstance(generation, str)
-        or not _RECORD_GENERATION_RE.fullmatch(generation)
+    if not isinstance(generation, str) or not _RECORD_GENERATION_RE.fullmatch(
+        generation
     ):
         # Records written by an older release have no exact generation. They
         # remain readable, but no collector is allowed to retire them.

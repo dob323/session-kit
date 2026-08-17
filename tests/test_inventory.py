@@ -25,6 +25,7 @@ import tempfile
 import termios
 import time
 import threading
+from typing import Any
 import unittest
 from unittest import mock
 import unicodedata
@@ -1376,6 +1377,32 @@ def inventory_fixture(
 
 
 class InventoryScaleTests(unittest.TestCase):
+    def test_claude_derived_placeholder_yields_to_alias_but_missing_source_wins(self) -> None:
+        fixture = list(inventory_fixture(1, providers=("claude",)))
+        uuid = uuid_for(1)
+        key = f"claude:{uuid}"
+        fixture[1][0].update({"name": "v2-5e", "nameSource": "derived"})
+        fixture[5].update(
+            {
+                "aliases": {key: "Session Kit Closeout"},
+                "automatic_titles": {key: "Session Kit Closeout"},
+                "pushed_titles": {key: "Session Kit Closeout"},
+            }
+        )
+
+        derived = inventory_core.build_inventory(*fixture, now=1_800_000_000)[
+            "sessions"
+        ][0]
+        self.assertEqual("Session Kit Closeout", derived["title"])
+        self.assertEqual("alias", derived["title_source"])
+
+        fixture[1][0].pop("nameSource")
+        historical = inventory_core.build_inventory(*fixture, now=1_800_000_000)[
+            "sessions"
+        ][0]
+        self.assertEqual("v2-5e", historical["title"])
+        self.assertEqual("native", historical["title_source"])
+
     def test_claude_agent_name_outranks_generated_native_title(self) -> None:
         fixture = list(inventory_fixture(1, providers=("claude",)))
         fixture[1][0].update(
@@ -1397,6 +1424,43 @@ class InventoryScaleTests(unittest.TestCase):
         self.assertEqual("native", row["title_source"])
         self.assertEqual("ready", row["provider_title_state"])
         self.assertEqual("not-needed", row["automatic_name_state"])
+
+    def test_claude_stale_pre_push_name_is_pending_and_third_name_is_human(self) -> None:
+        fixture = list(inventory_fixture(1, providers=("claude",)))
+        uuid = uuid_for(1)
+        key = f"claude:{uuid}"
+        fixture[5].update(
+            {
+                "aliases": {key: "New Kit Name"},
+                "automatic_titles": {key: "New Kit Name"},
+                "pushed_titles": {key: "New Kit Name"},
+                "pending_native_titles": {
+                    key: {
+                        "title": "Old Registry Name",
+                        "nameSince": 100,
+                        "nameSource": "",
+                    }
+                },
+            }
+        )
+        fixture[1][0]["name"] = "Old Registry Name"
+        fixture[1][0]["nameSince"] = 100
+
+        pending = inventory_core.build_inventory(*fixture, now=1_800_000_000)[
+            "sessions"
+        ][0]
+        self.assertEqual("New Kit Name", pending["title"])
+        self.assertEqual("alias", pending["title_source"])
+        self.assertEqual("pending", pending["provider_title_state"])
+
+        fixture[1][0]["name"] = "A Third Human Name"
+        fixture[1][0]["nameSince"] = 200
+        human = inventory_core.build_inventory(*fixture, now=1_800_000_000)[
+            "sessions"
+        ][0]
+        self.assertEqual("A Third Human Name", human["title"])
+        self.assertEqual("native", human["title_source"])
+        self.assertEqual("ready", human["provider_title_state"])
 
     def test_zero_one_and_100_plus_counts_have_no_ceiling(self) -> None:
         for count in (0, 1, 9, 10, 99, 125, 250):
@@ -2070,6 +2134,14 @@ class InventoryIdentityTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
+            sessions = custom_root / "sessions"
+            sessions.mkdir()
+            (sessions / "225.json").write_text(
+                json.dumps(
+                    {"sessionId": exact_uuid, "nameSource": "derived"}
+                ),
+                encoding="utf-8",
+            )
             payload = [
                 {
                     "pid": 225,
@@ -2085,6 +2157,50 @@ class InventoryIdentityTests(unittest.TestCase):
                 transcript_signals=inventory_core.read_claude_transcript_signals,
             )
         self.assertEqual("Custom profile title", enriched[0]["aiTitle"])
+        self.assertEqual("derived", enriched[0]["nameSource"])
+
+    def test_claude_enrichment_ignores_unreadable_or_symlinked_pid_record(self) -> None:
+        with tempfile.TemporaryDirectory(prefix=".claude-profile-", dir=REPO) as raw:
+            custom_root = Path(raw)
+            sessions = custom_root / "sessions"
+            sessions.mkdir()
+            exact_uuid = uuid_for(26)
+            payload = [
+                {
+                    "pid": 226,
+                    "sessionId": exact_uuid,
+                    "name": "Ordinary Native Name",
+                    "_session_kit_claude_config_dir": os.fspath(custom_root),
+                }
+            ]
+            record = sessions / "226.json"
+            record.write_text("not json", encoding="utf-8")
+            unreadable = claude_inventory._enrich_claude_payload(
+                [dict(payload[0])],
+                environ=os.environ,
+                home_factory=Path.home,
+                palette=inventory_core.CLAUDE_SESSION_COLORS,
+                transcript_signals=inventory_core.read_claude_transcript_signals,
+            )
+            self.assertNotIn("nameSource", unreadable[0])
+
+            external = custom_root / "external.json"
+            external.write_text(
+                json.dumps(
+                    {"sessionId": exact_uuid, "nameSource": "derived"}
+                ),
+                encoding="utf-8",
+            )
+            record.unlink()
+            record.symlink_to(external)
+            symlinked = claude_inventory._enrich_claude_payload(
+                [dict(payload[0])],
+                environ=os.environ,
+                home_factory=Path.home,
+                palette=inventory_core.CLAUDE_SESSION_COLORS,
+                transcript_signals=inventory_core.read_claude_transcript_signals,
+            )
+            self.assertNotIn("nameSource", symlinked[0])
 
     def test_live_collection_keeps_claude_and_codex_profiles_isolated(self) -> None:
         with tempfile.TemporaryDirectory(prefix=".profiles-", dir=REPO) as raw:

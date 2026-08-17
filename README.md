@@ -73,7 +73,7 @@ fallback.
 ## Install
 
 Download the archive, checksum, and provenance files attached to the
-[`v0.4.0` release](https://github.com/dob323/session-kit/releases/tag/v0.4.0).
+[`v0.4.1` release](https://github.com/dob323/session-kit/releases/tag/v0.4.1).
 Beta releases are GitHub prereleases, so browse
 [all releases](https://github.com/dob323/session-kit/releases) or name the tag
 explicitly. Assets are named by commit rather than by version.
@@ -81,7 +81,7 @@ explicitly. Assets are named by commit rather than by version.
 ```bash
 mkdir session-kit-download
 cd session-kit-download
-gh release download v0.4.0 --repo dob323/session-kit
+gh release download v0.4.1 --repo dob323/session-kit
 if command -v sha256sum >/dev/null; then
   sha256sum --check session-kit-*.sha256
 else

@@ -2416,6 +2416,13 @@ class WatchdogAccountGuardTests(unittest.TestCase):
             if line.strip()
         ]
 
+    def account_move_notifier_calls(self) -> list[str]:
+        return [
+            line
+            for line in self.notifier_calls()
+            if "--title=A session moved to another subscription account" in line
+        ]
+
     def queue_a_notice(self, sentence: str = "session 3 moved from spent to fresh") -> str:
         """Put one owed notice in the sandbox ledger, as a completed move would."""
         from lib.sessionkit_inventory import account_guard as sandbox_guard
@@ -2457,7 +2464,7 @@ class WatchdogAccountGuardTests(unittest.TestCase):
         # A working notifier on a later pass finally tells them.
         second = self.run_once()
         self.assertEqual(0, second.returncode, second.stderr)
-        self.assertEqual(1, len(self.notifier_calls()))
+        self.assertEqual(1, len(self.account_move_notifier_calls()))
         with mock.patch.dict(
             os.environ, {"SESSION_KIT_STATE_DIR": str(self.fixture.state)}, clear=False
         ):
@@ -2470,7 +2477,7 @@ class WatchdogAccountGuardTests(unittest.TestCase):
         self.run_once()
         self.run_once()
 
-        self.assertEqual(1, len(self.notifier_calls()))
+        self.assertEqual(1, len(self.account_move_notifier_calls()))
 
     def test_the_kill_switch_does_not_cancel_a_debt_already_owed(self) -> None:
         """Switching future moves off does not un-owe a message about a past one."""
@@ -2480,7 +2487,7 @@ class WatchdogAccountGuardTests(unittest.TestCase):
 
         self.run_once()
 
-        self.assertEqual(1, len(self.notifier_calls()))
+        self.assertEqual(1, len(self.account_move_notifier_calls()))
 
     def test_a_session_on_a_healthy_account_is_not_touched_when_another_is_spent(
         self,

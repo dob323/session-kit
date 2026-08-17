@@ -136,9 +136,9 @@ class JournalRenderer:
         self._col = 0
         self._top = 0
         self._bottom = height - 1
-        self._saved = None
+        self._saved: tuple[int, int] | None = None
         self._alt = False
-        self._alt_backup = None
+        self._alt_backup: tuple[list[str], int, int] | None = None
         self._pending = b""
         self._settled: list[str] = []
         self.settled_lines = 0
@@ -762,10 +762,10 @@ def render_journal(
         stamp = now or _datetime.datetime.now().astimezone().isoformat(
             timespec="seconds"
         )
-        block = [LIVE_MARKER_PREFIX + stamp + LIVE_MARKER_SUFFIX] + rows
+        live_block = [LIVE_MARKER_PREFIX + stamp + LIVE_MARKER_SUFFIX] + rows
         live_lines = len(rows)
         with open(out_path, "ab") as sink:
-            sink.write(("\n".join(block) + "\n").encode("utf-8"))
+            sink.write(("\n".join(live_block) + "\n").encode("utf-8"))
             sink.flush()
             os.fsync(sink.fileno())
 

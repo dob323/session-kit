@@ -171,7 +171,9 @@ def record_close(
         }
     )
     if entry is None:
-        raise CollectionError("a closed-session record needs a provider and conversation")
+        raise CollectionError(
+            "a closed-session record needs a provider and conversation"
+        )
     directory = _prepare_directory(environ)
     path = ledger_path(environ)
     line = (json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n").encode(
@@ -244,9 +246,7 @@ def record_close(
                         f"closed-sessions ledger changed after append: {path}"
                     )
                 _fsync_directory(directory)
-                _prove_descriptor_authoritative(
-                    descriptor, path, action="appended"
-                )
+                _prove_descriptor_authoritative(descriptor, path, action="appended")
             except BaseException:
                 # A short write, injected corruption, or post-write read error
                 # must not leave a new row behind when no tombstone will be
@@ -311,10 +311,7 @@ def _scan_descriptor_unlocked(
     try:
         os.lseek(scan_descriptor, 0, os.SEEK_SET)
         opened = os.fstat(scan_descriptor)
-        if (
-            not stat.S_ISREG(opened.st_mode)
-            or opened.st_uid != os.geteuid()
-        ):
+        if not stat.S_ISREG(opened.st_mode) or opened.st_uid != os.geteuid():
             raise CollectionError(
                 f"closed-sessions ledger must be a current-owner regular file: {path}"
             )
@@ -357,9 +354,9 @@ def _scan_descriptor_unlocked(
                 "closed-sessions ledger does not end at a complete row boundary"
             )
         finished = os.fstat(scan_descriptor)
-        if (
-            finished.st_size != opened.st_size
-            or (finished.st_dev, finished.st_ino) != (opened.st_dev, opened.st_ino)
+        if finished.st_size != opened.st_size or (finished.st_dev, finished.st_ino) != (
+            opened.st_dev,
+            opened.st_ino,
         ):
             raise CollectionError(
                 f"closed-sessions ledger changed while it was being read: {path}"
@@ -382,9 +379,9 @@ def _prove_descriptor_authoritative(
             f"closed-sessions ledger path no longer names the file that was "
             f"{action}: {path}"
         ) from exc
-    if (
-        not stat.S_ISREG(pathname.st_mode)
-        or (written.st_dev, written.st_ino) != (pathname.st_dev, pathname.st_ino)
+    if not stat.S_ISREG(pathname.st_mode) or (written.st_dev, written.st_ino) != (
+        pathname.st_dev,
+        pathname.st_ino,
     ):
         raise CollectionError(
             f"closed-sessions ledger path no longer names the file that was "
@@ -705,11 +702,10 @@ def forget(
             copied_source = _scan_records_unlocked(
                 path, maximum=None, visit=copy_unrelated
             )
-            if (
-                (copied_source.device, copied_source.inode)
-                != (source.device, source.inode)
-                or copied_removed != removed
-            ):
+            if (copied_source.device, copied_source.inode) != (
+                source.device,
+                source.inode,
+            ) or copied_removed != removed:
                 raise CollectionError(
                     f"closed-sessions ledger changed before rewrite: {path}"
                 )
@@ -733,9 +729,7 @@ def forget(
                 )
             os.replace(temporary, path)
             _fsync_directory(directory)
-            _prove_descriptor_authoritative(
-                descriptor, path, action="published"
-            )
+            _prove_descriptor_authoritative(descriptor, path, action="published")
         finally:
             if descriptor >= 0:
                 os.close(descriptor)

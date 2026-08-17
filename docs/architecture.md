@@ -109,10 +109,8 @@ hours after the timer is enabled. Live provider work, child work, attachment,
 recovery conflict, identity churn, or unreadable evidence blocks the close.
 
 Sub-agent cleanup is a separate pass. It watches the worker transcript's size
-and nanosecond modification time, not CPU use — and every exact copy of that
-transcript counts, so movement in any copy resets the clock and an unreadable
-copy blocks the close. An unreadable idle window turns the pass off rather
-than selecting a shorter timeout.
+and nanosecond modification time, not CPU use. An unreadable idle window turns
+that pass off rather than selecting a shorter timeout.
 
 ## Human and machine output
 
@@ -149,7 +147,7 @@ set under their live-session safety checks.
 
 Linux uses `/proc`, Bash, Python 3.10 or newer, and systemd user services.
 macOS 14 or newer supports Apple Silicon and Intel with Python 3.11 or newer,
-Homebrew Bash 4.2 or newer, native process APIs, and per-user LaunchAgents in the
+Homebrew Bash 4 or newer, native process APIs, and per-user LaunchAgents in the
 logged-in GUI domain. The macOS watchdog is report-only; repair mode depends on
 Linux daemon-thread evidence.
 

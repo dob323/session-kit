@@ -30,7 +30,10 @@ from .common import (
     _valid_automatic_title_failures,
     _valid_automatic_titles,
     _valid_name_ownership,
+    _valid_name_since,
+    _valid_pending_native_titles,
     _valid_pushed_titles,
+    _pending_native_title_matches,
     automatic_naming_enabled,
     clean_text,
     normalize_automatic_title,
@@ -65,6 +68,10 @@ def _alias_document_from_bytes(
         )
         or ("name_ownership" in raw and not isinstance(raw["name_ownership"], Mapping))
         or ("pushed_titles" in raw and not isinstance(raw["pushed_titles"], Mapping))
+        or (
+            "pending_native_titles" in raw
+            and not isinstance(raw["pending_native_titles"], Mapping)
+        )
     ):
         raise CollectionError(f"{label} has an invalid schema")
     aliases = raw.get("aliases", {})
@@ -95,6 +102,17 @@ def _alias_document_from_bytes(
         if len(pushed) != len(raw["pushed_titles"]):
             raise CollectionError(f"{label} contains an invalid pushed title")
         raw["pushed_titles"] = dict(sorted(pushed.items()))
+    if "pending_native_titles" in raw:
+        pending = _valid_pending_native_titles(raw["pending_native_titles"])
+        legacy_count = sum(
+            isinstance(value, str) for value in raw["pending_native_titles"].values()
+        )
+        if len(pending) + legacy_count != len(raw["pending_native_titles"]):
+            raise CollectionError(f"{label} contains an invalid pending native title")
+        if pending:
+            raw["pending_native_titles"] = dict(sorted(pending.items()))
+        else:
+            raw.pop("pending_native_titles", None)
     return raw
 
 
@@ -112,14 +130,24 @@ def last_kit_title(document: Mapping[str, Any], key: str) -> str:
     return _valid_automatic_titles(document.get("automatic_titles")).get(key, "")
 
 
-def native_rename(document: Mapping[str, Any], key: str, native_title: str) -> str:
+def native_rename(
+    document: Mapping[str, Any],
+    key: str,
+    native_title: str,
+    *,
+    native_name_source: str = "",
+    native_name_since: Any = None,
+) -> str:
     """The natively typed name for this thread, or "" if the kit wrote it.
 
-    A native title equal to what the kit last pushed is the kit's own echo. A
-    native title that differs is a person at a /rename prompt, and that is the
-    most recent statement of intent anyone has made about this name.
+    A native title equal to what the kit last pushed is the kit's own echo.
+    Claude's derived placeholder and the exact value observed immediately
+    before the newest push are provider state too. Any third value is a person
+    at a /rename prompt and is the newest statement of intent.
     """
     title = clean_text(native_title, 120)
+    if native_name_source == "derived":
+        return ""
     kit_title = last_kit_title(document, key)
     # No kit value means the kit never named this thread, so a native title is
     # not a correction of anything the kit did — it is just the name the
@@ -130,6 +158,13 @@ def native_rename(document: Mapping[str, Any], key: str, native_title: str) -> s
     # capitals is still a person deciding what their work is called, and the
     # kit is in no position to rule that it did not count.
     if title == kit_title:
+        return ""
+    pending = _valid_pending_native_titles(document.get("pending_native_titles")).get(
+        key
+    )
+    if key.startswith("claude:") and _pending_native_title_matches(
+        pending, title, native_name_since, native_name_source
+    ):
         return ""
     return title
 
@@ -358,6 +393,9 @@ def record_pushed_title(
     uuid: str,
     title: str,
     *,
+    previous_native_title: str | None = None,
+    previous_native_name_since: Any = None,
+    previous_native_name_source: str = "",
     atomic_write_json: Callable[[Path, Any], None],
     config_path: Callable[[], Path],
     private_alias_document: Callable[..., dict[str, Any]],
@@ -376,10 +414,32 @@ def record_pushed_title(
             private_alias_parent(path)
             document = private_alias_document(path, allow_missing=True)
             pushed = _valid_pushed_titles(document.get("pushed_titles"))
-            if pushed.get(key) == clean:
-                return
+            already_pushed = pushed.get(key) == clean
             pushed[key] = clean
             document["pushed_titles"] = dict(sorted(pushed.items()))
+            if provider == "claude":
+                pending = _valid_pending_native_titles(
+                    document.get("pending_native_titles")
+                )
+                old_pending = pending.get(key)
+                previous = clean_text(previous_native_title, 120)
+                name_since = _valid_name_since(previous_native_name_since)
+                if previous and previous != clean and name_since is not None:
+                    pending[key] = {
+                        "title": previous,
+                        "nameSince": name_since,
+                        "nameSource": clean_text(previous_native_name_source, 20),
+                    }
+                else:
+                    pending.pop(key, None)
+                if already_pushed and old_pending == pending.get(key):
+                    return
+                if pending:
+                    document["pending_native_titles"] = dict(sorted(pending.items()))
+                else:
+                    document.pop("pending_native_titles", None)
+            elif already_pushed:
+                return
             atomic_write_json(path, document)
 
 
@@ -389,6 +449,8 @@ def adopt_native_rename(
     uuid: str,
     native_title: str,
     *,
+    native_name_source: str = "",
+    native_name_since: Any = None,
     atomic_write_json: Callable[[Path, Any], None],
     config_path: Callable[[], Path],
     private_alias_document: Callable[..., dict[str, Any]],
@@ -418,7 +480,31 @@ def adopt_native_rename(
         with StateLock(paths["root"], paths["lock"]):
             private_alias_parent(path)
             document = private_alias_document(path, allow_missing=True)
-            adopted = native_rename(document, key, native_title)
+            pending = _valid_pending_native_titles(
+                document.get("pending_native_titles")
+            )
+            # Seeing the pushed value in Claude's registry proves the lag is
+            # over. Retire the exception permanently before any later rename
+            # can happen to reuse the old text.
+            if (
+                provider == "claude"
+                and key in pending
+                and clean_text(native_title, 120) == last_kit_title(document, key)
+            ):
+                pending.pop(key, None)
+                if pending:
+                    document["pending_native_titles"] = dict(sorted(pending.items()))
+                else:
+                    document.pop("pending_native_titles", None)
+                atomic_write_json(path, document)
+                return ""
+            adopted = native_rename(
+                document,
+                key,
+                native_title,
+                native_name_source=native_name_source,
+                native_name_since=native_name_since,
+            )
             if not adopted:
                 return ""
             aliases = dict(document["aliases"])
@@ -448,6 +534,14 @@ def adopt_native_rename(
             pushed = _valid_pushed_titles(document.get("pushed_titles"))
             pushed[key] = adopted
             document["pushed_titles"] = dict(sorted(pushed.items()))
+            pending = _valid_pending_native_titles(
+                document.get("pending_native_titles")
+            )
+            pending.pop(key, None)
+            if pending:
+                document["pending_native_titles"] = dict(sorted(pending.items()))
+            else:
+                document.pop("pending_native_titles", None)
             atomic_write_json(path, document)
             return adopted
 
@@ -817,6 +911,7 @@ def propagate_provider_title(
     *,
     environ: Mapping[str, str] | None = None,
     codex_home: Callable[..., Path],
+    claude_pre_push_title: Callable[..., Mapping[str, Any] | None],
     push_claude_title: Callable[..., tuple[list[str], list[str]]],
     push_codex_title: Callable[..., tuple[list[str], list[str]]],
     session_kit_state_dir: Callable[[Mapping[str, str], Path], Path],
@@ -854,8 +949,18 @@ def propagate_provider_title(
             ],
         }
     home = Path(home_raw)
+    previous_native_title: str | None = None
+    previous_native_name_since: Any = None
+    previous_native_name_source = ""
     if provider == "claude":
-        pushed, warnings = push_claude_title(home, exact_uuid, clean_title)
+        previous_native = claude_pre_push_title(home, exact_uuid, environ=env)
+        if previous_native:
+            previous_native_title = clean_text(previous_native.get("title"), 120)
+            previous_native_name_since = previous_native.get("nameSince")
+            previous_native_name_source = clean_text(
+                previous_native.get("nameSource"), 20
+            )
+        pushed, warnings = push_claude_title(home, exact_uuid, clean_title, environ=env)
     else:
         live_state_dir: Path | None = session_kit_state_dir(env, home)
         if env.get("SESSION_KIT_CODEX_LIVE_RENAME") == "0":
@@ -873,7 +978,18 @@ def propagate_provider_title(
         # that failed leaves the old title in the provider store, and calling
         # that the kit's own value would read the kit's own stale name back as
         # somebody's rename.
-        record_pushed(provider, exact_uuid, clean_title, environ=environ)
+        if provider == "claude":
+            record_pushed(
+                provider,
+                exact_uuid,
+                clean_title,
+                previous_native_title=previous_native_title,
+                previous_native_name_since=previous_native_name_since,
+                previous_native_name_source=previous_native_name_source,
+                environ=environ,
+            )
+        else:
+            record_pushed(provider, exact_uuid, clean_title, environ=environ)
     return {
         "provider_title_pushes": pushed,
         "provider_title_warnings": warnings,

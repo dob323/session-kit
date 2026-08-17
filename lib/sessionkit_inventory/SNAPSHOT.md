@@ -173,10 +173,9 @@ own display depends on any of them.
 ## Fleet stalls fold into `needs_you`
 
 `~/.local/state/fleet/stalls.json` (override the directory with
-`SESSION_KIT_FLEET_DIR` — the variable this fold's reader,
-`read_fleet_stalls`, actually honours; the refresh pulse watches the same
-directory under its own `FLEET_STATE_DIR` override, a divergence not yet
-converged) records sessions the fleet believes are stuck:
+`SESSION_KIT_FLEET_DIR` for the inventory reader, `FLEET_STATE_DIR` for the
+pulse pass — two readers, two variables) records sessions
+the fleet believes are stuck:
 
 ```json
 {"generated_at": 1786574881,

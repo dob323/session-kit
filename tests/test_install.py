@@ -24,9 +24,9 @@ import unittest
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, os.fspath(REPO / "lib"))
 
-from tests.support import THEME_COLORS
-from sessionkit_inventory.common import CollectionError
-from sessionkit_inventory.state_io import StateLock
+from tests.support import THEME_COLORS  # noqa: E402
+from sessionkit_inventory.common import CollectionError  # noqa: E402
+from sessionkit_inventory.state_io import StateLock  # noqa: E402
 
 
 RELEASE_A = "1" * 40
@@ -260,7 +260,7 @@ class InstallerTests(unittest.TestCase):
         inventory.chmod(0o600)
         command = (
             f"env SESSION_KIT_STATE_DIR={state} python3 "
-            f"{REPO / 'bin/reset-collection-order.py'}"
+            f"{REPO / 'tools/reset-collection-order.py'}"
         )
         expected = (
             "session-kit-release: collection allocation floor cannot be derived "
@@ -2403,7 +2403,7 @@ finally:
         self.assertIn("Recovered interrupted Session Kit install", failed.stdout)
 
         del self.env["SESSION_KIT_TEST_FAILPOINT"]
-        recovered = self.installed("update", "--source", str(REPO))
+        self.installed("update", "--source", str(REPO))
         self.assertEqual(current.resolve().name, RELEASE_B)
         self.assertFalse(transaction.exists())
         backups = list(

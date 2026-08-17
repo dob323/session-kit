@@ -17,6 +17,7 @@ from .common import (
     PROVIDERS,
     automatic_naming_enabled,
     clean_text,
+    _pending_native_title_matches,
     display_shpool_id,
     stall_threshold_seconds,
     shpool_id_mutation_policy,
@@ -85,7 +86,9 @@ def canonical_session_order_key(row: Mapping[str, Any]) -> tuple[Any, ...]:
     # overlays; it must never outrank the evidence which creates it.
     state = labels.session_state(row, stall_seconds=stall_threshold_seconds())
     return (
-        _PICKER_AVAILABILITY_ORDER.get(str(row.get("availability") or "").casefold(), 9),
+        _PICKER_AVAILABILITY_ORDER.get(
+            str(row.get("availability") or "").casefold(), 9
+        ),
         _PICKER_STATE_ORDER.get(str(state), 9),
         _PICKER_PROVIDER_ORDER.get(provider, 9),
         recent is None,
@@ -177,9 +180,7 @@ def classify_top_level_sessions(
             return provider, uuid.casefold()
         return None
 
-    by_identity = {
-        key: row for row in copied if (key := identity_key(row)) is not None
-    }
+    by_identity = {key: row for row in copied if (key := identity_key(row)) is not None}
 
     def root_for(row: Mapping[str, Any]) -> dict[str, Any] | None:
         wanted = parent_key(row)
@@ -232,14 +233,13 @@ def classify_top_level_sessions(
                 }
             )
         parent["subagents"] = summaries
-        parent["_grouped_subagent_count"] = int(
-            parent.get("_grouped_subagent_count") or 0
-        ) + 1
+        parent["_grouped_subagent_count"] = (
+            int(parent.get("_grouped_subagent_count") or 0) + 1
+        )
         parent["active_subagent_count"] = sum(
             1
             for item in summaries
-            if str(item.get("status") or "").casefold()
-            not in _INACTIVE_SUBAGENT_STATES
+            if str(item.get("status") or "").casefold() not in _INACTIVE_SUBAGENT_STATES
         )
         if row.get("needs_you") is True:
             parent["needs_you"] = True
@@ -335,11 +335,30 @@ def _provider_title_info(
     automatic_titles: Mapping[str, str] | None = None,
     *,
     provider_title_is_explicit: bool = True,
+    native_name_source: str = "",
+    native_name_since: Any = None,
     context_title: Callable[[str, str, int | None], str],
     pushed_titles: Mapping[str, str] | None = None,
+    pending_native_titles: Mapping[str, Mapping[str, Any]] | None = None,
     name_ownership: Mapping[str, Mapping[str, str]] | None = None,
 ) -> tuple[str, str]:
     key = f"{provider}:{uuid}" if uuid else ""
+    native_is_explicit = provider_title_is_explicit and not (
+        provider == "claude" and native_name_source == "derived"
+    )
+    if (
+        provider == "claude"
+        and key
+        and native_title
+        and _pending_native_title_matches(
+            (pending_native_titles or {}).get(key),
+            native_title,
+            native_name_since,
+            native_name_source,
+        )
+        and ((pushed_titles or {}).get(key) or (automatic_titles or {}).get(key))
+    ):
+        native_is_explicit = False
     if uuid:
         alias = aliases.get(key)
         # A provider-native rename outranks the alias tier. The alias layer
@@ -352,21 +371,20 @@ def _provider_title_info(
         last_kit_title = (pushed_titles or {}).get(key) or (automatic_titles or {}).get(
             key, ""
         )
-        # Divergence is the timestamp. `last_kit_title` is the last value the
-        # kit itself wrote into the provider's store — including the one
-        # `sp name` pushed — so a native title that differs from it can only
-        # have been typed after that push. Newer human act, newer name; an
-        # earlier `sp name` keeps its ownership but not its stale text.
+        # Divergence is the timestamp once provider placeholders and the one
+        # recorded pre-push value have been excluded above. `last_kit_title`
+        # is the last value the kit wrote into the provider store, including
+        # `sp name`; any third explicit value is therefore a newer human act.
         if (
             last_kit_title
             and native_title
-            and provider_title_is_explicit
+            and native_is_explicit
             and native_title != last_kit_title
         ):
             return native_title, "native"
         if alias:
             return alias, "alias"
-    if native_title and provider_title_is_explicit:
+    if native_title and native_is_explicit:
         return native_title, "native"
     if uuid and automatic_naming_enabled():
         automatic = (automatic_titles or {}).get(key)
@@ -391,8 +409,11 @@ def _provider_title(
     automatic_titles: Mapping[str, str] | None = None,
     *,
     provider_title_is_explicit: bool = True,
+    native_name_source: str = "",
+    native_name_since: Any = None,
     provider_title_info: Callable[..., tuple[str, str]],
     pushed_titles: Mapping[str, str] | None = None,
+    pending_native_titles: Mapping[str, Mapping[str, Any]] | None = None,
     name_ownership: Mapping[str, Mapping[str, str]] | None = None,
 ) -> str:
     return provider_title_info(
@@ -404,7 +425,10 @@ def _provider_title(
         started_at_unix_ms,
         automatic_titles,
         provider_title_is_explicit=provider_title_is_explicit,
+        native_name_source=native_name_source,
+        native_name_since=native_name_since,
         pushed_titles=pushed_titles,
+        pending_native_titles=pending_native_titles,
         name_ownership=name_ownership,
     )[0]
 
@@ -461,9 +485,7 @@ def _base_agent(
         if shpool_id is not None
         else (False, "outside-shpool")
     )
-    safe_subagents = [
-        dict(child) for child in subagents if isinstance(child, Mapping)
-    ]
+    safe_subagents = [dict(child) for child in subagents if isinstance(child, Mapping)]
     return {
         "row": row,
         "terminal_number": None,

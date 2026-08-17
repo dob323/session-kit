@@ -76,9 +76,7 @@ def atomic_private_write(path: Path, payload: bytes) -> None:
             os.unlink(temporary)
 
 
-def read_private_json(
-    path: Path, *, limit: int, label: str
-) -> dict[str, Any] | None:
+def read_private_json(path: Path, *, limit: int, label: str) -> dict[str, Any] | None:
     """One private JSON object, or None when the file does not exist."""
     try:
         info = path.lstat()

@@ -16,7 +16,6 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
-from pathlib import Path
 import sys
 import unittest
 
@@ -77,6 +76,41 @@ class OneNameWinsTests(unittest.TestCase):
             pushed_titles={KEY: "Kit Name"},
         )
         self.assertEqual(("Typed In The Window", "native"), (name, source))
+
+    def test_derived_placeholder_yields_to_automatic_alias(self) -> None:
+        common = {
+            "native": "v2-5e",
+            "aliases": {KEY: "Session Kit Closeout"},
+            "automatic_titles": {KEY: "Session Kit Closeout"},
+            "pushed_titles": {KEY: "Session Kit Closeout"},
+        }
+        self.assertEqual(
+            ("Session Kit Closeout", "alias"),
+            self.title(**common, native_name_source="derived"),
+        )
+        self.assertEqual(("v2-5e", "native"), self.title(**common))
+
+    def test_pre_push_registry_value_is_pending_but_third_value_wins(self) -> None:
+        common = {
+            "aliases": {KEY: "New Kit Name"},
+            "automatic_titles": {KEY: "New Kit Name"},
+            "pushed_titles": {KEY: "New Kit Name"},
+            "pending_native_titles": {
+                KEY: {
+                    "title": "Old Registry Name",
+                    "nameSince": 100,
+                    "nameSource": "",
+                }
+            },
+        }
+        self.assertEqual(
+            ("New Kit Name", "alias"),
+            self.title(native="Old Registry Name", native_name_since=100, **common),
+        )
+        self.assertEqual(
+            ("A Third Human Name", "native"),
+            self.title(native="A Third Human Name", native_name_since=200, **common),
+        )
 
 
 class RenameReachesTheBarTests(unittest.TestCase):

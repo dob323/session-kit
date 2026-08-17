@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -285,6 +286,70 @@ def _valid_pushed_titles(raw: Any) -> dict[str, str]:
         if separator and provider in PROVIDERS and valid_uuid(uuid) and title:
             titles[f"{provider}:{uuid.lower()}"] = title
     return titles
+
+
+def _valid_name_since(value: Any) -> str | int | float | None:
+    """One exact Claude ``nameSince`` value suitable for comparison."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int) and value >= 0:
+        return value
+    if isinstance(value, float) and math.isfinite(value) and value >= 0:
+        return value
+    if isinstance(value, str) and 0 < len(value) <= 120:
+        return value
+    return None
+
+
+def _valid_pending_native_titles(raw: Any) -> dict[str, dict[str, Any]]:
+    """Claude registry observations made immediately before a title push.
+
+    A bare pre-push string cannot prove lag: only an unchanged ``nameSince``
+    can.  Old entries and records made by an older Claude without that field
+    are therefore ignored instead of suppressing a later human rename.
+    """
+    pending: dict[str, dict[str, Any]] = {}
+    if not isinstance(raw, Mapping):
+        return pending
+    for key, value in raw.items():
+        if not isinstance(key, str) or not isinstance(value, Mapping):
+            continue
+        provider, separator, uuid = key.partition(":")
+        title = clean_text(value.get("title"), 120)
+        name_since = _valid_name_since(value.get("nameSince"))
+        raw_source = value.get("nameSource", "")
+        name_source = clean_text(raw_source, 20)
+        if (
+            separator
+            and provider == "claude"
+            and valid_uuid(uuid)
+            and title
+            and name_since is not None
+            and isinstance(raw_source, str)
+        ):
+            pending[f"claude:{uuid.lower()}"] = {
+                "title": title,
+                "nameSince": name_since,
+                "nameSource": name_source,
+            }
+    return pending
+
+
+def _pending_native_title_matches(
+    observation: Mapping[str, Any] | None,
+    title: str,
+    name_since: Any,
+    name_source: str,
+) -> bool:
+    """Whether a native value is still the exact pre-push registry record."""
+    if not isinstance(observation, Mapping):
+        return False
+    current_since = _valid_name_since(name_since)
+    return bool(
+        current_since is not None
+        and observation.get("title") == title
+        and observation.get("nameSince") == current_since
+    )
 
 
 def _valid_name_ownership(raw: Any) -> dict[str, dict[str, str]]:

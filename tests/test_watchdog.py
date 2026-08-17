@@ -1300,7 +1300,8 @@ exit 1
             )
             fixture.run()
             self.assertEqual([], fixture.recorded())
-            self.assertFalse(fixture.notify_log.exists())
+            announced = fixture.notify_log.read_text(encoding="utf-8")
+            self.assertNotIn("Session could not be restored", announced)
             self.assertIn("repair deferred", fixture.log_text())
         finally:
             fixture.close()

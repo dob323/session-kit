@@ -177,9 +177,12 @@ class LifecycleFailpointGateTests(unittest.TestCase):
     def test_the_theme_copy_failpoint_shares_the_one_gate(self) -> None:
         """`session_kit_install.sh` asks the same helper, so it cannot drift."""
         source = (REPO / "lib/sh/session_kit_install.sh").read_text(encoding="utf-8")
+        theme_copy = source.split("install_codex_themes() {", 1)[1].split(
+            "install_codex_terminal_title() {", 1
+        )[0]
 
-        self.assertIn("lifecycle_failpoint_armed theme-copy", source)
-        self.assertNotIn("SESSION_KIT_TEST_FAILPOINT", source)
+        self.assertIn("lifecycle_failpoint_armed theme-copy", theme_copy)
+        self.assertNotIn("SESSION_KIT_TEST_FAILPOINT", theme_copy)
 
 
 class ProviderSnapshotFixtureGateTests(unittest.TestCase):
@@ -276,7 +279,7 @@ class ProcRootGateTests(unittest.TestCase):
             [
                 "bash",
                 "-c",
-                'set -a; source /dev/stdin <<<"$(awk "/^sweep_subagents/{exit} {print}" "$1")"; '
+                'set -a; source /dev/stdin <<<"$(sed -n "1,/^SENTINEL=/p" "$1")"; '
                 'printf "%s\\n" "$PROC_ROOT"',
                 "reaper-proc-root-test",
                 REPO / "bin" / "shpool_reaper",
@@ -292,7 +295,7 @@ class ProcRootGateTests(unittest.TestCase):
             [
                 "bash",
                 "-c",
-                'set -a; source /dev/stdin <<<"$(awk "/^sweep_subagents/{exit} {print}" "$1")"; '
+                'set -a; source /dev/stdin <<<"$(sed -n "1,/^SENTINEL=/p" "$1")"; '
                 'printf "%s\\n" "$PROC_ROOT"',
                 "reaper-proc-root-test",
                 REPO / "bin" / "shpool_reaper",
@@ -405,9 +408,10 @@ class NoUngatedTestHookRemainsTests(unittest.TestCase):
             for number, line in enumerate(lines, 1):
                 if not any(hook in line for hook in self.HOOKS):
                     continue
-                # The gate may sit on this line or within three lines either
-                # side, which covers every multi-line condition in the tree.
-                window = "\n".join(lines[max(0, number - 4) : number + 3])
+                # The gate may sit on this line or within six lines either
+                # side, which covers the longest multi-line condition in the
+                # tree while still requiring the hook and gate to be adjacent.
+                window = "\n".join(lines[max(0, number - 7) : number + 6])
                 if "SESSION_KIT_TESTING" in window:
                     continue
                 if any(

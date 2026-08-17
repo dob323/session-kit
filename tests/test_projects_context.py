@@ -247,9 +247,7 @@ class ResumeContextTests(ProjectFixture):
         )
         self.assertEqual(result["counts"]["sessions"], 2)
         self.assertEqual(result["counts"]["team_roles"], 1)
-        self.assertEqual(
-            [row["shpool_id"] for row in result["sessions"]], ["s1", "s2"]
-        )
+        self.assertEqual([row["shpool_id"] for row in result["sessions"]], ["s1", "s2"])
 
     def test_a_context_view_carries_only_the_fields_it_declares(self) -> None:
         self.manifest()
@@ -515,9 +513,7 @@ class CommandLineTests(ProjectFixture):
             json.dumps({"sessions": [session(os.fspath(self.repo / "sub"))]}),
             encoding="utf-8",
         )
-        completed = self.run_cli(
-            "context", "demo", "--snapshot", os.fspath(snapshot)
-        )
+        completed = self.run_cli("context", "demo", "--snapshot", os.fspath(snapshot))
         self.assertEqual(completed.returncode, cli.EXIT_OK, completed.stderr)
         value = json.loads(completed.stdout)
         self.assertEqual(value["counts"]["sessions"], 1)

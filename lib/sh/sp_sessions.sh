@@ -1120,6 +1120,8 @@ PY
     return 1
   fi
   id=$SK_ATTACHED_ID
+  # sk_attach_new_unique, called above, publishes this sourced-module field.
+  # shellcheck disable=SC2153
   sk_attach_status=$SK_ATTACH_STATUS
   if [[ $id != "$allocated_id" ]]; then
     [[ -z $prompt_handoff ]] || prompt_handoff=$SK_START_DIR/$id.prompt

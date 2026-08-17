@@ -105,6 +105,166 @@ class ProviderTitlePushTest(unittest.TestCase):
             self.assertEqual(
                 unrelated_payload, unrelated.read_text(encoding="utf-8")
             )
+            config = json.loads(
+                (home / ".config/session-kit/inventory.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertNotIn(
+                f"claude:{exact}", config.get("pending_native_titles", {})
+            )
+
+    def test_claude_push_updates_account_record_and_clears_derived_source(self) -> None:
+        with tempfile.TemporaryDirectory(prefix=".title-push-", dir=REPO) as raw:
+            home = self._home(Path(raw))
+            exact = uuid_for(13)
+            account = (
+                home
+                / ".local/share/session-kit/accounts/claude/duck/sessions"
+            )
+            account.mkdir(parents=True, mode=0o700)
+            record = account / "789.json"
+            record.write_text(
+                json.dumps(
+                    {
+                        "pid": 789,
+                        "sessionId": exact,
+                        "name": "v2-5e",
+                        "nameSource": "derived",
+                        "nameSince": 100,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = self._push("claude", exact, "Session Kit Closeout", home)
+
+            self.assertEqual([], result["provider_title_warnings"])
+            self.assertIn("claude-session-record", result["provider_title_pushes"])
+            updated = json.loads(record.read_text(encoding="utf-8"))
+            self.assertEqual("Session Kit Closeout", updated["name"])
+            self.assertNotIn("nameSource", updated)
+            self.assertEqual(
+                "Session Kit Closeout\n",
+                (account / f"{exact}.nameintent").read_text(encoding="utf-8"),
+            )
+            config = json.loads(
+                (home / ".config/session-kit/inventory.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                {
+                    "title": "v2-5e",
+                    "nameSince": 100,
+                    "nameSource": "derived",
+                },
+                config["pending_native_titles"][f"claude:{exact}"],
+            )
+
+    def test_claude_record_without_name_since_gets_no_pending_tier(self) -> None:
+        with tempfile.TemporaryDirectory(prefix=".title-push-", dir=REPO) as raw:
+            home = self._home(Path(raw))
+            exact = uuid_for(16)
+            record = home / ".claude" / "sessions" / "791.json"
+            record.write_text(
+                json.dumps(
+                    {"pid": 791, "sessionId": exact, "name": "Legacy Name"}
+                ),
+                encoding="utf-8",
+            )
+
+            result = self._push("claude", exact, "New Kit Name", home)
+
+            self.assertEqual([], result["provider_title_warnings"])
+            config = json.loads(
+                (home / ".config/session-kit/inventory.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertNotIn("pending_native_titles", config)
+
+    def test_claude_push_regression_guard_refuses_symlinked_intent_and_record(self) -> None:
+        with tempfile.TemporaryDirectory(prefix=".title-push-", dir=REPO) as raw:
+            home = self._home(Path(raw))
+            sessions = home / ".claude" / "sessions"
+            exact = uuid_for(14)
+            external_intent = Path(raw) / "external-intent"
+            external_intent.write_text("keep\n", encoding="utf-8")
+            (sessions / f"{exact}.nameintent").symlink_to(external_intent)
+            external_record = Path(raw) / "external-record.json"
+            external_payload = json.dumps(
+                {"pid": 790, "sessionId": exact, "name": "Keep"}
+            )
+            external_record.write_text(external_payload, encoding="utf-8")
+            (sessions / "790.json").symlink_to(external_record)
+
+            result = self._push("claude", exact, "Must Not Land", home)
+
+            self.assertIn("refusing symlinked name intent", result["stderr"])
+            self.assertNotIn("claude-session-record", result["provider_title_pushes"])
+            self.assertEqual("keep\n", external_intent.read_text(encoding="utf-8"))
+            self.assertEqual(
+                external_payload, external_record.read_text(encoding="utf-8")
+            )
+
+    def test_claude_push_refuses_symlinked_account_but_pushes_healthy_roots(self) -> None:
+        with tempfile.TemporaryDirectory(prefix=".title-push-", dir=REPO) as raw:
+            base = Path(raw)
+            home = self._home(base)
+            exact = uuid_for(15)
+            ambient = home / ".claude" / "sessions"
+            healthy = (
+                home
+                / ".local/share/session-kit/accounts/claude/healthy/sessions"
+            )
+            healthy.mkdir(parents=True, mode=0o700)
+            external = base / "external-profile" / "sessions"
+            external.mkdir(parents=True, mode=0o700)
+            linked = home / ".local/share/session-kit/accounts/claude/linked"
+            linked.parent.mkdir(parents=True, exist_ok=True)
+            linked.symlink_to(external.parent, target_is_directory=True)
+
+            records = []
+            for sessions, pid, title in (
+                (ambient, 801, "Ambient Old"),
+                (healthy, 802, "Healthy Old"),
+                (external, 803, "External Keep"),
+            ):
+                record = sessions / f"{pid}.json"
+                record.write_text(
+                    json.dumps(
+                        {
+                            "pid": pid,
+                            "sessionId": exact,
+                            "name": title,
+                            "nameSince": 100,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                records.append(record)
+
+            result = self._push("claude", exact, "Bounded Push", home)
+
+            self.assertIn(str(linked / "sessions"), result["stderr"])
+            self.assertIn("account profile is a symlink", result["stderr"])
+            self.assertEqual(
+                "Bounded Push", json.loads(records[0].read_text())["name"]
+            )
+            self.assertEqual(
+                "Bounded Push", json.loads(records[1].read_text())["name"]
+            )
+            self.assertEqual(
+                "External Keep", json.loads(records[2].read_text())["name"]
+            )
+            self.assertEqual(
+                "Bounded Push\n", (ambient / f"{exact}.nameintent").read_text()
+            )
+            self.assertEqual(
+                "Bounded Push\n", (healthy / f"{exact}.nameintent").read_text()
+            )
+            self.assertFalse((external / f"{exact}.nameintent").exists())
 
     def test_codex_push_appends_and_preserves_existing_index(self) -> None:
         with tempfile.TemporaryDirectory(prefix=".title-push-", dir=REPO) as raw:
@@ -2521,6 +2681,140 @@ class NativeRenameOwnershipTests(unittest.TestCase):
                         ("Kit Test", "alias"),
                         self._title(document, provider, uuid, "Kit Test"),
                     )
+
+    def test_derived_placeholder_is_never_adopted_but_missing_source_is(self) -> None:
+        uuid = uuid_for(312)
+        key = f"claude:{uuid}"
+        for source, expected in (("derived", ""), ("", "v2-5e")):
+            with self.subTest(source=source or "missing"):
+                with tempfile.TemporaryDirectory() as raw:
+                    base = Path(raw)
+                    base.chmod(0o700)
+                    _home, config, env = self._sandbox(base)
+                    self._seed(
+                        config,
+                        {
+                            "schema_version": 1,
+                            "aliases": {key: "Session Kit Closeout"},
+                            "automatic_titles": {key: "Session Kit Closeout"},
+                            "pushed_titles": {key: "Session Kit Closeout"},
+                        },
+                    )
+                    adopted = inventory_core.adopt_native_rename(
+                        "claude",
+                        uuid,
+                        "v2-5e",
+                        native_name_source=source,
+                        environ=env,
+                    )
+                    self.assertEqual(expected, adopted)
+                    document = self._document(config)
+                    if source == "derived":
+                        self.assertEqual("Session Kit Closeout", document["aliases"][key])
+                    else:
+                        self.assertEqual("v2-5e", document["aliases"][key])
+
+    def test_pre_push_native_value_is_pending_but_a_third_value_is_human(self) -> None:
+        uuid = uuid_for(317)
+        key = f"claude:{uuid}"
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            base.chmod(0o700)
+            _home, config, env = self._sandbox(base)
+            self._seed(
+                config,
+                {
+                    "schema_version": 1,
+                    "aliases": {key: "New Kit Name"},
+                    "automatic_titles": {key: "New Kit Name"},
+                    "pushed_titles": {key: "New Kit Name"},
+                    "pending_native_titles": {
+                        key: {
+                            "title": "Old Registry Name",
+                            "nameSince": 100,
+                            "nameSource": "",
+                        }
+                    },
+                },
+            )
+            self.assertEqual(
+                "",
+                inventory_core.adopt_native_rename(
+                    "claude",
+                    uuid,
+                    "Old Registry Name",
+                    native_name_since=100,
+                    environ=env,
+                ),
+            )
+            self.assertEqual(
+                "A Third Human Name",
+                inventory_core.adopt_native_rename(
+                    "claude",
+                    uuid,
+                    "A Third Human Name",
+                    native_name_since=200,
+                    environ=env,
+                ),
+            )
+            document = self._document(config)
+            self.assertEqual("A Third Human Name", document["aliases"][key])
+            self.assertNotIn(key, document.get("pending_native_titles", {}))
+
+    def test_catch_up_then_rename_back_to_old_text_is_adopted_immediately(self) -> None:
+        """Exact blocking lane sequence: push, catch up, then rename back."""
+        uuid = uuid_for(318)
+        key = f"claude:{uuid}"
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            base.chmod(0o700)
+            _home, config, env = self._sandbox(base)
+            self._seed(
+                config,
+                {
+                    "schema_version": 1,
+                    "aliases": {key: "New Kit Name"},
+                    "automatic_titles": {key: "New Kit Name"},
+                    "pushed_titles": {key: "New Kit Name"},
+                    "pending_native_titles": {
+                        key: {
+                            "title": "Old Human Name",
+                            "nameSince": 100,
+                            "nameSource": "user",
+                        }
+                    },
+                },
+            )
+
+            self.assertEqual(
+                "",
+                inventory_core.adopt_native_rename(
+                    "claude",
+                    uuid,
+                    "New Kit Name",
+                    native_name_source="",
+                    native_name_since=100,
+                    environ=env,
+                ),
+            )
+            self.assertNotIn(
+                key, self._document(config).get("pending_native_titles", {})
+            )
+
+            self.assertEqual(
+                "Old Human Name",
+                inventory_core.adopt_native_rename(
+                    "claude",
+                    uuid,
+                    "Old Human Name",
+                    native_name_source="user",
+                    native_name_since=200,
+                    environ=env,
+                ),
+            )
+            document = self._document(config)
+            self.assertEqual("Old Human Name", document["aliases"][key])
+            self.assertEqual("human", document["name_ownership"][key]["owner"])
 
     def test_a_native_rename_after_sp_name_replaces_it_for_good(self) -> None:
         """`sp name` is not a shield. The newest human act is the name.

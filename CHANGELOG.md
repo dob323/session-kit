@@ -2,6 +2,34 @@
 
 All notable changes to Session Kit are documented here.
 
+## [0.4.1] - 2026-08-17
+
+### Changed
+
+- The sub-agent sweep's background-shell pass was hardened after live audits:
+  any live descendant now refuses closure outright (even a sleeping zero-CPU
+  child), the harness-shell fingerprint is anchored (a marker inside arbitrary
+  `-c` text never qualifies), the shell's own CPU counters veto closure, a
+  shell owning its terminal's foreground process group is never touched, and
+  delivery pins and stops the shell, re-proves every fact while it is frozen,
+  then signals and resumes it. A closing signal that reached its target is
+  reported delivered even when the target is reaped before the resume step.
+- A Claude-derived placeholder name (`nameSource: "derived"`) is never adopted
+  as a human rename: the automatic title now displays over it, and the kit's
+  title push updates per-PID session records inside every enrolled account
+  root, not only the ambient profile. Push lag ranks as pending, never as a
+  human rename; a real human rename still wins outright.
+- The title push reaches a profile's transcript even when that profile has no
+  sessions registry yet; the sessions-directory narrowing had silently skipped
+  fresh account roots.
+
+### Fixed
+
+- The public CI suite is genuinely green: thirteen baseline test failures were
+  root-caused and repaired against the code's actual contracts, shellcheck is
+  scoped to real shell scripts by shebang, pty-dependent tests are pinned, and
+  the Python tree passes ruff and mypy clean.
+
 ## [0.4.0] - 2026-08-16
 
 ### The picker is one screen again

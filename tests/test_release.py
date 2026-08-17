@@ -600,7 +600,7 @@ class ReleaseToolTests(unittest.TestCase):
         expected = (
             "session-kit-release: "
             + release_module.collection_floor_remedy(
-                state, release / "bin/reset-collection-order.py"
+                state, release / "tools/reset-collection-order.py"
             )
             + "\n"
         )

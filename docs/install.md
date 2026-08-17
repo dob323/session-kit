@@ -1,6 +1,6 @@
 # Install Session Kit
 
-Session Kit `v0.4.0` is a public beta for Linux with systemd and macOS 14 or
+Session Kit `v0.4.1` is a public beta for Linux with systemd and macOS 14 or
 newer. Install the accepted release artifact under a single-user account where
 provider conversations are recoverable.
 
@@ -12,7 +12,7 @@ are named by source commit rather than by version.
 ```bash
 mkdir session-kit-download
 cd session-kit-download
-gh release download v0.4.0 --repo dob323/session-kit
+gh release download v0.4.1 --repo dob323/session-kit
 if command -v sha256sum >/dev/null; then
   sha256sum --check session-kit-*.sha256
 else
@@ -65,7 +65,7 @@ an install or update.
 
 Without the GitHub CLI, download the `.tar.gz`, `.sha256`, and
 `.provenance.json` assets from the
-[`v0.4.0` release](https://github.com/dob323/session-kit/releases/tag/v0.4.0),
+[`v0.4.1` release](https://github.com/dob323/session-kit/releases/tag/v0.4.1),
 and put them in one empty directory. The checksum file covers the archive. Use
 `sha256sum --check` on Linux or
 `shasum -a 256 --check` on macOS. The provenance file records the exact source
@@ -91,14 +91,14 @@ Linux additionally requires:
 
 - Linux with readable `/proc`;
 - a systemd user manager;
-- Bash 4.2 or newer (the picker's fallback clock uses `printf '%(%s)T'`; Bash 5 preferred);
+- Bash 4 or newer;
 - Python 3.10 or newer.
 
 macOS additionally requires:
 
 - macOS 14 or newer on Apple Silicon or Intel;
 - an active desktop login so the per-user launchd GUI domain exists;
-- Homebrew Bash 4.2 or newer (Bash 5 preferred);
+- Homebrew Bash 4 or newer;
 - Python 3.11 or newer.
 
 The preflight checks the platform-specific tools it uses. Linux includes

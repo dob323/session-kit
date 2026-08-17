@@ -33,7 +33,7 @@ import os
 from pathlib import Path
 import stat
 import time
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 from .common import clean_text
 
@@ -312,7 +312,12 @@ def scan_backward(descriptor: int, provider: str, size: int) -> tuple[str, int]:
 # -------------------------------------------------------------------- cache
 
 
-def prune_cache(cache_dir: object, live_keys: object, *, now: float | None = None) -> int:
+def prune_cache(
+    cache_dir: object,
+    live_keys: Iterable[object] | None,
+    *,
+    now: float | None = None,
+) -> int:
     """Drop cache records for conversations that are gone.
 
     Everything else under the state directory has a reaper; this did not, and

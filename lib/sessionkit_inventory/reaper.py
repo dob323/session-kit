@@ -60,12 +60,8 @@ def scan_shell_facts(
 ) -> dict[str, dict[str, Any]]:
     """Return exact daemon-child shell generations and empty-tree proof."""
     daemon_before = _proc_stat(proc_root / str(daemon_pid) / "stat")
-    if (
-        daemon_start_ticks is not None
-        and (
-            daemon_before is None
-            or daemon_before[1] != daemon_start_ticks
-        )
+    if daemon_start_ticks is not None and (
+        daemon_before is None or daemon_before[1] != daemon_start_ticks
     ):
         raise CollectionError("bound shpool daemon generation changed")
     try:
@@ -115,8 +111,7 @@ def scan_shell_facts(
                 if _proc_stat(entry / "stat") is None:
                     continue
                 raise CollectionError(
-                    "an own-uid process has an unreadable environment; "
-                    "cleanup refused"
+                    "an own-uid process has an unreadable environment; cleanup refused"
                 ) from exc
         after = _proc_stat(entry / "stat")
         if before != after:
@@ -194,8 +189,8 @@ def scan_shell_facts(
 
     for session_id, named_pids in named_processes.items():
         fact = facts.get(session_id)
-        shell_pid = fact.get("shell_pid") if isinstance(fact, Mapping) else None
-        if isinstance(shell_pid, int):
+        shell_pid = fact.get("shell_pid") if fact is not None else None
+        if fact is not None and isinstance(shell_pid, int):
             outside = sorted(set(named_pids) - subtree(shell_pid))
             if outside:
                 fact["empty"] = False
@@ -203,12 +198,11 @@ def scan_shell_facts(
         elif fact is None:
             # Positive evidence of a surviving process without a daemon child.
             # Neither candidate predicate accepts this non-shell fact.
-            facts[session_id] = {
-                "unbound_session_processes": sorted(set(named_pids))
-            }
-    if daemon_start_ticks is not None and _proc_stat(
-        proc_root / str(daemon_pid) / "stat"
-    ) != daemon_before:
+            facts[session_id] = {"unbound_session_processes": sorted(set(named_pids))}
+    if (
+        daemon_start_ticks is not None
+        and _proc_stat(proc_root / str(daemon_pid) / "stat") != daemon_before
+    ):
         raise CollectionError("bound shpool daemon generation changed")
     return facts
 
@@ -217,11 +211,7 @@ def _bound_daemon_generation(inventory: Mapping[str, Any]) -> tuple[int, int]:
     """Return the exact socket-bound generation carried by a guard document."""
     daemon = inventory.get("daemon_generation")
     pid = daemon.get("pid") if isinstance(daemon, Mapping) else None
-    start = (
-        daemon.get("process_start_ticks")
-        if isinstance(daemon, Mapping)
-        else None
-    )
+    start = daemon.get("process_start_ticks") if isinstance(daemon, Mapping) else None
     if (
         not _positive_int(pid)
         or not isinstance(start, int)

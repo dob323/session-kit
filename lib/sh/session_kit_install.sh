@@ -1620,7 +1620,7 @@ install_command() {
   preflight_claude_integration "$source/config/claude" "$force" install
   python3 "$source/deploy/session-kit-release" seed-floor \
     --state-root "$state_root" \
-    --remedy-tool "$source/bin/reset-collection-order.py" >/dev/null
+    --remedy-tool "$source/tools/reset-collection-order.py" >/dev/null
   begin_transaction install
   install_transaction_pending=1
   trap 'if [[ ${install_transaction_pending:-0} == 1 ]]; then recover_pending_transaction || true; fi' EXIT

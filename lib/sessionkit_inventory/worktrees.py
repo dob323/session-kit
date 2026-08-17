@@ -324,9 +324,7 @@ def _git(
         check=False,
     )
     if check and completed.returncode != 0:
-        detail = " ".join(
-            (completed.stderr or completed.stdout or "").split()
-        )[:300]
+        detail = " ".join((completed.stderr or completed.stdout or "").split())[:300]
         raise WorktreeError(
             f"git {' '.join(arguments)} failed ({completed.returncode}): {detail}"
         )
@@ -351,13 +349,20 @@ def repository_root(
     if not directory.is_dir():
         return None
     completed = _git(
-        runner, directory, "rev-parse", "--path-format=absolute",
-        "--show-toplevel", "--git-dir", "--git-common-dir",
+        runner,
+        directory,
+        "rev-parse",
+        "--path-format=absolute",
+        "--show-toplevel",
+        "--git-dir",
+        "--git-common-dir",
         check=False,
     )
     if completed.returncode != 0:
         return None
-    lines = [line.strip() for line in (completed.stdout or "").splitlines() if line.strip()]
+    lines = [
+        line.strip() for line in (completed.stdout or "").splitlines() if line.strip()
+    ]
     if len(lines) != 3:
         return None
     top, git_dir, common_dir = (Path(value) for value in lines)
@@ -391,7 +396,11 @@ def forget_registration(runner: Runner, repo: Path, tree_path: Path) -> str:
     Returns the registration name it removed, ``""`` when there was none.
     """
     completed = _git(
-        runner, repo, "rev-parse", "--path-format=absolute", "--git-common-dir",
+        runner,
+        repo,
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-common-dir",
         check=False,
     )
     if completed.returncode != 0:
@@ -432,7 +441,12 @@ def forget_registration(runner: Runner, repo: Path, tree_path: Path) -> str:
 
 def _branch_exists(runner: Runner, repo: Path, branch: str) -> bool:
     completed = _git(
-        runner, repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}",
+        runner,
+        repo,
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        f"refs/heads/{branch}",
         check=False,
     )
     return completed.returncode == 0
@@ -475,9 +489,7 @@ def _validated_record(document: Mapping[str, Any], path: Path) -> dict[str, Any]
 
 def read_record(root: Path, token: str) -> dict[str, Any] | None:
     path = _record_path(root, token)
-    document = read_private_json(
-        path, limit=MAX_RECORD_BYTES, label="worktree record"
-    )
+    document = read_private_json(path, limit=MAX_RECORD_BYTES, label="worktree record")
     if document is None:
         return None
     return _validated_record(document, path)
@@ -646,15 +658,10 @@ def preflight(
         }
     root = worktree_root(state_dir, environ)
     destination = (
-        root
-        / "trees"
-        / f"{slug(top.name)}-{token_for(top, wanted)[:8]}"
-        / slug(wanted)
+        root / "trees" / f"{slug(top.name)}-{token_for(top, wanted)[:8]}" / slug(wanted)
     )
     occupied = _checked_out_at(runner, top, wanted)
-    blocked = (
-        occupied if occupied is not None and Path(occupied) != destination else ""
-    )
+    blocked = occupied if occupied is not None and Path(occupied) != destination else ""
     return {
         "repo": os.fspath(top),
         "branch": wanted,
@@ -788,9 +795,7 @@ def bind(
     return record
 
 
-def status(
-    *, path: Path | str, runner: Runner = subprocess.run
-) -> list[str]:
+def status(*, path: Path | str, runner: Runner = subprocess.run) -> list[str]:
     """Uncommitted, untracked and ignored entries in one worktree.
 
     ``--ignored`` is not optional here. A fresh worktree starts with no ignored
@@ -851,9 +856,7 @@ def head_of(*, path: Path | str, runner: Runner = subprocess.run) -> dict[str, A
     )
     # A failure here is normal and means exactly one thing: HEAD is detached.
     branch = (named.stdout or "").strip() if named.returncode == 0 else ""
-    top = _git(
-        runner, Path(path), "rev-parse", "--absolute-git-dir", check=False
-    )
+    top = _git(runner, Path(path), "rev-parse", "--absolute-git-dir", check=False)
     git_dir = (top.stdout or "").strip() if top.returncode == 0 else ""
     unreadable: list[str] = []
     if not commit:
@@ -884,9 +887,7 @@ def in_progress(git_dir: str | None) -> list[str]:
     if not git_dir:
         return []
     root = Path(git_dir)
-    return [
-        reason for name, reason in WORK_MARKERS if (root / name).exists()
-    ]
+    return [reason for name, reason in WORK_MARKERS if (root / name).exists()]
 
 
 def stashes_for(
@@ -1010,7 +1011,9 @@ def inspect_work(
     }
     if not tree.is_dir():
         return {
-            **facts, "refusals": refusals, "present": False,
+            **facts,
+            "refusals": refusals,
+            "present": False,
         }
     head = head_of(path=tree, runner=runner)
     facts["head"] = head
@@ -1096,7 +1099,9 @@ def inspect_work(
         )
         if completed.returncode not in (0, 1):
             detail = " ".join((completed.stderr or "").split())[:200]
-            blind.append(f"its commits could not be compared with {reference}: {detail}")
+            blind.append(
+                f"its commits could not be compared with {reference}: {detail}"
+            )
         else:
             facts["merged"] = completed.returncode == 0
             if not facts["merged"]:
@@ -1157,15 +1162,16 @@ def teardown(
     says — that is not a decision about unsaved work, it is pulling the floor
     out from under a live session.
     """
-    record = lookup(
-        state_dir, path=path, repo=repo, branch=branch, environ=environ
-    )
+    record = lookup(state_dir, path=path, repo=repo, branch=branch, environ=environ)
     if record is None:
         raise WorktreeError("no recorded worktree matches that request")
     root = worktree_root(state_dir, environ)
     tree_path = Path(record["path"])
     trees = (root / "trees").resolve(strict=False)
-    if not tree_path.is_absolute() or trees not in tree_path.resolve(strict=False).parents:
+    if (
+        not tree_path.is_absolute()
+        or trees not in tree_path.resolve(strict=False).parents
+    ):
         raise WorktreeError(
             f"refusing to remove {tree_path}: outside the kit's worktree root"
         )
@@ -1607,9 +1613,7 @@ def render_verdict(verdict: Mapping[str, Any]) -> str:
     if action == NONE:
         return ""
     if action == MANY:
-        return "".join(
-            render_verdict(item) for item in verdict.get("verdicts") or []
-        )
+        return "".join(render_verdict(item) for item in verdict.get("verdicts") or [])
     branch = str(verdict.get("branch") or "")
     path = str(verdict.get("path") or "")
     if action == REMOVED:

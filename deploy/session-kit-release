@@ -456,7 +456,7 @@ def seed_collection_floor(
                 )
                 else "preserved"
             )
-        result = {"status": status, "path": str(floor)}
+        result: dict[str, object] = {"status": status, "path": str(floor)}
         if status != "preserved":
             result["value"] = sequence
         return result
@@ -1902,7 +1902,7 @@ def collection_state_root(args: argparse.Namespace) -> Path:
 def target_floor_seed(args: argparse.Namespace, release: Path) -> dict:
     return seed_collection_floor(
         collection_state_root(args),
-        release / "bin/reset-collection-order.py",
+        release / "tools/reset-collection-order.py",
         dry_run=args.dry_run,
     )
 

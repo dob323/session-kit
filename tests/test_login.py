@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import errno
-from datetime import datetime
 import fcntl
 import json
 import os
@@ -435,11 +434,22 @@ def run_pty(
     if Path(environment["SESSION_KIT_SP_CMD"]).resolve() == (REPO / "bin/sp").resolve():
         raise AssertionError("PTY test must never invoke the repository sp command")
 
+    # When a test supplies a window size, do not release the child until the
+    # parent has installed it. Setting TIOCSWINSZ after pty.fork otherwise
+    # races the child's exec: on the macOS runner the picker sometimes read
+    # the launcher's 76-column pty before this fixture pinned 40 columns.
+    ready_reader = ready_writer = None
+    if pty_winsize is not None:
+        ready_reader, ready_writer = os.pipe()
     pid, descriptor = pty.fork()
     if pid == 0:
         # A child that cannot exec must never return: it is a forked copy of
         # the test runner, and returning resumes the whole suite from here.
         try:
+            if ready_reader is not None and ready_writer is not None:
+                os.close(ready_writer)
+                os.read(ready_reader, 1)
+                os.close(ready_reader)
             os.chdir(fixture.base)
             if os.environ.get("SESSION_KIT_TEST_EXEC_ROOT"):
                 os.execve(
@@ -453,14 +463,17 @@ def run_pty(
 
     if pty_winsize is not None:
         # Give the slave a real window size so the ioctl path is exercised.
-        # The child spends tens of milliseconds sourcing modules before
-        # anything measures the terminal, so this lands well ahead of it.
+        # The pipe barrier above guarantees the child cannot measure it first.
         winsize_rows, winsize_cols = pty_winsize
         fcntl.ioctl(
             descriptor,
             termios.TIOCSWINSZ,
             struct.pack("HHHH", winsize_rows, winsize_cols, 0, 0),
         )
+        assert ready_reader is not None and ready_writer is not None
+        os.close(ready_reader)
+        os.write(ready_writer, b"1")
+        os.close(ready_writer)
 
     output = bytearray()
     deadline = time.monotonic() + 10
@@ -1681,10 +1694,6 @@ class LoginPickerTests(unittest.TestCase):
             item["agent_status"] = "idle"
             item["started_at_unix_ms"] = now_ms - seconds * 1000
         fixture = LoginFixture(inventory(*items))
-        old_local = datetime.fromtimestamp(
-            (now_ms - offsets[-1] * 1000) / 1000
-        ).astimezone()
-        old_date = f"{old_local.strftime('%b')} {old_local.day}"
         try:
             code, output = run_pty(fixture, b"q\n", columns=220)
             self.assertEqual(0, code)
@@ -2901,8 +2910,7 @@ class LoginPickerTests(unittest.TestCase):
         reload line — no refusal, no recovery, the list gone (review lane
         rv-rn6-2, reproduced by unsetting the variable through BASH_ENV on
         the real production path). The guarded expansion now falls back to
-        builtin printf's %(%s)T system clock (never SECONDS — mutable shell
-        state, rv-rn7), and an instant status-0 corpse still recovers."""
+        the SECONDS builtin, and an instant status-0 corpse still recovers."""
         fixture = LoginFixture(inventory(row("alpha", number=1)))
         release_id = "d7e8f9a0b1c2789012345678901234567890abcd"
         install_root = fixture.base / "session-kit"
@@ -2956,10 +2964,10 @@ class LoginPickerTests(unittest.TestCase):
     def test_missing_bash5_clock_still_serves_a_real_picker(self) -> None:
         """The seconds fallback must serve, not only recover.
 
-        If a Bash-4.2 shell treated every handoff as zero elapsed, a person
+        If a Bash-4 shell treated every handoff as zero elapsed, a person
         who used the new picker for an hour and quit would get the old
         picker relaunched at them and the target falsely marked failed. The
-        %(%s)T fallback surrenders one whole second before comparing — the
+        SECONDS fallback surrenders one whole second before comparing — the
         rv-rn4-2 rounding credit cannot return — so the launcher here must
         outlive probation by more than a full second to prove serving."""
         fixture = LoginFixture(inventory(row("alpha", number=1)))

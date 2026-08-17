@@ -25,6 +25,7 @@ With neither, the answer is ``unknown`` — said as unknown, never as verified.
 Nothing in this module ever substitutes a model: it refuses, names what would
 serve the request instead, and leaves the choice to the person.
 """
+
 from __future__ import annotations
 
 import os
@@ -32,7 +33,7 @@ from pathlib import Path
 import re
 import tempfile
 import time
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 MODEL_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 
@@ -285,6 +286,7 @@ def configured_models(provider: str, environ: Mapping[str, str]) -> tuple[str, .
     verb therefore share one acceptance rule and never guess a catalog.
     """
     inline = environ.get("SESSION_KIT_TUI_MODELS", "")
+    candidates: Iterator[str]
     if inline.strip():
         candidates = (part.strip() for part in inline.split(","))
     else:

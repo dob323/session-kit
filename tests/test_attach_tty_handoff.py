@@ -76,7 +76,6 @@ import fcntl
 import os
 from pathlib import Path
 import pty
-import re
 import select
 import struct
 import subprocess

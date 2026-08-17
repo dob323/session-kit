@@ -158,6 +158,8 @@ sk_timeout() {
   # Keep the caller's stdin attached to the child. The former here-doc
   # replaced pipeline input with Python source, so the hidden Claude color
   # bootstrap never received its /color command.
+  # This is Python source, so shell expansion is deliberately disabled.
+  # shellcheck disable=SC2016
   python3 -c '
 import ctypes
 import os

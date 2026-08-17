@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from . import attention as _attention
-from .common import CollectionError, clean_text, valid_uuid
+from .common import CollectionError, _valid_name_since, clean_text, valid_uuid
 from .transcripts import claude_roots
 
 
@@ -92,6 +92,7 @@ def _parse_claude_payload(
                 if item.get("agentColor") in palette
                 else "",
                 "name_source": clean_text(item.get("nameSource"), 20),
+                "name_since": _valid_name_since(item.get("nameSince")),
                 "status": status or "unknown",
                 "needs_you": needs_you,
                 "blocking_question": blocking_question,
@@ -105,7 +106,9 @@ def _record_time_ms(record: Mapping[str, Any]) -> int | None:
     if not isinstance(raw, str):
         return None
     try:
-        return int(datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp() * 1000)
+        return int(
+            datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp() * 1000
+        )
     except ValueError:
         return None
 
@@ -131,7 +134,9 @@ def _pending_claude_tool_evidence(raw: bytes) -> tuple[bool, bool, int | None]:
         if record.get("isSidechain") is not False:
             continue
         message = record.get("message")
-        content = message.get("content") if isinstance(message, Mapping) else None
+        if not isinstance(message, Mapping):
+            continue
+        content = message.get("content")
         if not isinstance(content, list):
             continue
         for part in content:
@@ -339,14 +344,16 @@ def _enrich_claude_payload(
             else default_root
         )
         record_path = claude_root / "sessions" / f"{pid}.json"
-        if record_path.is_file():
+        if not record_path.is_symlink() and record_path.is_file():
             try:
                 record = json.loads(record_path.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 record = None
-            if isinstance(record, Mapping):
+            if isinstance(record, Mapping) and record.get("sessionId") == uuid:
                 if "nameSource" not in item:
                     item["nameSource"] = record.get("nameSource")
+                if "nameSince" not in item:
+                    item["nameSince"] = record.get("nameSince")
                 # When Claude last changed this session's status, by its own
                 # clock. It is the only way to tell a poll answer that is
                 # older than a hook record from one that supersedes it; a
@@ -381,9 +388,7 @@ def _enrich_claude_payload(
         item["_session_kit_pending_ask_user_question"] = bool(
             signals.get("pending_ask_user_question")
         )
-        item["_session_kit_pending_tool_use"] = bool(
-            signals.get("pending_tool_use")
-        )
+        item["_session_kit_pending_tool_use"] = bool(signals.get("pending_tool_use"))
         item["_session_kit_pending_tool_use_at_unix_ms"] = signals.get(
             "pending_tool_use_at_unix_ms"
         )

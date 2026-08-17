@@ -240,6 +240,8 @@ picker_takeover() {
 picker_close() {
   local proof=$1
   picker_action_event picker_close requested
+  # The final refusal block intentionally handles failure from any proof step.
+  # shellcheck disable=SC2015
   sk_prepare_state && sk_load_picker_proof "$proof" && make_guard_snapshot &&
     { sk_picker_proof_matches "$SNAPSHOT" ||
       sk_picker_proof_matches_dead_shell "$SNAPSHOT"; } || {
@@ -464,6 +466,8 @@ picker_recover() {
 picker_history() {
   local proof=$1
   picker_load_fresh "$proof" || return 1
+  # sk_load_picker_proof, called above, publishes this sourced-module field.
+  # shellcheck disable=SC2153
   show_history_id "$SK_PROOF_ID"
 }
 

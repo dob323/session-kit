@@ -377,9 +377,7 @@ def render_inventory(
     collected_sessions = [
         item for item in inventory.get("sessions", ()) if isinstance(item, Mapping)
     ]
-    sessions, machine_sessions, _ = classify_top_level_sessions(
-        collected_sessions
-    )
+    sessions, machine_sessions, _ = classify_top_level_sessions(collected_sessions)
     sessions = [item for item in sessions if not session_is_unavailable(item)]
     machine_sessions = [
         item for item in machine_sessions if not session_is_unavailable(item)
@@ -392,9 +390,7 @@ def render_inventory(
         for item in sessions
     )
     ready_count = sum(
-        1
-        for item in sessions
-        if item.get("availability") == labels.AVAILABILITY_READY
+        1 for item in sessions if item.get("availability") == labels.AVAILABILITY_READY
     )
     elsewhere_count = sum(
         1
@@ -411,7 +407,13 @@ def render_inventory(
         2,
         max(
             (
-                len(str(item.get("terminal_number") or item.get("row") or labels.UNNUMBERED))
+                len(
+                    str(
+                        item.get("terminal_number")
+                        or item.get("row")
+                        or labels.UNNUMBERED
+                    )
+                )
                 for item in sessions
             ),
             default=2,
@@ -457,13 +459,13 @@ def render_inventory(
                             )
                         )
                     )
-                ) + 1
+                )
+                + 1
                 for item in sessions
                 if int(
-                    item.get(
-                        "active_subagent_count", len(item.get("subagents", ()))
-                    )
-                ) > 0
+                    item.get("active_subagent_count", len(item.get("subagents", ())))
+                )
+                > 0
             ),
             default=4,
         ),
@@ -480,10 +482,17 @@ def render_inventory(
                 len(labels.SEPARATOR)
                 + _display_width(
                     labels.subagent_detail(
-                        int(item.get("active_subagent_count", len(item.get("subagents", ()))))
+                        int(
+                            item.get(
+                                "active_subagent_count", len(item.get("subagents", ()))
+                            )
+                        )
                     )
                 )
-                if int(item.get("active_subagent_count", len(item.get("subagents", ())))) > 0
+                if int(
+                    item.get("active_subagent_count", len(item.get("subagents", ())))
+                )
+                > 0
                 else 0
             )
             + len(labels.SEPARATOR)
@@ -529,7 +538,10 @@ def render_inventory(
         1,
         min(
             max(
-                (_display_width(clean_text(item.get("title"), 10000)) for item in sessions),
+                (
+                    _display_width(clean_text(item.get("title"), 10000))
+                    for item in sessions
+                ),
                 default=1,
             ),
             max(title_room, MIN_TITLE_CELLS),
@@ -572,7 +584,9 @@ def render_inventory(
                 or not isinstance(selector, int)
                 or selector <= 0
             ):
-                selector = labels.UNNUMBERED if has_terminal_numbers else item.get("row")
+                selector = (
+                    labels.UNNUMBERED if has_terminal_numbers else item.get("row")
+                )
             selector_text = str(selector)
             account = _display_title(
                 clean_text(item.get("account_alias"), 80) or labels.MISSING,
@@ -587,7 +601,8 @@ def render_inventory(
             detail_color = (
                 yellow
                 if item.get("needs_you")
-                or status in {
+                or status
+                in {
                     labels.QUESTION,
                     labels.WAITING_ON_YOU,
                     labels.SETUP_INCOMPLETE,
@@ -611,7 +626,9 @@ def render_inventory(
                     f"{detail_color}{narrow_detail}{reset}"
                 )
                 continue
-            fixed = 8 + number_width + 3 + account_width + model_width + 12 + title_width
+            fixed = (
+                8 + number_width + 3 + account_width + model_width + 12 + title_width
+            )
             # Truncated, never re-cleaned: the state cell is padded so the time
             # phrase after it starts at one column on every row, and cleaning
             # would eat that padding.
@@ -632,9 +649,7 @@ def render_inventory(
     collapsed_count = len(machine_sessions)
     if collapsed_count:
         count = collapsed_count
-        lines.append(
-            f"  {count} {labels.plural(count, 'machine session')}"
-        )
+        lines.append(f"  {count} {labels.plural(count, 'machine session')}")
     outside = list(inventory.get("outside_agents", ()))
     if outside:
         lines.append(f"  {bold}{labels.GROUP_OUTSIDE_THE_KIT}{reset}")
@@ -823,13 +838,9 @@ def render_picker_page(
             {
                 "row": row,
                 "number": number,
-                "title": clean_text(
-                    row.get("display_title") or row.get("title"), 120
-                ),
+                "title": clean_text(row.get("display_title") or row.get("title"), 120),
                 "provider": badge(row),
-                "account": shortened(
-                    field(row, "account_alias", 80), ACCOUNT_CELL_MAX
-                ),
+                "account": shortened(field(row, "account_alias", 80), ACCOUNT_CELL_MAX),
                 "model": shortened(_model_cell(row), MODEL_CELL_MAX),
                 "state": state,
                 "subagents": agent_detail,
@@ -841,7 +852,8 @@ def render_picker_page(
                 # this last -- and the title yields before this does.
                 "essential": compact_details,
                 "status": [state, *([agent_detail] if agent_detail else [])],
-                "warning": state in {
+                "warning": state
+                in {
                     labels.QUESTION,
                     labels.WAITING_ON_YOU,
                     labels.SETUP_INCOMPLETE,
@@ -853,9 +865,7 @@ def render_picker_page(
     if prepared:
         number_width = max(3, max(len(str(item["number"])) for item in prepared))
         provider_width = max(_display_width(item["provider"]) for item in prepared)
-        raw_account_width = _real_value_width(
-            (item["account"] for item in prepared)
-        )
+        raw_account_width = _real_value_width((item["account"] for item in prepared))
         raw_model_width = _real_value_width((item["model"] for item in prepared))
         prefix_width = 4 + number_width + 2
         # The same account/model allocator as ``sp list``. Preserve room for
@@ -946,9 +956,7 @@ def render_picker_page(
             responsive_floor = (
                 RESPONSIVE_MIN_TITLE_CELLS if width >= 59 else MIN_TITLE_CELLS
             )
-            label_width = max(
-                responsive_floor, label_width - remaining
-            )
+            label_width = max(responsive_floor, label_width - remaining)
         detail_room = room_for(label_width)
         status_only = widest("essential") > detail_room
 
@@ -958,7 +966,6 @@ def render_picker_page(
             # provider count. From 60 columns up, an identifiable compact time
             # follows them; at the narrowest tier waiting-on-you wins first.
             status_with_age = widest("essential")
-            status_without_age = widest("status")
             status_kind = "essential"
             status_room = width - prefix_width - 3 - 4
             if status_with_age > status_room:
@@ -985,11 +992,15 @@ def render_picker_page(
         # the whole pair gets it truncated rather than deleted — which is what
         # `sp list` has always done, and the two surfaces gave different answers
         # at the same width while this ladder ended in a state word alone.
-        forms = ["compact", "essential"] if compact else [
-            "details",
-            "compact",
-            "essential",
-        ]
+        forms = (
+            ["compact", "essential"]
+            if compact
+            else [
+                "details",
+                "compact",
+                "essential",
+            ]
+        )
         detail_form = forms[-1]
         for candidate in forms:
             if widest(candidate) <= detail_room:
@@ -999,9 +1010,9 @@ def render_picker_page(
         previous_group: str | None = None
         for item in prepared:
             row = item["row"]
-            group = clean_text(row.get("_picker_group_label"), 80) or labels.group_heading(
-                clean_text(row.get("availability"), 20)
-            )
+            group = clean_text(
+                row.get("_picker_group_label"), 80
+            ) or labels.group_heading(clean_text(row.get("availability"), 20))
             if not compact and group != previous_group:
                 lines.append(f"  {styled(group, bold)}")
                 previous_group = group
@@ -1012,20 +1023,22 @@ def render_picker_page(
             title = styled(title, color) if color else title
             title += padding
             if status_only:
-                details = aligned_shortened(
+                detail_line = aligned_shortened(
                     details_text(item[status_kind]), detail_room
                 )
                 if item["warning"]:
-                    details = styled(details, bold, yellow)
+                    detail_line = styled(detail_line, bold, yellow)
                 number_text = f"{item['number']:>{number_width}}"
                 marker = "  ▸ " if item["number"] == jump_number else "    "
                 lines.append(
-                    f"{marker}{styled(number_text, bold, green)}  {title} | {details}"
+                    f"{marker}{styled(number_text, bold, green)}  {title} | {detail_line}"
                 )
                 continue
-            details = aligned_shortened(details_text(item[detail_form]), detail_room)
+            detail_line = aligned_shortened(
+                details_text(item[detail_form]), detail_room
+            )
             if item["warning"]:
-                details = styled(details, bold, yellow)
+                detail_line = styled(detail_line, bold, yellow)
             number_text = f"{item['number']:>{number_width}}"
             marker = "  ▸ " if item["number"] == jump_number else "    "
             provider_key = key(row)
@@ -1038,7 +1051,7 @@ def render_picker_page(
             model = _pad(aligned_shortened(item["model"], model_width), model_width)
             lines.append(
                 f"{marker}{styled(number_text, bold, green)}  {title} | "
-                f"{provider} | {account} | {model} | {details}"
+                f"{provider} | {account} | {model} | {detail_line}"
             )
 
     if (
@@ -1047,7 +1060,9 @@ def render_picker_page(
         and not isinstance(machine_count, bool)
         and machine_count > 0
     ):
-        machine_line = f"{machine_count} {labels.plural(machine_count, 'machine session')}"
+        machine_line = (
+            f"{machine_count} {labels.plural(machine_count, 'machine session')}"
+        )
         if isinstance(machine_needs, int) and machine_needs > 0:
             machine_line += f" · {machine_needs} {labels.NEEDS_YOU}"
         if (
@@ -1096,9 +1111,7 @@ def render_detail(
     activity = activity if isinstance(activity, Mapping) else {}
     projected_now = _timestamp(now_ms)
     as_of = projected_now if projected_now is not None else int(time.time() * 1000)
-    status = labels.session_state(
-        row, stall_seconds=stall_threshold_seconds()
-    )
+    status = labels.session_state(row, stall_seconds=stall_threshold_seconds())
     is_waiting = status in {
         labels.QUESTION,
         labels.WAITING_ON_YOU,
@@ -1110,11 +1123,7 @@ def render_detail(
         if not isinstance(child, Mapping):
             continue
         age = child.get("age_seconds")
-        if (
-            isinstance(age, bool)
-            or not isinstance(age, int)
-            or age < 60 * 60
-        ):
+        if isinstance(age, bool) or not isinstance(age, int) or age < 60 * 60:
             continue
         title = clean_text(child.get("title"), 120)
         kind = clean_text(child.get("kind"), 20).casefold()

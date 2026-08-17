@@ -71,6 +71,7 @@ def session_names(
                 names[("journal", session_id)] = title
     manifest = _read_json(recovery / "recovery-manifest.json")
     rows = manifest.get("sessions") if isinstance(manifest, Mapping) else None
+    manifest_rows: Iterable[tuple[object, object]]
     if isinstance(rows, Mapping):
         manifest_rows = rows.items()
     else:

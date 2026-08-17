@@ -14,22 +14,289 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import errno
 import json
 import os
 from pathlib import Path
 import re
 import stat as statmod
 import sys
-import tempfile
 import time
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Protocol
 
-from .common import automatic_naming_enabled, valid_uuid
+from .common import (
+    _valid_name_since,
+    automatic_naming_enabled,
+    clean_text,
+    valid_uuid,
+)
 from .providers_codex import _codex_state_databases
 from .transcripts import claude_roots
 
 
 MAX_CLAUDE_SESSION_RECORDS = 512
+
+
+class LiveRename(Protocol):
+    def __call__(
+        self,
+        state_dir: Path,
+        uuid: str,
+        title: str,
+        /,
+        *,
+        timeout_seconds: float | None = None,
+        still_automatic: Callable[[], bool] | None = None,
+    ) -> tuple[list[str], list[str]]: ...
+
+
+def _claude_sessions_directories(
+    home: Path, environ: Mapping[str, str] | None = None
+) -> tuple[list[Path], list[str]]:
+    """Verified Claude registry directories which cannot escape a profile."""
+    env = dict(environ or {})
+    env["HOME"] = os.fspath(home)
+    found: list[Path] = []
+    warnings: list[str] = []
+    seen: set[str] = set()
+    account_root = Path(
+        env.get("SESSION_KIT_ACCOUNT_ROOT")
+        or home / ".local/share/session-kit/accounts"
+    )
+    account_profiles = (account_root / "claude").absolute()
+    for root in claude_roots(env):
+        sessions = root / "sessions"
+        try:
+            # An enrolled profile name is a trust boundary, not a redirect.
+            # Refuse it before resolve() can erase the evidence that the
+            # account-profile component itself was a symlink.
+            if root.absolute().parent == account_profiles and root.is_symlink():
+                warnings.append(
+                    f"Claude sessions directory refused: {sessions}: "
+                    "account profile is a symlink"
+                )
+                continue
+            if not sessions.exists() and not sessions.is_symlink():
+                continue
+            resolved_root = root.resolve(strict=True)
+            resolved_sessions = sessions.resolve(strict=True)
+            try:
+                resolved_sessions.relative_to(resolved_root)
+            except ValueError:
+                warnings.append(
+                    f"Claude sessions directory refused: {sessions}: "
+                    "resolved path escapes its profile root"
+                )
+                continue
+            descriptor = os.open(
+                resolved_sessions,
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            try:
+                if not statmod.S_ISDIR(os.fstat(descriptor).st_mode):
+                    raise OSError("not a directory")
+            finally:
+                os.close(descriptor)
+        except (OSError, RuntimeError) as exc:
+            warnings.append(f"Claude sessions directory refused: {sessions}: {exc}")
+            continue
+        key = os.fspath(resolved_sessions)
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append(resolved_sessions)
+    return found, warnings
+
+
+def _open_sessions_directory(sessions: Path) -> int:
+    descriptor = os.open(
+        sessions,
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        is_directory = statmod.S_ISDIR(os.fstat(descriptor).st_mode)
+    except OSError:
+        os.close(descriptor)
+        raise
+    if not is_directory:
+        os.close(descriptor)
+        raise OSError("not a directory")
+    return descriptor
+
+
+def _read_json_at(directory: int, name: str) -> dict[str, Any] | None:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(name, flags, dir_fd=directory)
+    try:
+        if not statmod.S_ISREG(os.fstat(descriptor).st_mode):
+            return None
+        chunks: list[bytes] = []
+        remaining = 1024 * 1024 + 1
+        while remaining:
+            block = os.read(descriptor, min(remaining, 65536))
+            if not block:
+                break
+            chunks.append(block)
+            remaining -= len(block)
+        payload = b"".join(chunks)
+        if len(payload) > 1024 * 1024:
+            return None
+        value = json.loads(payload.decode("utf-8", "strict"))
+        return value if isinstance(value, dict) else None
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+    finally:
+        os.close(descriptor)
+
+
+def _atomic_bytes_at(directory: int, name: str, payload: bytes) -> None:
+    """Publish one private file relative to an already verified directory."""
+    try:
+        existing = os.open(
+            name,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory,
+        )
+    except FileNotFoundError:
+        existing = -1
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            label = "name intent" if name.endswith(".nameintent") else f"target {name}"
+            raise OSError(f"refusing symlinked {label}") from exc
+        raise
+    if existing >= 0:
+        try:
+            if not statmod.S_ISREG(os.fstat(existing).st_mode):
+                raise OSError(f"refusing non-regular target {name}")
+        finally:
+            os.close(existing)
+
+    temporary = ""
+    descriptor = -1
+    for attempt in range(100):
+        candidate = f".{name}.{os.getpid()}.{time.time_ns()}.{attempt}"
+        try:
+            descriptor = os.open(
+                candidate,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=directory,
+            )
+            temporary = candidate
+            break
+        except FileExistsError:
+            continue
+    if descriptor < 0:
+        raise OSError("cannot allocate temporary registry file")
+    try:
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("short registry write")
+            view = view[written:]
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(
+            temporary,
+            name,
+            src_dir_fd=directory,
+            dst_dir_fd=directory,
+        )
+        temporary = ""
+        os.fsync(directory)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(temporary, dir_fd=directory)
+
+
+def _claude_session_records(
+    home: Path,
+    uuid: str,
+    *,
+    environ: Mapping[str, str] | None,
+    max_session_records: int,
+    session_directories: list[Path] | None = None,
+) -> tuple[list[tuple[Path, str, dict[str, Any]]], list[str]]:
+    """Readable, regular PID records for one exact conversation."""
+    found: list[tuple[Path, str, dict[str, Any]]] = []
+    if session_directories is None:
+        directories, warnings = _claude_sessions_directories(home, environ)
+    else:
+        directories, warnings = session_directories, []
+    for sessions in directories:
+        directory = -1
+        try:
+            directory = _open_sessions_directory(sessions)
+            records = sorted(
+                name
+                for name in os.listdir(directory)
+                if re.fullmatch(r"\d+\.json", name)
+            )[:max_session_records]
+        except OSError as exc:
+            warnings.append(f"Claude session records unreadable: {sessions}: {exc}")
+            if directory >= 0:
+                os.close(directory)
+            continue
+        try:
+            for record in records:
+                try:
+                    data = _read_json_at(directory, record)
+                except OSError:
+                    continue
+                if data is not None and data.get("sessionId") == uuid:
+                    found.append((sessions, record, data))
+        finally:
+            os.close(directory)
+    return found, warnings
+
+
+def _claude_pre_push_title(
+    home: Path,
+    uuid: str,
+    *,
+    environ: Mapping[str, str] | None,
+    max_session_records: int,
+) -> dict[str, Any] | None:
+    """The one unambiguous registry name observation before a Claude push.
+
+    ``None`` means the registry supplied no safe evidence.  Multiple matching
+    records count only when every readable copy agrees; uncertainty must keep
+    the historical human-rename behavior.
+    """
+    records, _warnings = _claude_session_records(
+        home,
+        uuid,
+        environ=environ,
+        max_session_records=max_session_records,
+    )
+    observations: set[tuple[str, str | int | float, str]] = set()
+    for _sessions, _name, data in records:
+        title = clean_text(data.get("name"), 120)
+        if not title:
+            continue
+        name_since = _valid_name_since(data.get("nameSince"))
+        if name_since is None:
+            return None
+        observations.add((title, name_since, clean_text(data.get("nameSource"), 20)))
+    if len(observations) != 1:
+        return None
+    title, name_since, name_source = next(iter(observations))
+    return {"title": title, "nameSince": name_since, "nameSource": name_source}
 
 
 def _claude_transcripts(home: Path, uuid: str) -> list[Path]:
@@ -76,40 +343,34 @@ def _push_claude_title(
     uuid: str,
     title: str,
     *,
+    environ: Mapping[str, str] | None = None,
     atomic_write_json: Callable[[Path, Any], None],
     max_session_records: int,
 ) -> tuple[list[str], list[str]]:
     pushed: list[str] = []
-    warnings: list[str] = []
-    sessions = home / ".claude" / "sessions"
-    if not sessions.is_dir():
-        return pushed, ["Claude sessions directory unavailable; title not pushed"]
-    intent = sessions / f"{uuid}.nameintent"
-    try:
-        if intent.is_symlink():
-            raise OSError("refusing symlinked name intent")
-        descriptor, temporary = tempfile.mkstemp(
-            prefix=f".{intent.name}.", dir=sessions
-        )
+    session_directories, warnings = _claude_sessions_directories(home, environ)
+    if not session_directories:
+        if not warnings:
+            warnings.append("Claude sessions directory unavailable; title not pushed")
+        return pushed, warnings
+    for sessions in session_directories:
+        intent_name = f"{uuid}.nameintent"
+        directory = -1
         try:
-            os.fchmod(descriptor, 0o600)
-            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                descriptor = -1
-                handle.write(title + "\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, intent)
+            directory = _open_sessions_directory(sessions)
+            _atomic_bytes_at(directory, intent_name, (title + "\n").encode("utf-8"))
+            pushed.append("claude-nameintent")
+        except OSError as exc:
+            warnings.append(f"Claude name intent not written: {sessions}: {exc}")
         finally:
-            if descriptor >= 0:
-                os.close(descriptor)
-            with contextlib.suppress(FileNotFoundError):
-                os.unlink(temporary)
-        pushed.append("claude-nameintent")
-    except OSError as exc:
-        warnings.append(f"Claude name intent not written: {exc}")
+            if directory >= 0:
+                os.close(directory)
     # The prompt bar's bottom-right name is a transcript agent-name record —
     # the exact store /rename persists, hydrated at session start/resume,
     # rendered beside the agent-color. Same append discipline as colors.
+    # A profile can hold the transcript without a sessions/ registry (fresh
+    # or partially migrated account roots), so transcript reach must never be
+    # narrowed to the roots that happened to have one.
     transcripts = _claude_transcripts(home, uuid)
     name_entry = json.dumps(
         {"type": "agent-name", "agentName": title, "sessionId": uuid},
@@ -133,25 +394,34 @@ def _push_claude_title(
             pushed.append("claude-transcript-name")
     # The per-PID session record names the thread in Claude's own session
     # picker. Records carry the exact sessionId, so match by content.
-    try:
-        records = sorted(sessions.glob("*.json"))[:max_session_records]
-    except OSError as exc:
-        return pushed, warnings + [f"Claude session records unreadable: {exc}"]
-    for record in records:
-        if record.is_symlink() or not re.fullmatch(r"\d+\.json", record.name):
-            continue
-        try:
-            data = json.loads(record.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if not isinstance(data, dict) or data.get("sessionId") != uuid:
-            continue
+    records, record_warnings = _claude_session_records(
+        home,
+        uuid,
+        environ=environ,
+        max_session_records=max_session_records,
+        session_directories=session_directories,
+    )
+    warnings.extend(record_warnings)
+    for sessions, record_name, data in records:
+        directory = -1
         try:
             data["name"] = title
-            atomic_write_json(record, data)
+            if data.get("nameSource") == "derived":
+                data.pop("nameSource", None)
+            directory = _open_sessions_directory(sessions)
+            _atomic_bytes_at(
+                directory,
+                record_name,
+                (json.dumps(data, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+            )
             pushed.append("claude-session-record")
         except OSError as exc:
-            warnings.append(f"Claude session record not updated: {exc}")
+            warnings.append(
+                f"Claude session record not updated: {sessions / record_name}: {exc}"
+            )
+        finally:
+            if directory >= 0:
+                os.close(directory)
     return pushed, warnings
 
 
@@ -363,7 +633,7 @@ def codex_pending_auto_titles(
     derive_title: Callable[[Any], str | None],
     load_config: Callable[[], dict[str, Any]],
     max_session_index_bytes: int,
-    push_live_rename: Callable[[Path, str, str], tuple[list[str], list[str]]],
+    push_live_rename: LiveRename,
     human_named: Callable[[Mapping[str, str]], frozenset[str]],
     name_owner: Callable[..., str],
     claim_name: Callable[..., str],
@@ -510,14 +780,12 @@ def codex_pending_auto_titles(
                 return []
             if after is None:
                 return connection.execute(
-                    select
-                    + " ORDER BY COALESCE(updated_at, 0) DESC, id DESC LIMIT ?",
+                    select + " ORDER BY COALESCE(updated_at, 0) DESC, id DESC LIMIT ?",
                     (AUTOTITLE_PAGE_ROWS,),
                 ).fetchall()
             stamp, last_id = after
             return connection.execute(
-                select
-                + " AND (COALESCE(updated_at, 0) < ?"
+                select + " AND (COALESCE(updated_at, 0) < ?"
                 " OR (COALESCE(updated_at, 0) = ? AND id < ?))"
                 " ORDER BY COALESCE(updated_at, 0) DESC, id DESC LIMIT ?",
                 (stamp, stamp, last_id, AUTOTITLE_PAGE_ROWS),
@@ -612,10 +880,7 @@ def codex_pending_auto_titles(
         # keeps human ownership but changes the native title, and that news
         # must reach adoption before restore can replay the older alias.
         key = f"codex:{exact}"
-        settled = (
-            exact in indexed
-            and indexed[exact] == str(raw_title or "").strip()
-        )
+        settled = exact in indexed and indexed[exact] == str(raw_title or "").strip()
         recorded_title = (
             aliases.get(key) if key in human_owned else pushed_titles.get(key)
         )
@@ -740,8 +1005,10 @@ def codex_pending_auto_titles(
         refusal = claim_name("codex", exact, environ=env)
         if refusal:
             continue
+
         def still_automatic() -> bool:
             return name_owner("codex", exact, environ=env) == "automatic"
+
         # The index is append-only, so its only safe race boundary is the
         # instant immediately before the append. A human claim that landed
         # after our automatic claim therefore suppresses this write entirely.
@@ -831,9 +1098,7 @@ def _clear_titler_failure(env: Mapping[str, str]) -> None:
     if not home:
         return
     try:
-        path = (
-            _session_kit_state_dir(env, Path(home)) / "codex-autotitle-error.json"
-        )
+        path = _session_kit_state_dir(env, Path(home)) / "codex-autotitle-error.json"
         if not path.is_symlink():
             path.unlink()
     except OSError:
@@ -909,9 +1174,7 @@ def _push_codex_thread_title(
             remaining = max(0.0, deadline - time.monotonic())
             if remaining <= 0:
                 return False
-            connection.execute(
-                f"PRAGMA busy_timeout={max(0, int(remaining * 1000))}"
-            )
+            connection.execute(f"PRAGMA busy_timeout={max(0, int(remaining * 1000))}")
             return True
 
         connection = sqlite3.connect(database, timeout=timeout_seconds)

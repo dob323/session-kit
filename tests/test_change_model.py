@@ -19,7 +19,6 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
-from pathlib import Path
 import sys
 import unittest
 
@@ -148,7 +147,7 @@ class ChangeModelTests(unittest.TestCase):
         self.assertIn("Restored", moved.stdout)
         self.assertIn("claude-new", moved.stdout)
         log = self.fixture.shpool_log.read_text(encoding="utf-8").split()
-        self.assertEqual(["kill", SESSION, "attach"], log[:3])
+        self.assertEqual(["attach-exit", SESSION, "attach"], log[:3])
         # The same conversation, resumed, on the new model: the launch record
         # the session shell reads names both.
         launches = sorted(self.fixture.start.glob("*.launch"))
@@ -191,7 +190,7 @@ class ChangeModelTests(unittest.TestCase):
         self.assertIn("Restored", moved.stdout)
         self.assertIn("gpt-new", moved.stdout)
         log = self.fixture.shpool_log.read_text(encoding="utf-8").split()
-        self.assertEqual(["kill", SESSION, "attach"], log[:3])
+        self.assertEqual(["attach-exit", SESSION, "attach"], log[:3])
         launches = sorted(self.fixture.start.glob("*.launch"))
         self.assertEqual(1, len(launches), launches)
         fields = launches[0].read_text(encoding="utf-8").rstrip("\n").split("\t")
@@ -270,7 +269,7 @@ class ChangeModelTests(unittest.TestCase):
         self.assertIn("Restored", changed.stdout)
         self.assertIn("claude-old", changed.stdout)
         self.assertEqual(
-            ["kill", SESSION, "attach"],
+            ["attach-exit", SESSION, "attach"],
             self.fixture.shpool_log.read_text(encoding="utf-8").split()[:3],
         )
         launches = sorted(self.fixture.start.glob("*.launch"))

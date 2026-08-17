@@ -135,12 +135,15 @@ def _pending_conversation_keys(value: Any, *, schema_version: int) -> set[str]:
         if isinstance(item, Mapping)
     )
     for generation in generations:
-        if _generation_key(
-            {
-                "boot_id": generation.get("source_boot_id"),
-                "daemon_generation": generation.get("source_daemon_generation"),
-            }
-        ) is None:
+        if (
+            _generation_key(
+                {
+                    "boot_id": generation.get("source_boot_id"),
+                    "daemon_generation": generation.get("source_daemon_generation"),
+                }
+            )
+            is None
+        ):
             continue
         for group in ("sessions", "outside_agents"):
             entries = generation.get(group, {})
@@ -178,9 +181,11 @@ def update_recovery_state(
     """
     detected = recovery_manifest(inventory)
     publish = (
-        (lambda path, payload: write_collection_json(
-            paths, path, payload, collection_start=collection_start
-        ))
+        (
+            lambda path, payload: write_collection_json(
+                paths, path, payload, collection_start=collection_start
+            )
+        )
         if write_collection_json is not None
         else atomic_write_json
     )
@@ -332,10 +337,7 @@ def _lost_entry(
     if not isinstance(session_id, str) or not isinstance(recovery, Mapping):
         return None
     if provider in PROVIDERS:
-        exact = (
-            isinstance(identity, Mapping)
-            and identity.get("confidence") == "exact"
-        )
+        exact = isinstance(identity, Mapping) and identity.get("confidence") == "exact"
     else:
         # The idle shell an exited provider leaves behind. Its exact identity
         # is the one the overlay put back on the row, from the committed
@@ -477,10 +479,10 @@ def enqueue_lost_conversations(
             # first record of a loss is the one that names when it happened.
             document["sessions"] = {**found, **dict(document.get("sessions", {}))}
         else:
-            bucket = None
+            bucket: dict[str, Any] | None = None
             for candidate in document.get("queued_generations", ()):
                 if (
-                    isinstance(candidate, Mapping)
+                    isinstance(candidate, dict)
                     and candidate.get("source_boot_id") == boot_id
                     and candidate.get("source_daemon_generation") == generation
                     and isinstance(candidate.get("sessions"), Mapping)

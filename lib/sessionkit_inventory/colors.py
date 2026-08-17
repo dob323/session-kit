@@ -368,6 +368,7 @@ def reconcile_conversation_colors(
     Nothing is ever deleted here except entries that name a colour outside the
     palette now in force, which are already ignored on read.
     """
+
     def ordered_from(
         source: Sequence[Mapping[str, Any]],
     ) -> list[tuple[str, str]]:
