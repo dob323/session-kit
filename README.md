@@ -12,7 +12,24 @@ closes, or restores anything. Drop your connection mid-answer, SSH back in,
 press Enter — the same session is still going. That is the whole pitch;
 everything else is guardrails around it.
 
-![The Session Kit picker showing ready and open sessions grouped by provider](docs/assets/session-kit-picker.png)
+![Ten coding sessions, one place to see who needs you: the Session Kit picker](docs/assets/session-kit-hero.png)
+
+## Where it runs
+
+Install Session Kit on the Linux or macOS machine where Claude Code or Codex
+actually runs. There is no separate server to set up.
+
+- On the machine in front of you, it organizes your sessions and keeps them
+  alive when a terminal window closes.
+- On a remote host, it also lets you disconnect from SSH — on purpose or not —
+  and pick the same session up later, from any window.
+- Sessions live as long as that host stays powered on and awake. The laptop or
+  phone you connect from can sleep, disconnect, or shut down freely.
+- Want sessions available around the clock? Run the kit on something that
+  stays on — a server, a workstation, a Mac mini. Optional, but that is what
+  makes overnight work possible.
+- A host shutdown or reboot ends the running processes themselves; the
+  conversations they carried are recoverable afterwards from Closed sessions.
 
 ## What it is
 
@@ -70,6 +87,8 @@ least an hour old, with their age.
 A picker already running during an upgrade reloads itself from the new release
 at a safe refresh point and keeps its view. If the new launcher cannot start,
 the old picker stays in place and reports the degraded target.
+
+![The Session Kit picker showing ready and open sessions grouped by provider](docs/assets/session-kit-picker.png)
 
 See [Picker navigation](docs/picker-navigation.md) for every key, action, and
 fallback.

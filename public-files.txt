@@ -22,6 +22,7 @@ bin/**
 config/**
 docs/**
 docs/assets/session-kit-picker.png
+docs/assets/session-kit-hero.png
 deploy/session-kit-launcher
 deploy/session-kit-release
 extras/**

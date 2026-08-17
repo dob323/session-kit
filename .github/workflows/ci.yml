@@ -25,12 +25,16 @@ jobs:
         python:
           - "3.10"
           - "3.11"
-          # 3.12 is pinned to an exact patch: the hosted toolcache's 3.12.13
-          # ships a _curses extension built against a newer CPython
-          # (undefined symbol _PySys_GetOptionalAttrString), which kills
-          # every TUI test. Unpin when the toolcache build is repaired.
-          - "3.12.11"
+          - "3.12"
           - "3.13"
+        exclude:
+          # Every 3.12.x build in the ubuntu-24.04 toolcache ships a _curses
+          # extension built against a newer CPython (undefined symbol
+          # _PySys_GetOptionalAttrString), which kills every TUI test; the
+          # ubuntu-22.04 3.12 build is healthy and keeps the version covered.
+          # Restore this cell when the 24.04 toolcache is repaired.
+          - os: ubuntu-24.04
+            python: "3.12"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7

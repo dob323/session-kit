@@ -66,6 +66,11 @@ APPROVED_BINARY_SHA256 = {
     # Shipped publicly with v0.4.0, later trimmed from the tree; the blob
     # stays reachable in public history. Reviewed 2026-08-17: a dashboard
     # screenshot, nothing private.
+    # The Reddit launch hero: a designed banner around a picker mock. Added
+    # 2026-08-17 as the README's lead image.
+    "docs/assets/session-kit-hero.png": (
+        "6323318e29c1d7ee9c5ab2d1e766107fa8303b742ebfa86d6621b846ecf14841",
+    ),
     "docs/assets/session-kit-dashboard.png": (
         "b14518a8a78aa077be5ee7d21bdc76929b43e1f035420a1519df8965cf94e3db",
     ),
