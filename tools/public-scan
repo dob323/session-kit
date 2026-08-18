@@ -101,6 +101,9 @@ APPROVED_BINARY_SHA256 = {
         # equal pixel for pixel. Includes the prompt line the renderer used to
         # trim, and the ↵ and ❯ glyphs now that the host has a font with them.
         "e637186dfc12ad5e631074fdc4b6edb6fc096d90d5abad151287dc16db58dfc6",
+        # 2026-08-17, final: no labels at all. The picker page speaks for
+        # itself, so the figure is the render and nothing else.
+        "929e3289e14ae3313d3e2ce39c5155b5a782a947bfc0103af2ad641f4e098ef8",
     ),
     # The bare picker render, identical to the docs/assets/session-kit-picker
     # blob above because both come from the same deterministic tool.

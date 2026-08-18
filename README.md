@@ -42,7 +42,7 @@ It runs locally around [shpool](https://github.com/shell-pool/shpool) sessions. 
 Type `kit` from an ordinary shell.
 
 <p align="center">
-  <img src="docs/assets/readme/picker-anatomy.png" alt="Annotated view of the real Session Kit picker" width="100%">
+  <img src="docs/assets/readme/picker-anatomy.png" alt="The Session Kit picker" width="100%">
 </p>
 
 Ready sessions come first. Sessions already attached to another window appear under **Open elsewhere**. Within a group, attention state determines the first part of the order, followed by provider and activity.
@@ -67,6 +67,7 @@ The key-driven home screen keeps the common actions visible:
 | `m` | Open More. |
 | `a` | Show everything that needs you. |
 | `h <number>` | Read settled history without opening the session. |
+| `p <number>` | Pin that session's project; its sessions hold the top of the list, marked `*`. |
 | `?` | Show picker help. |
 | `b` or `q` | Leave the home screen for an ordinary shell. |
 
