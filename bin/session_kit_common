@@ -109,8 +109,8 @@ sk_now_unix_ms() {
 # The wait is bounded on both. An unbounded acquire meant one holder wedged
 # inside the daemon stopped every attach, create and close on the machine for
 # as long as it stayed wedged, with no message and no way out but finding the
-# process by hand. The bound is generous — an honest create holds this lock
-# through an attach and its generation proof — so reaching it means the holder
+# process by hand. The bound is generous, an honest create holds this lock
+# through an attach and its generation proof, so reaching it means the holder
 # is stuck, not merely slow.
 SK_LOCK_WAIT_SECONDS=${SESSION_KIT_LOCK_WAIT_SECONDS:-120}
 [[ $SK_LOCK_WAIT_SECONDS =~ ^[0-9]+$ && $SK_LOCK_WAIT_SECONDS -ge 1 ]] ||
@@ -1627,7 +1627,7 @@ sk_provider_name() {
 }
 
 # How a session is named to a person: its session number and its own title,
-# or its provider when it has neither. Never an internal ID — no human-readable
+# or its provider when it has neither. Never an internal ID, no human-readable
 # Session Kit output prints one, anywhere.
 # The kit owns the terminal tab name (K3), on both providers.
 #
@@ -1706,8 +1706,8 @@ sk_human_label() {
 #   * a person at a terminal is told what is about to happen, by name, and the
 #     action proceeds;
 #   * automation, which has no one to tell, must name the exact session it is
-#     acting on in SESSION_KIT_CONFIRM_ID. That half is a proven safety net —
-#     a pipe feeding "y" was never a person reading a label — and it stays.
+#     acting on in SESSION_KIT_CONFIRM_ID. That half is a proven safety net 
+#     a pipe feeding "y" was never a person reading a label, and it stays.
 #
 # The exact ID travels as an argument and is never printed back.
 sk_confirm_exact() {

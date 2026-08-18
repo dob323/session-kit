@@ -167,7 +167,7 @@ class InstallerTests(unittest.TestCase):
         # The tree is walked to restore search permission on directories the
         # installer deliberately locked, then removed. A test's own git
         # subprocess can still be pruning objects underneath that walk, and
-        # rglob raises when a directory disappears mid-scan — a cleanup that
+        # rglob raises when a directory disappears mid-scan, a cleanup that
         # failed the run over work it was about to delete anyway. Both the
         # walk and each chmod tolerate a vanished entry.
         try:

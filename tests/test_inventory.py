@@ -4216,7 +4216,7 @@ class CodexTurnStateTests(unittest.TestCase):
         )
         completed = self._event("event_msg", {"type": "task_complete"})
         # A finished turn whose last words ask the human something is a soft
-        # wait, not idle — but never the hard "needs your reply".
+        # wait, not idle, but never the hard "needs your reply".
         self.assertEqual("reply optional", self._state([started, asking, completed]))
         # A statement ending the turn stays idle.
         stating = self._event(
@@ -4514,7 +4514,7 @@ class TerminalNumberRegistryTests(unittest.TestCase):
         )
         self.assertEqual({}, retired)
 
-        # Pass 2: session 1 died — ordinary number 1 enters quarantine.
+        # Pass 2: session 1 died, ordinary number 1 enters quarantine.
         survivor = inventory_core.build_inventory(
             *inventory_fixture(2), now=1_800_000_100
         )
@@ -4548,7 +4548,7 @@ class TerminalNumberRegistryTests(unittest.TestCase):
         self.assertEqual(3, numbers["main3"])
         self.assertIn(1, retired)
 
-        # Pass 4: the dead conversation RECOVERS inside the window — its AI
+        # Pass 4: the dead conversation RECOVERS inside the window, its AI
         # binding hands its old number back and the retirement clears.
         revived = inventory_core.build_inventory(
             *inventory_fixture(3), now=1_800_000_300
@@ -4568,7 +4568,7 @@ class TerminalNumberRegistryTests(unittest.TestCase):
         self.assertEqual(1, revived_numbers["main"])
         self.assertNotIn(1, retired)
 
-        # Pass 5: dead again, and the quarantine EXPIRES — the number frees,
+        # Pass 5: dead again, and the quarantine EXPIRES, the number frees,
         # its bindings prune, and the next new session takes the lowest gap.
         after = inventory_core.build_inventory(*inventory_fixture(3), now=1_800_000_400)
         after["sessions"] = after["sessions"][1:]
@@ -4705,7 +4705,7 @@ class TerminalNumberRegistryTests(unittest.TestCase):
                 )
                 unprovable = inventory["sessions"][1]
                 # The row that cannot be proven is named and made
-                # unactionable, not numbered — and it does not take the rest
+                # unactionable, not numbered, and it does not take the rest
                 # of the estate down with it.
                 self.assertIsNone(unprovable["terminal_number"])
                 self.assertIs(False, unprovable["mutation_allowed"])
@@ -5293,7 +5293,7 @@ class AutomaticTitleTests(unittest.TestCase):
             ),
         )
         # The alias keeps its place against a native title the kit itself
-        # pushed — that one is the kit's own echo, not somebody's rename.
+        # pushed, that one is the kit's own echo, not somebody's rename.
         self.assertEqual(
             ("Manual Override", "alias"),
             inventory_core._provider_title_info(
@@ -5847,7 +5847,7 @@ class AutomaticTitleTests(unittest.TestCase):
                     ):
                         call()
                 # The reset drops the alias. The override is not a display
-                # tier — it outlives the name it was recorded for.
+                # tier, it outlives the name it was recorded for.
                 inventory_core.mutate_canonical_alias(config, "codex", exact, None)
                 document = json.loads(config_path.read_text(encoding="utf-8"))
                 self.assertEqual({}, document["aliases"])
@@ -6356,7 +6356,7 @@ class CensusSelfExclusionTests(unittest.TestCase):
         self.assertEqual(
             ("Idle shell", "/srv/x", 100), _shell_title(tree, 100, table, chain)
         )
-        # Without the exclusion the census's own python3 wins — the exact
+        # Without the exclusion the census's own python3 wins, the exact
         # mechanism that made reopen structurally impossible.
         self.assertEqual("python3", _shell_title(tree, 100, table)[0])
 
@@ -7580,8 +7580,8 @@ class WorkerLaunchGateTests(unittest.TestCase):
         # provider-exit recovery is unavailable" for a session whose retained
         # record held `claude --resume <uuid>`. The menu runs the collector
         # from inside the managed shell, so the collector saw its own helper
-        # as the session's work, called the row running, and the overlay —
-        # which only annotates idle shells — never attached the recovery.
+        # as the session's work, called the row running, and the overlay 
+        # which only annotates idle shells, never attached the recovery.
         fixture = list(inventory_fixture(1, providers=("codex",)))
         active = inventory_core.build_inventory(*fixture, now=1_800_000_000)
         expected_uuid = uuid_for(1)
@@ -7715,7 +7715,7 @@ class WorkerLaunchGateTests(unittest.TestCase):
         # The suppression above is exactly the collector's own process and the
         # processes it started. A workload the terminal itself is running is a
         # sibling of the collector, not a descendant, and it is still reported
-        # — otherwise the row would lie about a busy terminal.
+        #, otherwise the row would lie about a busy terminal.
         fixture = list(inventory_fixture(1, providers=("codex",)))
         root_pid = 1001
         del fixture[2][2001]

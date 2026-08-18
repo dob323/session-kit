@@ -42,8 +42,8 @@ let it reach the public repository.
 
 ## The sequence
 
-1. Stop every writer of the mutable source state — the automatic picker,
-   cleanup, watchdog, new journals, and anything else that can touch it — and
+1. Stop every writer of the mutable source state, the automatic picker,
+   cleanup, watchdog, new journals, and anything else that can touch it, and
    verify they are stopped before you copy a byte.
 2. Capture a second frozen shpool list and provider inventory. Stop if the
    daemon generation or the managed-session set moved since the first capture:
@@ -71,11 +71,11 @@ let it reach the public repository.
 9. Convert names under the private configuration lock,
    `${XDG_STATE_HOME:-$HOME/.local/state}/session-kit/config.lock`, which is the
    lock the kit's own name and color writers hold.
-10. Plan the recovery-state conversion — `recovery-manifest.json` and
-    `recovery-pending.json` — from the frozen and current identity evidence.
+10. Plan the recovery-state conversion, `recovery-manifest.json` and
+    `recovery-pending.json`, from the frozen and current identity evidence.
 11. Review each affected conversation before applying that plan.
 12. Take a strict live inventory and compare generations.
-13. Publish the target integration marker and start the target services — now,
+13. Publish the target integration marker and start the target services, now,
     and only after every copy, conversion, and verification check has passed.
 14. Verify listing and a fresh login without moving, killing, repairing, or
     recovering an active session.
@@ -115,4 +115,4 @@ Migration is complete when the selected release and the integration marker
 agree, a strict inventory carries no unexplained warning, current sessions
 retain their identity and attachment state, a fresh login works, the rollback
 checks pass, and every private archive still verifies. Until all six hold, the
-old installation is still the one you can fall back to — keep it.
+old installation is still the one you can fall back to, keep it.

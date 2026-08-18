@@ -821,7 +821,7 @@ def _content_transcript_probe(
             # apart exactly: a worker's transcript cannot predate the worker
             # process. Older than the worker (with an hour of clock slack)
             # decides non-member; as new as the worker or newer REFUSES the
-            # whole answer — the no-close direction.
+            # whole answer, the no-close direction.
             if worker_started_ns is None:
                 return (
                     False,

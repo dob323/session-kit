@@ -528,7 +528,7 @@ def run_pty(
             # A second scripted beat for flows that hand the terminal to a
             # NEW process mid-run (the upgrade handoff): wait for a marker
             # only that successor can print, then type into it. The deadline
-            # is the followup's own — recovery spans exec boundaries and can
+            # is the followup's own, recovery spans exec boundaries and can
             # honestly take longer than the marker wait above.
             followup_marker, followup_payload, followup_wait = followup
             followup_deadline = time.monotonic() + followup_wait
@@ -1170,7 +1170,7 @@ class LoginPickerTests(unittest.TestCase):
             code, output = run_pty(fixture, b"q\n", lines=30, columns=120)
             self.assertEqual(0, code)
             # Three: the footer's "needs you a", and the two blocking rows'
-            # state slots — one word for one state since the needs-you rename.
+            # state slots, one word for one state since the needs-you rename.
             self.assertEqual(3, output.count("needs you"))
             self.assertLess(output.index("reply-codex"), output.index("ready-claude"))
             self.assertLess(

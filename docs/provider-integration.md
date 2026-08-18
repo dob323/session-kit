@@ -34,7 +34,7 @@ than `projects/-home-me-projects-api/`).
 The export happens only with every proof in hand: a launcher of 2.1.234 or
 newer, exactly one shortcut registered for that root, an alias that passes
 Claude's own naming rules, and no directory conflict. An existing munged
-directory is renamed to the alias in one atomic move first — and only while
+directory is renamed to the alias in one atomic move first, and only while
 no other session of that profile is running inside the root, because a
 half-migrated project would hide its own memory. Anything unprovable leaves
 the launch on the munged-name behaviour it has today; `session-kit doctor`

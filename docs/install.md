@@ -67,7 +67,7 @@ tag it points at, and every check that passed before publication.
 
 The installer puts its commands in `$HOME/.local/bin`. On Debian and Ubuntu,
 `~/.profile` adds that directory to `PATH` only if it already existed when you
-logged in — so if you have never had one, `session-kit` is `command not found`
+logged in, so if you have never had one, `session-kit` is `command not found`
 until you start a new login shell.
 
 That first `session-kit doctor` run then exits **1**, on a perfectly good
@@ -82,8 +82,7 @@ That is the expected result at this point, not a broken install: the installer
 writes the unit files and refreshes the user service manager, but it does not
 enable shpool or the watchdog on a fresh install. It may enable only a newly
 introduced timer that has no prior enabled/disabled policy. Doctor turns green after
-[Activate safely](#activate-safely) below. Everything else doctor checks —
-files, permissions, provider readers, kill switches — is meaningful right now.
+[Activate safely](#activate-safely) below. Everything else doctor checks (files, permissions, provider readers, kill switches) is meaningful right now.
 
 On the first interactive install, Session Kit reads the project paths already
 recorded by Claude Code and Codex, shows the existing directories it found,
@@ -126,9 +125,9 @@ stops, or restarts shpool.
 
 ## Requirements
 
-- shpool 0.11.0 — see [shpool](#shpool) for the two supported ways to get it,
+- shpool 0.11.0, see [shpool](#shpool) for the two supported ways to get it,
   including a route that needs no compiler on the target machine;
-- Claude Code, Codex, or both — see [Provider CLIs](#provider-clis);
+- Claude Code, Codex, or both, see [Provider CLIs](#provider-clis);
 - a single trusted Unix account;
 - enough local access to run per-user services.
 
@@ -159,7 +158,7 @@ installation. There is no preview switch that bypasses these checks.
 Session Kit manages provider conversations; it does not install or update the
 providers. The preflight **fails** with `install Claude Code, Codex, or both`
 until at least one provider command is on `PATH`, so install one first, from its
-vendor's own instructions. Either provider alone is enough. The commands below are the vendors' documented ones — check the
+vendor's own instructions. Either provider alone is enough. The commands below are the vendors' documented ones, check the
 linked page if a command fails, since these change.
 
 **Claude Code** ([install guide](https://code.claude.com/docs/en/setup)):
@@ -270,7 +269,7 @@ patches against that release and installs none of them automatically. Review
 [the patch guide](../shpool-patch/README.md) before deciding.
 
 Read about `0004` first. Stock 0.11.0 can deadlock on detach and make every
-managed session unreachable at once — the daemon stays alive and accepting
+managed session unreachable at once, the daemon stays alive and accepting
 connections while every list, attach, and detach blocks forever, and it does not
 recover on its own. One stalled SSH window is enough to trigger it. The other
 five patches address narrower problems.

@@ -191,7 +191,7 @@ class AliasVersusPathTests(ResolverFixture):
     def test_a_manifest_further_up_governs_neither_alias_launch(self) -> None:
         # Whether the parent is on the list or not, an alias pointing deeper
         # launches with the shortcut's own settings only. The alias directory
-        # is itself on the list, so the project is trusted — there is simply
+        # is itself on the list, so the project is trusted, there is simply
         # no manifest of its own to apply, and the one above it is not
         # reached. Adding /repo/tools is not a statement about who may write
         # /repo's manifest.

@@ -2,7 +2,7 @@
 # Safe session-kit reaper.
 #
 # The normal report records verified idle empty-shell candidates for confirmed
-# `sp prune` — seven days by default, SESSION_KIT_PRUNE_DAYS otherwise, and the
+# `sp prune`, seven days by default, SESSION_KIT_PRUNE_DAYS otherwise, and the
 # window travels with the list it produces. `--auto-close` is narrower, is now
 # a BACKSTOP (see WHAT --auto-close IS FOR NOW, under the variable block), and
 # may close only a generated, provider-exited terminal after 72 continuous
@@ -108,7 +108,7 @@ source "$SCRIPT_DIR/session_kit_common"
 #      bashrc once, at session start; installing a release does not restart a
 #      live session, so every session already running when the new close
 #      landed keeps the old path for the rest of its life.
-#   2. The close itself failed — an unwritable ledger, a python3 that was
+#   2. The close itself failed, an unwritable ledger, a python3 that was
 #      momentarily unavailable. The shell keeps such a session on purpose and
 #      says so; the record and the conversation are both intact, which is
 #      exactly what this engine needs, so it finishes the job three days on.
@@ -116,7 +116,7 @@ source "$SCRIPT_DIR/session_kit_common"
 #      daemon still advertises a session whose shell process is gone, no
 #      picker action can reach it, and only a daemon restart or this pass
 #      clears it. (Stock shpool leaves such a row behind whenever a session
-#      nobody is attached to loses its shell — measured on shpool 0.11.) This
+#      nobody is attached to loses its shell, measured on shpool 0.11.) This
 #      class clears on its first complete pass; the 72-hour window protects
 #      live empty shells and has no safety value once every session process is
 #      proved absent.
@@ -318,7 +318,7 @@ def stale_tui_capture(directory: int, name: str, cutoff_ns: int) -> bool:
         return False
     finally:
         os.close(capture)
-# mktemp writes <label>.json.XXXXXX — suffix AFTER .json. The old
+# mktemp writes <label>.json.XXXXXX, suffix AFTER .json. The old
 # <label>.SUFFIX.json form never matched a real file (the inversion leaked
 # every picker temp ever written); both spellings are accepted so any
 # stragglers from older releases are still collected.
@@ -355,7 +355,7 @@ except OSError:
 # A live picker refreshes its private temps every few seconds, so the 24-hour
 # age cutoff below already guarantees no in-use file is touched. The old
 # whole-run abort whenever ANY same-user picker was live made expiry
-# permanently dead on a box that always has a picker open — the leak this
+# permanently dead on a box that always has a picker open, the leak this
 # collector exists to prevent. Only an unreadable process table still aborts.
 for name in proc_names:
     if not name.isdigit():
@@ -584,7 +584,7 @@ except (OSError, ValueError):
 # readable only for a dumpable process, and `systemd --user`, `(sd-pam)` and
 # every `sshd-session` are same-uid and permanently non-dumpable. Treating that
 # PermissionError as "no proof" aborted the whole scan before the deletion loop
-# on every systemd-user host, so this GC had never once run to completion — 152
+# on every systemd-user host, so this GC had never once run to completion, 152
 # release directories and 368 MB with no log line to notice it by. A process
 # whose environment cannot be read still contributes its cmdline and cwd, and
 # neither can be forged into a reference the scan misses: an unreadable
@@ -841,7 +841,7 @@ json=$BOUND_SHPOOL_JSON
 
 # A Codex App Server socket dies with its window, but the private directory
 # holding it survives every reboot, so the tree grows one entry per Codex
-# session forever — and a live-rename sweep that walks it pays for every
+# session forever, and a live-rename sweep that walks it pays for every
 # corpse. Remove only directories whose session the daemon no longer lists,
 # whose socket refuses a connection, and that nothing has touched for an hour.
 # Entirely fail-open: no proof, no removal.

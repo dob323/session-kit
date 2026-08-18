@@ -352,7 +352,7 @@ def render_inventory(
     yellow = "\033[33m" if color else ""
     reset = "\033[0m" if color else ""
     # Truecolor values equal to what Codex RENDERS for each sk-<color> theme
-    # accent (measured from captured frames — Codex contrast-adjusts the raw
+    # accent (measured from captured frames, Codex contrast-adjusts the raw
     # theme hex), so a session's name is pixel-identical here and in its own
     # Codex status bar. Remeasure if the theme anchors ever change.
     session_palette = SESSION_PALETTE if color else {}
@@ -811,8 +811,8 @@ def render_picker_page(
         projected_now = _timestamp(row.get("_picker_time_as_of_unix_ms"))
         as_of = rendered_at if projected_now is None else projected_now
         # One time, one phrasing, on every row. Rows used to choose between
-        # three shapes — `needs you 3 hr`, `12 min ago`, `opened 3 hr
-        # ago` — depending on what each row happened to know, so no two rows
+        # three shapes, `needs you 3 hr`, `12 min ago`, `opened 3 hr
+        # ago`, depending on what each row happened to know, so no two rows
         # measured the same thing and nothing lined up.
         age_detail = _last_active(row, as_of)
         compact_age = labels.row_last_active_compact(row, as_of)
@@ -908,7 +908,7 @@ def render_picker_page(
         #
         # This was the review's blocking finding, and it deleted the time from
         # every row at the width the operator actually works at. `label_width`
-        # was sized against the SHORTEST detail form — the state word alone —
+        # was sized against the SHORTEST detail form, the state word alone, 
         # so the title grew until only that fit; the page-wide chooser then
         # found the real details would not fit the room the title had just
         # taken and fell all the way back to state-only, which carries no time.
@@ -985,11 +985,11 @@ def render_picker_page(
         # Which form of the details every row shows, decided ONCE for the page.
         # It used to be decided per row against the same room, so at one width
         # a row saying `last active just now` kept its time while the row above
-        # it saying `last active 3h 9m ago` — one cell longer — lost it. That
+        # it saying `last active 3h 9m ago`, one cell longer, lost it. That
         # is the ragged column the operator was reading: not a column at all,
         # just whatever each row happened to fit.
         # `essential` is the LAST form, not `status`. A window too narrow for
-        # the whole pair gets it truncated rather than deleted — which is what
+        # the whole pair gets it truncated rather than deleted, which is what
         # `sp list` has always done, and the two surfaces gave different answers
         # at the same width while this ladder ended in a state word alone.
         forms = (

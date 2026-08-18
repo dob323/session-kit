@@ -656,7 +656,7 @@ class ProviderExitShellTests(ProviderExitShellHarness):
     def test_a_clean_exit_closes_the_session_without_a_menu(self) -> None:
         # /exit is the operator saying "done here": the shell ends with the
         # provider, which ends the shpool session. No marker, no menu, no
-        # opt-in — tests/test_exit_closes_session.py covers the contract.
+        # opt-in, tests/test_exit_closes_session.py covers the contract.
         completed = self.launch("")
         self.assertEqual(0, completed.returncode, completed.stderr)
         self.assertNotIn("Provider exited:", completed.stdout)

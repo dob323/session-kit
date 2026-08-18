@@ -668,8 +668,8 @@ picker_read_raw() {
     echo
     return 1
   fi
-  # A plain `read` is RESTARTED after a trapped signal — bash runs the handler
-  # and goes straight back to waiting — so the interrupt flag set by the trap
+  # A plain `read` is RESTARTED after a trapped signal, bash runs the handler
+  # and goes straight back to waiting, so the interrupt flag set by the trap
   # is never looked at until a whole line is typed. That is the entire reason
   # Ctrl-C could not cancel a single prompt in this picker. A one-second bound
   # gives the flag somewhere to be noticed; the line discipline is holding any
@@ -1140,7 +1140,7 @@ new_temp() {
 
 # Compute-first home frame: the whole screen is rendered into the capture
 # file (in this shell, so renderer state survives), then reaches the
-# terminal as one write via picker_frame_emit_file — the screen is never
+# terminal as one write via picker_frame_emit_file, the screen is never
 # erased ahead of content, so a slow render cannot flash a blank frame.
 # Falls back to the erase-first path only when the capture file is missing.
 picker_redraw_home() {
@@ -1148,10 +1148,10 @@ picker_redraw_home() {
   if [[ -n ${PICKER_FRAME_FILE:-} && -f ${PICKER_FRAME_FILE:-} ]]; then
     # With stdout captured to a file, size probes that ioctl stdout return
     # their fallback and rows lay out for the wrong terminal. tput still
-    # reads the real size from stderr, so pin it for the capture — freshly
+    # reads the real size from stderr, so pin it for the capture, freshly
     # each frame, which is also what keeps a resize honest.
     # Kernel winsize first (0 means never sized), tput second, exported
-    # size last — same chain and reasons as the picker's own frame capture.
+    # size last, same chain and reasons as the picker's own frame capture.
     __sk_size=$(command stty size <&2 2>/dev/null) || __sk_size=
     cols=${__sk_size##* }; rows=${__sk_size%% *}
     [[ $cols =~ ^[0-9]+$ && $cols -gt 0 ]] || cols=
@@ -1259,7 +1259,7 @@ picker_live_stop() {
 }
 
 # A menu window can sit open across release rollovers, silently running old
-# code against new state — every fix ships and the standing windows never see
+# code against new state, every fix ships and the standing windows never see
 # it. Replace this picker with the current release at the next safe point.
 #
 # What the person was looking at travels with it: the grouping, the compact
@@ -1300,7 +1300,7 @@ picker_self_upgrade() {
   # A target that already failed a handoff in this window is broken until
   # `current` changes again. The marker survives the recovery exec, so the
   # relaunched picker warns once instead of tearing itself down every idle
-  # beat against the same corpse — the retry storm two review lanes built.
+  # beat against the same corpse, the retry storm two review lanes built.
   if [[ ${SESSION_KIT_PICKER_UPGRADE_FAILED_TARGET:-} == "$current" ]]; then
     if [[ ${PICKER_UPGRADE_WARNING_KEY:-} != "$warning_key" ]]; then
       PICKER_UPGRADE_WARNING_KEY=$warning_key
@@ -1311,7 +1311,7 @@ picker_self_upgrade() {
   fi
   # This is the release-owned launcher selected by the stable login front
   # door. Validate what is cheaply knowable before stopping children or
-  # removing any old temp file — but no static probe can prove a program will
+  # removing any old temp file, but no static probe can prove a program will
   # SERVE (an env-shebang launcher execs fine and exits 127 a beat later), so
   # the real guarantee is the supervised handoff below, not this check.
   if [[ ! -f $launcher || -L $launcher || ! -x $launcher ]]; then
@@ -1333,8 +1333,8 @@ picker_self_upgrade() {
   printf 'Reloading the picker into release %s.\n' "$release_id"
   # Supervised handoff: the new picker runs as this shell's foreground child
   # and owns the terminal. If it serves, this shell is a dormant wrapper that
-  # propagates the eventual exit. If it dies within the probation window —
-  # exec failure, missing env command, startup crash — the window has NOT
+  # propagates the eventual exit. If it dies within the probation window 
+  # exec failure, missing env command, startup crash, the window has NOT
   # been upgraded, this shell says so, marks the target failed, and relaunches
   # the release it was serving seconds ago. Announcing success is the one
   # thing that never happens before the child has outlived probation.
@@ -1343,7 +1343,7 @@ picker_self_upgrade() {
   probation=${SESSION_KIT_PICKER_HANDOFF_PROBATION_SECONDS:-5}
   # Bounded digits, forced base ten: bare [0-9]+ accepted "08", which bash
   # arithmetic reads as broken octal and ABORTS on, and a 16-digit value
-  # multiplied by 1000 wrapped the probation negative — both demonstrated by
+  # multiplied by 1000 wrapped the probation negative, both demonstrated by
   # review round five, both ending the picker. Six digits is 11.5 days.
   # Zero is not a probation: "0" (and "000000") disabled the guard entirely,
   # so an instant status-0 corpse was announced as served and the picker
@@ -1358,20 +1358,20 @@ picker_self_upgrade() {
   # EPOCHREALTIME, not SECONDS, when it exists: integer seconds rounded a
   # 4.2-second corpse up to the probation and accepted it as served (review
   # lane rv-rn4-2). Milliseconds leave no boundary to round across. The
-  # separator is the locale's — a decimal comma aborted the arithmetic in
-  # round five — so strip every non-digit rather than assume the point.
+  # separator is the locale's, a decimal comma aborted the arithmetic in
+  # round five, so strip every non-digit rather than assume the point.
   # The expansion is guarded: EPOCHREALTIME is a Bash 5.0 variable, this
   # script promises Bash 4, and under nounset a bare ${EPOCHREALTIME//...}
   # ABORTS the shell after the reload line with no recovery (review lane
   # rv-rn6-2). On a shell without it, the builtin printf's %(%s)T strftime
-  # clock (Bash 4.2) stands in — a builtin reading the system clock, never a
+  # clock (Bash 4.2) stands in, a builtin reading the system clock, never a
   # shell variable. SECONDS is deliberately NOT the fallback: it is mutable
   # shell state, and a hostile BASH_ENV turned it into a line counter
   # (declare -n SECONDS=LINENO) that credited an instant corpse with fifteen
   # seconds it never lived (review lanes rv-rn7-1/2). The whole-second
   # reading is discounted by one full second below so rounding can never
   # credit a corpse with time it did not live. A shell with neither clock
-  # reads zero elapsed and takes the recovery path — the direction that
+  # reads zero elapsed and takes the recovery path, the direction that
   # never announces a served picker falsely.
   local handoff_clock=millisecond
   handoff_started=${EPOCHREALTIME-}
@@ -1390,7 +1390,7 @@ picker_self_upgrade() {
       handoff_elapsed_ms=$(( (10#$handoff_ended - 10#$handoff_started) / 1000 ))
     else
       # A clock that cannot be read is not a served picker: zero elapsed
-      # takes the recovery path, which can only ever cost one relaunch — the
+      # takes the recovery path, which can only ever cost one relaunch, the
       # failure direction that never accepts a corpse.
       handoff_elapsed_ms=0
     fi
@@ -1408,13 +1408,13 @@ picker_self_upgrade() {
     fi
   fi
   # Two verdicts mean the child never served this window, whatever its exit
-  # status says. An instant zero exit is a corpse wearing a success code — a
+  # status says. An instant zero exit is a corpse wearing a success code, a
   # person cannot open and leave a picker faster than it draws (review lane
   # rv-rn3-2's zero-exit corpse). And death by signal is never a served
   # picker's own ending: a real picker handles INT by redrawing, so 128+N
   # means a hang someone had to kill (the same lane's non-serving hang).
   if (( handoff_elapsed_ms >= probation_ms && handoff_status < 128 )); then
-    # It served. Its ending — a person leaving, or its own exit — passes
+    # It served. Its ending, a person leaving, or its own exit, passes
     # through untouched.
     exit "$handoff_status"
   fi

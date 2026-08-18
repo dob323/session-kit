@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # User-level hook (SessionStart + UserPromptSubmit): if this session has a
-# recorded name intent (~/.claude/sessions/<sessionId>.nameintent — written by
+# recorded name intent (~/.claude/sessions/<sessionId>.nameintent, written by
 # session-kit name propagation or agent_name_session.sh), set the live TUI
 # title to it. Project-agnostic so kit-assigned names rename Claude Code in
 # every project, not just repos that ship their own coordination hooks.
@@ -15,7 +15,7 @@ case "$EVENT" in SessionStart|UserPromptSubmit|Stop) ;; *) exit 0 ;; esac
 INTENT="$HOME/.claude/sessions/$SID.nameintent"
 if [ -f "$INTENT" ] && [ ! -L "$INTENT" ]; then
   # Stop stays silent: the runtime ignores sessionTitle there (retested
-  # on 2.1.221, as did PostToolUse — only SessionStart and UserPromptSubmit
+  # on 2.1.221, as did PostToolUse, only SessionStart and UserPromptSubmit
   # apply it; probes 2026-08-04).
   [ "$EVENT" = Stop ] && exit 0
   TITLE="$(tr -d '\n\r' < "$INTENT" 2>/dev/null | cut -c1-64)"

@@ -185,7 +185,7 @@ class RowContentTests(unittest.TestCase):
     def test_an_absent_model_says_why_rather_than_showing_a_dash(self) -> None:
         sessions = inventory(row("Alpha", number=1)).sessions
         drawn = rowmod.build_rows(sessions)[0]
-        # Both unpulled sections say pending — the operator rule: until a
+        # Both unpulled sections say pending, the operator rule: until a
         # section has a valid read, it says pending, never a dash.
         self.assertIn("CLD | pending | pending |", drawn.detail)
 

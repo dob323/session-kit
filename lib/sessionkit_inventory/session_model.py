@@ -42,7 +42,7 @@ SCHEMA_VERSION = 1
 CACHE_DIRECTORY = "model"
 
 # The first backward window, per provider, chosen from measurement rather than
-# taste — and the two providers are nothing alike.
+# taste, and the two providers are nothing alike.
 #
 # Claude appends `message.model` on every assistant record, so the newest one is
 # usually near the end: 11 of 16 live transcripts here carry it within 48 KB.

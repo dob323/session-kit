@@ -8,7 +8,7 @@ be reached from a stdlib-only Python process.
 That dependency is not the danger by itself. The danger is how it fails: a
 format that changes shape says nothing. The reader finds no matching record,
 returns its empty answer, and a title, a colour or a whole history quietly stops
-working while every command still exits 0. So this page is the inventory —
+working while every command still exits 0. So this page is the inventory,
 every place the kit touches a vendor internal, the exact assumption it makes,
 and what a person sees when that assumption stops being true.
 
@@ -16,15 +16,15 @@ and what a person sees when that assumption stops being true.
 `internal-formats`, naming every format and every field it could not confirm:
 
 * **fail** when an example is present and a field a feature cannot work without
-  has gone — at that point something a person depends on is already broken;
+  has gone, at that point something a person depends on is already broken;
 * **warn** when the file is still readable and a field named below as degrading
   rather than breaking has gone (`statusUpdatedAt`, `messagingSocketPath`,
-  `thread_name`), or when no readable fixture is available — an unchecked
+  `thread_name`), or when no readable fixture is available, an unchecked
   format is not known to be healthy;
 * **ok** only when all five were found and every field was there.
 
-A file that is still being written — a transcript created a second ago, a line
-cut off mid-append — is not a moved format, and never produces the fail. The
+A file that is still being written, a transcript created a second ago, a line
+cut off mid-append, is not a moved format, and never produces the fail. The
 scan carries a wall-clock budget (`SESSION_KIT_DOCTOR_FORMAT_SECONDS`, default
 10) and bounded traversal, so a slow or enormous home ends the check instead of
 hanging doctor.
@@ -37,7 +37,7 @@ in silence.
 
 ## Claude Code
 
-### 1. The per-process session record — READ and WRITE
+### 1. The per-process session record, READ and WRITE
 
 `~/.claude/sessions/<pid>.json` (per account profile, so also
 `$CLAUDE_CONFIG_DIR/sessions/<pid>.json`).
@@ -50,14 +50,14 @@ in silence.
 | `name` is the title shown by Claude's own session picker | `providers_claude` (read), `names_push` (write) |
 | `statusUpdatedAt` is Claude's own millisecond stamp for `status` | `providers_claude._enrich_claude_payload` → `attention.merge` |
 | `messagingSocketPath` is the session's inbox socket | `claude_socket.find_target` |
-| the file's mtime moves when the session's status transitions | `pulse.watched_paths` — stat only, parses nothing |
+| the file's mtime moves when the session's status transitions | `pulse.watched_paths`, stat only, parses nothing |
 
 The reader recognises `bridgeSessionId, cwd, entrypoint, kind,
 messagingSocketPath, name, peerProtocol, pid, procStart, sessionId, startedAt,
 status, statusUpdatedAt, updatedAt, version`.
 
 **Sanctioned alternative:** `claude agents --json` is the documented command and
-the kit already runs it — but it returns seven fields only (`pid, cwd, kind,
+the kit already runs it, but it returns seven fields only (`pid, cwd, kind,
 startedAt, sessionId, name, status`), none of the four above. There is nothing
 to migrate to today.
 
@@ -70,7 +70,7 @@ and the pulse stops seeing status transitions, so the picker learns about a
 waiting session on the timed poll instead of within a second. Nothing crashes; a
 person sees stale titles, later attention and slower delivery.
 
-### 2. The transcript JSONL — READ and WRITE
+### 2. The transcript JSONL, READ and WRITE
 
 `~/.claude/projects/<slug>/<uuid>.jsonl`.
 
@@ -86,12 +86,12 @@ person sees stale titles, later attention and slower delivery.
 **Sanctioned alternatives, and why they are not in yet:**
 
 * the **hook `transcript_path`** field is sanctioned, and
-  `config/claude/nameintent_title.sh` already uses exactly that — it never
+  `config/claude/nameintent_title.sh` already uses exactly that, it never
   guesses a path. That reader is already on a supported interface;
 * `/export` is interactive only;
 * the TypeScript SDK's `getSessionMessages` / `renameSession` / `tagSession`
   would replace the reads and the name write, but reaching them needs a Node
-  process — the kit is stdlib-only Python by design, so this is a decision, not
+  process, the kit is stdlib-only Python by design, so this is a decision, not
   a patch;
 * the messaging socket's rename control frame is available and
   `sessionkit_messages.claude_socket.rename()` implements it. It renames a
@@ -104,13 +104,13 @@ person sees stale titles, later attention and slower delivery.
 in `transcript_text` does not apply to a Claude conversation), auto-titles and
 colours stop being recovered, and the name push appends records nothing reads.
 
-### 3. The messaging auth key — READ
+### 3. The messaging auth key, READ
 
 `~/.claude/sessions/<pid>.<sha256 of the resolved socket path>.key`, mode 0600,
 `{"peerToken": "<32 hex>", "procStart": "…"}`.
 
 Read by `claude_socket.read_peer_token`. The digest is over the **resolved**
-socket path — `/run/user/<uid>/cc-socks/<pid>.sock` — rather than the spelling
+socket path, `/run/user/<uid>/cc-socks/<pid>.sock`, rather than the spelling
 of an unresolved link.
 
 **Sanctioned alternative:** none; the token is what the protocol requires and
@@ -124,26 +124,26 @@ was designed to have.
 
 ## Codex
 
-### 4. Rollout JSONL — READ
+### 4. Rollout JSONL, READ
 
 `~/.codex/sessions/**/rollout-*.jsonl`.
 
 Read by `providers_codex` (turn state, bounded tail reads by descriptor) and
 `transcript_text.render_rollout` (history). Assumption: JSON lines, each with a
 `type` naming the event and a `payload` object under it. `pulse.watched_paths`
-also depends on this path — stat only, because a Codex session waiting for an
+also depends on this path, stat only, because a Codex session waiting for an
 approval appends a rollout record and raises no other signal.
 
 **Sanctioned alternative:** the Codex **app-server** JSON-RPC exposes
 conversation state, and the kit already speaks it for steering. Migrating the
 history and turn-state reads onto it is real work with a live dependency on the
-app server being up — it belongs to the app-server items, not to this page.
+app server being up, it belongs to the app-server items, not to this page.
 
 **When it breaks:** Codex history renders empty and turn state falls back to
 silence-only evidence, which is exactly the Codex-side blindness the ledger
 already records.
 
-### 5. Session index — READ and WRITE
+### 5. Session index, READ and WRITE
 
 `~/.codex/session_index.jsonl`, read by `names`, `names_push` and
 `providers_codex` to map a conversation id to its rollout, and stat-ed by

@@ -12,7 +12,7 @@
 
 # ---- projects ----------------------------------------------------------
 # Adding a project used to mean knowing an alias, a provider keyword, and an
-# absolute path — none of which the picker ever offered. It lives here rather
+# absolute path, none of which the picker ever offered. It lives here rather
 # than on the main screen because you add a project a few times a year.
 projects_tool() {
   [[ -f $PROJECTS_TOOL ]] || return 1

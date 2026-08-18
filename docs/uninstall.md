@@ -32,7 +32,7 @@ session-kit services disable
 
 On macOS this step is mandatory and uninstall enforces it twice over. Uninstall
 refuses while any of the three Session Kit labels is loaded, and refuses again
-while any of the three plist files remains in `~/Library/LaunchAgents` — even
+while any of the three plist files remains in `~/Library/LaunchAgents`, even
 unloaded, even after a manual `launchctl bootout`. Removing those files by hand
 is the case `services disable` exists to replace: before it touches an active
 plist it proves that file is byte-identical to the template this installation
@@ -123,9 +123,9 @@ the `session-kit` command are both gone, so there is no supported path back to a
 proved purge.
 
 Disable the services before purging code. The installed units execute paths
-inside the root being deleted — on Linux the watchdog unit runs
+inside the root being deleted, on Linux the watchdog unit runs
 `~/.local/lib/session-kit/current/bin/session_kit_watchdog` and the reaper unit
-runs `~/.local/bin/shpool_reaper` — so purging while they are enabled leaves
+runs `~/.local/bin/shpool_reaper`, so purging while they are enabled leaves
 them enabled and pointing at nothing. Do not purge code while a managed session
 still depends on an installed release.
 
@@ -176,7 +176,7 @@ judge what a journal or a recovery record is still worth. Before deleting
 anything, prove that no live process writes to the target, list each exact path
 and data class, and make and verify a backup if recovery matters. Reject
 symlinks, unexpected owners, and broad path targets, and never sweep Claude Code
-or Codex provider storage in by accident — those directories hold the
+or Codex provider storage in by accident, those directories hold the
 conversations themselves, not Session Kit's view of them.
 
 Session Kit provides no broad "delete everything" command.

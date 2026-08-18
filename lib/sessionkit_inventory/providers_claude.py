@@ -224,8 +224,8 @@ def read_claude_transcript_signals(
             # the session being read, so it is not a root here.
             search_env.pop("CLAUDE_CONFIG_DIR", None)
         roots = claude_roots(search_env) or [base / ".claude"]
-    # One conversation can exist in more than one profile — an account switch
-    # copies it — and "the last record wins" over a root list in alias order
+    # One conversation can exist in more than one profile, an account switch
+    # copies it, and "the last record wins" over a root list in alias order
     # handed the answer to whichever profile sorted last, so a stale copy
     # could out-rank the file the live session is writing, and a fixed cut-off
     # taken in that order could drop the current profile entirely. Order by

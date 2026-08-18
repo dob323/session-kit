@@ -53,8 +53,8 @@ class AttachedIsSeenTests(unittest.TestCase):
 
     def test_a_seen_session_no_longer_counts_as_needing_you(self) -> None:
         # One word for one state: the row still SAYS needs you, because that
-        # is its state. Being seen removes the attention treatment — the
-        # count and the needs-you list — not the state word.
+        # is its state. Being seen removes the attention treatment, the
+        # count and the needs-you list, not the state word.
         here = row("Here", number=1, needs_you=True)
         screen = picker(here, self_session_id=here["shpool_id"])
         self.assertEqual(0, attention_of(screen))

@@ -21,8 +21,8 @@ from .identity import Project, _within
 MAX_SESSIONS = 200
 
 # The fields a caller may see about a session. Copying a whitelist rather than
-# the whole row keeps a context view from growing new fields — including
-# sensitive ones — whenever the inventory row grows one.
+# the whole row keeps a context view from growing new fields, including
+# sensitive ones, whenever the inventory row grows one.
 SESSION_FIELDS = (
     "shpool_id",
     "display_shpool_id",
@@ -39,7 +39,7 @@ SESSION_FIELDS = (
     "active_subagent_count",
     "started_at_unix_ms",
     # Set by the worktree registry when a row's directory is a materialised
-    # worktree: {"branch", "repo"}, where repo is the main repository — the
+    # worktree: {"branch", "repo"}, where repo is the main repository, the
     # same path this module calls a group root.
     "worktree",
 )

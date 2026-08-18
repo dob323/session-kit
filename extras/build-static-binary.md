@@ -2,16 +2,16 @@
 
 The kit is built and tested against shpool 0.11.0, and the install preflight
 refuses any other version (`lib/sh/session_kit_checks.sh`). Pin the version in
-both routes below — an unpinned `cargo install shpool` fetches whatever is
+both routes below, an unpinned `cargo install shpool` fetches whatever is
 current on crates.io, and the preflight then rejects it.
 
-**1. cargo** — if the server has a Rust toolchain:
+**1. cargo**, if the server has a Rust toolchain:
 
 ```bash
 cargo install shpool --version 0.11.0 --locked
 ```
 
-**2. Container build** — when the server has no compiler. A throwaway
+**2. Container build**, when the server has no compiler. A throwaway
 container produces a fully static musl binary and copies it out; nothing is
 installed on the host. Tested with shpool 0.11.0:
 

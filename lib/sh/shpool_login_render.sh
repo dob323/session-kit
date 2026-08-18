@@ -297,7 +297,7 @@ render_main() {
   # Width used to be four hand-sized tiers; the Enter hint's variable width
   # (a 1-3 digit number) broke the narrowest one the day it landed. Now every
   # segment carries its own plain-text width and the line keeps segments,
-  # first to last, while they fit in cols-1 — measured on the words, not the
+  # first to last, while they fit in cols-1, measured on the words, not the
   # color codes. The Enter hint is first, so it is the last thing a narrow
   # window ever loses.
   local enter_plain enter_colored
@@ -375,7 +375,7 @@ show_attention_menu() {
       done
     fi
 
-    # The two one-door signals the home line counts must render HERE too — a
+    # The two one-door signals the home line counts must render HERE too, a
     # headline that advertises a review the review cannot show is a dead end
     # (defect found in tonight's reconciliation pass).
     local fleet_body="" fleet_rows=0
@@ -392,7 +392,7 @@ import time
 # (audit finding, 2026-08-12). Plus sanitization:
 # every printed field is fleet-controlled text headed for the login TTY, so
 # control characters are stripped and lengths capped (audit finding,
-# 2026-08-12) — a title must never forge rows or clear the operator's screen.
+# 2026-08-12), a title must never forge rows or clear the operator's screen.
 #
 # And the SAME de-duplication as the home count: this screen listed a session
 # once as a row and again as its own stall flag, so the review said 3 where the

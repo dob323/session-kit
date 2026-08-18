@@ -37,7 +37,7 @@ picker_clear_screen() {
 # Compute-first frames: a renderer runs with stdout captured (in the current
 # shell, so its state side effects survive), and the finished bytes reach the
 # terminal as ONE write. In `home` mode each replaced line erases its own
-# remainder and the frame ends by erasing below — nothing is blanked until
+# remainder and the frame ends by erasing below, nothing is blanked until
 # its replacement is in the same write, so a slow renderer can never expose
 # an empty screen, with or without DEC-2026 support. `append` mode emits the
 # captured block in one write at the cursor, which turns a progressively

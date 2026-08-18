@@ -103,8 +103,8 @@ rm ~/.local/state/session-kit/tui-on      # back to the key-driven picker
 ```
 
 Where it is on, it still has an automatic fallback: if it ends any way other
-than you leaving it deliberately — it cannot draw on this terminal, the Python
-it needs is missing, or it fails mid-screen — that `kit` invocation is handed
+than you leaving it deliberately, it cannot draw on this terminal, the Python
+it needs is missing, or it fails mid-screen, that `kit` invocation is handed
 to the key-driven picker. Login integration opens a normal shell; it does not
 open either picker automatically.
 
@@ -263,12 +263,11 @@ The conversation is in Closed sessions and one Restore brings it back.
 A crash is different. The conversation reopens itself once, with a one-line
 notice saying so. A second crash within a minute stops the loop, so a
 conversation that cannot start cannot spin. The session then closes into Closed
-sessions if its conversation can be brought back, and stays open — saying why —
-if it cannot. There is no menu to answer.
+sessions if its conversation can be brought back, and stays open, saying why, if it cannot. There is no menu to answer.
 
-A reopen that cannot run names what was missing — including an inexact live
+A reopen that cannot run names what was missing, including an inexact live
 inventory, a missing row, a changed shell generation, or a session the
-inventory no longer records as provider exited — and hands the window back in
+inventory no longer records as provider exited, and hands the window back in
 that same step. It
 never closes the session: one of those reasons is that a provider is still
 running in the terminal, and a refusal is not evidence that anything finished.
@@ -345,8 +344,8 @@ in a new one. It refuses attached, ambiguous, or UUID-less targets.
 ## The window echoes what you type and the session does not see it
 
 You open a session and the window goes deaf. What you type appears as literal
-text over the application's first screen — arrow keys show as `^[[B`, Ctrl-L
-shows as `^L` — Ctrl-L and Esc do nothing, and nothing reaches the session.
+text over the application's first screen, arrow keys show as `^[[B`, Ctrl-L
+shows as `^L`, Ctrl-L and Esc do nothing, and nothing reaches the session.
 
 **Get the window back.** From a second window, find the deaf window's terminal
 and reset it:
@@ -363,7 +362,7 @@ session. Run `tty` inside the deaf window to read `<N>`, or
 **Why it happens, and why it should not any more.**
 
 The session's client refuses to touch the terminal at all if any one of its
-three standard channels is not a terminal — silently, and it goes on shuffling
+three standard channels is not a terminal, silently, and it goes on shuffling
 bytes as if nothing were wrong. So the window keeps the ordinary line-typing
 mode it had, and a full-screen application never gets the keys.
 

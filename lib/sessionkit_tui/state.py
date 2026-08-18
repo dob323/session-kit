@@ -34,7 +34,7 @@ class Batch:
     success: str = ""
     failure: str = ""
     # The session this Enter puts in front of the person. It counts as seen
-    # once the open actually worked — a refused open showed them nothing.
+    # once the open actually worked, a refused open showed them nothing.
     seen_key: str = ""
 
     def __bool__(self) -> bool:

@@ -1102,7 +1102,7 @@ print(pathlib.Path(source).read_text(),end="")
         # describe snapshot creation rather than worker output, and it cannot
         # re-read a live PID generation when delivery happens (re-derived
         # X20-F1). The platform gate must keep the sweep out of the
-        # pass entirely: no signal, no state, no log — on a pass that RUNS
+        # pass entirely: no signal, no state, no log, on a pass that RUNS
         # THE DARWIN PATH TO COMPLETION. A deterministic process table is
         # served through the reaper's own SESSION_KIT_INVENTORY_CORE seam,
         # because an aborted pass would satisfy the absence assertions

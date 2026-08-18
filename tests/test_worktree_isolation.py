@@ -438,7 +438,7 @@ class WorkIsMoreThanGitStatusTests(unittest.TestCase):
         self.assertNotEqual(0, result.returncode, "the rebase must stop mid-way")
         self.assert_clean_to_git(path)
         # The replayed commit is the same object, so "unmerged" cannot be the
-        # reason this copy survives — only the interrupted rebase can be.
+        # reason this copy survives, only the interrupted rebase can be.
         self.assertEqual(before, git(path, "rev-parse", "HEAD").strip())
 
         verdict = self.release("44")

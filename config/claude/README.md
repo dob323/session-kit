@@ -59,7 +59,7 @@ to produce a real record when doctor feeds it a fixture notification. Not
 installed at all is a warning that names what you lose, not a failure.
 
 Two settings decide how far this goes. `SESSION_KIT_ATTENTION_SOURCE=poll` is
-the kill switch — the hook keeps writing, nothing reads it, and the picker is
+the kill switch, the hook keeps writing, nothing reads it, and the picker is
 back to the poll-only reading it shipped with. `hook` is the opposite extreme
 and exists for drills. The default, `auto`, merges the two.
 
@@ -149,7 +149,7 @@ restarting a provider that is mid-thought would lose work: it runs only against
 a detached ready session with no subagents, whose provider is idle or awaiting a
 reply, that has produced no output for at least 120 seconds, and whose PID and
 process start time still match the frozen proof. It also asks the kit whether a
-real prompt already followed the name intent — if one did, the live window has
+real prompt already followed the name intent, if one did, the live window has
 the name, so the pending marker is dropped and nothing restarts.
 
 ## Hook registration
@@ -181,9 +181,9 @@ including a title supplied by hook output:
 The switch silences the window's title writes entirely, hook output included,
 so setting it would leave every kit-launched Claude window with no tab name at
 all. The kit therefore leaves it alone, writes the tab name itself when a
-session is entered — `sp go`, `sp takeover`, a fresh `sp new`, and the picker's
+session is entered, `sp go`, `sp takeover`, a fresh `sp new`, and the picker's
 own open and take-over, all through `sk_tab_title` in `bin/session_kit_common`
-— and lets this hook carry renames from inside the window. A restore writes no
+, and lets this hook carry renames from inside the window. A restore writes no
 tab name (it ends at the picker or a prompt, not inside the session); it writes
 the name and colour into the provider's store, and the tab is named when the
 session is opened. `session-kit doctor` reports the variable under `tab-title`

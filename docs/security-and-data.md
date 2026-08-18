@@ -112,9 +112,9 @@ to `~/.local/state/session-kit/account-switching-off`; its presence also blocks
 enrollment and does not stop an already-running provider.
 
 An automatic account change carries the same proofs. It substitutes the
-operator's confirmation for a decision made from published account facts — a
+operator's confirmation for a decision made from published account facts, a
 fresh usage feed, the account's own weekly number, a target still above the
-reserve, and a per-conversation count of previous automatic moves — and it
+reserve, and a per-conversation count of previous automatic moves, and it
 takes every one of the manual path's safety proofs unchanged, twice, around the
 same action lock. It also checks that the account the live process is signed in
 to is the account found dry. If the provider was launched with an explicit
@@ -127,8 +127,8 @@ asked to identify itself, so a disable made mid-handoff stands.
 
 A successful move keeps the shell, the window and the exact conversation UUID:
 the in-place handoff is the only path it uses. A move that does not prove
-itself is rolled back without the picker's recreate tail — that tail closes the
-session and re-creates it, which is not a conversation left working — and where
+itself is rolled back without the picker's recreate tail, that tail closes the
+session and re-creates it, which is not a conversation left working, and where
 the rollback itself cannot be proven, nothing further is changed and the
 refusal says so.
 

@@ -817,7 +817,7 @@ class BothSurfacesShowOneListTests(unittest.TestCase):
                     },
                     # Closed long enough ago that its number finished its
                     # quarantine and went back into circulation. It still
-                    # restores, so it is still offered — under its name,
+                    # restores, so it is still offered, under its name,
                     # because it no longer has a number to be offered under.
                     {
                         "provider": "claude",

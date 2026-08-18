@@ -493,7 +493,7 @@ def load_config() -> dict[str, Any]:
         raw.get("colors") if isinstance(raw, Mapping) else None
     )
     # So does the record of what the kit last pushed into each provider's own
-    # store — the collector needs it to tell a native /rename from its own echo.
+    # store, the collector needs it to tell a native /rename from its own echo.
     config["pushed_titles"] = _common._valid_pushed_titles(
         raw.get("pushed_titles") if isinstance(raw, Mapping) else None
     )
@@ -1223,7 +1223,7 @@ def _live_model_fields(
     # The launch argument is recorded as evidence and is NEVER shown as the live
     # model. `--model` says what the session was STARTED with; a `/model` typed
     # inside it does not touch argv, and a conversation resumed from another
-    # machine has no local record at all — no record is proof of nothing, not
+    # machine has no local record at all, no record is proof of nothing, not
     # proof that the launch value is still current. Showing it would be a
     # confident wrong answer, and the operator asked for this column filled in
     # order to trust it. What the kit cannot prove, it does not say.
@@ -5005,7 +5005,7 @@ def _worktree_command(args: argparse.Namespace, config: dict[str, Any]) -> int:
             print(_worktrees.render_verdict(verdict), end="")
         return 0
     if args.worktree_action == "sweep":
-        # A sweep with no list of what is alive is not a sweep of nothing —
+        # A sweep with no list of what is alive is not a sweep of nothing 
         # it is a sweep of everything. The list is required, and `--none-alive`
         # is how a caller says an empty list is what it means.
         active = list(args.active or [])
@@ -5435,8 +5435,8 @@ def _parser() -> argparse.ArgumentParser:
     lifecycle_closed = lifecycle_subparsers.add_parser("closed")
     # Closing a session that CRASHED is only better than leaving it in the
     # list if the conversation comes back afterwards. With this flag the verb
-    # is a single decision — close and keep the conversation, or change
-    # nothing at all — so the caller can keep a session it must not lose
+    # is a single decision, close and keep the conversation, or change
+    # nothing at all, so the caller can keep a session it must not lose
     # without the asking itself leaving a record behind.
     lifecycle_closed.add_argument("--only-with-conversation", action="store_true")
     lifecycle_keep = lifecycle_subparsers.add_parser("keep")
@@ -5795,7 +5795,7 @@ def _lifecycle_command(args: argparse.Namespace) -> int:
             # inside the TUI, so a session started with `sp new` never hands
             # one back to the shell, and its provider-exit record carries
             # none. Such a session could then never be closed into anything
-            # but history — the one shape that loses the conversation — so it
+            # but history, the one shape that loses the conversation, so it
             # sat in the list until the 72-hour reaper.
             #
             # The collector proved an exact conversation while the provider

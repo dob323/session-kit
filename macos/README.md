@@ -55,7 +55,7 @@ their size yourself.
 daemon is already reachable, or while a probe for one times out. A second daemon
 on the same socket is the failure that loses sessions, so an ambiguous probe is
 treated as a positive. It also refuses to overwrite a loaded job whose active
-plist differs from the generated template — that combination means an update
+plist differs from the generated template, that combination means an update
 left a pending definition, and quietly replacing the file would leave the loaded
 job and the file on disk describing different things.
 

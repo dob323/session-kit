@@ -364,7 +364,7 @@ def _provider_title_info(
         # A provider-native rename outranks the alias tier. The alias layer
         # holds kit-authored names as well as typed ones, so an automatic
         # title that was also written as an alias would otherwise mask the
-        # name a person just typed into /rename — which is the newest thing
+        # name a person just typed into /rename, which is the newest thing
         # anyone has said about what this room is called. Reconciliation then
         # promotes it into the alias for good; this keeps the row honest in
         # the meantime.

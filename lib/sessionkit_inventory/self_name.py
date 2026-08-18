@@ -365,7 +365,7 @@ def self_name_automatic_title(
         # Runs INSIDE the name-store write locks. A fresh collection here is
         # forbidden: collecting can itself take config.lock through a second
         # descriptor, and a process cannot pass its own flock on a new handle
-        # — the self-name that jammed every collector on the machine for
+        #, the self-name that jammed every collector on the machine for
         # twenty minutes on 2026-08-17 was exactly this call re-collecting
         # under the lock. The caller proof is repeated against a fresh
         # process table (lock-free, and the part that can actually change:

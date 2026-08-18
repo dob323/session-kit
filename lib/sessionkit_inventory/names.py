@@ -150,7 +150,7 @@ def native_rename(
         return ""
     kit_title = last_kit_title(document, key)
     # No kit value means the kit never named this thread, so a native title is
-    # not a correction of anything the kit did — it is just the name the
+    # not a correction of anything the kit did, it is just the name the
     # thread has always had, and the ordinary precedence rules cover it.
     if not kit_title or not title:
         return ""
@@ -276,7 +276,7 @@ def mutate_canonical_alias(
                 if not clean_title:
                     raise CollectionError("alias title must contain visible text")
                 aliases[key] = clean_title
-                # This is the human rename surface — `sp name` and the picker
+                # This is the human rename surface, `sp name` and the picker
                 # reach the alias tier and nothing else does. Marking it here
                 # makes the override durable: `sp name reset` drops the alias
                 # but keeps the marker, so no automatic pass can resurrect a
@@ -1132,7 +1132,7 @@ def _reconcile_pending_provider_titles(
     entries = dict(raw.get("entries", {})) if isinstance(raw, Mapping) else {}
     # A queued retry outlives the process that queued it. If a person renamed
     # the session in the meantime, replaying the old automatic title would
-    # resurrect it over their name — after a restart, without them asking.
+    # resurrect it over their name, after a restart, without them asking.
     owned = human_named(environ)
     candidates = [
         (key, item)

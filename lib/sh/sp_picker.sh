@@ -290,7 +290,7 @@ picker_close() {
     "${SK_PROOF_PROVIDER_PID:-}" "${SK_PROOF_PROVIDER_START:-}" \
     "${SK_PROOF_SHELL_PID:-}" "${SK_PROOF_SHELL_START:-}"
   # Somebody chose this. The crash queue must never offer it back as work
-  # that was lost — a tombstone says the difference out loud, and the close
+  # that was lost, a tombstone says the difference out loud, and the close
   # itself is already done, so a store that cannot be written costs a
   # diagnostic, never the close.
   #

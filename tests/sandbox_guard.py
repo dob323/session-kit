@@ -110,7 +110,7 @@ _REAL_HOME = os.environ.get("HOME") or ""
 _INHERITED_STATE_HOME = os.environ.get("XDG_STATE_HOME")
 # A test run launched from inside a kit-managed session inherits the session's
 # own account profile in these. Any suite that starts a real provider CLI in a
-# fixture HOME would then write real transcripts into a real account profile —
+# fixture HOME would then write real transcripts into a real account profile 
 # 952 such stray directories were cleaned out of two profiles on 2026-08-17.
 # Captured here for the same inherited-versus-chosen test the state home uses.
 _INHERITED_PROVIDER_DIRS = {
@@ -121,7 +121,7 @@ _INHERITED_PROVIDER_DIRS = {
         "CLAUDE_CODE_PROJECT_DIR_NAME",
         # The estate identity of the SESSION the tests happen to run inside.
         # A generated SHPOOL_SESSION_NAME makes sp classify every launch as
-        # machine-origin — the person-origin worktree tests fail on a live
+        # machine-origin, the person-origin worktree tests fail on a live
         # box and nowhere else. A fixture that sets its own value keeps it;
         # only the inherited one is dropped.
         "SHPOOL_SESSION_NAME",

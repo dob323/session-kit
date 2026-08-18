@@ -104,7 +104,7 @@ def alias_for_root(projects_file: Path, cwd: Path) -> str | None:
 
 
 # The launch chain a migration may excuse: shells, multiplexers, and session
-# plumbing. A provider process is deliberately NOT here — a Claude ancestor
+# plumbing. A provider process is deliberately NOT here, a Claude ancestor
 # that carries this profile inside this root is a live session whatever its
 # position in the tree, and renaming under it splits its store. Anything
 # unrecognised counts as live; refusal is the safe direction.
@@ -173,7 +173,7 @@ def profile_live_in_root(profile: Path, root: Path, proc: Path = Path("/proc")) 
             continue
         if excused_ancestor:
             # The chain that requested this launch matches its own scan by
-            # construction — but only its shells and plumbing are excused. A
+            # construction, but only its shells and plumbing are excused. A
             # provider process above us is a session inside a session, and a
             # rename under it splits ITS store (proven by review lane
             # rv-pdn-1, 2026-08-17). An unreadable comm counts as live.
@@ -220,7 +220,7 @@ def resolve_project_dir_name(
     # Two windows of the same project can launch in the same second, and both
     # would pass the liveness scan (neither is running yet). Unserialised,
     # the rename loser would print nothing and its Claude would recreate the
-    # munged directory beside the renamed one — the exact split state the
+    # munged directory beside the renamed one, the exact split state the
     # both-names refusal below exists to prevent. One advisory lock makes the
     # decision serial: the loser re-reads the world the winner left behind.
     try:
@@ -239,7 +239,7 @@ def resolve_project_dir_name(
         if renamed.exists():
             # Both directories exist: someone already holds state under each
             # name. Renaming would clobber and exporting would split memory
-            # between them — this needs a person, not a launch-time guess.
+            # between them, this needs a person, not a launch-time guess.
             return None
         if profile_live_in_root(profile, root):
             return None
@@ -250,11 +250,11 @@ def resolve_project_dir_name(
         # A raw provider launch takes no part in this lock, so one can start
         # in the gap between the scan above and the rename. Scan again on the
         # far side: if a same-profile process now runs inside the root, its
-        # first write would recreate the munged path beside the moved one —
+        # first write would recreate the munged path beside the moved one 
         # the split-store defect review lane rv-pdn-1 reproduced. Undo the
         # move and refuse; the raw session then finds the world exactly as it
         # was. An undo that fails leaves the both-names state the next launch
-        # refuses on and doctor reports — visible, never silent.
+        # refuses on and doctor reports, visible, never silent.
         if profile_live_in_root(profile, root):
             try:
                 renamed.rename(legacy)

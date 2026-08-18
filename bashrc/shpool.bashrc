@@ -86,7 +86,7 @@ if [[ -n ${SHPOOL_SESSION_NAME:-} && $- == *i* ]]; then
   __sk_expected="$__sk_start.expected"
   __sk_launch="$__sk_start.launch"
   __sk_account="$__sk_start.account"
-  # The shell can start before `sp` has WRITTEN the main record at all — the
+  # The shell can start before `sp` has WRITTEN the main record at all, the
   # session exists the moment shpool spawns it, and on a loaded box the
   # launcher's first write can land a second later. A one-shot existence
   # check here made that launch permanently silent. The wait is bounded so a
@@ -104,7 +104,7 @@ if [[ -n ${SHPOOL_SESSION_NAME:-} && $- == *i* ]]; then
     # 3 seconds covers a healthy launch; a loaded box can take longer to arm
     # (a lost-by-milliseconds launch once left a relaunch hanging on a
     # plain shell). At the 3-second mark, a FRESH main record proves a launch
-    # is still in progress, and only that case earns the longer wait — a
+    # is still in progress, and only that case earns the longer wait, a
     # stale record still costs later shells 3 seconds, not 30.
     for __sk_arm_attempt in {1..300}; do
       [[ -r $__sk_expected ]] && break
@@ -460,7 +460,7 @@ print(profile)
             # hooks, so a session that boots before its name intent exists
             # (fresh uuid, or a pre-baked resume) shows a stale title until
             # the provider restarts. The marker lets the picker request one
-            # safe bounce once a name exists — same contract as Codex.
+            # safe bounce once a name exists, same contract as Codex.
             __sk_claude_intent_uuid=$__sk_uuid
             [[ $__sk_launch_mode == new ]] && __sk_claude_intent_uuid=$__sk_new_claude_uuid
             if [[ -n $__sk_claude_intent_uuid && \
@@ -482,9 +482,9 @@ print(profile)
               __sk_pdn_helper=${__sk_inventory_core%/*}/sessionkit_inventory/project_dir_name.py
               if [[ -f $__sk_pdn_helper ]]; then
                 # The version proof must name the exact file this shell then
-                # executes. A bare `claude` can re-resolve differently — a
+                # executes. A bare `claude` can re-resolve differently, a
                 # stale command hash, a launcher symlink retargeted after the
-                # proof — and an older executable silently ignores the export
+                # proof, and an older executable silently ignores the export
                 # after the directory has already been renamed (review lane
                 # rv-pdn-1, 2026-08-17). One realpath is proved, and an armed
                 # export launches exactly that path.
@@ -699,7 +699,7 @@ PY
               if [[ -z $__sk_app_dir ]]; then
                 # The private directory chain refused, so the gate quietly used
                 # the direct TUI and every reachability feature stayed dark for
-                # the life of the window. Name the reason once — on stderr, and
+                # the life of the window. Name the reason once, on stderr, and
                 # in this session's App Server log when one already exists.
                 python3 - "$__sk_state_root" "$SHPOOL_SESSION_NAME" <<'PY' || true
 import os
@@ -812,7 +812,7 @@ PY
             # as a per-launch theme override (status line, thread-title item).
             # Resumes and forks color from the conversation's effective color;
             # a brand-new session has no conversation ID yet, so it launches
-            # with a color picked from the shpool session name — the collector
+            # with a color picked from the shpool session name, the collector
             # adopts that pick as the conversation's override once the ID
             # exists, keeping window, picker, and future resumes identical.
             # Fail-open: unknown color or missing theme file launches plain.
@@ -1477,7 +1477,7 @@ PY
   # conversation this was, so ending it would lose the thing the operator
   # would want back.
   #
-  # When the conversation IS recorded, the caller closes instead — see
+  # When the conversation IS recorded, the caller closes instead, see
   # __sk_close_keeps_the_conversation. Leaving a row behind that says
   # "provider exited" for 72 hours was the operator's complaint (2026-08-15):
   # "the session closes at once and lands in Closed sessions, recoverable,
@@ -1569,7 +1569,7 @@ PY
   # goes with them (operator rule, 2026-08-11, replacing the detach-and-stay-
   # reopenable rule of the same day): the managed shell ends, shpool ends the
   # session with it, and the terminal number returns to the ordinary 7-day
-  # quarantine — the same outcome as pressing k on this row from the main
+  # quarantine, the same outcome as pressing k on this row from the main
   # menu, reached through the same close this shell has always used rather
   # than a second implementation of it. The exact conversation stays
   # recoverable for its retention window; /kit is the verb for leaving one

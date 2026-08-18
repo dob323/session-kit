@@ -64,8 +64,8 @@ All notable changes to Session Kit are documented here.
 - Short project directory names: a Claude session launched at the registered
   root of a project shortcut now stores transcripts and auto memory under the
   shortcut's alias (Claude Code 2.1.234's `CLAUDE_CODE_PROJECT_DIR_NAME`).
-  The export is proved per launch — launcher version, unambiguous registry,
-  valid alias, no directory conflict — and an existing munged directory is
+  The export is proved per launch, launcher version, unambiguous registry,
+  valid alias, no directory conflict, and an existing munged directory is
   renamed in one atomic move only while no other session of that profile runs
   inside the root. `session-kit doctor` gained a `project-dir-names` check;
   `SESSION_KIT_PROJECT_DIR_NAME=off` disables the feature.
@@ -76,8 +76,8 @@ All notable changes to Session Kit are documented here.
   kit. Daemon selection now rules out any daemon owned by another account
   before it asks who holds the listener: their `/proc/<pid>/fd` is
   unreadable, which the uniqueness rule read as "cannot establish", so
-  `daemon_generation` went null and every session became unprovable —
-  `sp new` produced an unresolved row and `sp go`/`sp close` refused. A
+  `daemon_generation` went null and every session became unprovable,
+`sp new` produced an unresolved row and `sp go`/`sp close` refused. A
   listener under `/run/user/<uid>` is mode 0700, so another account's daemon
   was never a candidate. Census rows now carry the owning uid; a row without
   one is still treated as a candidate.
@@ -86,12 +86,12 @@ All notable changes to Session Kit are documented here.
   the rename and undoes it if a raw same-profile launch appeared in the gap;
   a same-profile provider in the launcher's own ancestor chain counts as a
   live session (only shells and launch plumbing are excused); and the Claude
-  version proof is bound to the exact executable the shell then runs — an
+  version proof is bound to the exact executable the shell then runs, an
   armed export launches the proved realpath, never a re-resolved `claude`.
   An alias path occupied by a regular file or symlink now refuses instead of
   exporting an unusable name.
 - Enrolment writes `autoContinueAtUsageLimit: false` even when the source
-  Claude profile has no settings file at all — the default is a promise about
+  Claude profile has no settings file at all, the default is a promise about
   every managed profile, not a transform applied only when there was
   something to copy.
 - The project-dir-name helper reads the same projects registry every other
@@ -104,7 +104,7 @@ All notable changes to Session Kit are documented here.
 
 - A self-name could deadlock the whole estate: its write-time revalidation ran
   a fresh collection while holding the name-store locks, and collecting can
-  re-acquire `config.lock` through a second descriptor — the process then
+  re-acquire `config.lock` through a second descriptor, the process then
   waits forever on its own lock while every collector, picker refresh and
   name attempt queues behind it (observed live for twenty minutes on
   2026-08-17). Revalidation now re-reads only the process table; the one

@@ -34,7 +34,7 @@ from .common import PROVIDERS, CollectionError, valid_uuid
 # names were probed against Claude Code 2.1.223 with known-good and known-bad
 # controls: every other name is rejected, and gray/grey resolve to `default`,
 # which is no colour at all. This tuple is therefore a measurement, not a taste
-# decision — do not add to it without re-probing the provider.
+# decision, do not add to it without re-probing the provider.
 CLAUDE_SESSION_COLORS = (
     "red",
     "blue",
@@ -62,7 +62,7 @@ CODEX_SESSION_COLORS = (
 )
 
 # Every colour the kit knows. Use this only where the provider genuinely is not
-# known — CLI argument choices, the shared reservation ledger, stored-document
+# known, CLI argument choices, the shared reservation ledger, stored-document
 # scans. Anywhere the provider IS known, use palette_for_provider: validating a
 # Claude override against this union would accept `lime`, which Claude Code
 # rejects at the moment it matters and leaves the window with no colour.
@@ -114,7 +114,7 @@ def palette_for_provider(
 # launch theme cannot come from the identity hash. The launch color is picked
 # deterministically from the shpool session name, recorded as a marker, and
 # adopted as that conversation's explicit override the first time the live
-# collector sees the session's real ID — from then on the window theme, the
+# collector sees the session's real ID, from then on the window theme, the
 # picker row, and every future resume agree.
 LAUNCH_COLOR_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 

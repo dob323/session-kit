@@ -11,8 +11,8 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 source "$SCRIPT_DIR/session_kit_common"
 INVENTORY_CORE=${SESSION_KIT_INVENTORY_CORE:-"$SCRIPT_DIR/../lib/session_inventory.py"}
 # Background creates and restores run with no client terminal. The daemon
-# copies TERM from this environment into the new shell; with no TERM — or the
-# TERM=dumb that systemd/cron inject — every provider inside starts colorless
+# copies TERM from this environment into the new shell; with no TERM, or the
+# TERM=dumb that systemd/cron inject, every provider inside starts colorless
 # and stays that way for the life of the session (environment is fixed at
 # exec). Scoped to non-tty callers only: a human on a genuinely limited
 # terminal keeps the TERM they declared.
@@ -77,7 +77,7 @@ sp_require_subcommand() {
 }
 
 # The complete human command reference, grouped by the job being done. The
-# machine verbs — picker-*, restore-exact — are deliberately absent: the
+# machine verbs, picker-*, restore-exact, are deliberately absent: the
 # picker and the managed shell call them with proof arguments a person does
 # not hold, so listing them here would only invite someone to run one by hand.
 # `sp help machine` names them for anyone reading the source.

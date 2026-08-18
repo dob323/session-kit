@@ -23,7 +23,7 @@ import unittest
 from tests.support import REPO
 
 
-# `IFS=$'\t' read` — the whole class, in one greppable pattern.
+# `IFS=$'\t' read`, the whole class, in one greppable pattern.
 TAB_READ = re.compile(r"IFS=\$'\\t'\s+read\s+(?:-[A-Za-z]+\s+)*(?P<first>\w+)")
 
 # Where shell lives. Extensionless helpers are included by name.
@@ -100,7 +100,7 @@ REVIEWED_SAFE = {
 }
 
 # Sites that ARE the husk, with the evidence. Listed so the guardrail stays
-# green while the owner fixes them — and so a fix cannot be forgotten: the
+# green while the owner fixes them, and so a fix cannot be forgotten: the
 # staleness test below fails the day an entry stops matching.
 OPEN_HUSKS: dict[tuple[str, str], str] = {}
 

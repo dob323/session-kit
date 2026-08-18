@@ -114,8 +114,8 @@ SHARED_MARKER = ".session-kit-shared"
 # keeps a checkout to work in. A repository at or under one of these is a
 # deployment: a checkout under `/srv` or `/var/www` is often the site being
 # served, where the files on disk ARE the running thing. Copying one is not
-# isolation — it is editing somewhere the change never takes effect, so the
-# edit looks done and the site keeps serving the old page — and writing a
+# isolation, it is editing somewhere the change never takes effect, so the
+# edit looks done and the site keeps serving the old page, and writing a
 # branch or a worktree administrative directory into one is touching
 # production.
 #
@@ -146,7 +146,7 @@ SYSTEM_ROOTS = (
 
 
 # Directories a system sets aside for scratch. They sit inside system roots and
-# are not software the machine runs, so they are named out — otherwise a
+# are not software the machine runs, so they are named out, otherwise a
 # repository or a worktree root in `/var/tmp` or `$XDG_RUNTIME_DIR` would be
 # refused for living where scratch is supposed to live.
 SCRATCH_ROOTS = ("/tmp", "/var/tmp", "/run/user", "/run/shm", "/dev/shm")
@@ -708,7 +708,7 @@ def materialize(
     # The other direction of the same rule: a working copy is never *built*
     # where the machine keeps the software it runs, however the root was
     # configured. Checked here rather than in `worktree_root` so that listing
-    # and labelling a badly configured host still work — only creation stops.
+    # and labelling a badly configured host still work, only creation stops.
     landing = system_root_of(root)
     if landing:
         raise WorktreeError(
@@ -725,7 +725,7 @@ def materialize(
             return {**existing, "created": False}
         # The directory is gone from under a live record: let git forget that
         # one registration, then fall through and build it again at the
-        # recorded path. Scoped on purpose — see `forget_registration`.
+        # recorded path. Scoped on purpose, see `forget_registration`.
         forget_registration(runner, top, current)
     trees = _trees_dir(root)
     # The repository's own name is not unique on a machine: two projects on
@@ -1109,7 +1109,7 @@ def inspect_work(
                 refusals.append(f"{where} is not merged into {reference}")
     # Nothing but this copy's own reflog reaches a commit that is on no branch,
     # and `git worktree remove` deletes that reflog with the directory. So the
-    # rule is not "detached and *known* to be unmerged" — it is detached and
+    # rule is not "detached and *known* to be unmerged", it is detached and
     # not PROVED merged. A `merge-base` that errored, a reference that does not
     # exist, a HEAD git could not read: each of those leaves `merged` false for
     # a reason that has nothing to do with the work being safe, and each of
@@ -1134,7 +1134,7 @@ def inspect_work(
 
 # `merged_into()` used to live here: it asked whether `refs/heads/<recorded
 # branch>` was an ancestor of the reference. That is the question that removed a
-# commit made on a detached HEAD — the recorded branch had not moved, so it was
+# commit made on a detached HEAD, the recorded branch had not moved, so it was
 # an ancestor, so the copy read as merged. `inspect_work` asks about the copy's
 # actual HEAD instead. The old helper is deleted rather than left dead beside
 # the new one: a function that answers a nearly-identical question with the
@@ -1177,7 +1177,7 @@ def teardown(
         )
     # The second half of "nothing reaches a checkout like that". Creation is
     # refused in `materialize`; removal has its own door, because a removal
-    # runs `git worktree remove` *in the repository* — a write into the very
+    # runs `git worktree remove` *in the repository*, a write into the very
     # thing the creation guard exists to keep out of. A
     # record naming a protected repository is refused before either runs, and
     # `--force` is not a way past it: the answer is not about this copy.
@@ -1250,7 +1250,7 @@ def teardown(
     if repository.is_dir():
         # `git worktree remove` already dropped the registration in the normal
         # case; this covers the one it left behind. Scoped to this copy's own
-        # entry — a repository-wide prune here would delete the administrative
+        # entry, a repository-wide prune here would delete the administrative
         # directory, and therefore the index and rebase state, of every other
         # worktree of this repository that happens to be unreachable right now.
         forget_registration(runner, repository, tree_path)

@@ -724,7 +724,7 @@ PY
     return
   fi
   if [[ $availability == ready ]]; then
-    # The window's tab carries the thread name for the whole attachment —
+    # The window's tab carries the thread name for the whole attachment 
     # the only in-window name surface Codex has (Claude's own title hook
     # re-asserts the same name in-session). Cleared again on return.
     sk_tab_title "$title"

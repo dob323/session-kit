@@ -316,7 +316,7 @@ class StaleDirectorySweepTests(unittest.TestCase):
         )
 
     def test_an_unreadable_daemon_list_removes_nothing(self) -> None:
-        # No proof of what is live, no removal — a malformed list must never
+        # No proof of what is live, no removal, a malformed list must never
         # read as "no sessions are running".
         self.make_dir("s-abandoned")
         for payload in (

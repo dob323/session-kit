@@ -2452,7 +2452,7 @@ class DryRunAndRecords(SweepHarness):
     def test_a_cold_dry_run_creates_nothing_at_all(self) -> None:
         # The reaper may run its very first pass in dry-run mode against a
         # state directory that has never seen a sweep: even the lock must
-        # not appear (X20-F4 round 2 — the flock is on the directory itself).
+        # not appear (X20-F4 round 2, the flock is on the directory itself).
         write_process(self.proc, 500, worker_cmdline(), own=40)
         actions = self.run_sweep(now=0.0, dry_run=True)
         self.assertEqual(actions, [])

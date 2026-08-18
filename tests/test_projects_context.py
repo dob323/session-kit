@@ -390,7 +390,7 @@ class WorktreeLabelTests(ProjectFixture):
         # The delegated case: every worker is in a worktree and no session runs
         # in the project directory itself. Placing these needs the host's
         # project list, not the projects that happened to resolve from the
-        # session list — which here is none of them.
+        # session list, which here is none of them.
         self.manifest()
         resolver = identity.Resolver(self.projects_file, environ={})
         rows = []

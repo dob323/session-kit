@@ -1,4 +1,4 @@
-# The session snapshot — what a picker may read
+# The session snapshot, what a picker may read
 
 One JSON document describes every managed session. `sp list`, `sp detail`, the
 login picker and any new screen read that one document, so a session cannot be
@@ -84,7 +84,7 @@ Everything below is present on every session row. The first block is the
 collectors' evidence and predates this document; the second is published on top
 of it by `publish_view_fields()` in `lib/session_inventory.py`.
 
-### Evidence (existing fields — never rename)
+### Evidence (existing fields, never rename)
 
 | Field | Type | Meaning |
 |---|---|---|
@@ -96,10 +96,10 @@ of it by `publish_view_fields()` in `lib/session_inventory.py`.
 | `provider` | string | `claude`, `codex`, `shell`, `unknown`. |
 | `display_provider` | string | The provider to show; wins over `provider`. |
 | `title`, `display_title`, `native_title` | string | `display_title` is the one to show. |
-| `cwd` | string | The session's directory — the project a row belongs to. |
+| `cwd` | string | The session's directory, the project a row belongs to. |
 | `identity` | object | `uuid`, `pid`, `process_start_ticks`, `confidence`, `provenance`. Machine-only. |
 | `account_email`, `account_plan` | string | Enrolled account facts. |
-| `agent_status` | string | The provider's own state word. Evidence, not copy — translate before showing. |
+| `agent_status` | string | The provider's own state word. Evidence, not copy, translate before showing. |
 | `needs_you` | bool | The session is a person's turn. |
 | `reply_optional` | bool | The model would take a reply but is not blocked. |
 | `setup_incomplete` | bool | The launch never finished. |
@@ -132,13 +132,13 @@ of it by `publish_view_fields()` in `lib/session_inventory.py`.
 | `attached` | bool | `availability == "attached"`. True means open in another window. |
 | `age_seconds` | int\|null | Seconds since the session was opened. `process_age_seconds` remains the provider process's own age. |
 | `subagent_count` | int | `active_subagent_count`, or the length of `subagents`. |
-| `account_alias` | string\|null | The account a session runs on. `null` when there is none — show `—`. |
+| `account_alias` | string\|null | The account a session runs on. `null` when there is none, show `, `. |
 | `model` | string\|null | The model identifier a session is running NOW, read from the conversation's own record so it follows a `/model` typed inside the session. `null` when there is none to read. |
 | `display_model` | string\|null | That identifier as a product name (`Opus 5`, `GPT-5-Codex`). What every screen shows. |
 | `model_source` | string\|null | `transcript` when the conversation's own record answered. Nothing else sets a model: the launch argument is never presented as the live model. |
-| `launch_model` | string\|null | What the process was STARTED with, as evidence only. Never shown as the model a session is running — `/model` does not touch argv. |
+| `launch_model` | string\|null | What the process was STARTED with, as evidence only. Never shown as the model a session is running, `/model` does not touch argv. |
 | `model_state` | string\|null | Why there is no model: `not-applicable` (a shell), `no-reply-yet`, `unreadable`. Screens turn it into a word; the row does not carry copy. |
-| `origin` | string\|null | How the session was started — a person or a machine. `null` until a collector records one. This is what the row IS; for an unstamped session it can be a reading of the moment, so nothing durable may be derived from it. |
+| `origin` | string\|null | How the session was started, a person or a machine. `null` until a collector records one. This is what the row IS; for an unstamped session it can be a reading of the moment, so nothing durable may be derived from it. |
 
 `project` is deliberately **not** published. The picker derives a project label
 from `cwd` against `projects.tsv`, and a field of that name would silently
@@ -166,7 +166,7 @@ own display depends on any of them.
 
 | Field | Type | Meaning |
 |---|---|---|
-| `origin_recorded` | string | The stamp itself, present only where creation recorded one. Anything that writes provenance down for good — a repair that re-declares an origin, a close that fills the closed-session ledger — reads this, never `origin`. Its **absence** is what says nobody was ever recorded as this session's creator. |
+| `origin_recorded` | string | The stamp itself, present only where creation recorded one. Anything that writes provenance down for good (a repair that re-declares an origin, a close that fills the closed-session ledger) reads this, never `origin`. Its **absence** is what says nobody was ever recorded as this session's creator. |
 | `machine_driven` | bool | Present and true only where collection proved that a program, and no window, holds this Codex App Server's socket. It is the one reading that can put an unstamped row behind the machine count, and it is refused outright unless the reading of the machine was complete. |
 | `app_server_window` | bool | Present and true only when a window was positively seen holding this Codex App Server's socket. It is how a provider restart is known to have finished: the shell that relaunches a provider blocks on it and cannot report its own success, so it leaves its bounce marker behind and a sighting here is what settles it. |
 
@@ -174,7 +174,7 @@ own display depends on any of them.
 
 `~/.local/state/fleet/stalls.json` (override the directory with
 `SESSION_KIT_FLEET_DIR` for the inventory reader, `FLEET_STATE_DIR` for the
-pulse pass — two readers, two variables) records sessions
+pulse pass, two readers, two variables) records sessions
 the fleet believes are stuck:
 
 ```json
@@ -187,7 +187,7 @@ the fleet believes are stuck:
 `needs_you_reasons`. A fourth reason, `orphan`, is dropped: an orphaned session
 is a dead session, not a person's turn.
 
-The reader is bounded the same way the picker's is — file no larger than
+The reader is bounded the same way the picker's is, file no larger than
 256 KiB, at most 200 records, and ignored entirely once older than 300 seconds
 (a flagger that stopped running is no evidence). A screen therefore never has to
 read the fleet file itself, and the needs-you count on one screen can never
@@ -196,8 +196,8 @@ disagree with the rows on another.
 ## Words
 
 Never spell a label into a screen. `lib/sessionkit_inventory/labels.py` holds
-every word the kit shows a person — states, group headings, provider names, age
-phrases, the placeholder `—`, the refusal and cancel lines — and
+every word the kit shows a person, states, group headings, provider names, age
+phrases, the placeholder `, `, the refusal and cancel lines, and
 `tests/test_voice_labels.py` fails when a literal appears in a renderer instead.
 
 | Need | Call |
@@ -207,7 +207,7 @@ phrases, the placeholder `—`, the refusal and cancel lines — and
 | Group heading | `labels.group_heading(row["availability"])` |
 | Where it can be opened | `labels.where_word(row["availability"])` |
 | `needs you 12 min` | `labels.waiting_phrase(seconds)` |
-| `last active 3h 9m ago` | `labels.last_active(seconds)` — the one time a row shows |
+| `last active 3h 9m ago` | `labels.last_active(seconds)`, the one time a row shows |
 | `5m`, `2h 3m` | `labels.duration(seconds)` |
 | Missing value | `labels.MISSING` |
 | Nothing matched a filter | `labels.NO_MATCHES` |

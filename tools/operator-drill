@@ -70,7 +70,7 @@ def visible(text: str) -> str:
 # and refuses the daemon verb out loud so a future step cannot quietly acquire
 # one. Its own fence is the sandbox marker: pointed anywhere else, it exits.
 SHPOOL_STUB = r"""#!/usr/bin/env bash
-# session-kit drill stub — %s. Verbs only: no daemon, no socket.
+# session-kit drill stub, %s. Verbs only: no daemon, no socket.
 set -u
 state=${DRILL_STUB_STATE:?stub state directory is required}
 root=${DRILL_SANDBOX:?stub sandbox root is required}

@@ -365,7 +365,7 @@ def _push_claude_title(
         finally:
             if directory >= 0:
                 os.close(directory)
-    # The prompt bar's bottom-right name is a transcript agent-name record —
+    # The prompt bar's bottom-right name is a transcript agent-name record 
     # the exact store /rename persists, hydrated at session start/resume,
     # rendered beside the agent-color. Same append discipline as colors.
     # A profile can hold the transcript without a sessions/ registry (fresh
@@ -740,7 +740,7 @@ def codex_pending_auto_titles(
             # Only human root threads: subagent threads inherit their task
             # prompt as first_user_message, and titling them replaces useful
             # agent nicknames with near-duplicate task titles. Non-interactive
-            # `codex exec` runs are one-shot jobs nobody reopens — titling
+            # `codex exec` runs are one-shot jobs nobody reopens, titling
             # them only fills the index with prompt fragments.
             root_filter = ""
             if "thread_source" in columns:
@@ -811,7 +811,7 @@ def codex_pending_auto_titles(
 
     rows = _rows()
     index = codex_root / "session_index.jsonl"
-    # Latest entry per id wins — the file is append-ordered and renames are
+    # Latest entry per id wins, the file is append-ordered and renames are
     # appended, so later lines overwrite earlier ones here.
     indexed: dict[str, str] = {}
     if index.is_file() and not index.is_symlink():
@@ -837,7 +837,7 @@ def codex_pending_auto_titles(
                     ).strip()
         except OSError as exc:
             # Unable to prove which threads already carry deliberate names;
-            # titling anyway could overwrite one, so do nothing — but say so,
+            # titling anyway could overwrite one, so do nothing, but say so,
             # because silence here looks exactly like "nothing needed a name".
             detail = f"Codex session index unreadable; threads were not titled: {exc}"
             print(f"session inventory: {detail}", file=sys.stderr)
@@ -904,8 +904,8 @@ def codex_pending_auto_titles(
             record_pushed("codex", exact, indexed[exact], environ=env)
             pushed_titles[key] = indexed[exact]
             continue
-        # The index name is the deliberate one when it exists — /rename
-        # writes it — and threads.title is the fallback evidence. Codex may
+        # The index name is the deliberate one when it exists, /rename
+        # writes it, and threads.title is the fallback evidence. Codex may
         # re-stamp the raw first prompt and drop its index entry; that known
         # seed is not a person renaming the thread away from the kit's push.
         native_title = indexed.get(exact) or str(raw_title or "")
@@ -1024,7 +1024,7 @@ def codex_pending_auto_titles(
         # own title from a native /rename without reopening this row forever.
         record_pushed("codex", exact, derived, environ=env)
         # Both writes target the exact store tree the candidates were read
-        # from — pushing anywhere else would split reads and writes across
+        # from, pushing anywhere else would split reads and writes across
         # different Codex homes. Each is checked against the budget: one
         # SQLite update plus eight socket attempts at a two-second timeout can
         # outlast the whole pass on its own.

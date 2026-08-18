@@ -2363,7 +2363,7 @@ class WatchdogAccountGuardTests(unittest.TestCase):
         # The control for this is
         # test_a_spent_account_reaches_the_session_that_is_on_it: the same
         # fixture, the same spent account, and one `sp` call. Without that
-        # pair this test would pass on any machine where the pass never ran —
+        # pair this test would pass on any machine where the pass never ran 
         # which is exactly how it passed while the sentinel path was wrong.
         self.seed(spent_weekly=1.0)
         killer = self.fixture.state / "account-switching-off"

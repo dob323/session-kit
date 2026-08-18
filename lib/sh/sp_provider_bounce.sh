@@ -63,7 +63,7 @@ sk_write_bounce_marker() {
 
 # One safe provider bounce: a new-mode Codex booted before its thread title
 # existed, so its status bar shows the conversation ID forever. When the human
-# opens such a session and a title now exists, terminate the exact idle TUI —
+# opens such a session and a title now exists, terminate the exact idle TUI 
 # the session shell relaunches the SAME conversation immediately (marker
 # handshake with the bashrc), so the window opens named and themed. Guards,
 # all fail-open toward "no bounce": untitled-boot marker present (only
@@ -116,7 +116,7 @@ if row.get("subagents"):
     raise SystemExit(1)
 # Positive proof of a stable state, never "not working": "working" is
 # mid-computation and "state unavailable" proves nothing, so both refuse.
-# "needs your reply"/"reply optional" are TERM-safe wait states — the
+# "needs your reply"/"reply optional" are TERM-safe wait states, the
 # turn's computation is complete and only a human reply advances it. A
 # research-style session spends its whole life in "needs your reply", so
 # an idle-only rule left those bars unnamed forever; the question text

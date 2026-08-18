@@ -1667,7 +1667,7 @@ install_command() {
 
 update_command() {
   # journal defaults to preserve: an update must never flip recording off
-  # (or on) behind the operator's back — see install_command's rollover note.
+  # (or on) behind the operator's back, see install_command's rollover note.
   local source= login= journal=preserve force=0
   while (($#)); do
     case "$1" in

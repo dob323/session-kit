@@ -1136,7 +1136,7 @@ PY
           "$id" "$allocated_id" >&2
     fi
   fi
-  # A timed-out reply (124/137) does not prove the session was NOT created —
+  # A timed-out reply (124/137) does not prove the session was NOT created 
   # generation capture below settles it either way.
   if ! sk_capture_session_generation "$id" "$creation_floor_ms"; then
     local quarantine
@@ -1303,7 +1303,7 @@ print(repo)
     # A conversation bound to an account profile only exists in that
     # profile's transcript tree; restoring it on the default profile kills
     # the original and then fails identity proof. When no caller names the
-    # alias, the binding ledger does — best-effort, empty when unproven.
+    # alias, the binding ledger does, best-effort, empty when unproven.
     account_alias=$(python3 "$INVENTORY_CORE" account source "$provider" "$uuid" \
       2>/dev/null |
       python3 -c 'import json,sys

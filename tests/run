@@ -5,7 +5,7 @@ repo=$(cd -- "$(dirname -- "$0")/.." && pwd)
 export PYTHONDONTWRITEBYTECODE=1
 
 # A full suite on a live box must never outrank the person's sessions, the
-# picker, or the collectors — 2,619 tests at normal priority pushed the load
+# picker, or the collectors, 2,619 tests at normal priority pushed the load
 # to 12 and starved interactive use on 2026-08-17. Lowest scheduling priority
 # and idle IO for this process and everything it starts; harmless where the
 # tools are missing.
@@ -14,7 +14,7 @@ export PYTHONDONTWRITEBYTECODE=1
 # nobody to yield to, so lowering its own priority only starves the pty tests:
 # the picker under test loses its scheduling slice mid-read and a fixture
 # waiting on a repaint gives up on a picker that was behaving correctly. That
-# is measured, not supposed — under one identical load,
+# is measured, not supposed, under one identical load,
 # test_help_and_more_remain_modal_across_refresh_intervals passed 3 of 4 runs
 # at normal priority and 0 of 4 reniced, and the ubuntu-24.04/3.10 cell went
 # from five straight green runs to failing every run from the commit that
@@ -45,7 +45,7 @@ python3 "$repo/tests/sweep_sandboxes.py" || true
 # SESSION_KIT_TEST_EXEC_ROOT is deliberately NOT set here. The fixtures honour
 # it (sandboxes move out of the repository, which fixes sandbox litter and the
 # AF_UNIX path-length overflow on deep checkouts), but setting it also flips
-# every pty fixture onto its exec-via-bash branch — a different invocation
+# every pty fixture onto its exec-via-bash branch, a different invocation
 # path than the one CI has always tested, and one that proved timing-fragile
 # on hosted runners. Export it yourself for local runs from a long worktree.
 

@@ -2475,7 +2475,7 @@ class NativeRenameOwnershipTests(unittest.TestCase):
             self.assertEqual(
                 "human", inventory_core.name_owner("codex", uuid, environ=env)
             )
-            # A reconciliation pass is idempotent — nothing left to adopt.
+            # A reconciliation pass is idempotent, nothing left to adopt.
             self.assertEqual(
                 "", inventory_core.adopt_native_rename("codex", uuid, "kit test", environ=env)
             )

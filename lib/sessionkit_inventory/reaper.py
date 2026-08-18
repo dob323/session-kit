@@ -104,7 +104,7 @@ def scan_shell_facts(
             except OSError as exc:
                 # A child that exited mid-scan is an ordinary race: it is gone
                 # from the table below too. A child that is still there and
-                # will not say its session name is not — it leaves a listed
+                # will not say its session name is not, it leaves a listed
                 # session unaccounted for, and an unaccounted session is
                 # exactly what the phantom rule closes. Refuse the whole run,
                 # as the Darwin adapter already does on the same ambiguity.

@@ -135,7 +135,7 @@ def _parse_rollout_state(raw: bytes) -> str:
     if lifecycle_state == "idle" and final_message_asks:
         # A completed turn whose last words are a question: the human is
         # being waited on even though no structured request exists. Soft
-        # signal only — never the hard "needs your reply".
+        # signal only, never the hard "needs your reply".
         return "reply optional"
     return lifecycle_state
 

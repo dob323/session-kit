@@ -1,8 +1,8 @@
 # Projects
 
-A project is a directory. Everything Session Kit knows about your work —
+A project is a directory. Everything Session Kit knows about your work,
 the shortcut you launch it by, the settings it launches with, and the sessions
-running in it — hangs off that one directory.
+running in it, hangs off that one directory.
 
 - [What a project is](#what-a-project-is)
 - [The project manifest](#the-project-manifest)
@@ -16,7 +16,7 @@ running in it — hangs off that one directory.
 A project's identity is its **canonical absolute root directory**. Two things
 can point at that root:
 
-- a row in `projects.tsv` — the host's own shortcut list, one entry per
+- a row in `projects.tsv`, the host's own shortcut list, one entry per
   directory, carrying an alias and at most a *default* provider. The default is
   never a lock: which provider opens the directory is chosen when a session
   starts, so one directory stays one project however many providers you work in
@@ -32,7 +32,7 @@ A directory with neither a manifest above it nor a shortcut row above it is in
 no project. Its sessions are still listed; they are simply not grouped.
 
 A shortcut always launches its own directory. If you add a shortcut for a
-subdirectory of a project, sessions there are still grouped under the project —
+subdirectory of a project, sessions there are still grouped under the project,
 but the launch uses that shortcut's own settings, not the manifest further up.
 A manifest governs launches for its own directory.
 
@@ -60,8 +60,8 @@ model = "gpt-5-1-codex"
 | `model` | The model identifier to launch with. |
 | `startup` | A command to run after launch. See [Startup commands](#startup-commands). |
 
-Session Kit reads a documented subset of TOML — single-line strings, integers,
-booleans, and single-line arrays — with the same reader on
+Session Kit reads a documented subset of TOML, single-line strings, integers,
+booleans, and single-line arrays, with the same reader on
 every supported Python, so a manifest cannot mean one thing on Python 3.13 and
 another on 3.10. Anything outside the subset is refused with its line number
 rather than half-applied. Check a manifest before committing it:
@@ -71,7 +71,7 @@ session-kit projects check .
 ```
 
 A manifest that fails to parse never changes a launch, and the project it
-describes still resolves — the problem is reported, and the sessions running
+describes still resolves, the problem is reported, and the sessions running
 there stay grouped where they belong.
 
 ## Why a manifest has to be trusted first
@@ -85,8 +85,8 @@ this host's project list**:
 session-kit projects add demo /absolute/path/to/demo
 ```
 
-Until then the manifest is read, shown, and reported — you can see exactly what
-the repository proposes — but the provider, account, model, and startup command
+Until then the manifest is read, shown, and reported, you can see exactly what
+the repository proposes, but the provider, account, model, and startup command
 are not applied. Adding the project is the deliberate act that turns them on. A
 [worktree](#worktrees) of a listed repository inherits that decision.
 
@@ -99,7 +99,7 @@ per project, by its exact text:
 - approving records the command's digest for your account only;
 - editing the command in the repository withdraws the approval, and it must be
   approved again;
-- a non-interactive launch — a script — never approves
+- a non-interactive launch, a script, never approves
   anything. It starts without the startup command and says so.
 
 Review and approve one from the command line:
@@ -109,8 +109,8 @@ session-kit projects launch-plan <alias>       # what would start, and why
 session-kit projects approve-startup <alias>   # approve the exact command text
 ```
 
-`sp new <alias>` says which of the two states it found — `not approved here, so
-it was not run`, or `changed since it was approved, so it was not run` — and
+`sp new <alias>` says which of the two states it found, `not approved here, so
+it was not run`, or `changed since it was approved, so it was not run`, and
 names the file the command lives in. The approval records the command's digest
 for your account only; nothing about it travels with the repository.
 
@@ -139,7 +139,7 @@ session-kit projects approve-startup demo   # approve this project's startup com
 ```
 
 `launch-plan` reports a `decisions` map naming the source of every applied
-value — `flag`, `manifest`, `shortcut`, or `default` — so a session that
+value, `flag`, `manifest`, `shortcut`, or `default`, so a session that
 differs from what you typed can always be explained.
 
 `context` answers "where did I leave this?": the live sessions in the project

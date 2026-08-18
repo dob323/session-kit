@@ -193,7 +193,7 @@ def scan_process_table(
             # EXISTS and will not say what it is. Dropped, it left the table
             # reading "no such process", so a reader asking "is anything in
             # this tree holding that socket?" got "no" about a process it
-            # never saw — and answering that question with "no" is what puts
+            # never saw, and answering that question with "no" is what puts
             # a person's session behind the machine count. It stays, placed by
             # its parent, with the ambiguity recorded the same way an
             # unreadable environment is.
@@ -221,7 +221,7 @@ def scan_process_table(
         # empty one: `environ` needs PTRACE_MODE_READ, so a hardening change
         # (yama, a container policy) can deny it for a live managed shell. Left
         # indistinguishable, that shell looks like a session with no process at
-        # all — the exact state the auto-close engine treats as "nothing to
+        # all, the exact state the auto-close engine treats as "nothing to
         # preserve". Record the ambiguity and let the readers refuse.
         environ_unreadable = False
         try:
@@ -252,7 +252,7 @@ def scan_process_table(
         except (OSError, ValueError):
             # It was there when the walk started and it is not answering now.
             # The fields already read may describe a process that has since
-            # exec'd into something else, so they are not published — but the
+            # exec'd into something else, so they are not published, but the
             # slot is, because "it exited" and "it exec'd into the window" are
             # the same reading from here.
             table[pid] = (

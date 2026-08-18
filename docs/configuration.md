@@ -22,8 +22,7 @@ uses XDG locations where available.
 
 Private directories should be mode `0700`; private files should be mode `0600`.
 Sensitive proof files also require the expected owner, regular-file type, and
-link count. Provider transcripts are the one exception, because the provider —
-not Session Kit — creates them under your umask: a Codex rollout is accepted
+link count. Provider transcripts are the one exception, because the provider, not Session Kit, creates them under your umask: a Codex rollout is accepted
 when this uid owns it and no group or other write bit is set. See
 [Security and data](security-and-data.md).
 
@@ -68,12 +67,12 @@ a number from the usage feed rather than an estimate:
 * the roster and the rotation advice are both fresh. A stale or unreadable
   feed disables automatic switching outright, because stale advice is how a
   machine drains an account it believed was full;
-* the conversation's own account is spent — its published weekly usage has
+* the conversation's own account is spent, its published weekly usage has
   reached `SESSION_KIT_ACCOUNT_EXHAUSTED_PERCENT` (default `100`). A spent
   five-hour window alone does not qualify: it refills on its own within five
   hours, and moving for it would spend the single move for nothing;
-* the account it moves to still holds a reserve —
-  `SESSION_KIT_ACCOUNT_RESERVE_PERCENT` (default `25`) of its weekly window
+* the account it moves to still holds a reserve,
+`SESSION_KIT_ACCOUNT_RESERVE_PERCENT` (default `25`) of its weekly window
   must be unused. An account past that line is refused even when it is the
   only candidate left. An account whose published numbers are missing, or are
   present but not readable as window fractions, is never a candidate: unknown
@@ -86,8 +85,8 @@ a number from the usage feed rather than an estimate:
   gives it back;
 * the live session agrees with the record. The account a conversation is
   actually signed in to is published per row, and a row that disagrees with
-  the account on file, or that carries no readable account, is left alone —
-  the account found dry has to be the account the process is really using;
+  the account on file, or that carries no readable account, is left alone,
+the account found dry has to be the account the process is really using;
 * an explicitly requested model is still generation-bound to the same managed
   shell. The handoff rebuilds that model record and resumes with the same
   `--model`; a missing or mismatched record refuses the relaunch rather than
@@ -105,14 +104,14 @@ provider was being asked to identify itself, so an account the owner disables
 stays disabled even when that change happens in the middle of a handoff.
 
 A failed handoff leaves the conversation where it was. The unattended path
-rolls back without the picker's destructive last resort — that path closes the
-session and re-creates it, which is not "still working" — and where even the
+rolls back without the picker's destructive last resort, that path closes the
+session and re-creates it, which is not "still working", and where even the
 rollback cannot be proven it changes nothing further and says so.
 
 A number the feed publishes that cannot be a window fraction condemns the whole
-feed, not just its own row. A single value cannot reveal a units change — if
+feed, not just its own row. A single value cannot reveal a units change, if
 percents replaced fractions, `55` is obviously wrong but `0`, `1` and `2` still
-parse — so one impossible number means none of that feed's numbers are judged.
+parse, so one impossible number means none of that feed's numbers are judged.
 
 ### Before you turn automatic switching on
 
@@ -148,7 +147,7 @@ says a session is on a spent account and changes nothing.
 
 Being told is a debt, not an event. A completed move records what the owner is
 owed before anything tries to deliver it, and the record is cleared only by a
-delivery that actually succeeded — a notifier that is down costs a retry rather
+delivery that actually succeeded, a notifier that is down costs a retry rather
 than the message. `session_inventory.py account auto-pending-notices` lists
 every move whose notice is still owed, oldest first, which is the hand-off
 point for the configured delivery route. Automatic switching deliberately does
@@ -195,8 +194,8 @@ fallback descriptions.
 
 Renaming a session by hand also settles who owns its name, for good. Session Kit
 records the rename in `name_ownership` alongside the aliases, and every
-automatic naming path — the Claude title hook, the Codex auto-titler, `sp
-self-name`, and any queued title retry that outlives a restart — reads that
+automatic naming path, the Claude title hook, the Codex auto-titler, `sp
+self-name`, and any queued title retry that outlives a restart all read that
 record and leaves the session alone. `sp name reset` drops the name you gave and
 keeps the ownership: automatic naming does not come back and quietly rename a
 session you already named.
@@ -233,8 +232,7 @@ first run is never all or nothing. `add` takes a directory and, if you want one
 of your own, a short name; the provider is not asked, because which one opens a
 directory is answered when a session starts. `default` records the provider a
 project usually opens with, and `any` clears it again. `normalize` folds a
-directory that is listed twice — the shape the old three-answer add produced —
-into one entry, keeping the first short name. `here` adds the current directory
+directory that is listed twice, the shape the old three-answer add produced, into one entry, keeping the first short name. `here` adds the current directory
 under a derived short name. `ignore` keeps a directory out of the picker, and
 `unignore` takes that decision back so the directory is offered again.
 
@@ -255,7 +253,7 @@ a lock, so `sp new codex web` opens the same directory with the other provider
 without a second row. Adding a directory that is already listed is refused by
 name rather than given a second entry. Alias collisions are resolved
 with parent-folder or provider suffixes. Import is repeatable: directories
-that already have a row — including an `ignore` row — and all hand-written
+that already have a row, including an `ignore` row, and all hand-written
 lines are left unchanged. Before appending any new rows, Session Kit saves an
 owner-only backup under its state `backups` directory.
 
@@ -275,7 +273,7 @@ docs	any	/absolute/path/to/docs
 ```
 
 Aliases use lowercase letters, numbers, `_`, or `-`. The middle column is the
-project's default provider — `claude`, `codex`, `shell`, or `any` for a project
+project's default provider, `claude`, `codex`, `shell`, or `any` for a project
 that keeps no default. The directory must be absolute and exist when used.
 
 ```text
@@ -372,7 +370,7 @@ never used to repair one.
 
 `SESSION_KIT_WATCHDOG_NOTIFY` is **unset by default, so the watchdog raises no
 alert anywhere.** It detects and logs conditions either way, but without a
-notifier the only record is the owner-only watchdog log and the picker banner —
+notifier the only record is the owner-only watchdog log and the picker banner,
 nobody is told. Set it to an executable that accepts:
 
 ```text
@@ -397,8 +395,8 @@ Environment=SESSION_KIT_WATCHDOG_NOTIFY=/path/to/your/notifier
 ## Notice routing
 
 The picker lists sessions waiting for you. Everything else that used to appear
-there — a repair that failed, a session reported quiet with nothing changed, a
-stalled session, a question another window is asking — is not a session waiting
+there, a repair that failed, a session reported quiet with nothing changed, a
+stalled session (a question another window is asking) is not a session waiting
 for you, and it is routed instead of listed. The installed
 `session_kit_notice` helper is that route, and the watchdog calls it.
 
@@ -406,8 +404,8 @@ for you, and it is routed instead of listed. The installed
 you are at the machine; to the away transport when you are not.
 
 **The terminal leg only applies inside a managed session.** If you are working
-in a terminal Session Kit does not manage — an ordinary SSH window, a local
-shell, an editor's terminal — nothing is attached, so presence reads as away and
+in a terminal Session Kit does not manage, an ordinary SSH window, a local
+shell, an editor's terminal, nothing is attached, so presence reads as away and
 every notice takes the away transport. That is not a fault to fix: there is no
 managed conversation to deliver into. It does mean that on a machine whose
 operator usually works outside the kit, **the away transport is the only route
@@ -419,20 +417,20 @@ one** session is attached, and **a person has typed in it** in the last few
 minutes (`SESSION_KIT_NOTICE_PRESENT_WITHIN`, default 300s).
 
 Nothing else counts, and in particular *provider output does not*. Output is
-autonomous — a session prints for as long as its turn takes, with nobody in the
-room — so a window you walked away from mid-turn would look more present than
+autonomous, a session prints for as long as its turn takes, with nobody in the
+room, so a window you walked away from mid-turn would look more present than
 one you were reading. The evidence used is INPUT: Claude Code's
 `UserPromptSubmit` hook, which the kit already records per session, and which
 only fires when a person submits a prompt. A session with no hook installed, a
 Codex session, or one whose newest record is a notification rather than a
 prompt, all read as no evidence, which is away.
 
-`attached` on its own means only "open in another window" — no focus, no proof
+`attached` on its own means only "open in another window", no focus, no proof
 anyone is there, and a session can stay wired to an SSH window that no longer
 exists. Two attached sessions mean the machine cannot say which one you are in,
 and a notice into a Claude session PROMPTS that conversation, so ambiguity takes
 the away route rather than guessing. No snapshot, a stale one, nothing attached,
-several attached, or no sign of typing all mean away — a duplicate notice costs
+several attached, or no sign of typing all mean away, a duplicate notice costs
 a glance, a missed one costs an evening.
 `session_kit_notice presence` prints the verdict and sends nothing.
 
@@ -473,14 +471,14 @@ terminal, and uncertainty defaults to away rather than false success.
 
 **One incident, one notice, and the watchdog decides what an incident is.**
 Every notice is latched by its key and by the evidence behind it, in
-`notice-latch.json`, and the key is the SESSION rather than the record — one
+`notice-latch.json`, and the key is the SESSION rather than the record, one
 wedged session can write many records. Within an incident, a stronger statement
 (ordinary silence, then the daemon's own handoff failure) is a new one and is
 made; a weaker one is not. Across incidents the rule is the watchdog's own: it
 treats output after its last record as recovery and writes a fresh record, so a
 record written **after** the last thing said about that session is a new
 incident and is said. There is deliberately no second definition of "new
-incident" here — two rules over one event stream is how a real second failure
+incident" here, two rules over one event stream is how a real second failure
 goes unmentioned. An attempt that did not land is never latched as delivered,
 and only an entry explicitly marked `reconciled` with `landed=true` suppresses
 a replay. A provisional entry is retried.
@@ -511,7 +509,7 @@ for a quiet night.
 | Variable | Meaning |
 | --- | --- |
 | `SESSION_KIT_NOTICE=off` | route nothing at all (kill switch) |
-| `SESSION_KIT_NOTICE_AWAY_CMD` | the away transport. Same `--type/--severity/--title/--body` contract as the watchdog notifier, so any conforming notifier fits — but it is never inherited from that notifier, because that one is usually a board and a board is not a person. Unset means there is no away route, and every attempt says so |
+| `SESSION_KIT_NOTICE_AWAY_CMD` | the away transport. Same `--type/--severity/--title/--body` contract as the watchdog notifier, so any conforming notifier fits, but it is never inherited from that notifier, because that one is usually a board and a board is not a person. Unset means there is no away route, and every attempt says so |
 | `SESSION_KIT_NOTICE_TERMINAL=off` | never use the terminal route |
 | `SESSION_KIT_NOTICE_QUESTION_AWAY=hold` | stop pushing another window's open question to the away transport. The default is `send`: a class with no route is the thing this exists to prevent. A held question is still recorded, logged and counted |
 | `SESSION_KIT_NOTICE_PRESENT_WITHIN` | seconds since the last valid UserPromptSubmit after which the one attached session reads as a window left open (default 300) |
@@ -575,8 +573,8 @@ it is.
 
 It gets there three ways, because no single one covers every moment.
 
-**When you enter a session** — `sp go`, `sp takeover`, a fresh `sp new`, and the
-picker's own open and take-over — the kit writes the tab name itself, from one
+**When you enter a session**, `sp go`, `sp takeover`, a fresh `sp new`, and the
+picker's own open and take-over, the kit writes the tab name itself, from one
 function, so the kill switch and the scrub below apply to every one of them.
 Leaving a session through the picker puts `session kit` back on the tab.
 
@@ -589,7 +587,7 @@ carries a rename into a window that is already open.
 on its own command line, so your `~/.codex/config.toml` is never edited and
 Codex windows you start yourself keep whatever it says. The deployed template
 lives at `$CODEX_HOME/session-kit/terminal-title.toml`. It is owned by the
-release and replaced on every install and update, like the kit's Codex themes —
+release and replaced on every install and update, like the kit's Codex themes,
 to change what kit sessions put on the tab, change it in the kit's own
 `config/codex/terminal-title.toml` and install, or turn the feature off below.
 
@@ -658,7 +656,7 @@ reads today.
 | Name | Default | What it changes |
 | --- | --- | --- |
 | `SESSION_KIT_PICKER_REFRESH_SECONDS` | `5` | picker live-refresh interval |
-| `SESSION_KIT_PICKER_GROUP` | `state` | key-driven picker only: grouping it starts in — `state`, `provider`, or `project` |
+| `SESSION_KIT_PICKER_GROUP` | `state` | key-driven picker only: grouping it starts in, `state`, `provider`, or `project` |
 | `SESSION_KIT_PICKER_COMPACT` | `0` | key-driven picker only: `1` starts it with compact rows |
 | `SESSION_KIT_PICKER_FILTER_LIVE` | `1` | key-driven picker only: `0` disables filter-as-you-type; `/text` still searches on Enter |
 | `SESSION_KIT_PICKER_PULSE_SECONDS` | `1` | how often the attention-pulse child scans while the picker is open; an unreadable value falls back to the default |
@@ -675,21 +673,21 @@ reads today.
 | `SESSION_KIT_AUTO_CLOSE_HOURS` | `72` | continuous quiet hours before the cleanup observer may close a provider-exited terminal. A BACKSTOP: a session whose provider exits closes itself at once, so a terminal that reaches this window is one the shell could not close |
 | `SESSION_KIT_PRUNE_DAYS` | `7` | age at which the reaper prunes its own records |
 | `SESSION_KIT_REAPER_DRY_RUN` | `0` | `1` makes the reaper report what it would close and close nothing |
-| `SESSION_KIT_SUBAGENT_IDLE_MINUTES` | `15` | quiet minutes before the sweep closes a sub-agent worker or background shell (TERM, then KILL one pass later). Workers are judged by movement of their own output transcripts; a long call that writes nothing can therefore look finished. The independent background-shell pass watches fd/1 and the shell's own CPU counters. Any live descendant refuses closure, including a sleeping zero-CPU child. Before signaling, the pass pins and stops a childless shell, verifies the stopped state, rechecks identity, zero descendants, own CPU, terminal foreground ownership, and fd/1, then sends the signal and resumes it. CPU is never evidence for closing a worker. The sweep runs every five minutes on its own `session-kit-subagent-sweep.timer`, so closure lands within about twenty. `0` turns the sweep off. **An unreadable value turns the sweep off and says so** — it never guesses a window. **Raise this if a real worker is ever closed while it is still working.** Exported variables do NOT reach the timer (the systemd user manager inherits none of your shell environment) — put the number in `<state>/subagent-sweep-minutes` instead, which the pass reads itself |
-| `SESSION_KIT_SUBAGENT_IDLE_HOURS` | — | the older name, still honoured when the minutes name is unset, including `0` to disable; an unreadable value turns the sweep off. Linux only — the settled exact-PID delivery proof requires live procfs, so the sweep never runs on macOS. A reaper dry run previews sweep actions only after real passes have armed the idle clock, and touches nothing on disk |
+| `SESSION_KIT_SUBAGENT_IDLE_MINUTES` | `15` | quiet minutes before the sweep closes a sub-agent worker or background shell (TERM, then KILL one pass later). Workers are judged by movement of their own output transcripts; a long call that writes nothing can therefore look finished. The independent background-shell pass watches fd/1 and the shell's own CPU counters. Any live descendant refuses closure, including a sleeping zero-CPU child. Before signaling, the pass pins and stops a childless shell, verifies the stopped state, rechecks identity, zero descendants, own CPU, terminal foreground ownership, and fd/1, then sends the signal and resumes it. CPU is never evidence for closing a worker. The sweep runs every five minutes on its own `session-kit-subagent-sweep.timer`, so closure lands within about twenty. `0` turns the sweep off. **An unreadable value turns the sweep off and says so**, it never guesses a window. **Raise this if a real worker is ever closed while it is still working.** Exported variables do NOT reach the timer (the systemd user manager inherits none of your shell environment), put the number in `<state>/subagent-sweep-minutes` instead, which the pass reads itself |
+| `SESSION_KIT_SUBAGENT_IDLE_HOURS` | none | the older name, still honoured when the minutes name is unset, including `0` to disable; an unreadable value turns the sweep off. Linux only, the settled exact-PID delivery proof requires live procfs, so the sweep never runs on macOS. A reaper dry run previews sweep actions only after real passes have armed the idle clock, and touches nothing on disk |
 | `SESSION_KIT_SUBAGENT_SWEEP` | on | `0`, `off`, `no`, or `false` turns the sub-agent sweep off; a `subagent-sweep-off` file in the state directory does the same |
 | `SESSION_KIT_WATCHDOG_POLL_SECONDS` | `60` | watchdog pass interval |
 | `SESSION_KIT_WATCHDOG_DEAD_SECONDS` | `2700` | quiet time before a terminal is treated as dead |
 | `SESSION_KIT_WATCHDOG_FLAGGED_QUIET_SECONDS` | `120` | quiet time before an already-flagged terminal is acted on |
 | `SESSION_KIT_WATCHDOG_QUIET_REPORT_COOLDOWN` | `21600` | minimum gap between repeat manager-level alerts (an unresponsive session manager, a replaced manager binary). It no longer governs per-session reports: a session gets one record per incident, and a second only when the session has produced output since the first or the watchdog has learned something stronger about it |
 | `SESSION_KIT_WATCHDOG_MANAGER_TIMEOUT` | `20` | seconds the watchdog waits on a service-manager probe |
-| `SESSION_KIT_WATCHDOG_RETIRE_DAYS` | `2` | age at which a watchdog record whose session no longer exists retires itself. A record is kept at any age while the session it names is live, while the REPLACEMENT it names is live (a repaired record points at the session still carrying the conversation), or while the published inventory still lists either — and nothing is retired at all unless the snapshot proved itself live. `0` turns retirement off |
+| `SESSION_KIT_WATCHDOG_RETIRE_DAYS` | `2` | age at which a watchdog record whose session no longer exists retires itself. A record is kept at any age while the session it names is live, while the REPLACEMENT it names is live (a repaired record points at the session still carrying the conversation), or while the published inventory still lists either, and nothing is retired at all unless the snapshot proved itself live. `0` turns retirement off |
 | `SESSION_KIT_WATCHDOG_RETIRE` | on | `off` turns record retirement off |
 | `SESSION_KIT_WATCHDOG_RETIRE_DRY_RUN` | `0` | `1` reports what retirement would remove in the watchdog log and writes nothing |
 | `SESSION_KIT_ACCOUNT_ADVICE_MAX_AGE_SECONDS` | `600` | age past which account rotation advice is treated as stale |
-| `SESSION_KIT_WORKTREE_ROOT` | `<state>/worktrees` | absolute directory holding materialized worktrees and their registry. Refused if it is under a system root — a working copy is never built where the machine keeps the software it runs |
+| `SESSION_KIT_WORKTREE_ROOT` | `<state>/worktrees` | absolute directory holding materialized worktrees and their registry. Refused if it is under a system root, a working copy is never built where the machine keeps the software it runs |
 | `SESSION_KIT_SHARED_REPOS` | unset | colon-separated absolute paths that are never copied: a delegated session runs in the checkout itself, and nothing is written into that repository. A `.session-kit-shared` file at a repository's root says the same thing, and travels with the checkout |
-| `SESSION_KIT_COPYABLE_REPOS` | unset | colon-separated absolute paths that **are** yours to copy, overruling every reason the kit would otherwise refuse — the system-root rule included. Use it when a project genuinely lives under `/srv`, `/opt` or `/var` and is not the thing the machine is serving |
+| `SESSION_KIT_COPYABLE_REPOS` | unset | colon-separated absolute paths that **are** yours to copy, overruling every reason the kit would otherwise refuse, the system-root rule included. Use it when a project genuinely lives under `/srv`, `/opt` or `/var` and is not the thing the machine is serving |
 | `SESSION_KIT_CODEX_AUTOTITLE_BUDGET_SECONDS` | `2` | how long one pass of the Codex auto-titler may spend before the next inventory build; a backlog continues on the following pass (clamped above 0 and at 60) |
 | `SESSION_KIT_ATTACH_HISTORY` | `500` | lines of the session's settled rendered journal replayed into the terminal's scrollback when a session is opened or reattached, so earlier output stays reachable by scrolling; `0` turns the refill off; a session without a journal replays nothing; an unreadable value falls back to the default |
 
@@ -704,20 +702,20 @@ the Session Kit state directory.
 | Session prebake | `SESSION_KIT_NO_PREBAKE=1` | `<state>/prebake-off` |
 | Self-heal on start | `SESSION_KIT_NO_SELF_HEAL=1` | `<state>/self-heal-off` |
 | Sub-agent sweep | `SESSION_KIT_SUBAGENT_SWEEP=off` | `<state>/subagent-sweep-off` |
-| Sub-agent sweep, and every other closing pass | — | `~/.no_shpool_reaper` |
+| Sub-agent sweep, and every other closing pass | none | `~/.no_shpool_reaper` |
 | Sub-agent sweep window | `SESSION_KIT_SUBAGENT_IDLE_MINUTES` | `<state>/subagent-sweep-minutes` |
 
 `session-kit doctor` reports the sub-agent sweep as a state, on its own
 `subagent-sweep` line: which window is in force and where it came from, which
-switch is holding it off if one is, and — because a pass that never runs closes
-nothing and says nothing — how long ago a pass last ran to completion. A sweep
+switch is holding it off if one is, and, because a pass that never runs closes
+nothing and says nothing, how long ago a pass last ran to completion. A sweep
 that has gone quiet for more than twenty minutes is named there, whether the
 cause is a held state-directory lock, a crashed pass, or a timer that is not
 firing.
 
 Shortening the window restarts every clock. The sweep records the window it
 judged by alongside its evidence, and an idle clock gathered under a wider rule
-is not evidence under a narrower one — so the first pass after any narrowing,
+is not evidence under a narrower one, so the first pass after any narrowing,
 including the upgrade that introduced the fifteen-minute default, closes
 nothing, and every worker is watched afresh for a full window. Widening keeps
 the existing clocks, because a wider window can only ever close less.
@@ -741,7 +739,7 @@ The `$HOME` kill switches `.no_shpool_reaper`, `.no_shpool_watchdog`, and
 [Optional feature sentinels](#optional-feature-sentinels) and audited by
 `session-kit doctor`.
 
-A clean provider exit closes the managed session outright, on every machine —
+A clean provider exit closes the managed session outright, on every machine,
 there is no switch, and the retired `~/.sk_autoclose_on_clean_exit` marker is
 no longer read anywhere. A non-zero exit is a crash and still stops at the
 recovery menu with the terminal open.

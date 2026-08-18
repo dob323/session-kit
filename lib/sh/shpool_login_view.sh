@@ -526,7 +526,7 @@ clamp_page() {
 }
 
 # Every number the current page is showing, in display order. `all` means
-# exactly what a person can see — never a session on another page.
+# exactly what a person can see, never a session on another page.
 page_numbers() {
   python3 - "$VIEW" "$PAGE" "$PAGE_SIZE" <<'PY'
 import json

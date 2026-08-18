@@ -182,14 +182,14 @@ REPAIR_FILE=${SESSION_KIT_WATCHDOG_REPAIRS:-"$SK_STATE_DIR/watchdog-repairs.json
 
 # Recovery pending count is refreshed with the snapshot, not on every
 # keystroke: recovery state only changes through actions or refreshes, and
-# recomputing it per redraw ran a full status build each keypress — most of
+# recomputing it per redraw ran a full status build each keypress, most of
 # the visible menu lag on a loaded box.
 PENDING_CACHE=0
 
 # Start from a clean frame: after a daemon restart the previous attachment's
 # dead screen is still in the terminal, and menus painted over it read as
 # corruption. Then treat a briefly-unavailable manager as a wait, not a
-# failure — a planned restart takes a few seconds.
+# failure, a planned restart takes a few seconds.
 picker_clear_screen
 if ! refresh_snapshot; then
   echo "  The session manager is not responding. Retrying for a minute."
@@ -226,7 +226,7 @@ while true; do
     # The kernel's winsize on stderr is the one honest answer here: macOS
     # tput answers 80 from terminfo when it cannot ioctl the captured stdout,
     # and an exported COLUMNS can be stale after a resize. A pty that was
-    # never sized reports 0x0 — treat 0 as no answer, then fall back to tput
+    # never sized reports 0x0, treat 0 as no answer, then fall back to tput
     # (ncurses honours $COLUMNS), then to the exported size itself.
     __sk_size=$(command stty size <&2 2>/dev/null) || __sk_size=
     __sk_cols=${__sk_size##* }; __sk_rows=${__sk_size%% *}

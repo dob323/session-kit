@@ -44,7 +44,7 @@ IGNORE_KIND = "ignore"
 # A directory is one project, whatever it is worked on with. The kind column
 # on a live row is that project's DEFAULT provider, never a lock: the provider
 # is chosen when a session starts, and naming one there overrides the default.
-# "any" is a project with no default at all — the row a plain `projects add`
+# "any" is a project with no default at all, the row a plain `projects add`
 # writes, because adding a directory is not the moment to decide that.
 ANY_KIND = "any"
 LAUNCH_KINDS = (*PROVIDERS, "shell")

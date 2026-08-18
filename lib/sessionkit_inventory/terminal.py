@@ -170,7 +170,7 @@ def apply_terminal_numbers(
                 # collection. That took the machine read-only: every close,
                 # switch and repair goes through the guard snapshot, and
                 # arming a launch needs one that is live, fresh and
-                # warning-free — so a single unprovable session stopped every
+                # warning-free, so a single unprovable session stopped every
                 # session on the box, with a message that named none of them.
                 # Quarantine the row that cannot be proven, name it, and let
                 # the rest of the estate work.

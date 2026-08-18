@@ -32,7 +32,7 @@ from .common import clean_text
 # --------------------------------------------------------------- placeholders
 
 # A value the kit has not pulled yet. One rule for every column (operator
-# ruling, 2026-08-16): until a section has a valid read, it says `pending` —
+# ruling, 2026-08-16): until a section has a valid read, it says `pending` 
 # never `unknown`, never a dash, never an empty cell.
 MISSING = "pending"
 
@@ -417,8 +417,8 @@ def quiet_status(age: str) -> str:
 # ------------------------------------------------------ the one time phrase
 
 # Every session row carries exactly one time, and it answers one question:
-# when did this session last do something. It used to carry two — `recent
-# output 3h 9m ago` beside `process age 3h 9m` — which is one fact more than
+# when did this session last do something. It used to carry two, `recent
+# output 3h 9m ago` beside `process age 3h 9m`, which is one fact more than
 # any row had room for, so every row truncated at a different point and the
 # column stopped being a column (operator ruling, 2026-08-15). The second fact, how long
 # the process has been alive, is still on `sp detail`, where there is room for
@@ -450,7 +450,7 @@ def last_active(seconds: int | None) -> str:
 # they already knew; each of these says WHY it is empty instead.
 #
 # The collector records the reason (`model_state`) and the screens turn it into
-# a word here — a placeholder is copy, and copy does not belong in a row.
+# a word here, a placeholder is copy, and copy does not belong in a row.
 MODEL_STATE_NOT_APPLICABLE = "not-applicable"
 MODEL_STATE_NO_REPLY_YET = "no-reply-yet"
 MODEL_STATE_UNREADABLE = "unreadable"

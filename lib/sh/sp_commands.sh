@@ -890,7 +890,7 @@ show_history_id() {
 
   if (( ${#files[@]} > 0 )); then
     # Journal exists: replay it through the screen model and page the SETTLED
-    # text — never the raw bytes (raw TUI repaints braid when read as text;
+    # text, never the raw bytes (raw TUI repaints braid when read as text;
     # operator finding 2026-08-12). Incremental: only new bytes render, so a
     # fresh sidecar costs milliseconds and recall stays instant.
     local journal sidecar state
@@ -944,7 +944,7 @@ show_history_id() {
 
   # No recording exists (recording was off 2026-07-30..08-12, and sessions
   # created in that window can never be re-recorded). The conversation
-  # transcript survives everything — render that instead.
+  # transcript survives everything, render that instead.
   if [[ ${SK_PROVIDER:-} == claude || ${SK_PROVIDER:-} == codex ]] &&
      [[ -n ${SK_UUID:-} && -f $transcript_tool ]]; then
     local rendered

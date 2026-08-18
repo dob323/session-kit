@@ -22,7 +22,7 @@ from __future__ import annotations
 # "needs you" in their own row.
 # Priority order to match the key-driven picker's footer (operator ruling,
 # 2026-08-16): a narrow window truncates from the end, so position is
-# survival — history is the first luxury, more is a door. esc stays last on
+# survival, history is the first luxury, more is a door. esc stays last on
 # this surface because it is named nowhere else.
 FOOTER = (
     "↵ open · open # · kill k # · new n · more m · "

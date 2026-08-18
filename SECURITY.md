@@ -2,16 +2,21 @@
 
 ## Supported versions
 
-Each beta minor line is supported for 90 days after its first release, or for
-30 days after the next beta minor release, whichever ends later. A security fix
-may require moving to the latest patch release on that line.
+Session Kit is maintained by one person alongside other work, so this policy
+says only what one person can actually keep.
+
+Security fixes go into the current release. There are no dated support windows
+and nothing is back-ported to an older line: if you are running an older
+release, the fix is to move to the current one.
 
 `releases/latest` resolves to the current beta.
-[All releases](https://github.com/dob323/session-kit/releases) shows that line
-and everything published before it.
+[All releases](https://github.com/dob323/session-kit/releases) lists it and
+everything published before it. Earlier lines stay published so that whatever
+you already downloaded keeps its checksum and provenance files beside it, not
+because those lines still receive fixes.
 
-The current beta supports its documented Linux targets and macOS 14 or newer on
-Apple Silicon and Intel. Other operating systems, older macOS releases, Apple
+The current release supports its documented Linux targets and macOS 14 or newer
+on Apple Silicon and Intel. Other operating systems, older macOS releases, Apple
 Bash 3.2, and service arrangements outside the documented systemd and per-user
 launchd models are outside this policy.
 

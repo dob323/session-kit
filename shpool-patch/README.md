@@ -65,7 +65,7 @@ The last point is not decoration. The buffer slot introduced above can still
 hold an ack the heartbeat thread gave up waiting for, and the receiving half
 lives in the long-lived control struct, so it never disconnects. A blocking
 send into a full slot would therefore park the shell-to-client thread with
-nobody left to drain it — the same wedge this patch exists to prevent, reached
+nobody left to drain it, the same wedge this patch exists to prevent, reached
 through a different door. Dropping an ack is safe precisely because requests
 carry IDs: the heartbeat thread times out and asks again under a fresh one.
 
@@ -167,8 +167,8 @@ never performs either restart.
 
 On attach, shpool replays restorable screen contents but not the input modes
 the application enabled: bracketed paste, application cursor and keypad keys,
-and the mouse protocol. A freshly connected terminal — a new window
-reattaching to a long-lived session — starts with those modes off while the
+and the mouse protocol. A freshly connected terminal, a new window
+reattaching to a long-lived session, starts with those modes off while the
 application inside still believes they are on.
 
 The visible failure is pasting. Terminals with paste protection prompt before
@@ -190,8 +190,8 @@ daemon-restart requirement.
 ## Dead-shell kill patch (0003)
 
 `shpool kill` sends SIGHUP to the session's child and treats any signal
-error as fatal. If the child already exited on its own — a crash, a clean
-exit the daemon's bookkeeping missed, an external kill — the signal returns
+error as fatal. If the child already exited on its own, a crash, a clean
+exit the daemon's bookkeeping missed, an external kill, the signal returns
 ESRCH, the kill handler aborts, and the session is never removed from the
 daemon's table. The result is a phantom session that `shpool list` keeps
 advertising, that cannot be attached, and that no kill can remove until the
@@ -225,12 +225,12 @@ let shells = self.shells.lock();                  // global lock HELD
 ```
 
 `client_connection` and `client_connection_ack` are both created as
-`crossbeam_channel::bounded(0)` — **rendezvous** channels. Neither half
+`crossbeam_channel::bounded(0)`, **rendezvous** channels. Neither half
 completes unless the session's shell→client thread is sitting in its `select!`
 loop ready to receive.
 
-A client whose socket has stopped draining — a stalled ssh window, a suspended
-laptop, a terminal tab that went away without closing cleanly — leaves that
+A client whose socket has stopped draining, a stalled ssh window, a suspended
+laptop, a terminal tab that went away without closing cleanly, leaves that
 thread blocked in `write()` to the client socket instead. The detach then waits
 forever while holding the global lock, and every `list`, `attach`, `detach` and
 `kill` in the daemon queues behind it. The daemon still accepts connections
@@ -239,7 +239,7 @@ like a hang rather than a crash.
 
 **One unresponsive client window takes down every session in the daemon.**
 
-Log signature — a `handle_detach` span that opens and never closes, followed by
+Log signature, a `handle_detach` span that opens and never closes, followed by
 `handle_list` spans that all stop at the same place:
 
 ```text
@@ -264,7 +264,7 @@ into three phases:
    `SESSION_MSG_TIMEOUT`;
 3. re-take the shells lock briefly for the `last_disconnected_at` bookkeeping.
 
-This is not a new design — it is the pattern upstream already uses for the
+This is not a new design, it is the pattern upstream already uses for the
 session-message detach in the same file (`SessionMessageRequestPayload::Detach`),
 and every other user of that control channel is bounded too
 (`SHELL_TO_CLIENT_CTL_TIMEOUT` at the attach and disconnect sites).
@@ -283,12 +283,12 @@ outage.
 
 The patch bounds the wait; it does not explain why a shell→client thread
 stopped servicing its control channel in the first place. That remains
-uninvestigated — the containment is deliberate, because no single-session fault
+uninvestigated, the containment is deliberate, because no single-session fault
 should be able to take the daemon down regardless of its cause.
 
 Build, activation and rollback are the same as for `0001`, including the
 daemon-restart requirement. Because a restart ends every managed terminal
-process, capture exact provider recovery identities first — after the restart
+process, capture exact provider recovery identities first, after the restart
 they come back through the one recovery list, which the login chooser's Closed
 sessions screen and `sp recover` both read.
 
@@ -297,8 +297,8 @@ sessions screen and `sp recover` both read.
 `shpool attach` exits 1 instead of the shell's real exit status whenever the
 terminal closes the client's stdin before the status frame arrives.
 
-The attach client runs two threads over the daemon socket — `stdin->sock` and
-`sock->stdout` — with a coordinator loop that watches both. The moment
+The attach client runs two threads over the daemon socket, `stdin->sock` and
+`sock->stdout`, with a coordinator loop that watches both. The moment
 **either** finishes, the coordinator stamps its fallback status of 1 into the
 shared result slot so the other thread will notice and stop:
 

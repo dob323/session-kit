@@ -1180,7 +1180,7 @@ def build_inventory(
             )
             # The session-index name is exact rename evidence. A database
             # title also counts as a real name on current Codex, which
-            # auto-titles threads there — recognizable by the schema carrying
+            # auto-titles threads there, recognizable by the schema carrying
             # first_user_message separately. Older stores kept the raw prompt
             # in the title, and a title that still echoes the first prompt is
             # that same behavior on any schema.
@@ -1246,7 +1246,7 @@ def build_inventory(
                 )
                 agent_status = "unknown"
                 # A new Codex session has no rollout until its first message, so
-                # it cannot be identified — but calling it "unresolved" reads as
+                # it cannot be identified, but calling it "unresolved" reads as
                 # broken when it is simply unused. Name what is actually running
                 # so the row is recognisable. Identity stays unknown: this is a
                 # label, and it grants nothing.

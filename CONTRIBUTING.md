@@ -115,7 +115,7 @@ installations on a persistent Mac account.
 bug again.** Tab is IFS whitespace, so a run of tabs collapses to one
 separator and every empty field between them disappears; the fields after it
 shift one place left and a record written perfectly is read as garbage. This
-cost the project three launches in one night — every `sp new --model` without
+cost the project three launches in one night, every `sp new --model` without
 `--launch-key` wrote an empty launch key, the generation fields shifted, and
 the session came up as a shell with no provider.
 
@@ -128,7 +128,7 @@ line=${line//$'\t'/$'\034'}
 IFS=$'\034' read -r provider cwd model launch_key <<<"$line"
 ```
 
-The pattern sites are in `bashrc/shpool.bashrc` — the start record, the
+The pattern sites are in `bashrc/shpool.bashrc`, the start record, the
 sidecar, and the launch record all read this way, each with a Python shape
 check above it that refuses a record containing `\034` in the first place.
 
@@ -148,8 +148,8 @@ separate checklist:
 
 ## No personal names in shipped files
 
-Everything the public export ships — code, comments, docstrings, tests,
-identifiers, configuration, prompts, and docs — names roles, not people. Write
+Everything the public export ships, code, comments, docstrings, tests,
+identifiers, configuration, prompts, and docs, names roles, not people. Write
 "the operator" or "the maintainer"; never a person's name. This covers
 identifiers as much as prose: a keyword argument or JSON key with a name in it
 ships just as publicly as a comment does.
@@ -164,7 +164,7 @@ release tree that contains a personal-name token, and it is the gate that
 `tools/build-public-tree` runs on every export. The scanner stores the blocked
 words only as one-way SHA-256 digests in `PRIVATE_TOKEN_DIGESTS`, so the
 scanner itself stays safe to publish, and it tests each underscore-separated
-part of an identifier as well as the whole token — `operator_confirmed` is
+part of an identifier as well as the whole token, `operator_confirmed` is
 fine, a name in that position is not.
 
 The rule reaches published history too, and history published before the rule
@@ -174,7 +174,7 @@ and accepted, and `tools/public-scan --git-history --baseline` skips those
 exact objects. It skips nothing else: a credential in a listed blob still
 fails, the working-tree scan ignores the baseline entirely, and an edited file
 is a different object that fails again. Append to that list only after reading
-the blob and only for something already published — a failure on a blob that
+the blob and only for something already published, a failure on a blob that
 has not shipped means the tree still has to be fixed.
 
 Adding a new blocked word means adding its digest, not the word:
