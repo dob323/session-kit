@@ -37,7 +37,7 @@ PAD_TOP, PAD_BOTTOM = 46, 50
 WINDOW_WIDTH = WIDTH - PAD * 2
 
 HEADLINE = ("Many AI coding sessions.", "One place to see which one needs you.")
-SUPPORTS = "Claude Code · Codex · shells · Linux and macOS"
+SUPPORTS = "Claude Code · Codex · Linux and macOS"
 
 CSS = """
 body{{

@@ -7,12 +7,47 @@ provider conversations are recoverable.
 The commands below name no version. `releases/latest` resolves to the current
 beta, so they keep working across releases. Release assets are named by source
 commit rather than by version, which is why the download needs a pattern and
-every later step uses a glob.
+every later step uses a glob. It is also why there is no fixed download URL:
+`releases/latest/download/<name>` cannot work when the name changes with every
+release.
+
+Two routes fetch the same four files. Use either.
+
+### Without the GitHub CLI
+
+Python 3 is already required, so this needs nothing that the install does not
+need anyway. It asks the release API which files belong to the current release
+and downloads each one.
+
+```bash
+mkdir session-kit-download
+cd session-kit-download
+
+python3 - <<'PY'
+import json, urllib.request
+url = "https://api.github.com/repos/dob323/session-kit/releases/latest"
+with urllib.request.urlopen(url) as response:
+    release = json.load(response)
+for asset in release["assets"]:
+    urllib.request.urlretrieve(asset["browser_download_url"], asset["name"])
+    print("downloaded", asset["name"])
+PY
+```
+
+The GitHub API allows sixty unauthenticated requests an hour from one address,
+which this uses one of.
+
+### With the GitHub CLI
 
 ```bash
 mkdir session-kit-download
 cd session-kit-download
 gh release download --repo dob323/session-kit --pattern 'session-kit-*'
+```
+
+### Then, either way
+
+```bash
 if command -v sha256sum >/dev/null; then
   sha256sum --check session-kit-*.sha256
 else
@@ -24,6 +59,11 @@ cd session-kit-*/
 ./install.sh
 session-kit doctor
 ```
+
+Verify the checksum before unpacking. The `.provenance.json` file beside the
+archive records the source commit, the public tree hash, and that the artifact
+rebuilds byte for byte; the `.chain.json` file records the release commit, the
+tag it points at, and every check that passed before publication.
 
 The installer puts its commands in `$HOME/.local/bin`. On Debian and Ubuntu,
 `~/.profile` adds that directory to `PATH` only if it already existed when you

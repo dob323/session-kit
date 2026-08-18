@@ -156,7 +156,14 @@ APPROVED_BINARY_SHA256 = {
     # Laid-out diagrams with no capture in them; text only, all of it written
     # for the page.
     "docs/assets/readme/how-it-works.png": (
+        # Advertised shell sessions as a third kind of managed session.
         "05e0ec07f0c0ebbfeac344811aad70ad4ad04ca7fe19f95fb8fb28da97b7b009",
+        # 2026-08-18 render, reviewed: panel three now reads "Claude Code or
+        # Codex runs inside it", matching a page that no longer offers shells
+        # as a session type. Panel one still says "an ordinary shell", which is
+        # the person's own terminal and a different thing entirely. Text only,
+        # no capture, nothing private; layout unchanged.
+        "09531a327b2f22f2d29f5db9e408cf0bb4433a7baa702fe916d9812c39a9a5a8",
     ),
     "docs/assets/readme/safety-model.png": (
         "872acd2a47dfe8a238eddf389c3efcab50d970a2c5496084f6b6477264ab3293",
@@ -169,6 +176,11 @@ APPROVED_BINARY_SHA256 = {
         # 2026-08-18: tools/render-readme-social, headline plus the real
         # needs-you screen.
         "d16d0c508e109e5a7a6efc5d186e7039696e2c2f0d5495acb76317fc331f217e",
+        # 2026-08-18 re-render, reviewed: the supported line no longer offers
+        # "shells". This card is what every shared link shows, so it was the
+        # last place still advertising a session type the page has dropped.
+        # Same layout, same captured needs-you screen, nothing private.
+        "b89ffe3efb183e1fcb71fe70f77c96c9a3a112b0a940c742ecb8818cced2941a",
     ),
 }
 

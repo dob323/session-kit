@@ -19,13 +19,18 @@ Session Kit is a local picker for Claude Code and Codex. Type `kit` and every se
 <p align="center">
   <a href="#install">Install</a> ·
   <a href="#the-picker">The picker</a> ·
+  <a href="#accounts-and-subscriptions">Accounts</a> ·
   <a href="#delegated-work">Delegated work</a> ·
   <a href="#how-it-works">How it works</a> ·
   <a href="#safety-model">Safety model</a> ·
   <a href="#documentation">Documentation</a>
 </p>
 
-> **Public beta.** `v0.4.2` supports Linux with systemd and macOS 14 or newer. Start on a single trusted Unix account where provider conversations can be recovered. Session Kit is not a security boundary against another process already running as the same Unix user.
+> **Public beta — `v0.4.2`.** Linux with systemd, or macOS 14 and newer.
+>
+> **Settled:** the picker, session identity and the guards around every action, install, update and rollback, and the Claude Code and Codex integrations. Around 2,700 tests run on both platforms for every change.
+>
+> **Not settled:** the beta line moves quickly — thirteen releases in its first three weeks — and each beta minor is supported for 90 days, so expect to update. Codex does not report a blocking prompt yet. Start on a single trusted Unix account where provider conversations can be recovered. Session Kit is not a security boundary against another process already running as your Unix user.
 
 ## What you get
 
@@ -61,11 +66,21 @@ If what you actually need is reviewing the diff each agent produced, a different
 
 Session Kit installs per user, on the Linux or macOS machine where the work runs.
 
+Artifacts are named by the exact commit they were built from, so there is no fixed download URL. This asks the release API which files belong to the current release, checks what arrived, and only then unpacks it. It needs nothing but Python 3 and `tar`, both of which the install needs anyway.
+
 ```bash
 mkdir session-kit-download
 cd session-kit-download
 
-gh release download --repo dob323/session-kit --pattern 'session-kit-*'
+python3 - <<'PY'
+import json, urllib.request
+url = "https://api.github.com/repos/dob323/session-kit/releases/latest"
+with urllib.request.urlopen(url) as response:
+    release = json.load(response)
+for asset in release["assets"]:
+    urllib.request.urlretrieve(asset["browser_download_url"], asset["name"])
+    print("downloaded", asset["name"])
+PY
 
 if command -v sha256sum >/dev/null; then
   sha256sum --check session-kit-*.sha256
@@ -95,7 +110,7 @@ session-kit doctor
 **Linux** additionally needs a readable `/proc`, a systemd user manager, Bash 4+, and Python 3.10+.
 **macOS** additionally needs macOS 14+, an active desktop login for the per-user launchd GUI domain, Homebrew Bash 4+, and Python 3.11+.
 
-For supported shpool paths, provider setup, manual asset download, project import, and activation, read [Install Session Kit](docs/install.md).
+Prefer the GitHub CLI, installing without a network path to the API, or checking the provenance file by hand? [Install Session Kit](docs/install.md) has every route, plus supported shpool paths, provider setup, project import, and activation.
 
 ### Installing with an AI assistant
 
@@ -114,7 +129,6 @@ New session defaults to Claude Code. A session can also be started directly:
 ```bash
 sp new claude
 sp new codex
-sp new shell
 ```
 
 Project aliases, provider choice, account selection, and configured models make those launches more specific. See [Projects](docs/projects.md) and [Use Session Kit](docs/usage.md).
@@ -156,6 +170,23 @@ The home screen keeps the common actions one key away:
 A session that is open elsewhere defaults to **Move it here** after a fresh identity check. The earlier window returns to its picker, and the provider conversation is not duplicated.
 
 Press `?` for the full key reference — filtering, ranges, grouping, forking, renaming, and `g` to jump to the next session that needs you are all there. See [Picker navigation](docs/picker-navigation.md) for the cursor-driven picker, mouse behavior, action panels, machine sessions, and closed-session restore.
+
+## Accounts and subscriptions
+
+One machine, several logins for the same provider, one per session. Enrol each account once and it becomes a choice at launch:
+
+```bash
+sp account enroll claude work you@example.com
+sp account list claude
+```
+
+Each enrolled account keeps its own provider configuration directory, so a session started on it authenticates as that account and no other. Three Claude Code subscriptions can be running in three sessions at the same moment, and the picker shows which account each session belongs to — the `personal` and `work` column in the screenshot above.
+
+This is the part most session tools do not do. A terminal multiplexer inherits whichever login the shell that started it happened to have, so every window shares one subscription. Here the account is a property of the session.
+
+Provider authentication stays in provider-owned storage throughout. Session Kit does not ask for, copy, print, or log provider tokens.
+
+When a conversation's weekly quota runs out, it can be carried to another enrolled account once, and you are told after the fact rather than asked in the middle of your work. Read [Configure Session Kit](docs/configuration.md) for enrolment, verification, and the carry-over rules.
 
 ## Delegated work
 
@@ -213,21 +244,7 @@ For **Claude Code**, it can supply the installed status line, session name and c
 
 For **Codex**, it leaves the Codex status bar under Codex control, and supplies per-launch terminal-title items and the session theme without editing `~/.codex/config.toml`.
 
-Provider authentication stays in provider-owned storage. Session Kit does not ask for, copy, print, or log provider tokens.
-
 Read [Claude Code and Codex integration](docs/provider-integration.md) for the exact contracts.
-
-## Display
-
-Session Kit is developed and tested against Ghostty, but any truecolor terminal runs the key-driven picker. The cursor-driven picker has a reduced-color fallback.
-
-```bash
-NO_COLOR=1 kit
-```
-
-`SESSION_KIT_NO_COLOR=1` does the same. State words and safety meaning never depend on color.
-
-Opening, moving, or creating a session can push the session name into the terminal title; returning to the picker restores `session kit`. Set `SESSION_KIT_TAB_TITLE=off` to disable title pushes.
 
 ## Local data and privacy
 
@@ -243,44 +260,31 @@ By default:
 
 Optional history can contain prompts, source code, command output, credentials, and other sensitive terminal content. Read [Security and local data](docs/security-and-data.md) before enabling it.
 
-## Maintenance
+## Running it
 
 ```bash
-session-kit doctor
-session-kit update --source <release-directory>
-session-kit rollback [--to <full-commit>]
-
-session-kit services enable
-session-kit services disable
-session-kit services status
-
-sp help
-sp help exit-codes
-sp help selectors
+session-kit doctor      # what is installed, what is wrong, and what to do
+sp help                 # every command, with exit codes and selectors
 ```
 
-Updates install an immutable local release and atomically move `current`. Rollback selects a verified release already on the machine. Read [Update and roll back](docs/update-and-rollback.md) before changing releases.
+`doctor` is the first thing to run when anything looks wrong. Updates install an immutable local release and move `current` atomically; rollback selects a verified release already on the machine. Read [Update and roll back](docs/update-and-rollback.md) before changing releases, [Configure Session Kit](docs/configuration.md) for colour, terminal titles and every setting, and [Troubleshooting](docs/troubleshooting.md) when `doctor` names something you have not met.
 
-## shpool
-
-Session Kit runs on [shpool](https://github.com/shell-pool/shpool). It does not vendor or replace it.
-
-The repository includes optional shpool patches with their scope and checks. `session-kit doctor` records the shpool binary validated at installation and reports when that binary later changes. See `shpool-patch/` before choosing a patched binary.
+Session Kit runs on [shpool](https://github.com/shell-pool/shpool) and neither vendors nor replaces it. The repository carries optional shpool patches with their scope and checks; `doctor` records the shpool binary validated at installation and reports when it later changes. Read [`shpool-patch/`](shpool-patch/) before choosing a patched binary.
 
 ## Documentation
+
+**[Documentation index](docs/)** — every document, grouped by what you are trying to do.
+
+The ones people reach for first:
 
 | Topic | Document |
 |---|---|
 | Install | [docs/install.md](docs/install.md) |
-| Configure | [docs/configuration.md](docs/configuration.md) |
 | Use Session Kit | [docs/usage.md](docs/usage.md) |
+| Configure | [docs/configuration.md](docs/configuration.md) |
 | Picker navigation | [docs/picker-navigation.md](docs/picker-navigation.md) |
-| Projects | [docs/projects.md](docs/projects.md) |
-| Claude Code and Codex integration | [docs/provider-integration.md](docs/provider-integration.md) |
-| Security and local data | [docs/security-and-data.md](docs/security-and-data.md) |
 | Troubleshooting | [docs/troubleshooting.md](docs/troubleshooting.md) |
-| Update and rollback | [docs/update-and-rollback.md](docs/update-and-rollback.md) |
-| Uninstall | [docs/uninstall.md](docs/uninstall.md) |
+| Security and local data | [docs/security-and-data.md](docs/security-and-data.md) |
 | Architecture | [docs/architecture.md](docs/architecture.md) |
 | Release history | [CHANGELOG.md](CHANGELOG.md) |
 

@@ -103,7 +103,7 @@ def how_it_works() -> tuple[str, str, int]:
             "head": "3 &middot; The managed session",
             "body": [
                 "<p>The session runs on the host, inside shpool.</p>",
-                "<p>Claude Code, Codex, or a shell runs inside it.</p>",
+                "<p>Claude Code or Codex runs inside it.</p>",
             ],
         },
         {
