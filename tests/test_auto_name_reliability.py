@@ -198,11 +198,19 @@ class CodexTitlerTests(unittest.TestCase):
             )
             received: list[float | None] = []
 
+            # A write that ignores its deadline blocks for five seconds; one
+            # that honours it returns in ten milliseconds. The gap is that wide
+            # on purpose. It used to be 60ms against a 45ms ceiling, which asked
+            # the machine to be fast rather than asking the code to be right --
+            # a busy runner spent 45ms on the fixture alone and failed a
+            # deadline that had been passed and honoured (2026-08-18,
+            # ubuntu-24.04/3.11). The sleep only ever runs long when the
+            # behaviour under test is actually broken.
             def slow_store(
                 _root, _uuid, _title, *, timeout_seconds=None, **_keywords
             ):
                 received.append(timeout_seconds)
-                time.sleep(0.06 if timeout_seconds is None else timeout_seconds)
+                time.sleep(5.0 if timeout_seconds is None else timeout_seconds)
                 return [], []
 
             started = time.monotonic()
@@ -213,7 +221,7 @@ class CodexTitlerTests(unittest.TestCase):
             elapsed = time.monotonic() - started
             self.assertIsNotNone(received[0])
             self.assertLessEqual(received[0], 0.01)
-            self.assertLess(elapsed, 0.045, f"10ms pass took {elapsed:.3f}s")
+            self.assertLess(elapsed, 2.0, f"10ms pass took {elapsed:.3f}s")
 
     def test_live_rename_receives_only_the_remaining_pass_budget(self) -> None:
         with tempfile.TemporaryDirectory(prefix=".titler-live-budget-", dir=REPO) as raw:
@@ -606,7 +614,17 @@ class CodexTitlerTests(unittest.TestCase):
             passes = 0
             while passes < 12:
                 passes += 1
-                named = self.run_pass(codex, home)
+                # A stopped clock, for the same reason the 260-thread test
+                # pins one: this is about two thousand threads all reaching a
+                # name, not about how many of them one machine fits inside a
+                # two-second budget. Against the real clock a loaded runner
+                # drained too little per pass and ran out of passes with the
+                # backlog still standing -- a failure about the runner
+                # (2026-08-18, ubuntu-24.04/3.11). The budget has its own
+                # tests, which pin the clock exactly this way.
+                named = self.run_pass(
+                    codex, home, budget_seconds=1.0, monotonic=lambda: 0.0
+                )
                 if not named:
                     break
             self.assertEqual(total, len(self.indexed(codex)))
