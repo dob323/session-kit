@@ -58,6 +58,10 @@ RETIRE_DAYS=${SESSION_KIT_WATCHDOG_RETIRE_DAYS:-2}
 QUIET_RETRY_SECONDS=${SESSION_KIT_WATCHDOG_QUIET_RETRY:-900}
 # Seconds allowed for the read-only "is the manager alive" question.
 MANAGER_PROBE_TIMEOUT=${SESSION_KIT_WATCHDOG_MANAGER_TIMEOUT:-20}
+# A snapshot older than this while a kit state lock has waiters is a jam, not
+# load: collections run in seconds and retry constantly, so five quiet minutes
+# with a queue means the queue is not moving.
+STALE_SNAPSHOT_SECONDS=${SESSION_KIT_WATCHDOG_STALE_SNAPSHOT_SECONDS:-300}
 # sha256 of the session-manager binary this machine is supposed to run. Absent
 # means the check is skipped, so nothing breaks if it was never recorded.
 BINARY_FINGERPRINT=${SESSION_KIT_WATCHDOG_BINARY_FINGERPRINT:-"$STATE_ROOT/session-kit/shpool-binary.sha256"}
@@ -1144,8 +1148,38 @@ report_once() {
   fi
 }
 
+# The 2026-08-17 estate jam: a self-name held config.lock and then waited on
+# its own second descriptor for it, so every collector, picker refresh and
+# name attempt queued behind one process for twenty minutes — while the
+# session manager answered normally, so manager_answers saw nothing. The
+# durable, cheap symptom of that whole class: the snapshot has stopped aging
+# forward AND a kit state lock has waiters. Report the holder by pid so the
+# person (or an agent) can end it. config.lock also serialises atomic config
+# writes (colors, names), so ending the holder can abort that one command —
+# the write itself stays whole either way, and collections retry on their
+# own. The message says exactly that instead of promising universal safety
+# (review lane rv-pdn-2, 2026-08-17).
+state_lock_jam_check() {
+  local snapshot="$SK_STATE_DIR/inventory.json"
+  local age lockfile inode rows holder
+  [[ -f $snapshot ]] || return 0
+  age=$(( $(date +%s) - $(stat -c %Y "$snapshot" 2>/dev/null || echo 0) ))
+  (( age > STALE_SNAPSHOT_SECONDS )) || return 0
+  for lockfile in "$SK_STATE_DIR/inventory-v2.lock" "$SK_STATE_DIR/config.lock"; do
+    [[ -f $lockfile ]] || continue
+    inode=$(stat -c %i "$lockfile" 2>/dev/null) || continue
+    rows=$(grep -F ":$inode " /proc/locks 2>/dev/null) || continue
+    printf '%s\n' "$rows" | grep -q -- '->' || continue
+    holder=$(printf '%s\n' "$rows" | grep -v -- '->' | head -1 | awk '{print $5}')
+    report_once state-lock-jam "Session Kit state locks are jammed" \
+      "The session snapshot has not refreshed for $((age / 60)) minutes and ${lockfile##*/} has processes queued behind pid ${holder:-unknown} ($(ps -o args= -p "${holder:-0}" 2>/dev/null | cut -c1-120)). Sessions keep running, but the picker, collectors and naming are all waiting. Ending the holder clears the jam; atomic writes stay whole, collections retry on their own, and at worst the holder's own command reports a failure and can be rerun: kill ${holder:-<pid>}"
+    return 0
+  done
+}
+
 health_check() {
   [[ -e $SENTINEL ]] && return 0
+  state_lock_jam_check
   if ! manager_answers; then
     # Confirm before speaking: a single slow answer under load is not a jam.
     sleep 5

@@ -108,6 +108,31 @@ ABSENT_MARKER = "SESSION_KIT_TEST_SHPOOL_ABSENT"
 # path that would leak into the public export.
 _REAL_HOME = os.environ.get("HOME") or ""
 _INHERITED_STATE_HOME = os.environ.get("XDG_STATE_HOME")
+# A test run launched from inside a kit-managed session inherits the session's
+# own account profile in these. Any suite that starts a real provider CLI in a
+# fixture HOME would then write real transcripts into a real account profile —
+# 952 such stray directories were cleaned out of two profiles on 2026-08-17.
+# Captured here for the same inherited-versus-chosen test the state home uses.
+_INHERITED_PROVIDER_DIRS = {
+    name: os.environ.get(name)
+    for name in (
+        "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
+        "CLAUDE_CODE_PROJECT_DIR_NAME",
+        # The estate identity of the SESSION the tests happen to run inside.
+        # A generated SHPOOL_SESSION_NAME makes sp classify every launch as
+        # machine-origin — the person-origin worktree tests fail on a live
+        # box and nowhere else. A fixture that sets its own value keeps it;
+        # only the inherited one is dropped.
+        "SHPOOL_SESSION_NAME",
+        "SHPOOL_SESSION_DIR",
+        "SHPOOL_JOURNAL",
+        "SESSION_KIT_ORIGIN",
+        "SESSION_KIT_ACCOUNT_ALIAS",
+        "SESSION_KIT_ACCOUNT_CAPABLE",
+    )
+    if os.environ.get(name) is not None
+}
 INHERITED_PATH = os.environ.get("PATH") or ""
 
 _guard_dir: Path | None = None
@@ -280,6 +305,12 @@ def guarded_environment(env):
             # nothing and stops an inherited value from ever mattering. A value
             # the test chose is left alone.
             guarded["XDG_STATE_HOME"] = os.path.join(home, ".local", "state")
+        # A provider directory the test chose is honoured; one this process
+        # merely inherited is dropped, so a real provider CLI started in a
+        # fixture HOME falls back to that HOME instead of a real profile.
+        for name, inherited_value in _INHERITED_PROVIDER_DIRS.items():
+            if guarded.get(name) == inherited_value:
+                guarded.pop(name, None)
     return guarded
 
 
@@ -364,6 +395,8 @@ def install() -> Path:
     # Drop an inherited value rather than carry it into every os.environ.copy().
     if _INHERITED_STATE_HOME is not None:
         os.environ.pop("XDG_STATE_HOME", None)
+    for name in _INHERITED_PROVIDER_DIRS:
+        os.environ.pop(name, None)
 
     _patch_subprocess()
     _patch_os_exec()

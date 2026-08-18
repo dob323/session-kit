@@ -4,6 +4,14 @@ set -euo pipefail
 repo=$(cd -- "$(dirname -- "$0")/.." && pwd)
 export PYTHONDONTWRITEBYTECODE=1
 
+# A full suite on a live box must never outrank the person's sessions, the
+# picker, or the collectors — 2,619 tests at normal priority pushed the load
+# to 12 and starved interactive use on 2026-08-17. Lowest scheduling priority
+# and idle IO for this process and everything it starts; harmless where the
+# tools are missing.
+renice -n 15 -p $$ >/dev/null 2>&1 || true
+ionice -c 3 -p $$ >/dev/null 2>&1 || true
+
 # The suite must not inherit the operator's window, and must not inherit a
 # kill switch their shell happened to export either. tests/__init__.py pins
 # this for every entry point, including a bare

@@ -15,6 +15,32 @@ verified account description needed to show the choice.
 It does not copy credentials between profiles, put tokens in its account
 registry, or print them in picker and detail output.
 
+Enrollment writes each Claude profile's settings with
+`autoContinueAtUsageLimit` off: in a managed profile the account layer is the
+only thing that decides when a reset usage window starts being spent again.
+Turn it back on per profile in Claude's `/config` if you want a limited
+session to resume by itself.
+
+## Project directory names
+
+Claude Code 2.1.234 added `CLAUDE_CODE_PROJECT_DIR_NAME`: with
+`CLAUDE_CONFIG_DIR` set, it names the per-project directory under
+`<config>/projects/` instead of deriving a munged path from the working
+directory. When a session launches at the registered root of a project
+shortcut, the kit exports the shortcut's alias as that name, so transcripts
+and auto memory live under a short, stable directory (`projects/api/` rather
+than `projects/-home-me-projects-api/`).
+
+The export happens only with every proof in hand: a launcher of 2.1.234 or
+newer, exactly one shortcut registered for that root, an alias that passes
+Claude's own naming rules, and no directory conflict. An existing munged
+directory is renamed to the alias in one atomic move first — and only while
+no other session of that profile is running inside the root, because a
+half-migrated project would hide its own memory. Anything unprovable leaves
+the launch on the munged-name behaviour it has today; `session-kit doctor`
+reports the naming state per profile. Set `SESSION_KIT_PROJECT_DIR_NAME=off`
+to disable the feature entirely.
+
 ## Exact provider identity
 
 Claude identity comes from structured agent state joined to the exact native

@@ -62,8 +62,8 @@ class DocumentedKeyTests(unittest.TestCase):
 
 class RefusalTests(unittest.TestCase):
     def test_an_undocumented_key_stops_the_render(self) -> None:
-        # `p` played this part until the README documented it; `z` is nobody's
-        # key, so the refusal stays honest.
+        # `p` played this part until pinning shipped and the README learned
+        # it; `z` is nobody's key, so the refusal stays honest.
         futured = FOOTER.replace("· leave", f"· zap {G}z #{OFF} · leave")
         with self.assertRaises(SystemExit) as refusal:
             anatomy.refuse_undocumented_keys(futured)

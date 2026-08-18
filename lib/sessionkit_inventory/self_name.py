@@ -362,15 +362,23 @@ def self_name_automatic_title(
     evidence = prove_caller(live, table, caller_environ, pid)
 
     def revalidate() -> None:
+        # Runs INSIDE the name-store write locks. A fresh collection here is
+        # forbidden: collecting can itself take config.lock through a second
+        # descriptor, and a process cannot pass its own flock on a new handle
+        # — the self-name that jammed every collector on the machine for
+        # twenty minutes on 2026-08-17 was exactly this call re-collecting
+        # under the lock. The caller proof is repeated against a fresh
+        # process table (lock-free, and the part that can actually change:
+        # pid death and reuse); the inventory evidence stays the snapshot
+        # taken moments ago, which the held lock now protects from writers.
         if supplied_evidence:
-            new_live, new_table = live, table
+            new_table = table
         else:
-            new_live = snapshot_inventory(write_state=False, config=dict(config))
             new_table = process_table_reader(
                 proc_root,
                 int(config.get("max_proc_nodes", default_max_proc_nodes)),
             )
-        repeated = prove_caller(new_live, new_table, caller_environ, pid)
+        repeated = prove_caller(live, new_table, caller_environ, pid)
         if repeated != evidence:
             raise CollectionError("automatic name caller changed before write")
 

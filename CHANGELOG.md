@@ -2,6 +2,74 @@
 
 All notable changes to Session Kit are documented here.
 
+## [0.4.2] - 2026-08-18
+
+### Added
+
+- Short project directory names: a Claude session launched at the registered
+  root of a project shortcut now stores transcripts and auto memory under the
+  shortcut's alias (Claude Code 2.1.234's `CLAUDE_CODE_PROJECT_DIR_NAME`).
+  The export is proved per launch — launcher version, unambiguous registry,
+  valid alias, no directory conflict — and an existing munged directory is
+  renamed in one atomic move only while no other session of that profile runs
+  inside the root. `session-kit doctor` gained a `project-dir-names` check;
+  `SESSION_KIT_PROJECT_DIR_NAME=off` disables the feature.
+
+### Security / data safety
+
+- A second Unix account's shpool daemon no longer disables this account's
+  kit. Daemon selection now rules out any daemon owned by another account
+  before it asks who holds the listener: their `/proc/<pid>/fd` is
+  unreadable, which the uniqueness rule read as "cannot establish", so
+  `daemon_generation` went null and every session became unprovable —
+  `sp new` produced an unresolved row and `sp go`/`sp close` refused. A
+  listener under `/run/user/<uid>` is mode 0700, so another account's daemon
+  was never a candidate. Census rows now carry the owning uid; a row without
+  one is still treated as a candidate.
+- The project-directory migration closed three lose-work races found by a
+  post-install review lane: the liveness scan now re-runs on the far side of
+  the rename and undoes it if a raw same-profile launch appeared in the gap;
+  a same-profile provider in the launcher's own ancestor chain counts as a
+  live session (only shells and launch plumbing are excused); and the Claude
+  version proof is bound to the exact executable the shell then runs — an
+  armed export launches the proved realpath, never a re-resolved `claude`.
+  An alias path occupied by a regular file or symlink now refuses instead of
+  exporting an unusable name.
+- Enrolment writes `autoContinueAtUsageLimit: false` even when the source
+  Claude profile has no settings file at all — the default is a promise about
+  every managed profile, not a transform applied only when there was
+  something to copy.
+- The project-dir-name helper reads the same projects registry every other
+  consumer does (`SESSION_KIT_PROJECTS_FILE`, then the XDG location), and its
+  doctor honours `SESSION_KIT_ACCOUNT_ROOT`. The watchdog's lock-jam notice
+  no longer promises that ending the holder is universally safe; it says what
+  actually happens.
+
+### Fixed
+
+- A self-name could deadlock the whole estate: its write-time revalidation ran
+  a fresh collection while holding the name-store locks, and collecting can
+  re-acquire `config.lock` through a second descriptor — the process then
+  waits forever on its own lock while every collector, picker refresh and
+  name attempt queues behind it (observed live for twenty minutes on
+  2026-08-17). Revalidation now re-reads only the process table; the one
+  snapshot is taken before any lock.
+- The watchdog now detects that class of jam: a snapshot that has stopped
+  refreshing while a kit state lock has queued waiters is reported once, with
+  the holding pid and the safe remedy.
+- `tests/run` drops itself to the lowest CPU and idle IO priority, so a full
+  suite on a live box can no longer starve the picker and sessions.
+
+### Changed
+
+- Enrolled Claude profiles now start with `autoContinueAtUsageLimit` off, so
+  a managed account never resumes spending by itself when a usage window
+  resets; turn it back on per profile in Claude's `/config`.
+- The test sandbox guard now drops an inherited `CLAUDE_CONFIG_DIR`,
+  `CODEX_HOME`, and `CLAUDE_CODE_PROJECT_DIR_NAME` from fixture-homed
+  children, so a suite that starts a real provider CLI can no longer write
+  transcripts into a real account profile.
+
 ## [0.4.1] - 2026-08-17
 
 ### Changed
@@ -182,4 +250,6 @@ All notable changes to Session Kit are documented here.
   attach.
 - Added patch `0006`, which coalesces bursts of client resize events.
 
+[0.4.2]: https://github.com/dob323/session-kit/releases/tag/v0.4.2
+[0.4.1]: https://github.com/dob323/session-kit/releases/tag/v0.4.1
 [0.4.0]: https://github.com/dob323/session-kit/releases/tag/v0.4.0

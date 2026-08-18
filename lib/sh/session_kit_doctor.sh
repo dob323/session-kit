@@ -357,6 +357,15 @@ doctor_command() {
   IFS=$'\034' read -r transcript_status transcript_detail <<<"$transcript_line"
   add_check "${transcript_status:-warn}" transcripts \
     "${transcript_detail:-transcript reachability could not be checked}"
+  local project_dir_status= project_dir_detail= project_dir_line= project_dir_helper
+  project_dir_helper=$install_root/current/lib/sessionkit_inventory/project_dir_name.py
+  if [[ -f $project_dir_helper && ! -L $project_dir_helper ]]; then
+    IFS= read -r project_dir_line < <(python3 "$project_dir_helper" --doctor 2>/dev/null)
+    project_dir_line=${project_dir_line//$'\t'/$'\034'}
+    IFS=$'\034' read -r project_dir_status project_dir_detail <<<"$project_dir_line"
+  fi
+  add_check "${project_dir_status:-warn}" project-dir-names \
+    "${project_dir_detail:-project directory naming could not be checked}"
   local audit_output audit_ok=1 audit_name
   local -a audit_names=(
     claude-version codex-version codex-themes naming-instructions naming-hook

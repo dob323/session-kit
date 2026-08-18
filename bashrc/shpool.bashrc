@@ -473,6 +473,40 @@ print(profile)
               ) 2>/dev/null || true
             fi
             unset __sk_claude_intent_uuid
+            # A relaunch through `exec bash -i` re-enters here with the
+            # previous launch's exports intact; a stale project-dir name from
+            # another directory or profile must never survive into this one.
+            unset CLAUDE_CODE_PROJECT_DIR_NAME
+            __sk_claude_cmd=claude
+            if [[ ${SESSION_KIT_PROJECT_DIR_NAME:-} != off && -n ${CLAUDE_CONFIG_DIR:-} ]]; then
+              __sk_pdn_helper=${__sk_inventory_core%/*}/sessionkit_inventory/project_dir_name.py
+              if [[ -f $__sk_pdn_helper ]]; then
+                # The version proof must name the exact file this shell then
+                # executes. A bare `claude` can re-resolve differently — a
+                # stale command hash, a launcher symlink retargeted after the
+                # proof — and an older executable silently ignores the export
+                # after the directory has already been renamed (review lane
+                # rv-pdn-1, 2026-08-17). One realpath is proved, and an armed
+                # export launches exactly that path.
+                hash -d claude 2>/dev/null
+                __sk_claude_real=$(command -v claude 2>/dev/null) &&
+                  __sk_claude_real=$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' \
+                    "$__sk_claude_real" 2>/dev/null) || __sk_claude_real=
+                if [[ -n $__sk_claude_real && -x $__sk_claude_real ]]; then
+                  __sk_pdn=$(python3 "$__sk_pdn_helper" --profile "$CLAUDE_CONFIG_DIR" \
+                    --cwd "$PWD" --claude-command "$__sk_claude_real" 2>/dev/null) || __sk_pdn=
+                  # The helper already refused anything unprovable; the pattern
+                  # guard here only keeps a mangled pipe from exporting garbage.
+                  if [[ $__sk_pdn =~ ^[A-Za-z0-9_-]{1,64}$ ]]; then
+                    export CLAUDE_CODE_PROJECT_DIR_NAME=$__sk_pdn
+                    __sk_claude_cmd=$__sk_claude_real
+                  fi
+                  unset __sk_pdn
+                fi
+                unset __sk_claude_real
+              fi
+              unset __sk_pdn_helper
+            fi
             __sk_mcp_args=()
             __sk_resume_degraded=0
             while :; do
@@ -498,9 +532,9 @@ print(profile)
                 fi
               fi
               case "$__sk_launch_mode" in
-                new) claude "${__sk_model_args[@]}" --session-id "$__sk_new_claude_uuid" "${__sk_mcp_args[@]}"; __sk_provider_rc=$? ;;
-                resume) claude "${__sk_model_args[@]}" --resume "$__sk_uuid" "${__sk_mcp_args[@]}"; __sk_provider_rc=$? ;;
-                fork) claude "${__sk_model_args[@]}" --resume "$__sk_uuid" --fork-session "${__sk_mcp_args[@]}"; __sk_provider_rc=$? ;;
+                new) "$__sk_claude_cmd" "${__sk_model_args[@]}" --session-id "$__sk_new_claude_uuid" "${__sk_mcp_args[@]}"; __sk_provider_rc=$? ;;
+                resume) "$__sk_claude_cmd" "${__sk_model_args[@]}" --resume "$__sk_uuid" "${__sk_mcp_args[@]}"; __sk_provider_rc=$? ;;
+                fork) "$__sk_claude_cmd" "${__sk_model_args[@]}" --resume "$__sk_uuid" --fork-session "${__sk_mcp_args[@]}"; __sk_provider_rc=$? ;;
               esac
               # Same rule after the fact: a resume that exited nonzero without
               # its conversation being anywhere this profile can see is not a

@@ -583,13 +583,19 @@ def sync_profile_configuration(provider: str, profile_dir: Path) -> None:
         if candidate.is_file() and not candidate.is_symlink():
             _copy_regular(candidate, profile_dir / "CLAUDE.md")
         settings = source / "settings.json"
+        # A source profile with no settings file still yields one here: the
+        # auto-continue default below is a promise enrolment makes about
+        # every managed profile, not a transform applied only when there was
+        # something to copy (review lane rv-pdn-2, 2026-08-17).
+        value: dict[str, Any] = {}
         if settings.is_file() and not settings.is_symlink():
             try:
-                value = json.loads(settings.read_text(encoding="utf-8"))
+                parsed = json.loads(settings.read_text(encoding="utf-8"))
             except (OSError, ValueError) as exc:
                 raise CollectionError("Claude settings could not be safely copied") from exc
-            if not isinstance(value, dict):
+            if not isinstance(parsed, dict):
                 raise CollectionError("Claude settings could not be safely copied")
+            value = parsed
             allowed_environment = {
                 "CLAUDE_AFK_TIMEOUT_MS",
                 "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS",
@@ -605,18 +611,24 @@ def sync_profile_configuration(provider: str, profile_dir: Path) -> None:
                 }
             else:
                 value.pop("env", None)
-            destination = profile_dir / "settings.json"
-            temporary = profile_dir / f".settings.{uuidlib.uuid4().hex}.tmp"
-            try:
-                temporary.write_text(
-                    json.dumps(value, indent=2, sort_keys=True) + "\n",
-                    encoding="utf-8",
-                )
-                os.chmod(temporary, 0o600)
-                os.replace(temporary, destination)
-            finally:
-                with contextlib.suppress(FileNotFoundError):
-                    temporary.unlink()
+        # Claude Code 2.1.234 resumes a limited session by itself when the
+        # usage window resets. In a managed profile the account layer is
+        # the only thing that decides when a reset account spends again,
+        # so enrolment starts every profile with the switch off; the
+        # person can turn it back on per profile in /config afterwards.
+        value["autoContinueAtUsageLimit"] = False
+        destination = profile_dir / "settings.json"
+        temporary = profile_dir / f".settings.{uuidlib.uuid4().hex}.tmp"
+        try:
+            temporary.write_text(
+                json.dumps(value, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, destination)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                temporary.unlink()
         for name in ("agents", "commands", "output-styles"):
             _copy_tree(source / name, profile_dir / name)
         return

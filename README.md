@@ -22,7 +22,7 @@ Session Kit keeps terminal AI work in one place. It gives every managed session 
 
 It runs locally around [shpool](https://github.com/shell-pool/shpool) sessions. Claude Code, Codex, or a shell stays inside the managed session on the host. Session Kit adds the picker, status model, recovery records, and proof-bound actions around it.
 
-> **Public beta:** Session Kit `v0.4.1` supports Linux with systemd and macOS 14 or newer. Start on a single trusted Unix account where provider conversations can be recovered. Session Kit is not a security boundary against another process already running as the same Unix user.
+> **Public beta:** Session Kit `v0.4.2` supports Linux with systemd and macOS 14 or newer. Start on a single trusted Unix account where provider conversations can be recovered. Session Kit is not a security boundary against another process already running as the same Unix user.
 
 ## What you get
 
@@ -114,13 +114,13 @@ Read [Security and local data](docs/security-and-data.md) and [Architecture](doc
 
 ## Install
 
-The current beta is `v0.4.1`. Beta releases are GitHub prereleases, so name the tag explicitly.
+The current beta is `v0.4.2`. Beta releases are GitHub prereleases, so name the tag explicitly.
 
 ```bash
 mkdir session-kit-download
 cd session-kit-download
 
-gh release download v0.4.1 --repo dob323/session-kit
+gh release download v0.4.2 --repo dob323/session-kit
 
 if command -v sha256sum >/dev/null; then
   sha256sum --check session-kit-*.sha256
@@ -160,7 +160,7 @@ For the supported shpool paths, platform prerequisites, provider setup, manual a
 
 If Claude Code, Codex, or another terminal agent is doing the installation, give it this:
 
-> Install Session Kit from `https://github.com/dob323/session-kit`. Use the `v0.4.1` release artifact, not a clone of `main`. Download the release archive with its `.sha256` and `.provenance.json` files, verify the checksum, extract it, and run `./install.sh --check` first. Fix only the remedies that preflight explicitly names. Then run `./install.sh`, `session-kit doctor`, `session-kit services enable`, and `session-kit doctor` again. Never bypass a refused step. Show me the final doctor output and finish by telling me to type `kit`.
+> Install Session Kit from `https://github.com/dob323/session-kit`. Use the `v0.4.2` release artifact, not a clone of `main`. Download the release archive with its `.sha256` and `.provenance.json` files, verify the checksum, extract it, and run `./install.sh --check` first. Fix only the remedies that preflight explicitly names. Then run `./install.sh`, `session-kit doctor`, `session-kit services enable`, and `session-kit doctor` again. Never bypass a refused step. Show me the final doctor output and finish by telling me to type `kit`.
 
 ## First run
 

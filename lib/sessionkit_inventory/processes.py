@@ -224,6 +224,10 @@ def scan_process_table(
         # all — the exact state the auto-close engine treats as "nothing to
         # preserve". Record the ambiguity and let the readers refuse.
         environ_unreadable = False
+        try:
+            owner_uid: int | None = entry.stat().st_uid
+        except OSError:
+            owner_uid = None
         readable = _readable_by_us(entry)
         if readable:
             try:
@@ -275,6 +279,10 @@ def scan_process_table(
             "cmdline": cmdline,
             "comm": comm,
             "cwd": cwd,
+            # Which account owns the process. Read here, while /proc/<pid> is
+            # in hand, so daemon selection can rule out another account's
+            # shpool without a second pass over the process table.
+            "uid": owner_uid,
             "environ_unreadable": environ_unreadable,
             "session_name": environ.get("SHPOOL_SESSION_NAME", ""),
             "claude_config_dir": environ.get("CLAUDE_CONFIG_DIR", ""),
@@ -661,6 +669,29 @@ def _holds_any_socket(pid: int, inodes: set[int], proc_root: Path) -> _SocketHol
     return _SocketHolding.UNKNOWN if unreadable else _SocketHolding.DOES_NOT_HOLD
 
 
+def _owned_by_this_account(process: Mapping[str, Any]) -> bool:
+    """Whether this process could possibly be serving THIS account's kit.
+
+    A shpool daemon answers on a listener under ``/run/user/<uid>``, which the
+    kernel keeps mode 0700 for that uid alone, so a daemon running as another
+    account is never ours no matter what it is called. Without this question,
+    a second account's daemon on the same host was a permanent outage: its
+    ``/proc/<pid>/fd`` is unreadable, the socket-holder check answered
+    "unknown", the uniqueness rule then refused to name any daemon, and every
+    session on the board became unprovable (found live on a shared host,
+    2026-08-17).
+
+    The uid comes from the census row, which read it from ``/proc/<pid>``
+    while it was there. A row without one — an old snapshot, a hand-built
+    table — is a candidate as before: an unproven guess about a process is
+    not evidence against it.
+    """
+    uid = process.get("uid")
+    if isinstance(uid, bool) or not isinstance(uid, int):
+        return True
+    return uid == os.getuid()
+
+
 def _kit_daemons(
     process_table: Mapping[int, Mapping[str, Any]],
     is_shpool_daemon: Callable[[Mapping[str, Any]], bool],
@@ -700,13 +731,20 @@ def _kit_daemons(
         # busy host some scan is nearly always churned, and treating every
         # churned scan as "no daemon" unresolved every session on the board.
         return []
+    # Ownership first, and before every later question. Another account's
+    # daemon is not a candidate this kit has to rule out; it is one the kernel
+    # already ruled out.
     daemons = sorted(
-        pid for pid, process in process_table.items() if is_shpool_daemon(process)
+        pid
+        for pid, process in process_table.items()
+        if is_shpool_daemon(process) and _owned_by_this_account(process)
     )
     unknown = sorted(
         pid
         for pid, process in process_table.items()
-        if pid not in daemons and _is_unknown_shpool_daemon(process)
+        if pid not in daemons
+        and _is_unknown_shpool_daemon(process)
+        and _owned_by_this_account(process)
     )
     if unknown:
         # An unreadable exact shpool command line is the same kind of evidence

@@ -37,7 +37,7 @@ def picker_module():
 
 DEFAULT_OUTPUT = REPO / "docs" / "assets" / "readme" / "picker-anatomy.png"
 
-WIDTH, HEIGHT = 1600, 1200
+WIDTH, HEIGHT = 1600, 1230
 MARGIN, GAP = 44, 20
 CAPTURE_X, CAPTURE_Y, CAPTURE_W = MARGIN, 126, 1512
 

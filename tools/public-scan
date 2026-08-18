@@ -112,6 +112,12 @@ APPROVED_BINARY_SHA256 = {
         # neutral ~ title, and a cursor on the prompt so the command line
         # reads as one. Matches what the picker looks like on screen.
         "3f437edeb57aa016fbd465f3b146b4e9ec53482174e065e352cbf2d1d1f747d8",
+        # 2026-08-17, re-rendered for v0.4.2 after pinned projects stepped
+        # out of the release: neither the command bar nor the key panel
+        # shows a `p` the shipped version does not have. Reviewed before
+        # approval — the same neutral demo data (personal/work aliases,
+        # demo session numbers, a "session kit" title bar), nothing private.
+        "11967030cc802fac34a0288e630f13bc14d6ff0780ee7ce5654339dae7956de1",
     ),
     # The bare picker render, identical to the docs/assets/session-kit-picker
     # blob above because both come from the same deterministic tool.

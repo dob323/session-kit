@@ -226,9 +226,10 @@ class SnapshotPublicationOrderTests(unittest.TestCase):
 
         def update_recovery(current_paths, value, *, collection_start=None):
             extra = {}
-            if "collection_start" in inspect.signature(
-                recovery_state.update_recovery_state
-            ).parameters:
+            if (
+                "collection_start"
+                in inspect.signature(recovery_state.update_recovery_state).parameters
+            ):
                 extra.update(
                     collection_start=collection_start,
                     write_collection_json=(
@@ -243,11 +244,15 @@ class SnapshotPublicationOrderTests(unittest.TestCase):
                 schema_version=inventory_core.SCHEMA_VERSION,
                 recovery_manifest=manifest,
                 read_state_json=inventory_core._read_state_json,
-                has_recovery_entries=lambda document: recovery_state._has_recovery_entries(
-                    document,
-                    valid_recovery_state=lambda candidate: recovery_state._valid_recovery_state(
-                        candidate, schema_version=inventory_core.SCHEMA_VERSION
-                    ),
+                has_recovery_entries=lambda document: (
+                    recovery_state._has_recovery_entries(
+                        document,
+                        valid_recovery_state=lambda candidate: (
+                            recovery_state._valid_recovery_state(
+                                candidate, schema_version=inventory_core.SCHEMA_VERSION
+                            )
+                        ),
+                    )
                 ),
                 generation_key=recovery_state._generation_key,
                 atomic_write_json=state_io_state.atomic_write_json,
@@ -263,9 +268,12 @@ class SnapshotPublicationOrderTests(unittest.TestCase):
             collection_start=None,
         ):
             extra = {}
-            if "collection_start" in inspect.signature(
-                inventory_core.enqueue_lost_conversations
-            ).parameters:
+            if (
+                "collection_start"
+                in inspect.signature(
+                    inventory_core.enqueue_lost_conversations
+                ).parameters
+            ):
                 extra["collection_start"] = collection_start
             return inventory_core.enqueue_lost_conversations(
                 current_paths,
@@ -385,14 +393,13 @@ class SnapshotPublicationOrderTests(unittest.TestCase):
             )
             self.assertEqual(
                 ["human-new", "new", "old"],
-                sorted(
-                    row["shpool_id_raw"]
-                    for row in outcomes["older"]["sessions"]
-                ),
+                sorted(row["shpool_id_raw"] for row in outcomes["older"]["sessions"]),
             )
 
     def test_preupgrade_document_without_allocation_state_refuses(self) -> None:
-        with tempfile.TemporaryDirectory(prefix=".publication-upgrade-", dir=REPO) as raw:
+        with tempfile.TemporaryDirectory(
+            prefix=".publication-upgrade-", dir=REPO
+        ) as raw:
             state = Path(raw)
             state.chmod(0o700)
             paths = state_io_state._state_paths({"state_dir": state})
@@ -408,18 +415,21 @@ class SnapshotPublicationOrderTests(unittest.TestCase):
             self.assertFalse(paths["collection_sequence"].exists())
             self.assertFalse(paths["collection_sequence_floor"].exists())
             self.assertNotIn("collection_start", result)
-            self.assertEqual(["new"], [row["shpool_id_raw"] for row in result["sessions"]])
+            self.assertEqual(
+                ["new"], [row["shpool_id_raw"] for row in result["sessions"]]
+            )
             self.assertTrue(
                 any(
-                    "both durable collection sequence records are unreadable"
-                    in warning
+                    "both durable collection sequence records are unreadable" in warning
                     and "read-only" in warning
                     for warning in result["warnings"]
                 )
             )
 
     def test_corrupt_document_without_allocation_state_refuses(self) -> None:
-        with tempfile.TemporaryDirectory(prefix=".publication-corrupt-", dir=REPO) as raw:
+        with tempfile.TemporaryDirectory(
+            prefix=".publication-corrupt-", dir=REPO
+        ) as raw:
             state = Path(raw)
             state.chmod(0o700)
             paths = state_io_state._state_paths({"state_dir": state})
@@ -442,15 +452,16 @@ class SnapshotPublicationOrderTests(unittest.TestCase):
             )
             self.assertTrue(
                 any(
-                    "both durable collection sequence records are unreadable"
-                    in warning
+                    "both durable collection sequence records are unreadable" in warning
                     and "read-only" in warning
                     for warning in result["warnings"]
                 )
             )
 
     def test_unknown_incoming_cannot_replace_a_marked_document(self) -> None:
-        with tempfile.TemporaryDirectory(prefix=".publication-unknown-", dir=REPO) as raw:
+        with tempfile.TemporaryDirectory(
+            prefix=".publication-unknown-", dir=REPO
+        ) as raw:
             state = Path(raw)
             state.chmod(0o700)
             paths = state_io_state._state_paths({"state_dir": state})
@@ -502,7 +513,9 @@ class SnapshotPublicationOrderTests(unittest.TestCase):
             self.assertEqual(second, floor["last_collection_start"])
 
     def test_two_unreadable_sequence_records_refuse_publication(self) -> None:
-        with tempfile.TemporaryDirectory(prefix=".publication-refusal-", dir=REPO) as raw:
+        with tempfile.TemporaryDirectory(
+            prefix=".publication-refusal-", dir=REPO
+        ) as raw:
             state = Path(raw)
             state.chmod(0o700)
             paths = state_io_state._state_paths({"state_dir": state})
@@ -673,9 +686,12 @@ class SnapshotPublicationOrderTests(unittest.TestCase):
             "pending",
         )
         for evidence in (*document_keys, "marker"):
-            with self.subTest(evidence=evidence), tempfile.TemporaryDirectory(
-                prefix=".publication-evidence-", dir=REPO
-            ) as raw:
+            with (
+                self.subTest(evidence=evidence),
+                tempfile.TemporaryDirectory(
+                    prefix=".publication-evidence-", dir=REPO
+                ) as raw,
+            ):
                 state = Path(raw)
                 state.chmod(0o700)
                 paths = state_io_state._state_paths({"state_dir": state})
@@ -720,11 +736,16 @@ class SnapshotPublicationOrderTests(unittest.TestCase):
                 record = state_io_state.read_private_json(paths[key], max_bytes=8192)
                 self.assertEqual(1, record["last_collection_start"])
 
-    def test_one_readable_record_recovers_above_markers_and_inflight_floor(self) -> None:
+    def test_one_readable_record_recovers_above_markers_and_inflight_floor(
+        self,
+    ) -> None:
         for floor, marker, expected in ((12, 20, 21), (20, 12, 21)):
-            with self.subTest(floor=floor, marker=marker), tempfile.TemporaryDirectory(
-                prefix=".publication-recovery-", dir=REPO
-            ) as raw:
+            with (
+                self.subTest(floor=floor, marker=marker),
+                tempfile.TemporaryDirectory(
+                    prefix=".publication-recovery-", dir=REPO
+                ) as raw,
+            ):
                 state = Path(raw)
                 state.chmod(0o700)
                 paths = state_io_state._state_paths({"state_dir": state})
@@ -743,11 +764,15 @@ class SnapshotPublicationOrderTests(unittest.TestCase):
 
                 self.assertEqual(expected, sequence)
                 for key in ("collection_sequence", "collection_sequence_floor"):
-                    record = state_io_state.read_private_json(paths[key], max_bytes=8192)
+                    record = state_io_state.read_private_json(
+                        paths[key], max_bytes=8192
+                    )
                     self.assertEqual(expected, record["last_collection_start"])
 
     def test_witness_precedes_document_and_closes_each_crash_boundary(self) -> None:
-        with tempfile.TemporaryDirectory(prefix=".publication-intent-", dir=REPO) as raw:
+        with tempfile.TemporaryDirectory(
+            prefix=".publication-intent-", dir=REPO
+        ) as raw:
             state = Path(raw)
             state.chmod(0o700)
             paths = state_io_state._state_paths({"state_dir": state})
@@ -761,9 +786,7 @@ class SnapshotPublicationOrderTests(unittest.TestCase):
                 collection_start=first,
             )
             second, _diagnostic = self.allocate_start(paths)
-            marker_dir = paths.get(
-                "collection_markers", state / "collection-markers"
-            )
+            marker_dir = paths.get("collection_markers", state / "collection-markers")
             marker_path = marker_dir / f"{paths['inventory'].name}.json"
             original_atomic_write = state_io_state.atomic_write_json
 
@@ -871,7 +894,9 @@ class SnapshotPublicationOrderTests(unittest.TestCase):
                         old_payload,
                         collection_start=fourth,
                     )
-            self.assertEqual(fourth, self.assert_exact_marker(state, paths["inventory"]))
+            self.assertEqual(
+                fourth, self.assert_exact_marker(state, paths["inventory"])
+            )
             refused, _diagnostics = state_io_state.preflight_collection_documents(
                 paths, ("inventory",), third
             )
@@ -955,9 +980,7 @@ class SnapshotPublicationOrderTests(unittest.TestCase):
             )
             self.assertEqual(
                 ["lost", "survivor"],
-                sorted(
-                    inventory_core._read_state_json(paths["manifest"])["sessions"]
-                ),
+                sorted(inventory_core._read_state_json(paths["manifest"])["sessions"]),
             )
             self.assertTrue(
                 any(
@@ -1195,9 +1218,7 @@ class SnapshotPublicationOrderTests(unittest.TestCase):
         facade = (REPO / "lib/session_inventory.py").read_text(encoding="utf-8")
         self.assertEqual(4, facade.count("_require_pending_publication_lock(path)"))
         self.assertEqual(2, facade.count("with _state_io.publication_lock("))
-        reset = (REPO / "bin/reset-collection-order.py").read_text(
-            encoding="utf-8"
-        )
+        reset = (REPO / "bin/reset-collection-order.py").read_text(encoding="utf-8")
         self.assertLess(
             reset.index("fcntl.flock(descriptor, fcntl.LOCK_EX)"),
             reset.index("os.replace(source, target)"),
@@ -1213,9 +1234,7 @@ class SnapshotPublicationOrderTests(unittest.TestCase):
             # inode assertion below instead of dying on a new-only dict key.
             legacy_lock = state / "inventory.lock"
             legacy_lock.touch(mode=0o600)
-            waiting_fd = os.open(
-                legacy_lock, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC
-            )
+            waiting_fd = os.open(legacy_lock, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
             self.addCleanup(lambda: os.close(waiting_fd))
             old_inode = os.fstat(waiting_fd).st_ino
 
@@ -1311,12 +1330,12 @@ def inventory_fixture(
     count: int,
     *,
     providers: tuple[str, ...] = ("claude", "codex"),
-) -> tuple[dict, list[dict], dict[int, dict], dict[int, list[dict]], tuple[dict, dict], dict]:
+) -> tuple[
+    dict, list[dict], dict[int, dict], dict[int, list[dict]], tuple[dict, dict], dict
+]:
     shpool = {"sessions": []}
     claude: list[dict] = []
-    table = {
-        10: process(10, 1, "shpool", cmdline=["/usr/bin/shpool", "daemon"])
-    }
+    table = {10: process(10, 1, "shpool", cmdline=["/usr/bin/shpool", "daemon"])}
     codex_index: dict[int, list[dict]] = {}
     threads: dict[str, dict] = {}
     for index in range(1, count + 1):
@@ -1333,9 +1352,7 @@ def inventory_fixture(
                 "started_at_unix_ms": 1_700_000_000_000 + index,
             }
         )
-        table[root_pid] = process(
-            root_pid, 10, "bash", session_name=name, cwd=cwd
-        )
+        table[root_pid] = process(root_pid, 10, "bash", session_name=name, cwd=cwd)
         table[agent_pid] = process(
             agent_pid,
             root_pid,
@@ -1377,7 +1394,9 @@ def inventory_fixture(
 
 
 class InventoryScaleTests(unittest.TestCase):
-    def test_claude_derived_placeholder_yields_to_alias_but_missing_source_wins(self) -> None:
+    def test_claude_derived_placeholder_yields_to_alias_but_missing_source_wins(
+        self,
+    ) -> None:
         fixture = list(inventory_fixture(1, providers=("claude",)))
         uuid = uuid_for(1)
         key = f"claude:{uuid}"
@@ -1414,9 +1433,7 @@ class InventoryScaleTests(unittest.TestCase):
             }
         )
 
-        result = inventory_core.build_inventory(
-            *fixture, now=1_800_000_000
-        )
+        result = inventory_core.build_inventory(*fixture, now=1_800_000_000)
 
         row = result["sessions"][0]
         self.assertEqual("Disposable Claude Proof", row["native_title"])
@@ -1425,7 +1442,9 @@ class InventoryScaleTests(unittest.TestCase):
         self.assertEqual("ready", row["provider_title_state"])
         self.assertEqual("not-needed", row["automatic_name_state"])
 
-    def test_claude_stale_pre_push_name_is_pending_and_third_name_is_human(self) -> None:
+    def test_claude_stale_pre_push_name_is_pending_and_third_name_is_human(
+        self,
+    ) -> None:
         fixture = list(inventory_fixture(1, providers=("claude",)))
         uuid = uuid_for(1)
         key = f"claude:{uuid}"
@@ -1455,9 +1474,9 @@ class InventoryScaleTests(unittest.TestCase):
 
         fixture[1][0]["name"] = "A Third Human Name"
         fixture[1][0]["nameSince"] = 200
-        human = inventory_core.build_inventory(*fixture, now=1_800_000_000)[
-            "sessions"
-        ][0]
+        human = inventory_core.build_inventory(*fixture, now=1_800_000_000)["sessions"][
+            0
+        ]
         self.assertEqual("A Third Human Name", human["title"])
         self.assertEqual("native", human["title_source"])
         self.assertEqual("ready", human["provider_title_state"])
@@ -1481,9 +1500,7 @@ class InventoryScaleTests(unittest.TestCase):
                     {"COLUMNS": "60", "SESSION_KIT_NO_COLOR": "1"},
                     clear=False,
                 ):
-                    rendered = inventory_core.render_inventory(
-                        result, rows_only=True
-                    )
+                    rendered = inventory_core.render_inventory(result, rows_only=True)
                 if count:
                     session_word = "session" if count == 1 else "sessions"
                     self.assertTrue(
@@ -1544,7 +1561,9 @@ class InventoryScaleTests(unittest.TestCase):
         first_rows = {item["shpool_id"]: item["row"] for item in first["sessions"]}
         second_rows = {item["shpool_id"]: item["row"] for item in second["sessions"]}
         self.assertEqual(first_rows, second_rows)
-        self.assertEqual(list(range(1, 13)), [item["row"] for item in first["sessions"]])
+        self.assertEqual(
+            list(range(1, 13)), [item["row"] for item in first["sessions"]]
+        )
         self.assertTrue(first["sessions"][3]["needs_you"])
         self.assertEqual(3_000, first["sessions"][0]["recent_output_at_unix_ms"])
         self.assertEqual(3_000, first["sessions"][1]["recent_output_at_unix_ms"])
@@ -1602,9 +1621,7 @@ class InventoryScaleTests(unittest.TestCase):
             recovered.write_text("mapped", encoding="utf-8")
             os.utime(recovered, ns=(4_000_000_000, 4_000_000_000))
             (recovery / "current-map.tsv").write_text(
-                f"main3\t{recovered}\n"
-                f"main4\t{recovered}\n"
-                f"main4\t{active_but_mapped}\n",
+                f"main3\t{recovered}\nmain4\t{recovered}\nmain4\t{active_but_mapped}\n",
                 encoding="utf-8",
             )
 
@@ -1647,9 +1664,7 @@ class InventoryIdentityTests(unittest.TestCase):
             "cwd": "/srv/project-1",
         }
 
-        result = inventory_core.build_inventory(
-            *fixture, now=1_800_000_000
-        )
+        result = inventory_core.build_inventory(*fixture, now=1_800_000_000)
 
         row = result["sessions"][0]
         self.assertEqual("claude", row["provider"])
@@ -1694,9 +1709,7 @@ class InventoryIdentityTests(unittest.TestCase):
             }
         )
 
-        result = inventory_core.build_inventory(
-            *fixture, now=1_800_000_000
-        )
+        result = inventory_core.build_inventory(*fixture, now=1_800_000_000)
 
         row = result["sessions"][0]
         self.assertEqual("codex", row["provider"])
@@ -1736,9 +1749,7 @@ class InventoryIdentityTests(unittest.TestCase):
             "cwd": "/srv/project-1",
         }
 
-        row = inventory_core.build_inventory(
-            *fixture, now=1_800_000_000
-        )["sessions"][0]
+        row = inventory_core.build_inventory(*fixture, now=1_800_000_000)["sessions"][0]
 
         self.assertEqual("unknown", row["provider"])
         self.assertEqual("Unresolved provider session", row["title"])
@@ -1769,9 +1780,7 @@ class InventoryIdentityTests(unittest.TestCase):
             "cwd": "/srv/project-1",
         }
 
-        row = inventory_core.build_inventory(
-            *fixture, now=1_800_000_000
-        )["sessions"][0]
+        row = inventory_core.build_inventory(*fixture, now=1_800_000_000)["sessions"][0]
 
         self.assertEqual("unknown", row["provider"])
         self.assertEqual("Unresolved provider session", row["title"])
@@ -1798,9 +1807,7 @@ class InventoryIdentityTests(unittest.TestCase):
             "cwd": "/srv/project-1",
         }
 
-        row = inventory_core.build_inventory(
-            *fixture, now=1_800_000_000
-        )["sessions"][0]
+        row = inventory_core.build_inventory(*fixture, now=1_800_000_000)["sessions"][0]
 
         self.assertEqual("unknown", row["provider"])
         self.assertEqual("Unresolved provider session", row["title"])
@@ -1889,10 +1896,13 @@ class InventoryIdentityTests(unittest.TestCase):
             (entry / "stat").write_text("fixture\n", encoding="utf-8")
             (entry / "cmdline").write_bytes(b"bash\0")
             (entry / "comm").write_text("bash\n", encoding="utf-8")
-            with mock.patch.object(
-                process_inventory, "_proc_stat", return_value=(123, 10, 1000)
-            ), mock.patch.object(
-                process_inventory, "_readable_by_us", return_value=None
+            with (
+                mock.patch.object(
+                    process_inventory, "_proc_stat", return_value=(123, 10, 1000)
+                ),
+                mock.patch.object(
+                    process_inventory, "_readable_by_us", return_value=None
+                ),
             ):
                 scanned = process_inventory.scan_process_table(
                     proc_root,
@@ -2137,9 +2147,7 @@ class InventoryIdentityTests(unittest.TestCase):
             sessions = custom_root / "sessions"
             sessions.mkdir()
             (sessions / "225.json").write_text(
-                json.dumps(
-                    {"sessionId": exact_uuid, "nameSource": "derived"}
-                ),
+                json.dumps({"sessionId": exact_uuid, "nameSource": "derived"}),
                 encoding="utf-8",
             )
             payload = [
@@ -2186,9 +2194,7 @@ class InventoryIdentityTests(unittest.TestCase):
 
             external = custom_root / "external.json"
             external.write_text(
-                json.dumps(
-                    {"sessionId": exact_uuid, "nameSource": "derived"}
-                ),
+                json.dumps({"sessionId": exact_uuid, "nameSource": "derived"}),
                 encoding="utf-8",
             )
             record.unlink()
@@ -2214,9 +2220,7 @@ class InventoryIdentityTests(unittest.TestCase):
             default_codex.mkdir()
             custom_codex.mkdir()
             fixture = list(
-                inventory_fixture(
-                    4, providers=("claude", "claude", "codex", "codex")
-                )
+                inventory_fixture(4, providers=("claude", "claude", "codex", "codex"))
             )
             claude_pids = sorted(
                 pid for pid, row in fixture[2].items() if row["comm"] == "claude"
@@ -2360,9 +2364,7 @@ class InventoryIdentityTests(unittest.TestCase):
             "descendants",
             wraps=inventory_core.descendants,
         ) as descend:
-            inventory_core.build_inventory(
-                *partial_fixture, now=1_800_000_000
-            )
+            inventory_core.build_inventory(*partial_fixture, now=1_800_000_000)
         self.assertEqual(
             inventory_core.DEFAULT_MAX_PROC_NODES,
             descend.call_args.kwargs["max_nodes"],
@@ -2415,10 +2417,18 @@ class InventoryIdentityTests(unittest.TestCase):
             return fixture[1]
 
         with (
-            mock.patch.object(inventory_core, "_command_json", side_effect=command_json),
+            mock.patch.object(
+                inventory_core, "_command_json", side_effect=command_json
+            ),
             mock.patch.object(inventory_core, "scan_process_table", side_effect=scan),
-            mock.patch.object(inventory_core, "_codex_paths", return_value=(REPO, REPO / "missing.sqlite")),
-            mock.patch.object(inventory_core, "read_codex_session_index", return_value={}),
+            mock.patch.object(
+                inventory_core,
+                "_codex_paths",
+                return_value=(REPO, REPO / "missing.sqlite"),
+            ),
+            mock.patch.object(
+                inventory_core, "read_codex_session_index", return_value={}
+            ),
             mock.patch.object(inventory_core, "read_codex_db", return_value=({}, {})),
             mock.patch.object(inventory_core, "recent_output_times", return_value={}),
         ):
@@ -2443,13 +2453,31 @@ class InventoryIdentityTests(unittest.TestCase):
         ):
             with self.subTest(case=label):
                 with (
-                    mock.patch.object(inventory_core, "_command_json", side_effect=command_json),
-                    mock.patch.object(inventory_core, "scan_process_table", return_value=fixture[2]),
-                    mock.patch.object(inventory_core, "_payload_daemon_identity", side_effect=observations) as identity,
-                    mock.patch.object(inventory_core, "_codex_paths", return_value=(REPO, REPO / "missing.sqlite")),
-                    mock.patch.object(inventory_core, "read_codex_session_index", return_value={}),
-                    mock.patch.object(inventory_core, "read_codex_db", return_value=({}, {})),
-                    mock.patch.object(inventory_core, "recent_output_times", return_value={}),
+                    mock.patch.object(
+                        inventory_core, "_command_json", side_effect=command_json
+                    ),
+                    mock.patch.object(
+                        inventory_core, "scan_process_table", return_value=fixture[2]
+                    ),
+                    mock.patch.object(
+                        inventory_core,
+                        "_payload_daemon_identity",
+                        side_effect=observations,
+                    ) as identity,
+                    mock.patch.object(
+                        inventory_core,
+                        "_codex_paths",
+                        return_value=(REPO, REPO / "missing.sqlite"),
+                    ),
+                    mock.patch.object(
+                        inventory_core, "read_codex_session_index", return_value={}
+                    ),
+                    mock.patch.object(
+                        inventory_core, "read_codex_db", return_value=({}, {})
+                    ),
+                    mock.patch.object(
+                        inventory_core, "recent_output_times", return_value={}
+                    ),
                 ):
                     document = inventory_core.collect_live(fixture[5])
                 self.assertEqual(3, identity.call_count)
@@ -2478,7 +2506,9 @@ class InventoryIdentityTests(unittest.TestCase):
                 return int(path.parent.name), 1, int(path.parent.name) * 10
 
             with mock.patch.object(
-                vars(inventory_core)["_processes"], "_readable_by_us", return_value=False
+                vars(inventory_core)["_processes"],
+                "_readable_by_us",
+                return_value=False,
             ):
                 table = vars(inventory_core)["_processes"].scan_process_table(
                     root,
@@ -2540,7 +2570,9 @@ class InventoryIdentityTests(unittest.TestCase):
         self.assertEqual(1, len(result["sessions"]))
         self.assertEqual("claude", result["sessions"][0]["provider"])
         self.assertEqual(parent_uuid, result["sessions"][0]["identity"]["uuid"])
-        self.assertEqual(["Verifier"], [x["title"] for x in result["sessions"][0]["subagents"]])
+        self.assertEqual(
+            ["Verifier"], [x["title"] for x in result["sessions"][0]["subagents"]]
+        )
         self.assertEqual([], result["outside_agents"])
 
     def test_separately_managed_claude_children_record_the_exact_parent(self) -> None:
@@ -2561,14 +2593,10 @@ class InventoryIdentityTests(unittest.TestCase):
         result = inventory_core.build_inventory(*fixture, now=1_800_000_000)
 
         parent_row = next(
-            row
-            for row in result["sessions"]
-            if row["identity"]["uuid"] == parent_uuid
+            row for row in result["sessions"] if row["identity"]["uuid"] == parent_uuid
         )
         self.assertNotIn("is_subagent", parent_row)
-        children = [
-            row for row in result["sessions"] if row is not parent_row
-        ]
+        children = [row for row in result["sessions"] if row is not parent_row]
         self.assertEqual(2, len(children))
         for child in children:
             self.assertTrue(child["is_subagent"])
@@ -2598,12 +2626,8 @@ class InventoryIdentityTests(unittest.TestCase):
                     *parent_args,
                 ]
 
-                result = inventory_core.build_inventory(
-                    *fixture, now=1_800_000_000
-                )
-                by_uuid = {
-                    row["identity"]["uuid"]: row for row in result["sessions"]
-                }
+                result = inventory_core.build_inventory(*fixture, now=1_800_000_000)
+                by_uuid = {row["identity"]["uuid"]: row for row in result["sessions"]}
                 child = by_uuid[uuid_for(2)]
                 people, machines, orphans = classify_top_level_sessions(
                     result["sessions"]
@@ -2613,17 +2637,15 @@ class InventoryIdentityTests(unittest.TestCase):
                 self.assertNotIn(child, people)
                 self.assertNotIn(child, machines)
                 if label == "valid joined value":
-                    self.assertEqual(
-                        parent_uuid, child["parent_session"]["uuid"]
-                    )
+                    self.assertEqual(parent_uuid, child["parent_session"]["uuid"])
                     self.assertEqual([], orphans)
                     self.assertEqual(1, len(people))
                     self.assertEqual(1, people[0]["active_subagent_count"])
                 else:
                     self.assertNotIn("parent_session", child)
-                    self.assertEqual([uuid_for(2)], [
-                        row["identity"]["uuid"] for row in orphans
-                    ])
+                    self.assertEqual(
+                        [uuid_for(2)], [row["identity"]["uuid"] for row in orphans]
+                    )
 
     def test_codex_spawn_edge_and_headless_exec_classify_child_rows(self) -> None:
         fixture = list(inventory_fixture(3, providers=("codex",)))
@@ -2644,9 +2666,7 @@ class InventoryIdentityTests(unittest.TestCase):
         fixture[2][2003]["cmdline"] = ["/usr/bin/codex", "exec", "build"]
 
         result = inventory_core.build_inventory(*fixture, now=1_800_000_000)
-        by_uuid = {
-            row["identity"]["uuid"]: row for row in result["sessions"]
-        }
+        by_uuid = {row["identity"]["uuid"]: row for row in result["sessions"]}
 
         self.assertEqual(parent, by_uuid[child]["parent_session"]["uuid"])
         self.assertTrue(by_uuid[child]["is_subagent"])
@@ -2687,17 +2707,13 @@ class InventoryIdentityTests(unittest.TestCase):
                 fixture = list(inventory_fixture(1, providers=("codex",)))
                 fixture[2][2001]["cmdline"] = argv
 
-                result = inventory_core.build_inventory(
-                    *fixture, now=1_800_000_000
-                )
+                result = inventory_core.build_inventory(*fixture, now=1_800_000_000)
                 session = result["sessions"][0]
                 people, machines, orphans = classify_top_level_sessions(
                     result["sessions"]
                 )
 
-                self.assertEqual(
-                    expected_headless, session.get("is_subagent", False)
-                )
+                self.assertEqual(expected_headless, session.get("is_subagent", False))
                 self.assertEqual([] if expected_headless else [session], people)
                 self.assertEqual([], machines)
                 self.assertEqual([session] if expected_headless else [], orphans)
@@ -2721,14 +2737,27 @@ class InventoryIdentityTests(unittest.TestCase):
         cases = (
             (
                 "app-server is the kit's own plumbing, never machine by argv",
-                [vendor, "-c", "check_for_update_on_startup=false",
-                 "app-server", "--listen", "unix:///run/x/app.sock"],
+                [
+                    vendor,
+                    "-c",
+                    "check_for_update_on_startup=false",
+                    "app-server",
+                    "--listen",
+                    "unix:///run/x/app.sock",
+                ],
                 False,
             ),
             (
                 "wrapper + app-server stays visible too",
-                ["node", "/home/x/.npm-global/bin/codex", "-c", "k=v",
-                 "app-server", "--listen", "unix:///run/x/app.sock"],
+                [
+                    "node",
+                    "/home/x/.npm-global/bin/codex",
+                    "-c",
+                    "k=v",
+                    "app-server",
+                    "--listen",
+                    "unix:///run/x/app.sock",
+                ],
                 False,
             ),
             (
@@ -2769,17 +2798,13 @@ class InventoryIdentityTests(unittest.TestCase):
                 fixture = list(inventory_fixture(1, providers=("codex",)))
                 fixture[2][2001]["cmdline"] = argv
 
-                result = inventory_core.build_inventory(
-                    *fixture, now=1_800_000_000
-                )
+                result = inventory_core.build_inventory(*fixture, now=1_800_000_000)
                 session = result["sessions"][0]
                 people, machines, orphans = classify_top_level_sessions(
                     result["sessions"]
                 )
 
-                self.assertEqual(
-                    expected_machine, session.get("is_subagent", False)
-                )
+                self.assertEqual(expected_machine, session.get("is_subagent", False))
                 self.assertEqual([] if expected_machine else [session], people)
                 self.assertEqual([], machines)
                 self.assertEqual([session] if expected_machine else [], orphans)
@@ -2850,12 +2875,8 @@ class InventoryIdentityTests(unittest.TestCase):
         """Build the row, stamp origins from an empty store, then project it."""
         result = inventory_core.build_inventory(*fixture, now=1_800_000_000)
         with tempfile.TemporaryDirectory(prefix=".origins-") as directory:
-            origins_state.apply_session_origins(
-                result, state_dir=Path(directory)
-            )
-        return result["sessions"][0], classify_top_level_sessions(
-            result["sessions"]
-        )
+            origins_state.apply_session_origins(result, state_dir=Path(directory))
+        return result["sessions"][0], classify_top_level_sessions(result["sessions"])
 
     def test_app_server_driven_by_a_program_is_never_a_persons_row(self) -> None:
         """Tour finding X16: session 87, the Matrix lead's Codex worker.
@@ -2929,9 +2950,12 @@ class InventoryIdentityTests(unittest.TestCase):
             "future-after-clock-move": time.time() + threshold + 1,
         }
         for label, record_mtime in clock_cases.items():
-            with self.subTest(label=label), tempfile.TemporaryDirectory(
-                prefix=".lifecycle-stale-snapshot-", dir=REPO
-            ) as raw:
+            with (
+                self.subTest(label=label),
+                tempfile.TemporaryDirectory(
+                    prefix=".lifecycle-stale-snapshot-", dir=REPO
+                ) as raw,
+            ):
                 state = Path(raw)
                 state.chmod(0o700)
                 newer_session = "s20260815-170000-19"
@@ -3038,7 +3062,9 @@ class InventoryIdentityTests(unittest.TestCase):
                 window=False, broker=False
             ),
             "a broker on some other socket": self.app_server_fixture(
-                window=False, socket="/run/x/s1/app.sock", listen="unix:///run/x/s2/app.sock"
+                window=False,
+                socket="/run/x/s1/app.sock",
+                listen="unix:///run/x/s2/app.sock",
             ),
             "no listen endpoint to compare": self.app_server_fixture(
                 window=False, listen=""
@@ -3180,9 +3206,7 @@ class InventoryIdentityTests(unittest.TestCase):
         fixture[2][2002]["cmdline"] = ["/usr/bin/codex", "exec", "build"]
 
         result = inventory_core.build_inventory(*fixture, now=1_800_000_000)
-        by_uuid = {
-            row["identity"]["uuid"]: row for row in result["sessions"]
-        }
+        by_uuid = {row["identity"]["uuid"]: row for row in result["sessions"]}
 
         self.assertEqual([], by_uuid[parent]["subagents"])
         self.assertTrue(by_uuid[child]["is_subagent"])
@@ -3242,10 +3266,17 @@ class InventoryIdentityTests(unittest.TestCase):
         first = inventory_core.build_inventory(*fixture, now=1_800_000_000)
         new_uuid = uuid_for(777)
         fixture[2][2001]["start_ticks"] += 50_000
-        fixture[3][2001] = [
-            {"source": "cli", "id": new_uuid, "session_id": new_uuid}
-        ]
-        fixture[4] = ({new_uuid: {"id": new_uuid, "title": "Replacement", "cwd": "/srv/project-1"}}, {})
+        fixture[3][2001] = [{"source": "cli", "id": new_uuid, "session_id": new_uuid}]
+        fixture[4] = (
+            {
+                new_uuid: {
+                    "id": new_uuid,
+                    "title": "Replacement",
+                    "cwd": "/srv/project-1",
+                }
+            },
+            {},
+        )
         second = inventory_core.build_inventory(*fixture, now=1_800_000_001)
         self.assertNotEqual(
             first["sessions"][0]["identity"]["process_start_ticks"],
@@ -3260,7 +3291,10 @@ class InventoryIdentityTests(unittest.TestCase):
             f"codex:{uuid_for(2)}": "Deploy review",
         }
         result = inventory_core.build_inventory(*fixture, now=1_800_000_000)
-        titles = {(row["provider"], row["identity"]["uuid"]): row["title"] for row in result["sessions"]}
+        titles = {
+            (row["provider"], row["identity"]["uuid"]): row["title"]
+            for row in result["sessions"]
+        }
         self.assertEqual("Config audit", titles[("claude", uuid_for(1))])
         self.assertEqual("Deploy review", titles[("codex", uuid_for(2))])
 
@@ -3302,9 +3336,7 @@ class InventoryIdentityTests(unittest.TestCase):
         self.assertEqual("Exact menu name", threads[exact]["session_index_name"])
         self.assertEqual(1, len(warnings))
         fixture = list(inventory_fixture(2))
-        fixture[5]["automatic_titles"] = {
-            f"codex:{exact}": "Automatic Menu Name"
-        }
+        fixture[5]["automatic_titles"] = {f"codex:{exact}": "Automatic Menu Name"}
         fixture[4] = (threads, {})
         result = inventory_core.build_inventory(*fixture, now=1_800_000_000)
         codex = next(row for row in result["sessions"] if row["provider"] == "codex")
@@ -3426,9 +3458,7 @@ class InventoryIdentityTests(unittest.TestCase):
         fixture[4] = (threads, edges)
         result = inventory_core.build_inventory(*fixture, now=1_800_000_000)
         row = result["sessions"][0]
-        self.assertEqual(
-            ["Verifier"], [x["title"] for x in row["subagents"]]
-        )
+        self.assertEqual(["Verifier"], [x["title"] for x in row["subagents"]])
         self.assertEqual(1, row["active_subagent_count"])
 
     def test_codex_database_prompt_never_outranks_automatic_or_context_title(
@@ -3451,23 +3481,15 @@ class InventoryIdentityTests(unittest.TestCase):
             },
             {},
         )
-        fixture[5]["automatic_titles"] = {
-            f"codex:{exact}": "Session Kit Updates"
-        }
-        automatic = inventory_core.build_inventory(
-            *fixture, now=1_800_000_000
-        )
-        codex = next(
-            row for row in automatic["sessions"] if row["provider"] == "codex"
-        )
+        fixture[5]["automatic_titles"] = {f"codex:{exact}": "Session Kit Updates"}
+        automatic = inventory_core.build_inventory(*fixture, now=1_800_000_000)
+        codex = next(row for row in automatic["sessions"] if row["provider"] == "codex")
         self.assertEqual("Session Kit Updates", codex["title"])
         self.assertEqual("automatic", codex["title_source"])
         self.assertEqual("ready", codex["automatic_name_state"])
         fixture[5]["automatic_titles"] = {}
         pending = inventory_core.build_inventory(*fixture, now=1_800_000_000)
-        codex = next(
-            row for row in pending["sessions"] if row["provider"] == "codex"
-        )
+        codex = next(row for row in pending["sessions"] if row["provider"] == "codex")
         self.assertEqual("context", codex["title_source"])
         self.assertNotIn("i need you", codex["title"].casefold())
         self.assertEqual("pending", codex["automatic_name_state"])
@@ -3587,7 +3609,9 @@ class InventoryIdentityTests(unittest.TestCase):
         self.assertNotIn("/srv/", title)
         self.assertNotIn(exact[:8], title)
 
-    def test_operational_id_policy_preserves_raw_ids_and_bounds_display_only(self) -> None:
+    def test_operational_id_policy_preserves_raw_ids_and_bounds_display_only(
+        self,
+    ) -> None:
         safe = (
             "main",
             "main10",
@@ -3596,7 +3620,9 @@ class InventoryIdentityTests(unittest.TestCase):
         )
         for raw in safe:
             with self.subTest(raw=raw):
-                self.assertEqual((True, None), inventory_core.shpool_id_mutation_policy(raw))
+                self.assertEqual(
+                    (True, None), inventory_core.shpool_id_mutation_policy(raw)
+                )
 
         rejected = {
             "main-template": "template",
@@ -3754,26 +3780,32 @@ class InventoryIdentityTests(unittest.TestCase):
             real_fstat = os.fstat
             opened_paths: list[Path] = []
 
-            def open_spy(path: object, flags: int, *args: object, **kwargs: object) -> int:
+            def open_spy(
+                path: object, flags: int, *args: object, **kwargs: object
+            ) -> int:
                 candidate = Path(os.fspath(path))
                 opened_paths.append(candidate)
                 if candidate == rollout:
                     raise AssertionError("rollout pathname must never be reopened")
                 return real_open(path, flags, *args, **kwargs)
 
-            with mock.patch.object(
-                inventory_core,
-                "_expected_proc_identity",
-                return_value=stable,
-            ), mock.patch.object(
-                inventory_core.os,
-                "open",
-                side_effect=open_spy,
-            ), mock.patch.object(
-                inventory_core.os,
-                "fstat",
-                wraps=real_fstat,
-            ) as fstat_spy:
+            with (
+                mock.patch.object(
+                    inventory_core,
+                    "_expected_proc_identity",
+                    return_value=stable,
+                ),
+                mock.patch.object(
+                    inventory_core.os,
+                    "open",
+                    side_effect=open_spy,
+                ),
+                mock.patch.object(
+                    inventory_core.os,
+                    "fstat",
+                    wraps=real_fstat,
+                ) as fstat_spy,
+            ):
                 metadata = inventory_core.codex_open_rollouts(
                     654, proc_root, codex_home, expected_process
                 )
@@ -3919,9 +3951,7 @@ class InventoryIdentityTests(unittest.TestCase):
         fixture[3][app_pid].append(
             {"source": "vscode", "id": second, "session_id": second}
         )
-        ambiguous = inventory_core.build_inventory(
-            *fixture, now=1_800_000_000
-        )
+        ambiguous = inventory_core.build_inventory(*fixture, now=1_800_000_000)
         self.assertEqual("unknown", ambiguous["sessions"][0]["provider"])
         self.assertIsNone(ambiguous["sessions"][0]["identity"]["uuid"])
 
@@ -4042,9 +4072,7 @@ class ChurnedCensusIdentityTests(unittest.TestCase):
         with mock.patch.object(
             collector_inventory, "_process_age", return_value=24 * 3600
         ):
-            result = inventory_core.build_inventory(
-                *fixture, now=1_800_000_000
-            )
+            result = inventory_core.build_inventory(*fixture, now=1_800_000_000)
 
         row = result["sessions"][0]
         self.assertEqual(1, row["active_subagent_count"])
@@ -4088,9 +4116,7 @@ class ChurnedCensusIdentityTests(unittest.TestCase):
             ("claude-agent", 200, uuid_for(9)),
             ("codex", 300, uuid_for(8)),
         ]
-        self.assertIsNone(
-            collector_inventory._lineage_owner(100, claims, table)
-        )
+        self.assertIsNone(collector_inventory._lineage_owner(100, claims, table))
 
 
 class CodexTurnStateTests(unittest.TestCase):
@@ -4191,9 +4217,7 @@ class CodexTurnStateTests(unittest.TestCase):
         completed = self._event("event_msg", {"type": "task_complete"})
         # A finished turn whose last words ask the human something is a soft
         # wait, not idle — but never the hard "needs your reply".
-        self.assertEqual(
-            "reply optional", self._state([started, asking, completed])
-        )
+        self.assertEqual("reply optional", self._state([started, asking, completed]))
         # A statement ending the turn stays idle.
         stating = self._event(
             "response_item",
@@ -4207,9 +4231,7 @@ class CodexTurnStateTests(unittest.TestCase):
         )
         self.assertEqual("idle", self._state([started, stating, completed]))
         # A NEW turn clears the stale question.
-        self.assertEqual(
-            "working", self._state([started, asking, completed, started])
-        )
+        self.assertEqual("working", self._state([started, asking, completed, started]))
 
     def test_timed_question_is_optional_and_never_blocking(self) -> None:
         state = self._state(
@@ -4329,12 +4351,8 @@ class CodexTurnStateTests(unittest.TestCase):
             with self.subTest(state=state):
                 fixture = list(inventory_fixture(1, providers=("codex",)))
                 fixture[3][2001][0]["_turn_state"] = state
-                managed = inventory_core.build_inventory(
-                    *fixture, now=1_800_000_000
-                )
-                self.assertEqual(
-                    state, managed["sessions"][0]["agent_status"]
-                )
+                managed = inventory_core.build_inventory(*fixture, now=1_800_000_000)
+                self.assertEqual(state, managed["sessions"][0]["agent_status"])
                 self.assertEqual(
                     expected_needs_you, managed["sessions"][0]["needs_you"]
                 )
@@ -4348,9 +4366,7 @@ class CodexTurnStateTests(unittest.TestCase):
                     fixture[5],
                     now=1_800_000_000,
                 )
-                self.assertEqual(
-                    state, outside["outside_agents"][0]["agent_status"]
-                )
+                self.assertEqual(state, outside["outside_agents"][0]["agent_status"])
                 self.assertEqual(
                     expected_needs_you,
                     outside["outside_agents"][0]["needs_you"],
@@ -4365,11 +4381,11 @@ class CodexTurnStateTests(unittest.TestCase):
             ]
         }
         output = io.StringIO()
-        with mock.patch.object(
-            inventory_core, "load_config", return_value={}
-        ), mock.patch.object(
-            inventory_core, "snapshot", return_value=snapshot
-        ), contextlib.redirect_stdout(output):
+        with (
+            mock.patch.object(inventory_core, "load_config", return_value={}),
+            mock.patch.object(inventory_core, "snapshot", return_value=snapshot),
+            contextlib.redirect_stdout(output),
+        ):
             return_code = inventory_core.main(["waiting-count"])
         self.assertEqual(0, return_code)
         self.assertEqual("1\n", output.getvalue())
@@ -4515,9 +4531,7 @@ class TerminalNumberRegistryTests(unittest.TestCase):
         self.assertEqual({1: now + 100}, retired)
 
         # Pass 3, inside the quarantine: a NEW session must not take 1.
-        fresh = inventory_core.build_inventory(
-            *inventory_fixture(3), now=1_800_000_200
-        )
+        fresh = inventory_core.build_inventory(*inventory_fixture(3), now=1_800_000_200)
         fresh["sessions"] = fresh["sessions"][1:]
         registry = inventory_core.apply_terminal_numbers(
             fresh,
@@ -4528,8 +4542,7 @@ class TerminalNumberRegistryTests(unittest.TestCase):
             current_time=now + 200,
         )
         numbers = {
-            item["shpool_id_raw"]: item["terminal_number"]
-            for item in fresh["sessions"]
+            item["shpool_id_raw"]: item["terminal_number"] for item in fresh["sessions"]
         }
         self.assertEqual(2, numbers["main2"])
         self.assertEqual(3, numbers["main3"])
@@ -4557,9 +4570,7 @@ class TerminalNumberRegistryTests(unittest.TestCase):
 
         # Pass 5: dead again, and the quarantine EXPIRES — the number frees,
         # its bindings prune, and the next new session takes the lowest gap.
-        after = inventory_core.build_inventory(
-            *inventory_fixture(3), now=1_800_000_400
-        )
+        after = inventory_core.build_inventory(*inventory_fixture(3), now=1_800_000_400)
         after["sessions"] = after["sessions"][1:]
         registry = inventory_core.apply_terminal_numbers(
             after,
@@ -4589,13 +4600,9 @@ class TerminalNumberRegistryTests(unittest.TestCase):
         # main4 is new; 1 finished quarantine and is the lowest ordinary number.
         self.assertEqual(1, expired_numbers["main4"])
         self.assertNotIn(1, retired)
-        self.assertNotIn(
-            f"ai:claude:{uuid_for(1)}", registry["bindings"]
-        )
+        self.assertNotIn(f"ai:claude:{uuid_for(1)}", registry["bindings"])
         # Legacy invariant for pinned releases stays intact.
-        self.assertGreater(
-            registry["next_number"], max(registry["bindings"].values())
-        )
+        self.assertGreater(registry["next_number"], max(registry["bindings"].values()))
 
     def test_retirement_ledger_round_trip_and_boot_reset(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -4642,9 +4649,7 @@ class TerminalNumberRegistryTests(unittest.TestCase):
         session. Each shape below is a row whose generation cannot be proven;
         each one is now quarantined and named, and the estate keeps working.
         """
-        base = inventory_core.build_inventory(
-            *inventory_fixture(2), now=1_800_000_000
-        )
+        base = inventory_core.build_inventory(*inventory_fixture(2), now=1_800_000_000)
         self._orphan(base["sessions"][1])
 
         def known_provider(item: dict) -> None:
@@ -4748,9 +4753,7 @@ class TerminalNumberRegistryTests(unittest.TestCase):
         self.assertIsInstance(healthy["terminal_number"], int)
         self.assertIs(True, healthy["mutation_allowed"])
         # And the unprovable one is refused by name rather than by silence.
-        self.assertEqual(
-            "unprovable-generation", broken["mutation_rejection_reason"]
-        )
+        self.assertEqual("unprovable-generation", broken["mutation_rejection_reason"])
 
     def test_unprovable_generation_stays_on_the_board(self) -> None:
         """Only a PROVEN missing shell quarantines; doubt stays visible.
@@ -4841,9 +4844,7 @@ class TerminalNumberRegistryTests(unittest.TestCase):
             self.assertEqual([], result["warnings"])
             self.assertEqual(1, result["sessions"][0]["terminal_number"])
             self.assertIsNone(result["sessions"][1]["terminal_number"])
-            stored = json.loads(
-                (state / "inventory.json").read_text(encoding="utf-8")
-            )
+            stored = json.loads((state / "inventory.json").read_text(encoding="utf-8"))
             self.assertEqual(result, stored)
 
     def test_provisional_generation_promotes_without_renumbering(self) -> None:
@@ -4875,9 +4876,7 @@ class TerminalNumberRegistryTests(unittest.TestCase):
             inventory, registry, boot_id="boot-a", allocate=True
         )
         self.assertEqual(1, item["terminal_number"])
-        self.assertEqual(
-            1, promoted["bindings"][f"ai:claude:{exact_identity['uuid']}"]
-        )
+        self.assertEqual(1, promoted["bindings"][f"ai:claude:{exact_identity['uuid']}"])
 
         item["shpool_id"] = item["shpool_id_raw"] = "main20"
         item["started_at_unix_ms"] += 100
@@ -4922,9 +4921,7 @@ class TerminalNumberRegistryTests(unittest.TestCase):
         )
         self.assertEqual(1, item["terminal_number"])
         self.assertEqual(3, recovered["next_number"])
-        generation = inventory_core._terminal_generation_key(
-            inventory, item, "boot-a"
-        )
+        generation = inventory_core._terminal_generation_key(inventory, item, "boot-a")
         self.assertEqual(1, recovered["bindings"][generation])
         self.assertEqual(
             [generation],
@@ -4988,9 +4985,7 @@ class TerminalNumberRegistryTests(unittest.TestCase):
         updated = inventory_core.apply_terminal_numbers(
             inventory, registry, boot_id="boot-a", allocate=True
         )
-        generation = inventory_core._terminal_generation_key(
-            inventory, item, "boot-a"
-        )
+        generation = inventory_core._terminal_generation_key(inventory, item, "boot-a")
         self.assertEqual(2, item["terminal_number"])
         self.assertEqual(2, updated["bindings"][generation])
 
@@ -5020,9 +5015,7 @@ class TerminalNumberRegistryTests(unittest.TestCase):
             boot_id="boot-a",
             allocate=True,
         )
-        inventory["sessions"][1]["provider"] = inventory["sessions"][0][
-            "provider"
-        ]
+        inventory["sessions"][1]["provider"] = inventory["sessions"][0]["provider"]
         inventory["sessions"][1]["identity"] = copy.deepcopy(
             inventory["sessions"][0]["identity"]
         )
@@ -5102,26 +5095,16 @@ class TerminalNumberRegistryTests(unittest.TestCase):
                 encoding="utf-8",
             )
             epoch.chmod(0o600)
-            with self.assertRaisesRegex(
-                inventory_core.CollectionError, "disappeared"
-            ):
-                inventory_core._read_terminal_registry(
-                    registry, "boot-a", epoch
-                )
+            with self.assertRaisesRegex(inventory_core.CollectionError, "disappeared"):
+                inventory_core._read_terminal_registry(registry, "boot-a", epoch)
             registry.write_text("{broken", encoding="utf-8")
             registry.chmod(0o600)
-            with self.assertRaisesRegex(
-                inventory_core.CollectionError, "invalid JSON"
-            ):
-                inventory_core._read_terminal_registry(
-                    registry, "boot-a", epoch
-                )
+            with self.assertRaisesRegex(inventory_core.CollectionError, "invalid JSON"):
+                inventory_core._read_terminal_registry(registry, "boot-a", epoch)
             registry.unlink()
             os.symlink(epoch, registry)
             with self.assertRaises(inventory_core.CollectionError):
-                inventory_core._read_terminal_registry(
-                    registry, "boot-a", epoch
-                )
+                inventory_core._read_terminal_registry(registry, "boot-a", epoch)
 
     def test_registry_receipt_requires_exact_schema_but_allows_old_boot(
         self,
@@ -5157,9 +5140,7 @@ class TerminalNumberRegistryTests(unittest.TestCase):
             epoch.chmod(0o600)
             self.assertEqual(
                 inventory_core._empty_terminal_registry("boot-a"),
-                inventory_core._read_terminal_registry(
-                    registry, "boot-a", epoch
-                ),
+                inventory_core._read_terminal_registry(registry, "boot-a", epoch),
             )
 
     def test_verified_new_boot_resets_monotonic_registry(self) -> None:
@@ -5172,9 +5153,7 @@ class TerminalNumberRegistryTests(unittest.TestCase):
             },
         }
         reset = inventory_core._validate_terminal_registry(registry, "boot-b")
-        self.assertEqual(
-            inventory_core._empty_terminal_registry("boot-b"), reset
-        )
+        self.assertEqual(inventory_core._empty_terminal_registry("boot-b"), reset)
 
 
 class AutomaticTitleTests(unittest.TestCase):
@@ -5210,13 +5189,9 @@ class AutomaticTitleTests(unittest.TestCase):
             },
             {},
         )
-        fixture[3] = {
-            2001: [{"source": "cli", "id": exact, "session_id": exact}]
-        }
+        fixture[3] = {2001: [{"source": "cli", "id": exact, "session_id": exact}]}
         fixture[2][3001] = process(3001, 2001, "python3")
-        inventory = inventory_core.build_inventory(
-            *fixture, now=1_800_000_000
-        )
+        inventory = inventory_core.build_inventory(*fixture, now=1_800_000_000)
         environment = {
             "SHPOOL_SESSION_NAME": "main",
             "CODEX_THREAD_ID": exact,
@@ -5225,6 +5200,62 @@ class AutomaticTitleTests(unittest.TestCase):
             "HOME": str(config.get("state_dir", "/nonexistent-home")),
         }
         return inventory, fixture[2], environment, 3001
+
+    def test_self_name_revalidation_never_collects_under_the_name_lock(self) -> None:
+        """The 2026-08-17 estate jam, as a call-count contract.
+
+        ``mutate_self_name`` runs ``revalidate`` inside the name-store locks.
+        The old revalidate took a fresh full collection there, and collecting
+        can re-acquire config.lock on a second descriptor — a process waiting
+        on its own flock, which no other process can break; every collector on
+        the machine queued behind it. The contract: one snapshot total, taken
+        before any lock; revalidation re-reads only the process table.
+        """
+        from lib.sessionkit_inventory import self_name as low_level
+
+        snapshots: list[dict] = []
+        tables: list[object] = []
+
+        def fake_snapshot(**kwargs: object) -> dict:
+            snapshots.append(dict(kwargs))
+            return {"sessions": []}
+
+        def fake_table(root: object, cap: int) -> dict:
+            tables.append(root)
+            return {}
+
+        def fake_mutate(
+            config: dict, provider: str, uuid: str, title: str, *, revalidate=None
+        ) -> dict:
+            self.assertIsNotNone(revalidate)
+            revalidate()  # exactly what names.py does inside its locks
+            return {"aliases": {}, "automatic_titles": {}}
+
+        result = low_level.self_name_automatic_title(
+            {"max_proc_nodes": 10},
+            "Session Kit Updates",
+            environ={},
+            default_max_proc_nodes=10,
+            record_retry=lambda *a, **k: None,
+            canonical_colors=lambda config: {},
+            mutate_self_name=fake_mutate,
+            normalize_title=lambda title: title,
+            process_table_reader=fake_table,
+            propagate_color=lambda *a, **k: {},
+            propagate_title=lambda *a, **k: {},
+            prove_caller=lambda live, table, environ, pid: {
+                "provider": "codex",
+                "uuid": uuid_for(91),
+            },
+            record_title_failure=lambda *a, **k: 0,
+            session_color=lambda *a, **k: None,
+            snapshot_inventory=fake_snapshot,
+        )
+        self.assertEqual(
+            1, len(snapshots), "a revalidation re-collected under the name lock"
+        )
+        self.assertEqual(2, len(tables))
+        self.assertEqual("ready", result["automatic_name_state"])
 
     def test_title_validation_kill_switch_and_provenance_precedence(self) -> None:
         self.assertEqual(
@@ -5243,9 +5274,7 @@ class AutomaticTitleTests(unittest.TestCase):
                 with self.assertRaises(inventory_core.CollectionError):
                     inventory_core.normalize_automatic_title(rejected)
         self.assertFalse(
-            inventory_core.automatic_naming_enabled(
-                {"SESSION_KIT_AUTO_NAME": "0"}
-            )
+            inventory_core.automatic_naming_enabled({"SESSION_KIT_AUTO_NAME": "0"})
         )
         exact = uuid_for(81)
         automatic = {f"codex:{exact}": "Session Kit Updates"}
@@ -5285,9 +5314,7 @@ class AutomaticTitleTests(unittest.TestCase):
                 automatic_titles=automatic,
             ),
         )
-        with mock.patch.dict(
-            os.environ, {"SESSION_KIT_AUTO_NAME": "0"}, clear=False
-        ):
+        with mock.patch.dict(os.environ, {"SESSION_KIT_AUTO_NAME": "0"}, clear=False):
             title, source = inventory_core._provider_title_info(
                 "codex",
                 exact,
@@ -5341,9 +5368,7 @@ class AutomaticTitleTests(unittest.TestCase):
                     exact,
                     "Raw prompt",
                     inventory_core.canonical_aliases(config),
-                    automatic_titles=inventory_core.canonical_automatic_titles(
-                        config
-                    ),
+                    automatic_titles=inventory_core.canonical_automatic_titles(config),
                     provider_title_is_explicit=False,
                 )
                 self.assertEqual(("Manual Override", "alias"), (title, source))
@@ -5353,9 +5378,7 @@ class AutomaticTitleTests(unittest.TestCase):
                     config, "codex", exact, None
                 )
                 document = json.loads(config_path.read_text(encoding="utf-8"))
-                self.assertNotIn(
-                    f"codex:{exact}", document.get("automatic_titles", {})
-                )
+                self.assertNotIn(f"codex:{exact}", document.get("automatic_titles", {}))
                 self.assertEqual(
                     "Manual Override", document["aliases"][f"codex:{exact}"]
                 )
@@ -5405,9 +5428,7 @@ class AutomaticTitleTests(unittest.TestCase):
                     raced,
                     "Raw prompt",
                     inventory_core.canonical_aliases(config),
-                    automatic_titles=inventory_core.canonical_automatic_titles(
-                        config
-                    ),
+                    automatic_titles=inventory_core.canonical_automatic_titles(config),
                     provider_title_is_explicit=False,
                 )
                 self.assertEqual(("Concurrent Manual Name", "alias"), (title, source))
@@ -5524,9 +5545,7 @@ class AutomaticTitleTests(unittest.TestCase):
                 ]
                 child_environment = dict(environment)
                 child_environment["CODEX_THREAD_ID"] = child_uuid
-                with self.assertRaisesRegex(
-                    inventory_core.CollectionError, "subagent"
-                ):
+                with self.assertRaisesRegex(inventory_core.CollectionError, "subagent"):
                     inventory_core.self_name_automatic_title(
                         config,
                         "Another Task Name",
@@ -5567,9 +5586,7 @@ class AutomaticTitleTests(unittest.TestCase):
                     "--parent-session-id",
                     exact,
                 ]
-                with self.assertRaisesRegex(
-                    inventory_core.CollectionError, "subagent"
-                ):
+                with self.assertRaisesRegex(inventory_core.CollectionError, "subagent"):
                     inventory_core.prove_self_name_caller(
                         inventory,
                         subagent_table,
@@ -5596,33 +5613,21 @@ class AutomaticTitleTests(unittest.TestCase):
                 ]
             }
             (marker_root / "main2").touch()
-            inventory_core.apply_provider_title_states(
-                live, {"state_dir": state}
-            )
-            self.assertEqual(
-                "pending", live["sessions"][0]["provider_title_state"]
-            )
+            inventory_core.apply_provider_title_states(live, {"state_dir": state})
+            self.assertEqual("pending", live["sessions"][0]["provider_title_state"])
             self.assertNotIn("provider_title_state", live["sessions"][1])
 
             live["sessions"][0].update(
                 {"availability": "attached", "agent_status": "working"}
             )
-            inventory_core.apply_provider_title_states(
-                live, {"state_dir": state}
-            )
-            self.assertEqual(
-                "deferred", live["sessions"][0]["provider_title_state"]
-            )
+            inventory_core.apply_provider_title_states(live, {"state_dir": state})
+            self.assertEqual("deferred", live["sessions"][0]["provider_title_state"])
 
             (marker_root / "main2").unlink()
             (marker_root / "target").touch()
             (marker_root / "main2").symlink_to(marker_root / "target")
-            inventory_core.apply_provider_title_states(
-                live, {"state_dir": state}
-            )
-            self.assertEqual(
-                "ready", live["sessions"][0]["provider_title_state"]
-            )
+            inventory_core.apply_provider_title_states(live, {"state_dir": state})
+            self.assertEqual("ready", live["sessions"][0]["provider_title_state"])
 
             old_active = marker_root / "main"
             old_active.write_text("activegeneration\n", encoding="utf-8")
@@ -5636,17 +5641,27 @@ class AutomaticTitleTests(unittest.TestCase):
                 now=1_800_000_000,
             )
             with (
-                mock.patch.object(inventory_core, "collect_live", return_value=exact_live),
+                mock.patch.object(
+                    inventory_core, "collect_live", return_value=exact_live
+                ),
                 mock.patch.object(inventory_core, "_boot_id", return_value="boot-a"),
             ):
                 result = inventory_core.snapshot(
                     write_state=True,
-                    config={"state_dir": state, "max_proc_nodes": 8192, "max_proc_depth": 32},
+                    config={
+                        "state_dir": state,
+                        "max_proc_nodes": 8192,
+                        "max_proc_depth": 32,
+                    },
                 )
             self.assertTrue(old_active.exists())
             self.assertFalse(old_orphan.exists())
-            self.assertEqual("gone", result["provider_untitled_quarantine"][0]["marker"])
-            self.assertTrue(Path(result["provider_untitled_quarantine"][0]["quarantine"]).is_file())
+            self.assertEqual(
+                "gone", result["provider_untitled_quarantine"][0]["marker"]
+            )
+            self.assertTrue(
+                Path(result["provider_untitled_quarantine"][0]["quarantine"]).is_file()
+            )
             exact_live.pop("provider_untitled_quarantine", None)
 
             unsafe_state = state / "unsafe-state"
@@ -5660,7 +5675,9 @@ class AutomaticTitleTests(unittest.TestCase):
                 external, target_is_directory=True
             )
             with (
-                mock.patch.object(inventory_core, "collect_live", return_value=exact_live),
+                mock.patch.object(
+                    inventory_core, "collect_live", return_value=exact_live
+                ),
                 mock.patch.object(inventory_core, "_boot_id", return_value="boot-a"),
             ):
                 unsafe_result = inventory_core.snapshot(
@@ -5733,9 +5750,7 @@ class AutomaticTitleTests(unittest.TestCase):
                 with self.assertRaisesRegex(
                     inventory_core.CollectionError, "stale or does not match"
                 ):
-                    inventory_core.prune_automatic_titles(
-                        config, live, "0" * 64
-                    )
+                    inventory_core.prune_automatic_titles(config, live, "0" * 64)
                 pruned = inventory_core.prune_automatic_titles(
                     config, live, audit["prune_token"]
                 )
@@ -5758,9 +5773,7 @@ class AutomaticTitleTests(unittest.TestCase):
                     config, "codex", newly_active, "Retained New Session"
                 )
                 old_inventory, _, _, _ = self._caller_fixture(config, first)
-                current_inventory, _, _, _ = self._caller_fixture(
-                    config, newly_active
-                )
+                current_inventory, _, _, _ = self._caller_fixture(config, newly_active)
                 audit = inventory_core.audit_automatic_titles(config, old_inventory)
                 calls: list[str] = []
 
@@ -5804,12 +5817,11 @@ class AutomaticTitleTests(unittest.TestCase):
                     document["name_ownership"][f"codex:{exact}"]["owner"],
                 )
                 self.assertEqual(
-                    {"owner": "human", "at": document["name_ownership"][
-                        f"codex:{exact}"
-                    ]["at"]},
-                    inventory_core.canonical_name_ownership(config)[
-                        f"codex:{exact}"
-                    ],
+                    {
+                        "owner": "human",
+                        "at": document["name_ownership"][f"codex:{exact}"]["at"],
+                    },
+                    inventory_core.canonical_name_ownership(config)[f"codex:{exact}"],
                 )
                 for message, call in (
                     (
@@ -5907,14 +5919,11 @@ class AutomaticTitleTests(unittest.TestCase):
                     config, empty, audit["prune_token"]
                 )
                 document = json.loads(config_path.read_text(encoding="utf-8"))
-                self.assertNotIn(
-                    f"codex:{exact}", document.get("name_ownership", {})
-                )
+                self.assertNotIn(f"codex:{exact}", document.get("name_ownership", {}))
                 self.assertEqual(
                     "human",
                     document["name_ownership"][f"codex:{human}"]["owner"],
                 )
-
 
 
 class CanonicalAliasTests(unittest.TestCase):
@@ -5965,9 +5974,7 @@ class CanonicalAliasTests(unittest.TestCase):
                     thread.start()
                     self.assertTrue(started.wait(1))
                     self.assertFalse(finished.wait(0.1))
-                    old_document = json.loads(
-                        config_path.read_text(encoding="utf-8")
-                    )
+                    old_document = json.loads(config_path.read_text(encoding="utf-8"))
                     old_document["aliases"][old_key] = "Pinned writer"
                     inventory_core.atomic_write_json(config_path, old_document)
                 finally:
@@ -5979,9 +5986,7 @@ class CanonicalAliasTests(unittest.TestCase):
             self.assertEqual([], errors)
             stored = json.loads(config_path.read_text(encoding="utf-8"))
             self.assertEqual("Pinned writer", stored["aliases"][old_key])
-            self.assertEqual(
-                "New writer", stored["aliases"][f"codex:{new_uuid}"]
-            )
+            self.assertEqual("New writer", stored["aliases"][f"codex:{new_uuid}"])
 
     def test_explicit_runtime_migration_preserves_runtime_wins_then_retires_overlay(
         self,
@@ -6173,9 +6178,9 @@ class CanonicalAliasTests(unittest.TestCase):
                 self.assertFalse(runtime.exists())
                 self.assertEqual(
                     "Rollback value",
-                    json.loads(config_path.read_text(encoding="utf-8"))[
-                        "aliases"
-                    ][f"codex:{uuid_for(41)}"],
+                    json.loads(config_path.read_text(encoding="utf-8"))["aliases"][
+                        f"codex:{uuid_for(41)}"
+                    ],
                 )
                 archive_preimage = archive.read_bytes()
                 runtime.write_text(
@@ -6190,9 +6195,7 @@ class CanonicalAliasTests(unittest.TestCase):
                     encoding="utf-8",
                 )
                 runtime.chmod(0o600)
-                with self.assertRaisesRegex(
-                    inventory_core.CollectionError, "differ"
-                ):
+                with self.assertRaisesRegex(inventory_core.CollectionError, "differ"):
                     inventory_core.migrate_runtime_aliases(config)
             self.assertEqual(archive_preimage, archive.read_bytes())
             self.assertTrue(runtime.exists())
@@ -6301,19 +6304,15 @@ class CanonicalAliasTests(unittest.TestCase):
                 self.assertTrue(retried["migrated"])
                 self.assertEqual(
                     "Only runtime",
-                    json.loads(config_path.read_text(encoding="utf-8"))[
-                        "aliases"
-                    ][f"claude:{uuid_for(42)}"],
+                    json.loads(config_path.read_text(encoding="utf-8"))["aliases"][
+                        f"claude:{uuid_for(42)}"
+                    ],
                 )
-                config_path.write_bytes(
-                    inventory_core.ABSENT_ALIAS_CONFIG_BACKUP
-                )
+                config_path.write_bytes(inventory_core.ABSENT_ALIAS_CONFIG_BACKUP)
                 config_path.chmod(0o600)
                 runtime.write_bytes(archive.read_bytes())
                 runtime.chmod(0o600)
-                with self.assertRaisesRegex(
-                    inventory_core.CollectionError, "diverged"
-                ):
+                with self.assertRaisesRegex(inventory_core.CollectionError, "diverged"):
                     inventory_core.migrate_runtime_aliases(config)
             self.assertEqual(
                 inventory_core.ABSENT_ALIAS_CONFIG_BACKUP,
@@ -6394,9 +6393,7 @@ class InventoryInputAndRecoveryTests(unittest.TestCase):
             item["identity"] = {
                 "uuid": None,
                 "pid": item["shpool_shell"]["pid"],
-                "process_start_ticks": item["shpool_shell"][
-                    "process_start_ticks"
-                ],
+                "process_start_ticks": item["shpool_shell"]["process_start_ticks"],
                 "provenance": "process tree",
                 "confidence": "unknown",
             }
@@ -6464,18 +6461,14 @@ class InventoryInputAndRecoveryTests(unittest.TestCase):
             item["identity"] = {
                 "uuid": None,
                 "pid": item["shpool_shell"]["pid"],
-                "process_start_ticks": item["shpool_shell"][
-                    "process_start_ticks"
-                ],
+                "process_start_ticks": item["shpool_shell"]["process_start_ticks"],
                 "provenance": "process tree",
                 "confidence": "unknown",
             }
             item["title"] = "Unresolved provider session"
             item["display_title"] = item["title"]
 
-        with tempfile.TemporaryDirectory(
-            prefix=".retained-setup-", dir=REPO
-        ) as raw:
+        with tempfile.TemporaryDirectory(prefix=".retained-setup-", dir=REPO) as raw:
             start_dir = Path(raw)
             start_dir.chmod(0o700)
             for item, (_, provider) in zip(fixture["sessions"], expected):
@@ -6525,17 +6518,13 @@ class InventoryInputAndRecoveryTests(unittest.TestCase):
             item["identity"] = {
                 "uuid": None,
                 "pid": item["shpool_shell"]["pid"],
-                "process_start_ticks": item["shpool_shell"][
-                    "process_start_ticks"
-                ],
+                "process_start_ticks": item["shpool_shell"]["process_start_ticks"],
                 "provenance": "process tree",
                 "confidence": "unknown",
             }
             return fixture
 
-        with tempfile.TemporaryDirectory(
-            prefix=".retained-reject-", dir=REPO
-        ) as raw:
+        with tempfile.TemporaryDirectory(prefix=".retained-reject-", dir=REPO) as raw:
             start_dir = Path(raw)
             start_dir.chmod(0o700)
 
@@ -6544,9 +6533,7 @@ class InventoryInputAndRecoveryTests(unittest.TestCase):
                 generation = fixture["daemon_generation"]
                 start = start_dir / "main"
                 sidecar = start_dir / "main.expected"
-                start.write_text(
-                    f"claude\t{item['cwd']}\t\n", encoding="utf-8"
-                )
+                start.write_text(f"claude\t{item['cwd']}\t\n", encoding="utf-8")
                 sidecar.write_text(
                     f"claude\t{item['cwd']}\t{boot}\t"
                     f"{item['started_at_unix_ms']}\t"
@@ -6652,9 +6639,7 @@ class InventoryInputAndRecoveryTests(unittest.TestCase):
         unknown["identity"] = {
             "uuid": None,
             "pid": unknown["shpool_shell"]["pid"],
-            "process_start_ticks": unknown["shpool_shell"][
-                "process_start_ticks"
-            ],
+            "process_start_ticks": unknown["shpool_shell"]["process_start_ticks"],
             "provenance": "process tree",
             "confidence": "unknown",
         }
@@ -6690,9 +6675,7 @@ class InventoryInputAndRecoveryTests(unittest.TestCase):
 
         duplicate = copy.deepcopy(fixture)
         duplicate["outside_agents"][0]["provider"] = managed["provider"]
-        duplicate["outside_agents"][0]["identity"] = copy.deepcopy(
-            managed["identity"]
-        )
+        duplicate["outside_agents"][0]["identity"] = copy.deepcopy(managed["identity"])
         self.assertTrue(inventory_core.guard_live_inventory(duplicate))
         self.assertFalse(inventory_core.strict_live_inventory(duplicate))
 
@@ -6738,9 +6721,7 @@ class InventoryInputAndRecoveryTests(unittest.TestCase):
         )
         changed(
             "daemon generation",
-            lambda value: value["daemon_generation"].update(
-                process_start_ticks=0
-            ),
+            lambda value: value["daemon_generation"].update(process_start_ticks=0),
         )
         changed(
             "shell generation",
@@ -6748,9 +6729,7 @@ class InventoryInputAndRecoveryTests(unittest.TestCase):
         )
         changed(
             "known confidence",
-            lambda value: value["sessions"][0]["identity"].update(
-                confidence="unknown"
-            ),
+            lambda value: value["sessions"][0]["identity"].update(confidence="unknown"),
         )
         changed(
             "known uuid",
@@ -6758,9 +6737,7 @@ class InventoryInputAndRecoveryTests(unittest.TestCase):
         )
         changed(
             "duplicate row",
-            lambda value: value["sessions"][1].update(
-                row=value["sessions"][0]["row"]
-            ),
+            lambda value: value["sessions"][1].update(row=value["sessions"][0]["row"]),
         )
         changed(
             "duplicate raw id",
@@ -6777,12 +6754,8 @@ class InventoryInputAndRecoveryTests(unittest.TestCase):
 
         for label, candidate in malformed:
             with self.subTest(label=label):
-                self.assertFalse(
-                    inventory_core.guard_live_inventory(candidate)
-                )
-                self.assertFalse(
-                    inventory_core.strict_live_inventory(candidate)
-                )
+                self.assertFalse(inventory_core.guard_live_inventory(candidate))
+                self.assertFalse(inventory_core.strict_live_inventory(candidate))
 
     def test_malformed_json_and_duplicate_selectors_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory(prefix=".inventory-input-", dir=REPO) as raw:
@@ -6833,9 +6806,7 @@ class InventoryInputAndRecoveryTests(unittest.TestCase):
         claude = inventory_core.recovery_spec("claude", exact, "/srv/a b")
         codex = inventory_core.recovery_spec("codex", exact)
         self.assertEqual(["claude", "--resume", exact], claude["argv"])
-        self.assertEqual(
-            ["codex", "--no-alt-screen", "resume", exact], codex["argv"]
-        )
+        self.assertEqual(["codex", "--no-alt-screen", "resume", exact], codex["argv"])
         joined = json.dumps([claude, codex]).casefold()
         for fallback in ("continue", "latest", "newest", "--last"):
             self.assertNotIn(fallback, joined)
@@ -6861,9 +6832,7 @@ class InventoryInputAndRecoveryTests(unittest.TestCase):
             cached = inventory_core.build_inventory(
                 *inventory_fixture(1), now=1_800_000_000
             )
-            (state / "inventory.json").write_text(
-                json.dumps(cached), encoding="utf-8"
-            )
+            (state / "inventory.json").write_text(json.dumps(cached), encoding="utf-8")
             config = base / "inventory.json"
             config.write_text(
                 json.dumps({"schema_version": 1, "state_dir": str(state)}),
@@ -6907,7 +6876,9 @@ class InventoryInputAndRecoveryTests(unittest.TestCase):
 
 
 class InventoryRenderingTests(unittest.TestCase):
-    def test_list_screen_in_a_real_80_column_terminal_hides_machine_titles(self) -> None:
+    def test_list_screen_in_a_real_80_column_terminal_hides_machine_titles(
+        self,
+    ) -> None:
         fixture = inventory_core.build_inventory(
             *inventory_fixture(2), now=1_800_000_000
         )
@@ -7085,9 +7056,7 @@ class InventoryRenderingTests(unittest.TestCase):
         )
         fixture["sessions"][0]["needs_you"] = True
         fixture["sessions"][0]["agent_status"] = "needs your reply"
-        with mock.patch.object(
-            inventory_core, "_color_enabled", return_value=True
-        ):
+        with mock.patch.object(inventory_core, "_color_enabled", return_value=True):
             rendered = inventory_core.render_inventory(fixture)
         visible = re.sub(r"\x1b\[[0-9;]*m", "", rendered)
         for item in fixture["sessions"]:
@@ -7188,9 +7157,7 @@ class InventoryRenderingTests(unittest.TestCase):
             "A screenshot-sized title that must not wrap in the SSH picker"
         )
         with (
-            mock.patch.dict(
-                os.environ, {"SESSION_KIT_NO_COLOR": "1"}, clear=False
-            ),
+            mock.patch.dict(os.environ, {"SESSION_KIT_NO_COLOR": "1"}, clear=False),
             mock.patch.object(
                 inventory_core.shutil,
                 "get_terminal_size",
@@ -7215,10 +7182,10 @@ class InventoryRenderingTests(unittest.TestCase):
             "Styled wide 漢字 title that reaches the terminal boundary"
         )
         for width in (60, 80, 100, 160):
-            with self.subTest(width=width), mock.patch.dict(
-                os.environ, {"COLUMNS": str(width)}, clear=False
-            ), mock.patch.object(
-                inventory_core, "_color_enabled", return_value=True
+            with (
+                self.subTest(width=width),
+                mock.patch.dict(os.environ, {"COLUMNS": str(width)}, clear=False),
+                mock.patch.object(inventory_core, "_color_enabled", return_value=True),
             ):
                 rendered = inventory_core.render_inventory(fixture)
             self.assertIn("\x1b[", rendered)
@@ -7264,7 +7231,10 @@ class ProviderLifecycleStateTests(unittest.TestCase):
             }
             with mock.patch.dict(os.environ, environment, clear=False):
                 exact = inventory_core._lifecycle_committed_conversation(
-                    provider="codex", boot_id="aaaaaaaa-bbbb", shell_pid=123, shell_start=456
+                    provider="codex",
+                    boot_id="aaaaaaaa-bbbb",
+                    shell_pid=123,
+                    shell_start=456,
                 )
             self.assertEqual(conversation, exact)
 
@@ -7278,28 +7248,44 @@ class ProviderLifecycleStateTests(unittest.TestCase):
                 broken[field] = changed
                 marker.write_text(json.dumps(broken) + "\n", encoding="utf-8")
                 marker.chmod(0o600)
-                with mock.patch.dict(os.environ, environment, clear=False), self.assertRaises(
-                    inventory_core.CollectionError
+                with (
+                    mock.patch.dict(os.environ, environment, clear=False),
+                    self.assertRaises(inventory_core.CollectionError),
                 ):
                     inventory_core._lifecycle_committed_conversation(
-                        provider="codex", boot_id="aaaaaaaa-bbbb", shell_pid=123, shell_start=456
+                        provider="codex",
+                        boot_id="aaaaaaaa-bbbb",
+                        shell_pid=123,
+                        shell_start=456,
                     )
 
             marker.unlink()
-            with mock.patch.dict(os.environ, environment, clear=False), self.assertRaisesRegex(
-                inventory_core.CollectionError, "unavailable"
+            with (
+                mock.patch.dict(os.environ, environment, clear=False),
+                self.assertRaisesRegex(inventory_core.CollectionError, "unavailable"),
             ):
                 inventory_core._lifecycle_committed_conversation(
-                    provider="codex", boot_id="aaaaaaaa-bbbb", shell_pid=123, shell_start=456
+                    provider="codex",
+                    boot_id="aaaaaaaa-bbbb",
+                    shell_pid=123,
+                    shell_start=456,
                 )
 
     def test_conversation_uuid_is_persisted_in_provider_exit_state(self) -> None:
-        with tempfile.TemporaryDirectory(prefix=".lifecycle-conversation-", dir=REPO) as raw:
+        with tempfile.TemporaryDirectory(
+            prefix=".lifecycle-conversation-", dir=REPO
+        ) as raw:
             value = lifecycle_state.record_provider_exit(
-                Path(raw), session_id="main", boot_id="aaaaaaaa-bbbb",
-                shell_pid=123, shell_start_ticks=456, provider="codex",
-                conversation_uuid=uuid_for(93), exit_code=0,
-                input_tracking=True, now_monotonic_ns=999,
+                Path(raw),
+                session_id="main",
+                boot_id="aaaaaaaa-bbbb",
+                shell_pid=123,
+                shell_start_ticks=456,
+                provider="codex",
+                conversation_uuid=uuid_for(93),
+                exit_code=0,
+                input_tracking=True,
+                now_monotonic_ns=999,
             )
             self.assertEqual(uuid_for(93), value["conversation_uuid"])
             self.assertEqual(4, value["schema_version"])
@@ -7308,19 +7294,33 @@ class ProviderLifecycleStateTests(unittest.TestCase):
                 inventory_core.CollectionError, "conversation changed"
             ):
                 lifecycle_state.record_provider_exit(
-                    Path(raw), session_id="main", boot_id="aaaaaaaa-bbbb",
-                    shell_pid=123, shell_start_ticks=456, provider="codex",
-                    conversation_uuid=uuid_for(94), exit_code=0,
-                    input_tracking=True, now_monotonic_ns=1000,
+                    Path(raw),
+                    session_id="main",
+                    boot_id="aaaaaaaa-bbbb",
+                    shell_pid=123,
+                    shell_start_ticks=456,
+                    provider="codex",
+                    conversation_uuid=uuid_for(94),
+                    exit_code=0,
+                    input_tracking=True,
+                    now_monotonic_ns=1000,
                 )
 
 
 class WorkerLaunchGateTests(unittest.TestCase):
-    def test_inventory_row_carries_only_bound_process_model_and_launch_key(self) -> None:
+    def test_inventory_row_carries_only_bound_process_model_and_launch_key(
+        self,
+    ) -> None:
         fixture = list(inventory_fixture(1))
         table = fixture[2]
-        provider_pid = next(pid for pid, row in table.items() if row["comm"] == "claude")
-        table[provider_pid]["cmdline"] = ["/usr/bin/claude", "--model", "claude-opus-test"]
+        provider_pid = next(
+            pid for pid, row in table.items() if row["comm"] == "claude"
+        )
+        table[provider_pid]["cmdline"] = [
+            "/usr/bin/claude",
+            "--model",
+            "claude-opus-test",
+        ]
         table[provider_pid]["requested_model"] = "claude-opus-test"
         table[provider_pid]["launch_idempotency_key"] = "worker:research:1"
         inventory = inventory_core.build_inventory(*fixture)
@@ -7366,31 +7366,21 @@ class WorkerLaunchGateTests(unittest.TestCase):
             mock.patch.object(
                 inventory_core, "_require_supported_platform", return_value="linux"
             ),
-            mock.patch.object(
-                inventory_core, "scan_process_table", return_value=table
-            ),
+            mock.patch.object(inventory_core, "scan_process_table", return_value=table),
         ):
-            inventory_core._prove_lifecycle_caller(
-                "main2", shell_pid, 987_654
-            )
+            inventory_core._prove_lifecycle_caller("main2", shell_pid, 987_654)
             with self.assertRaisesRegex(
                 inventory_core.CollectionError, "outside the exact"
             ):
-                inventory_core._prove_lifecycle_caller(
-                    "main2", shell_pid, 987_655
-                )
+                inventory_core._prove_lifecycle_caller("main2", shell_pid, 987_655)
             table[shell_pid]["session_name"] = "main3"
             with self.assertRaisesRegex(
                 inventory_core.CollectionError, "outside the exact"
             ):
-                inventory_core._prove_lifecycle_caller(
-                    "main2", shell_pid, 987_654
-                )
+                inventory_core._prove_lifecycle_caller("main2", shell_pid, 987_654)
 
     def test_state_is_private_minimal_and_first_input_is_permanent(self) -> None:
-        with tempfile.TemporaryDirectory(
-            prefix=".lifecycle-state-", dir=REPO
-        ) as raw:
+        with tempfile.TemporaryDirectory(prefix=".lifecycle-state-", dir=REPO) as raw:
             state_dir = Path(raw)
             session_id = "s20260730-220500-19"
             boot_id = "11111111-2222-3333-4444-555555555555"
@@ -7501,9 +7491,7 @@ class WorkerLaunchGateTests(unittest.TestCase):
 
     def test_exact_recovery_retention_is_separate_from_generation_guard(self) -> None:
         """Only exact recovery has an age-based housekeeping lifetime."""
-        with tempfile.TemporaryDirectory(
-            prefix="session-kit-lifecycle-retain."
-        ) as raw:
+        with tempfile.TemporaryDirectory(prefix="session-kit-lifecycle-retain.") as raw:
             state_dir = Path(raw)
             lifecycle_dir = state_dir / "lifecycle"
             lifecycle_dir.mkdir(mode=0o700, parents=True)
@@ -7524,9 +7512,7 @@ class WorkerLaunchGateTests(unittest.TestCase):
                     encoding="utf-8",
                 )
                 path.chmod(0o600)
-            aged = time.time() - (
-                lifecycle_state.EXACT_RECOVERY_RETENTION_SECONDS + 1
-            )
+            aged = time.time() - (lifecycle_state.EXACT_RECOVERY_RETENTION_SECONDS + 1)
             for path in (plain_old, exact_old):
                 os.utime(path, (aged, aged))
             captured = lifecycle_state.capture_lifecycle_generations(state_dir)
@@ -7543,21 +7529,15 @@ class WorkerLaunchGateTests(unittest.TestCase):
 
     def test_exact_exit_overlay_keeps_shell_live_and_recovery_available(self) -> None:
         fixture = list(inventory_fixture(1, providers=("codex",)))
-        active = inventory_core.build_inventory(
-            *fixture, now=1_800_000_000
-        )
+        active = inventory_core.build_inventory(*fixture, now=1_800_000_000)
         expected_uuid = uuid_for(1)
         root_pid = 1001
         provider_pid = 2001
         del fixture[2][provider_pid]
         fixture[3] = {}
-        idle = inventory_core.build_inventory(
-            *fixture, now=1_800_000_001
-        )
+        idle = inventory_core.build_inventory(*fixture, now=1_800_000_001)
         self.assertEqual("shell", idle["sessions"][0]["provider"])
-        with tempfile.TemporaryDirectory(
-            prefix=".lifecycle-overlay-", dir=REPO
-        ) as raw:
+        with tempfile.TemporaryDirectory(prefix=".lifecycle-overlay-", dir=REPO) as raw:
             state_dir = Path(raw)
             lifecycle_state.persist_last_exact(
                 idle,
@@ -7773,19 +7753,26 @@ class WorkerLaunchGateTests(unittest.TestCase):
         fixture[3] = {}
         idle = inventory_core.build_inventory(*fixture, now=1_800_000_001)
         expected_uuid = uuid_for(81)
-        with tempfile.TemporaryDirectory(prefix=".lifecycle-fast-exit-", dir=REPO) as raw:
+        with tempfile.TemporaryDirectory(
+            prefix=".lifecycle-fast-exit-", dir=REPO
+        ) as raw:
             state_dir = Path(raw)
             lifecycle_state.record_provider_exit(
-                state_dir, session_id="main",
+                state_dir,
+                session_id="main",
                 boot_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
                 shell_pid=root_pid,
                 shell_start_ticks=fixture[2][root_pid]["start_ticks"],
-                provider="codex", conversation_uuid=expected_uuid,
-                exit_code=0, input_tracking=True,
+                provider="codex",
+                conversation_uuid=expected_uuid,
+                exit_code=0,
+                input_tracking=True,
                 now_monotonic_ns=1_800_000_000_500,
             )
             lifecycle_state.apply_provider_exit_states(
-                idle, None, state_dir=state_dir,
+                idle,
+                None,
+                state_dir=state_dir,
                 boot_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
             )
         item = idle["sessions"][0]
@@ -7795,9 +7782,7 @@ class WorkerLaunchGateTests(unittest.TestCase):
         self.assertTrue(item["recovery"]["available"])
 
     def test_reopen_executes_only_generation_bound_exact_recovery(self) -> None:
-        with tempfile.TemporaryDirectory(
-            prefix=".lifecycle-reopen-", dir=REPO
-        ) as raw:
+        with tempfile.TemporaryDirectory(prefix=".lifecycle-reopen-", dir=REPO) as raw:
             state_dir = Path(raw)
             boot_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
             lifecycle_state.record_provider_exit(
@@ -7832,21 +7817,15 @@ class WorkerLaunchGateTests(unittest.TestCase):
                 "recovery": recovery,
             }
             args = argparse.Namespace(lifecycle_action="reopen")
-            completed = subprocess.CompletedProcess(
-                recovery["argv"], 0
-            )
+            completed = subprocess.CompletedProcess(recovery["argv"], 0)
             with (
                 mock.patch.object(
                     inventory_core,
                     "_lifecycle_environment",
                     return_value=(state_dir, "main2", boot_id, 123, 456),
                 ),
-                mock.patch.object(
-                    inventory_core, "_prove_lifecycle_caller"
-                ),
-                mock.patch.object(
-                    inventory_core, "_prove_unchanged_daemon_generation"
-                ),
+                mock.patch.object(inventory_core, "_prove_lifecycle_caller"),
+                mock.patch.object(inventory_core, "_prove_unchanged_daemon_generation"),
                 mock.patch.object(
                     inventory_core, "load_config", return_value={"state_dir": state_dir}
                 ),
@@ -7856,9 +7835,7 @@ class WorkerLaunchGateTests(unittest.TestCase):
                 mock.patch.object(
                     inventory_core, "guard_live_inventory", return_value=True
                 ),
-                mock.patch.object(
-                    inventory_core, "lookup", return_value=item
-                ),
+                mock.patch.object(inventory_core, "lookup", return_value=item),
                 mock.patch.object(
                     inventory_core.subprocess,
                     "run",
@@ -7931,13 +7908,10 @@ class WorkerLaunchGateTests(unittest.TestCase):
         """Drive the reopen verb; return its status or the refusal it raised."""
         args = argparse.Namespace(lifecycle_action="reopen")
         launched = mock.Mock(
-            return_value=completed
-            or subprocess.CompletedProcess(["codex"], 0)
+            return_value=completed or subprocess.CompletedProcess(["codex"], 0)
         )
         generation = (
-            mock.DEFAULT
-            if daemon_generation == "unchanged"
-            else daemon_generation
+            mock.DEFAULT if daemon_generation == "unchanged" else daemon_generation
         )
         with (
             mock.patch.object(
@@ -7949,9 +7923,7 @@ class WorkerLaunchGateTests(unittest.TestCase):
             mock.patch.object(
                 inventory_core,
                 "_prove_unchanged_daemon_generation",
-                side_effect=(
-                    None if generation is mock.DEFAULT else generation
-                ),
+                side_effect=(None if generation is mock.DEFAULT else generation),
             ),
             mock.patch.object(
                 inventory_core, "load_config", return_value={"state_dir": state_dir}
@@ -8066,7 +8038,10 @@ class WorkerLaunchGateTests(unittest.TestCase):
                 "not the one that recorded the exit",
             ),
             (
-                {"provider": "shell", "shpool_shell": {"pid": 123, "process_start_ticks": 456}},
+                {
+                    "provider": "shell",
+                    "shpool_shell": {"pid": 123, "process_start_ticks": 456},
+                },
                 "the recorded exit was not the provider this terminal last ran",
             ),
             (
@@ -8182,9 +8157,7 @@ class WorkerLaunchGateTests(unittest.TestCase):
                 input_tracking=True,
                 now_monotonic_ns=500,
             )
-            recovery = inventory_core.recovery_spec(
-                "claude", exact, str(state_dir)
-            )
+            recovery = inventory_core.recovery_spec("claude", exact, str(state_dir))
             item = {
                 "provider": "shell",
                 "exited_provider": "claude",
@@ -8204,9 +8177,7 @@ class WorkerLaunchGateTests(unittest.TestCase):
                     return_value=(state_dir, "main3", boot_id, 123, 456),
                 ),
                 mock.patch.object(inventory_core, "_prove_lifecycle_caller"),
-                mock.patch.object(
-                    inventory_core, "_prove_unchanged_daemon_generation"
-                ),
+                mock.patch.object(inventory_core, "_prove_unchanged_daemon_generation"),
                 mock.patch.object(
                     inventory_core, "load_config", return_value={"state_dir": state_dir}
                 ),

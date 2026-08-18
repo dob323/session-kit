@@ -494,6 +494,83 @@ class DuplicatePathRowsTest(unittest.TestCase):
             self.assertEqual({}, roots_for(names, table)[0])
 
 
+class AnotherAccountsDaemonTest(unittest.TestCase):
+    """A second account's shpool is not an unknown; it is not a candidate.
+
+    Found live on a shared host, 2026-08-17: a second Unix account started
+    its own shpool daemon, and from then on this account could prove nothing.
+    Its `/proc/<pid>/fd` belongs to that account, so the socket-holder check
+    answered UNKNOWN, the uniqueness rule refused to name any daemon, and
+    every session on the board went unprovable — `sp new` produced
+    "Unresolved provider session" and `sp go`/`sp close` refused. The kernel
+    had already settled it: a listener under /run/user/<uid> is 0700, so a
+    daemon owned by another uid can never be the one answering us.
+    """
+
+    def foreign_uid(self) -> int:
+        return os.getuid() + 1
+
+    def test_another_accounts_daemon_is_not_a_candidate(self) -> None:
+        table, names = live_incident_table()
+        table[FOREIGN_DAEMON] = {
+            **table[FOREIGN_DAEMON],
+            "uid": self.foreign_uid(),
+        }
+        table[KIT_DAEMON] = {**table[KIT_DAEMON], "uid": os.getuid()}
+        self.assertEqual(
+            [KIT_DAEMON],
+            process_inventory._kit_daemons(
+                table, process_inventory._is_shpool_daemon
+            ),
+        )
+
+    def test_the_board_survives_an_unreadable_foreign_daemon(self) -> None:
+        """The exact live shape: their fd directory cannot be read at all."""
+        table, names = live_incident_table()
+        table[FOREIGN_DAEMON] = {
+            **table[FOREIGN_DAEMON],
+            "uid": self.foreign_uid(),
+        }
+        table[KIT_DAEMON] = {**table[KIT_DAEMON], "uid": os.getuid()}
+        with kernel_says([KIT_DAEMON], unreadable=[FOREIGN_DAEMON]):
+            resolved, diagnostics = roots_for(names, table)
+            self.assertEqual(len(names), len(resolved), diagnostics)
+            self.assertEqual(KIT_DAEMON, generation_for(table)["pid"])
+
+    def test_an_unreadable_owner_stays_a_candidate(self) -> None:
+        """No uid on the row is not evidence against the process."""
+        table, names = live_incident_table()
+        table[FOREIGN_DAEMON] = {**table[FOREIGN_DAEMON], "uid": None}
+        self.assertEqual(
+            [KIT_DAEMON, FOREIGN_DAEMON],
+            process_inventory._kit_daemons(
+                table, process_inventory._is_shpool_daemon
+            ),
+        )
+
+    def test_a_foreign_unreadable_argv_namesake_is_not_a_candidate(self) -> None:
+        """The other account's daemon whose command line we cannot read."""
+        table, names = live_incident_table()
+        del table[FOREIGN_DAEMON]
+        table[KIT_DAEMON] = {**table[KIT_DAEMON], "uid": os.getuid()}
+        table[FOREIGN_DAEMON] = {
+            "pid": FOREIGN_DAEMON,
+            "ppid": 1,
+            "comm": "shpool",
+            "cmdline": [],
+            "argv_unreadable": True,
+            "start_ticks": FOREIGN_DAEMON * 10,
+            "session_name": "",
+            "uid": self.foreign_uid(),
+        }
+        self.assertEqual(
+            [KIT_DAEMON],
+            process_inventory._kit_daemons(
+                table, process_inventory._is_shpool_daemon
+            ),
+        )
+
+
 class UnknownKernelEvidenceTest(unittest.TestCase):
     def assert_refuses(self, table, names) -> None:
         self.assertEqual(
