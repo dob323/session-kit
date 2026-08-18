@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""Render the GitHub social preview card.
+
+This is the picture GitHub shows when the repository is linked anywhere, so it
+has one job: say what Session Kit is at a size where only the headline is
+readable. The terminal under the headline is the real needs-you screen, come
+from the same capture that produces the README's figures, because the sentence
+above it is a claim about that screen.
+
+The card is built in a browser like every other figure here, so the same guard
+applies: nothing may escape the canvas.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+from pathlib import Path
+import sys
+
+TOOLS = Path(__file__).resolve().parent
+if str(TOOLS) not in sys.path:
+    sys.path.insert(0, str(TOOLS))
+
+import readme_art_lib as art  # noqa: E402
+import readme_capture as capture  # noqa: E402
+
+MARK = art.REPO / "docs" / "assets" / "mark.svg"
+
+# GitHub's documented size for a social preview.
+WIDTH, HEIGHT = 1280, 640
+PAD = 60
+# The headline needs air under it; the terminal is the floor of the card.
+PAD_TOP, PAD_BOTTOM = 46, 50
+# The window is drawn at its native size and scaled, so the terminal keeps the
+# exact proportions it has in the README rather than being re-typeset smaller.
+WINDOW_WIDTH = WIDTH - PAD * 2
+
+HEADLINE = ("Many AI coding sessions.", "One place to see which one needs you.")
+SUPPORTS = "Claude Code · Codex · shells · Linux and macOS"
+
+CSS = """
+body{{
+  width:{w}px;height:{h}px;overflow:hidden;position:relative;
+  background:
+    repeating-linear-gradient(0deg,{line}22 0 1px,transparent 1px 64px),
+    repeating-linear-gradient(90deg,{line}22 0 1px,transparent 1px 64px),
+    radial-gradient(120% 90% at 12% 0%,{panel} 0%,{bg} 62%);
+}}
+.card{{position:absolute;left:{pad}px;right:{pad}px;top:{padtop}px}}
+.top{{display:flex;align-items:baseline;justify-content:space-between;gap:24px}}
+.mark{{
+  display:flex;align-items:center;gap:14px;
+  font-family:KitMono,monospace;font-size:22px;color:{dim};
+  letter-spacing:.1em;white-space:nowrap;
+}}
+.mark img{{display:block;width:34px;height:34px}}
+.supports{{font-size:19px;color:{dim};white-space:nowrap}}
+h1{{
+  margin-top:24px;font-size:43px;line-height:1.16;font-weight:800;
+  letter-spacing:-.022em;color:{text};
+}}
+h1 span{{color:{green};display:block}}
+.stage{{
+  position:absolute;left:{pad}px;top:{top}px;
+  width:{ww}px;height:{wh}px;overflow:visible;
+}}
+.stage .win{{transform:scale({scale});transform-origin:top left}}
+"""
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--output", type=Path, default=art.ASSETS / "social-preview.png"
+    )
+    parser.add_argument("--scale", type=int, default=2)
+    args = parser.parse_args()
+
+    frames = capture.capture(b"a\nb\nq\n", columns=art.COLUMNS)
+    listing = capture.list_frame(frames)
+    needs = capture.needs_frame(frames)
+    # The card claims the needs-you screen answers the question. If that screen
+    # disagrees with the list it came from, the claim is not true of this build.
+    capture.refuse_disagreeing_screens(listing, needs)
+
+    markup, native_width, native_height = art.window_html(
+        capture.frame_html(needs), len(needs.splitlines())
+    )
+    # window_html pads the box for the drop shadow; the card supplies its own
+    # space, so scale against the window rather than the padded box.
+    scale = WINDOW_WIDTH / (native_width - 40)
+    stage_height = round((native_height - 40) * scale)
+    top = HEIGHT - PAD_BOTTOM - stage_height
+
+    mark = "data:image/svg+xml;base64," + base64.b64encode(MARK.read_bytes()).decode(
+        "ascii"
+    )
+    body = (
+        '<div class="card">'
+        '<div class="top">'
+        f'<div class="mark"><img src="{mark}" alt=""> session kit</div>'
+        f'<div class="supports">{SUPPORTS}</div>'
+        "</div>"
+        f"<h1>{HEADLINE[0]}<span>{HEADLINE[1]}</span></h1>"
+        "</div>"
+        f'<div class="stage">{markup}</div>'
+    )
+    css = art.window_css() + CSS.format(
+        w=WIDTH,
+        h=HEIGHT,
+        pad=PAD,
+        padtop=PAD_TOP,
+        top=top,
+        ww=WINDOW_WIDTH,
+        wh=stage_height,
+        scale=f"{scale:.6f}",
+        bg=art.INK["bg"],
+        panel=art.INK["panel"],
+        line=art.INK["line"],
+        dim=art.INK["dim"],
+        text=art.INK["text"],
+        green=art.INK["green"],
+    )
+    html = art.page(body, css, width=WIDTH, height=HEIGHT)
+    art.render(html, args.output, width=WIDTH, height=HEIGHT, scale=args.scale)
+    size = args.output.stat().st_size
+    print(
+        f"wrote {args.output} ({WIDTH}x{HEIGHT} at {args.scale}x, {size // 1024} KiB)"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

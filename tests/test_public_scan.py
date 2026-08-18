@@ -9,7 +9,11 @@ import unittest
 
 REPO = Path(__file__).resolve().parents[1]
 SCANNER = REPO / "tools" / "public-scan"
-APPROVED_PICKER_IMAGE = REPO / "docs" / "assets" / "session-kit-picker.png"
+# One shipped, approved binary, used as the fixture for every digest case
+# below. It has to be a file the scanner really approves at the path it
+# really lives at, so it moves whenever the artwork does.
+APPROVED_IMAGE = REPO / "docs" / "assets" / "readme" / "picker.png"
+APPROVED_IMAGE_PATH = "docs/assets/readme/picker.png"
 
 
 class PublicScanTests(unittest.TestCase):
@@ -73,12 +77,10 @@ class PublicScanTests(unittest.TestCase):
         subprocess.run(["git", "-C", self.root, "add", "."], check=True)
         subprocess.run(["git", "-C", self.root, "commit", "-qm", message], check=True)
 
-    def copy_dashboard(
-        self, relative: str = "docs/assets/session-kit-picker.png"
-    ) -> Path:
+    def copy_approved_image(self, relative: str = APPROVED_IMAGE_PATH) -> Path:
         target = self.root / relative
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(APPROVED_PICKER_IMAGE, target)
+        shutil.copyfile(APPROVED_IMAGE, target)
         return target
 
     def test_clean_tree_ignores_tool_and_git_caches(self) -> None:
@@ -157,26 +159,26 @@ class PublicScanTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("linked-directory: symlink is not allowed", result.stdout)
 
-    def test_approved_dashboard_binary_is_accepted(self) -> None:
-        self.copy_dashboard()
+    def test_approved_binary_is_accepted(self) -> None:
+        self.copy_approved_image()
 
         result = self.run_scan()
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def test_dashboard_with_changed_digest_is_rejected(self) -> None:
-        dashboard = self.copy_dashboard()
-        payload = bytearray(dashboard.read_bytes())
+    def test_approved_binary_with_changed_digest_is_rejected(self) -> None:
+        approved = self.copy_approved_image()
+        payload = bytearray(approved.read_bytes())
         payload[-1] ^= 1
-        dashboard.write_bytes(payload)
+        approved.write_bytes(payload)
 
         result = self.run_scan()
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("approved binary digest mismatch", result.stdout)
 
-    def test_approved_dashboard_bytes_at_another_path_are_rejected(self) -> None:
-        self.copy_dashboard("docs/assets/other.png")
+    def test_approved_bytes_at_another_path_are_rejected(self) -> None:
+        self.copy_approved_image("docs/assets/other.png")
 
         result = self.run_scan()
 
@@ -191,15 +193,15 @@ class PublicScanTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("binary file is not allowed", result.stdout)
 
-    def test_history_rejects_superseded_dashboard_digest(self) -> None:
+    def test_history_rejects_superseded_digest(self) -> None:
         self.init_git()
-        dashboard = self.copy_dashboard()
-        payload = bytearray(dashboard.read_bytes())
+        approved = self.copy_approved_image()
+        payload = bytearray(approved.read_bytes())
         payload[-1] ^= 1
-        dashboard.write_bytes(payload)
-        self.commit("add altered dashboard")
-        self.copy_dashboard()
-        self.commit("restore approved dashboard")
+        approved.write_bytes(payload)
+        self.commit("add altered image")
+        self.copy_approved_image()
+        self.commit("restore approved image")
 
         tree_only = self.run_scan()
         history = self.run_scan("--git-history")

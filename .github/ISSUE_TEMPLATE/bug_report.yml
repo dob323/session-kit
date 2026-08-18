@@ -34,12 +34,12 @@ body:
     attributes:
       label: Affected area
       options:
-        - Dashboard or color
-        - Reply state
+        - The picker or session colors
+        - Session state (needs you, working, idle)
         - Open or move
         - Provider exit or reopen
-        - Kill confirmation
-        - Recovery or repair
+        - Closing a session
+        - Restore or repair
         - Cleanup
         - Install, update, rollback, or uninstall
         - Privacy or journals

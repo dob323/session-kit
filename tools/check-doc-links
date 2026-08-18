@@ -1,16 +1,66 @@
 #!/usr/bin/env python3
-"""Check local links in public Markdown files."""
+"""Check local links in public Markdown files.
+
+Both halves of a link are checked: the file it points at, and the heading
+inside that file when the link carries a `#fragment`. The fragment half was
+unchecked for a long time, which meant a renamed heading silently turned
+every link to it into a link that scrolls nowhere — invisible in review
+because the page still loads.
+"""
 
 from __future__ import annotations
 
 import argparse
+from itertools import chain
 from pathlib import Path
 import re
 from urllib.parse import unquote, urlsplit
 
 
 LINK = re.compile(r"(?<!!)\[[^\]]+\]\(([^)]+)\)")
+# Markdown is not the only way a shipped page links. The README's own
+# navigation is a row of <a href="#section">, and every picture on it is an
+# <img src="docs/assets/...">. Neither was checked, so a renamed section or a
+# deleted picture broke the front page with nothing failing.
+HTML_LINK = re.compile(
+    r"<(?:a[^>]*?\shref|img[^>]*?\ssrc)=[\"']([^\"']+)[\"']", re.IGNORECASE
+)
+HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
+FENCE = re.compile(r"^\s*(?:```|~~~)")
 IGNORED_PARTS = {".git", ".mypy_cache", ".ruff_cache", "__pycache__"}
+
+
+def anchors(document: Path) -> set[str]:
+    """Every fragment GitHub will resolve inside one Markdown file.
+
+    GitHub lowercases the heading, drops everything that is not a word
+    character, a space, or a hyphen, turns runs of spaces into hyphens, and
+    suffixes a repeat with -1, -2. Headings inside fenced code are not
+    headings.
+    """
+
+    found: set[str] = set()
+    seen: dict[str, int] = {}
+    fenced = False
+    for line in document.read_text(encoding="utf-8").splitlines():
+        if FENCE.match(line):
+            fenced = not fenced
+            continue
+        if fenced:
+            continue
+        match = HEADING.match(line)
+        if match is None:
+            continue
+        text = match.group(2)
+        text = re.sub(r"`([^`]*)`", r"\1", text)
+        text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)
+        text = re.sub(r"[*_]{1,3}([^*_]*)[*_]{1,3}", r"\1", text)
+        slug = re.sub(r"[^\w\s-]", "", text.strip().casefold())
+        slug = re.sub(r"\s+", "-", slug)
+        repeats = seen.get(slug, 0)
+        seen[slug] = repeats + 1
+        found.add(slug if repeats == 0 else f"{slug}-{repeats}")
+    return found
 
 
 def main() -> int:
@@ -28,13 +78,21 @@ def main() -> int:
             continue
         text = document.read_text(encoding="utf-8")
         for line_number, line in enumerate(text.splitlines(), 1):
-            for match in LINK.finditer(line):
+            for match in chain(LINK.finditer(line), HTML_LINK.finditer(line)):
                 raw = match.group(1).strip().split(maxsplit=1)[0].strip("<>")
                 parsed = urlsplit(raw)
-                if parsed.scheme or raw.startswith(("#", "//")):
+                if parsed.scheme or raw.startswith(("//", "data:")):
                     continue
                 target_text = unquote(parsed.path)
                 if not target_text:
+                    # A bare "#section" points inside this very document.
+                    if parsed.fragment:
+                        checked += 1
+                        if parsed.fragment.casefold() not in anchors(document):
+                            failures.append(
+                                f"{document.relative_to(root)}:{line_number}: "
+                                f"no such heading: {raw}"
+                            )
                     continue
                 checked += 1
                 if target_text.startswith("/"):
@@ -56,6 +114,16 @@ def main() -> int:
                     failures.append(
                         f"{document.relative_to(root)}:{line_number}: "
                         f"missing target: {raw}"
+                    )
+                    continue
+                if (
+                    parsed.fragment
+                    and target.suffix == ".md"
+                    and parsed.fragment.casefold() not in anchors(target)
+                ):
+                    failures.append(
+                        f"{document.relative_to(root)}:{line_number}: "
+                        f"no such heading: {raw}"
                     )
     if failures:
         print("documentation link check failed:")

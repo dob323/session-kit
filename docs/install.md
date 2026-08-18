@@ -4,15 +4,15 @@ Session Kit `v0.4.2` is a public beta for Linux with systemd and macOS 14 or
 newer. Install the accepted release artifact under a single-user account where
 provider conversations are recoverable.
 
-Beta releases are published as GitHub prereleases. `releases/latest` does not
-resolve to a prerelease, so name the tag explicitly or browse
-[all releases](https://github.com/dob323/session-kit/releases). Release assets
-are named by source commit rather than by version.
+The commands below name no version. `releases/latest` resolves to the current
+beta, so they keep working across releases. Release assets are named by source
+commit rather than by version, which is why the download needs a pattern and
+every later step uses a glob.
 
 ```bash
 mkdir session-kit-download
 cd session-kit-download
-gh release download v0.4.2 --repo dob323/session-kit
+gh release download --repo dob323/session-kit --pattern 'session-kit-*'
 if command -v sha256sum >/dev/null; then
   sha256sum --check session-kit-*.sha256
 else
@@ -65,14 +65,19 @@ an install or update.
 
 Without the GitHub CLI, download the `.tar.gz`, `.sha256`, and
 `.provenance.json` assets from the
-[`v0.4.2` release](https://github.com/dob323/session-kit/releases/tag/v0.4.2),
-and put them in one empty directory. The checksum file covers the archive. Use
+[latest release](https://github.com/dob323/session-kit/releases/latest), and
+put them in one empty directory. The checksum file covers the archive. Use
 `sha256sum --check` on Linux or
 `shasum -a 256 --check` on macOS. The provenance file records the exact source
 commit and public-tree digest.
 
 Cloning `main` is the development path, not the normal installation path. If
 you use it, review and test the exact commit before installation.
+
+Coming from a hand-managed shpool setup, or from an unversioned private layout,
+read [Migrate an older installation](migrations/legacy-install.md) first. There
+is no migration tool, and the order of the steps is what keeps live sessions
+and recovery state intact.
 
 `./install.sh --check` is read-only. The installer copies files and user-service
 definitions. The real install performs the bounded service refresh described

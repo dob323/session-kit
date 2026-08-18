@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+"""Render the README's explanatory figures.
+
+These replace two hand-written SVGs whose text sat at fixed x/y coordinates in
+a font almost no reader has installed. Three lines in the safety figure crossed
+their own card borders as a result, and nothing caught it. Here the browser
+sizes every box to its content and `readme_art_lib.render` refuses to save a
+layout where anything overflows, so that failure cannot ship again.
+"""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+import sys
+
+TOOLS = Path(__file__).resolve().parent
+if str(TOOLS) not in sys.path:
+    sys.path.insert(0, str(TOOLS))
+
+import readme_art_lib as art  # noqa: E402
+
+WIDTH = 1600
+
+SHARED_CSS = """
+body{{padding:56px 64px;display:flex;flex-direction:column}}
+h1{{font-size:46px;font-weight:800;letter-spacing:-.02em;margin-bottom:10px}}
+.lede{{font-size:21px;color:{dim};line-height:1.45;max-width:1180px}}
+.row{{display:flex;align-items:stretch;gap:0;margin-top:44px}}
+.card{{
+  flex:1 1 0;min-width:0;background:{panel};border:2px solid {line};
+  border-radius:16px;padding:26px 24px;display:flex;flex-direction:column;
+}}
+.card h2{{font-size:23px;font-weight:600;margin-bottom:14px;line-height:1.25}}
+.card p{{font-size:17px;color:{dim};line-height:1.5}}
+.card p + p{{margin-top:12px}}
+.chip{{
+  font-family:KitMono,monospace;font-size:15px;color:{text};
+  background:{raised};border-radius:8px;padding:8px 11px;
+  margin:14px 0 10px;align-self:flex-start;max-width:100%;
+  overflow-wrap:anywhere;
+}}
+.arrow{{
+  flex:0 0 54px;display:flex;align-items:center;justify-content:center;
+  color:{accent};font-size:30px;
+}}
+.band{{
+  margin-top:40px;background:{raised};border:1px solid {line};
+  border-radius:16px;padding:26px 32px;
+}}
+.band h3{{font-size:22px;font-weight:600;margin-bottom:10px}}
+.band p{{font-size:17px;color:{dim};line-height:1.55}}
+.good{{color:{green};font-weight:600;font-size:19px}}
+.bad{{color:{red};font-weight:600;font-size:19px}}
+"""
+
+
+def shared_css(accent: str) -> str:
+    return SHARED_CSS.format(accent=accent, **art.INK)
+
+
+def cards(items: list[dict], accent: str) -> str:
+    """Four cards with an arrow between each pair."""
+
+    blocks = []
+    for index, item in enumerate(items):
+        if index:
+            blocks.append('<div class="arrow">&#8594;</div>')
+        inner = [
+            f'<h2 style="color:{item.get("ink", art.INK["text"])}">{item["head"]}</h2>'
+        ]
+        inner.extend(item["body"])
+        blocks.append(
+            f'<div class="card" style="border-color:{item["edge"]}">'
+            + "".join(inner)
+            + "</div>"
+        )
+    return f'<div class="row">{"".join(blocks)}</div>'
+
+
+def how_it_works() -> tuple[str, str, int]:
+    steps = [
+        {
+            "edge": art.INK["line"],
+            "head": "1 &middot; An ordinary shell",
+            "body": [
+                '<div class="chip">kit</div>',
+                "<p>Open the picker only when you want it. Nothing runs in "
+                "your shell the rest of the time.</p>",
+            ],
+        },
+        {
+            "edge": art.INK["green"],
+            "head": "2 &middot; The picker",
+            "body": [
+                "<p>Pick a stable session number, or start a new one.</p>",
+                "<p>Sessions ready here and sessions open in another window "
+                "stay separate.</p>",
+            ],
+        },
+        {
+            "edge": art.INK["cyan"],
+            "head": "3 &middot; The managed session",
+            "body": [
+                "<p>The session runs on the host, inside shpool.</p>",
+                "<p>Claude Code, Codex, or a shell runs inside it.</p>",
+            ],
+        },
+        {
+            "edge": art.INK["purple"],
+            "head": "4 &middot; Disconnect, return",
+            "body": [
+                "<p>Close the terminal, or lose SSH.</p>",
+                "<p>Reconnect whenever, and pick the same session back up "
+                "where it was.</p>",
+            ],
+        },
+    ]
+    body = (
+        "<h1>How Session Kit works</h1>"
+        '<p class="lede">The work stays alive because the session lives on the '
+        "host, not in your terminal window. Session Kit adds the picker, the "
+        "state words, and the guarded actions around it.</p>"
+        + cards(steps, art.INK["green"])
+        + '<div class="band"><h3>What actually survives</h3>'
+        "<p>As long as the host stays powered on and awake, a running session "
+        "survives the terminal window closing and the SSH connection dropping. "
+        "A host reboot ends the running processes &mdash; recoverable Claude "
+        "Code and Codex conversations remain available through Closed "
+        "sessions.</p></div>"
+    )
+    return body, shared_css(art.INK["green"]), 0
+
+
+def safety_model() -> tuple[str, str, int]:
+    steps = [
+        {
+            "edge": art.INK["line"],
+            "head": "1 &middot; A frozen snapshot",
+            "body": [
+                "<p>The picker shows a stable view of what exists right now.</p>",
+                '<div class="chip">number &middot; title &middot; directory</div>',
+                "<p>Useful context. Not identity.</p>",
+            ],
+        },
+        {
+            "edge": art.INK["cyan"],
+            "head": "2 &middot; Bind an action proof",
+            "body": [
+                "<p>The session you chose is bound to that snapshot and to "
+                "exact process data.</p>",
+                '<div class="chip">provider UUID + generation</div>',
+                "<p>Owner-only, and short-lived.</p>",
+            ],
+        },
+        {
+            "edge": art.INK["amber"],
+            "head": "3 &middot; Recheck, at the last moment",
+            "body": [
+                "<p>Immediately before anything changes, Session Kit rechecks "
+                "the live chain: session manager, terminal, shell, provider "
+                "process, and conversation UUID.</p>",
+            ],
+        },
+        {
+            "edge": art.INK["green"],
+            "head": "4 &middot; Act, or refuse",
+            "body": [
+                '<p><span class="good">Evidence still exact &#8594; act</span></p>',
+                '<p><span class="bad">Missing, stale, or conflicting '
+                "&#8594; refuse</span></p>",
+                "<p>A refusal changes nothing at all.</p>",
+            ],
+        },
+    ]
+    body = (
+        "<h1>The safety model</h1>"
+        '<p class="lede">What you see and what Session Kit trusts are '
+        "deliberately different things. Display text helps you choose; only "
+        "exact live evidence decides whether it is allowed to act.</p>"
+        + cards(steps, art.INK["cyan"])
+        + '<div class="band"><h3>Where the boundary is</h3>'
+        "<p>This is designed for one trusted Unix account. These checks stop "
+        "stale or ambiguous picker state from acting on a session you did not "
+        "mean. They are <strong>not</strong> isolation from a hostile process "
+        "already running with your own privileges.</p></div>"
+    )
+    return body, shared_css(art.INK["cyan"]), 0
+
+
+FIGURES = {
+    "how-it-works": how_it_works,
+    "safety-model": safety_model,
+}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--only", choices=sorted(FIGURES), action="append")
+    parser.add_argument("--out-dir", type=Path, default=art.ASSETS)
+    args = parser.parse_args()
+
+    wanted = args.only or sorted(FIGURES)
+    for name in wanted:
+        body, css, _ = FIGURES[name]()
+        # Lay it out once to learn how tall the content is, then render at
+        # exactly that height. Nothing here carries a hand-tuned page size.
+        probe = art.page(body, css, width=WIDTH, height=4000)
+        height = art.measure_height(probe, width=WIDTH)
+        html = art.page(body, css, width=WIDTH, height=height)
+        target = args.out_dir / f"{name}.png"
+        art.render(html, target, width=WIDTH, height=height, scale=1)
+        print(f"wrote {target} ({WIDTH}x{height})")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

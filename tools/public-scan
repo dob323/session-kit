@@ -74,6 +74,7 @@ APPROVED_BINARY_SHA256 = {
     "docs/assets/session-kit-dashboard.png": (
         "b14518a8a78aa077be5ee7d21bdc76929b43e1f035420a1519df8965cf94e3db",
     ),
+    # --------------------------------------------------------------- history
     # README redesign, 2026-08-17. Every terminal region in these four is the
     # deterministic tools/render-readme-picker output, whose demo data is
     # neutral by construction: aliases "personal" and "work", demo session
@@ -136,10 +137,38 @@ APPROVED_BINARY_SHA256 = {
         # reads as one. Matches what the picker looks like on screen.
         "3f437edeb57aa016fbd465f3b146b4e9ec53482174e065e352cbf2d1d1f747d8",
     ),
+    # ---------------------------------------------------------------- current
+    # The README's four figures, 2026-08-18. Every terminal region in them is
+    # tools/render-readme-picker output, captured from the real picker through
+    # the login fixture, whose demo data is neutral by construction: aliases
+    # "personal" and "work", demo session ids, and a "session kit" title bar
+    # rather than a real user@host. The render is byte-deterministic — two runs
+    # of the tools produce identical files — so a digest here changes only when
+    # the artwork or the picker does. Reviewed at 3x zoom: nothing private.
+    "docs/assets/readme/picker.png": (
+        "ecd92cfbb801252cc6b6a8036484e617bbb6f4eb9c25d48ceee035ef2bb1cca8",
+    ),
+    # The needs-you screen behind `a`, captured in the same picker run as the
+    # list above so the two cannot describe different inventories.
+    "docs/assets/readme/needs-you.png": (
+        "3df51a0db5f8fb1f095b5e21e788f299ac320d95ab7aab4b54894fdb75286afe",
+    ),
+    # Laid-out diagrams with no capture in them; text only, all of it written
+    # for the page.
+    "docs/assets/readme/how-it-works.png": (
+        "05e0ec07f0c0ebbfeac344811aad70ad4ad04ca7fe19f95fb8fb28da97b7b009",
+    ),
+    "docs/assets/readme/safety-model.png": (
+        "872acd2a47dfe8a238eddf389c3efcab50d970a2c5496084f6b6477264ab3293",
+    ),
     # GitHub social preview: 1280x640, uploaded through repository settings,
     # versioned here so the share artwork travels with the rest.
     "docs/assets/readme/social-preview.png": (
+        # 2026-08-17 card, superseded: it led with the old positioning.
         "562bf99a1b7728b670092b7a6d0bd26016d28c4ecba07f3bc8ea18d0538e3349",
+        # 2026-08-18: tools/render-readme-social, headline plus the real
+        # needs-you screen.
+        "d16d0c508e109e5a7a6efc5d186e7039696e2c2f0d5495acb76317fc331f217e",
     ),
 }
 

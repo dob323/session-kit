@@ -6,7 +6,7 @@ and release assets.
 
 ## Version and support policy
 
-The release documented by this tree is `v0.4.0` and remains beta software.
+The release documented by this tree is `v0.4.2` and remains beta software.
 Follow Semantic Versioning and never move or reuse a tag.
 
 Before `1.0.0`, put every incompatible command, configuration, or private-state
@@ -41,9 +41,10 @@ ends later. A security fix may require upgrading to the latest patch.
 9. Confirm the export contains every file in the reviewed manifest, the release
    archive is reproducible, and the checksum and provenance record name the
    candidate commit.
-10. Search every shipped README and documentation directory, including nested
-    directories, for version strings. Reader-facing references must name
-    `v0.4.0`; the changelog may retain older release headings.
+10. Confirm every reader-facing version reference names the release being
+    published. `tools/publish-release` checks this across `README.md` and every
+    Markdown file under `docs/`, nested directories included; the changelog may
+    retain older release headings.
 
 ## Build a candidate
 

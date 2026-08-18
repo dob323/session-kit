@@ -2,6 +2,49 @@
 
 All notable changes to Session Kit are documented here.
 
+## [Unreleased]
+
+### Fixed
+
+- The documented install command could not run. `gh release download` without a
+  tag requires `--pattern` or `--archive`, so the version-free form printed a
+  flag error instead of downloading anything. The README and `docs/install.md`
+  now pass `--pattern 'session-kit-*'`.
+- The README, `docs/install.md`, `SECURITY.md`, and `CONTRIBUTING.md` no longer
+  say beta releases are published as GitHub prereleases. They are ordinary
+  releases, so `releases/latest` resolves to the current beta and the install
+  no longer has to name a version.
+- The README claimed Session Kit does not isolate work in a git worktree. It
+  does: a delegated session is given its own worktree on its own branch and
+  hands it back when it closes. The front page now documents that, and the
+  "does not do" list keeps only what is true.
+- `tools/publish-release` checked version references under `docs/*.md`, which
+  never reached `docs/maintainers` or `docs/migrations`. The maintainer release
+  process had named `v0.4.0` ever since, while telling its reader to search
+  nested directories by hand. The check now walks them.
+- `tools/check-doc-links` now resolves a `#fragment` against the headings of
+  the document it points into. A renamed heading used to leave every link to it
+  scrolling nowhere, with nothing failing.
+- Two shipped documents were reachable from nothing. The legacy-install
+  migration is linked from `docs/install.md`, and the maintainer release
+  process from `CONTRIBUTING.md`.
+- The bug-report and pull-request templates offered `Dashboard` and
+  `Kill confirmation`. `docs/voice.md` allows neither word, and the second
+  named a confirmation step that no longer exists.
+
+### Added
+
+- `CODE_OF_CONDUCT.md`, the Contributor Covenant 2.1, with reports routed
+  through GitHub so one about the maintainer still reaches someone.
+- The README's pictures are generated from the running picker rather than
+  drawn. `tools/render-readme-picker` captures the session list and the
+  needs-you screen in one run of the real picker, `tools/render-readme-figures`
+  lays out the two diagrams, and `tools/render-readme-social` builds the
+  GitHub social card. A render is refused if any text escapes its box, if the
+  command bar offers a key the README does not document, or if the two picker
+  screens disagree about which sessions are waiting.
+- `docs/assets/mark.svg`: the project mark, which is the picker's own prompt.
+
 ## [0.4.2] - 2026-08-18
 
 ### Added

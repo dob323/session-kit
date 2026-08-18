@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64"
+     role="img" aria-label="Session Kit">
+  <title>Session Kit</title>
+  <!-- The picker's own prompt: a chevron and the block cursor that sits after
+       it. Nothing is invented here — this is the character pair Session Kit
+       draws at the bottom of every screen. The chevron is kept narrow on
+       purpose; a wider one reads as a play button once it is small. -->
+  <rect x="1" y="1" width="62" height="62" rx="15" fill="#0d1117" stroke="#30363d"
+        stroke-width="2"/>
+  <path d="M18 19 L29 32 L18 45" fill="none" stroke="#9ece6a" stroke-width="6.5"
+        stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="38" y="21.5" width="10" height="21" rx="2.5" fill="#f0f6fc"/>
+</svg>

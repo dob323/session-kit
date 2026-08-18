@@ -6,9 +6,9 @@ Each beta minor line is supported for 90 days after its first release, or for
 30 days after the next beta minor release, whichever ends later. A security fix
 may require moving to the latest patch release on that line.
 
-Beta releases are published as GitHub prereleases, so `releases/latest` does not
-resolve to them. Check [all releases](https://github.com/dob323/session-kit/releases)
-for the current supported line.
+`releases/latest` resolves to the current beta.
+[All releases](https://github.com/dob323/session-kit/releases) shows that line
+and everything published before it.
 
 The current beta supports its documented Linux targets and macOS 14 or newer on
 Apple Silicon and Intel. Other operating systems, older macOS releases, Apple

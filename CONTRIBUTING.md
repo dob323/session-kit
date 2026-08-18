@@ -1,13 +1,13 @@
 # Contributing
 
 Session Kit welcomes focused bug reports, feature requests, documentation
-fixes, and pull requests.
+fixes, and pull requests. Everyone taking part is covered by the
+[Code of Conduct](CODE_OF_CONDUCT.md).
 
-The project ships Linux and macOS public betas, published as GitHub
-prereleases. Reports about provider compatibility, lifecycle safety, privacy,
-and clean installation are especially useful, and reports from operating
-systems, shells, and hardware the maintainer cannot test are the most valuable
-of all.
+The project ships Linux and macOS public betas. Reports about provider
+compatibility, lifecycle safety, privacy, and clean installation are especially
+useful, and reports from operating systems, shells, and hardware the maintainer
+cannot test are the most valuable of all.
 
 ## What to expect
 
@@ -142,7 +142,9 @@ A change that moves code between modules must not change behavior in the same
 commit, and every symbol an existing test patches on `lib/session_inventory.py`
 must stay reachable through it. See
 [the modularization roadmap](docs/maintainers/modularization-roadmap.md) for the
-compatibility contract and the patch-point ledger.
+compatibility contract and the patch-point ledger. Cutting a release is a
+separate checklist:
+[the maintainer release process](docs/maintainers/release-process.md).
 
 ## No personal names in shipped files
 

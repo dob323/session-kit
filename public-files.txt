@@ -9,6 +9,7 @@
 .gitignore
 .shellcheckrc
 CHANGELOG.md
+CODE_OF_CONDUCT.md
 CONTRIBUTING.md
 LICENSE
 LICENSES/Apache-2.0.txt
@@ -21,8 +22,6 @@ bashrc/**
 bin/**
 config/**
 docs/**
-docs/assets/session-kit-picker.png
-docs/assets/session-kit-hero.png
 deploy/session-kit-launcher
 deploy/session-kit-release
 extras/**
@@ -111,7 +110,8 @@ tests/test_picker_rows_grammar.py
 tests/test_picker_stderr_survives.py
 tests/test_picker_ux.py
 tests/test_project_dir_name.py
-tests/test_readme_anatomy.py
+tests/test_readme_art.py
+tests/test_readme_keys.py
 tests/test_self_name_exit_status.py
 tests/test_projects.py
 tests/test_projects_context.py
@@ -153,8 +153,12 @@ tools/install-matrix.d/**
 tools/operator-drill
 tools/public-scan
 tools/public-scan-history-baseline
-tools/render-readme-anatomy
+tools/readme_art_lib.py
+tools/readme_capture.py
+tools/readme_keys.py
+tools/render-readme-figures
 tools/render-readme-picker
+tools/render-readme-social
 tools/title-ownership-drill
 tests/tui_support.py
 tests/test_tui_actions.py
