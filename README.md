@@ -1,6 +1,4 @@
-<img src="docs/assets/mark.svg" alt="" width="52" height="52">
-
-# Session Kit
+# <img src="docs/assets/mark.svg" alt="" width="44" height="44" align="absmiddle"> Session Kit
 
 [![CI](https://github.com/dob323/session-kit/actions/workflows/ci.yml/badge.svg)](https://github.com/dob323/session-kit/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/dob323/session-kit)](https://github.com/dob323/session-kit/releases)
