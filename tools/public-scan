@@ -104,6 +104,10 @@ APPROVED_BINARY_SHA256 = {
         # 2026-08-17, final: no labels at all. The picker page speaks for
         # itself, so the figure is the render and nothing else.
         "929e3289e14ae3313d3e2ce39c5155b5a782a947bfc0103af2ad641f4e098ef8",
+        # 2026-08-17: the picker as it actually appears on screen — no window
+        # chrome, no traffic lights, terminal padding only. The framed version
+        # looked like a product shot of a terminal rather than the terminal.
+        "c3e0f3c7a3feeab6a3deb59accb3f32bea2666abecf683a94fb47d7c06d66882",
     ),
     # The bare picker render, identical to the docs/assets/session-kit-picker
     # blob above because both come from the same deterministic tool.
@@ -113,6 +117,10 @@ APPROVED_BINARY_SHA256 = {
         # resolve now that the render host has a font carrying them. Both used
         # to reach the README as missing-glyph boxes.
         "f41b7567f281bf4d0548769442673c4e2908ba762ae7edd92f5b840a895d9c95",
+        # 2026-08-17: the picker as it actually appears on screen — no window
+        # chrome, no traffic lights, terminal padding only. The framed version
+        # looked like a product shot of a terminal rather than the terminal.
+        "c3e0f3c7a3feeab6a3deb59accb3f32bea2666abecf683a94fb47d7c06d66882",
     ),
     # GitHub social preview: 1280x640, uploaded through repository settings,
     # versioned here so the share artwork travels with the rest.
