@@ -2,7 +2,7 @@
 
 Releases accumulate one per roll. The collector that prunes them read
 `/proc/<pid>/environ` for every same-uid process and treated a refusal as
-"no proof, delete nothing" — but `environ` is readable only for a dumpable
+"no proof, delete nothing", but `environ` is readable only for a dumpable
 process, and `systemd --user` is same-uid and never dumpable. So the scan
 aborted before the deletion loop on every systemd-user host, silently, from
 the day it shipped: 152 release directories and 368 MB with no log line to

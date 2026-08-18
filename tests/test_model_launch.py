@@ -130,8 +130,8 @@ class RequestedModelLaunchTests(unittest.TestCase):
         around an empty field and shifts every generation value one place
         left: the boot id lands in the key, the daemon start lands nowhere,
         and the cross-check refuses a record that was armed perfectly. The
-        session then sits as a shell with no provider — three of them in one
-        night — and the test suite never saw it because every case here
+        session then sits as a shell with no provider, three of them in one
+        night, and the test suite never saw it because every case here
         passed a key.
         """
         provider, model = "claude", "claude-opus-5"

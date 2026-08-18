@@ -233,7 +233,7 @@ def default_state_dir() -> Path:
 def _scoped_config_path(environ: Mapping[str, str] | None) -> Path | None:
     """Resolve the naming document inside the caller's own environment.
 
-    An explicit environment IS the caller's sandbox — the automatic namers
+    An explicit environment IS the caller's sandbox, the automatic namers
     run inside one, and resolving the real home from in there would read (and
     write) name ownership outside the sandbox that asked for the work.
     """
@@ -1188,7 +1188,7 @@ def _live_model_fields(
     what it actually runs and never touches argv again, so a row built from the
     process table shows the wrong model, confidently, for the rest of that
     session's life. The conversation's own record moves when the person moves
-    the model, so that is what is read — and the command line answers only for
+    the model, so that is what is read, and the command line answers only for
     a session whose record this machine cannot reach.
     """
     provider = _common.clean_text(item.get("provider"), 20).casefold()
@@ -3669,7 +3669,7 @@ def publish_session_colors(
     """Write each live session's colour where its own shell can read it.
 
     The in-session prompt cannot afford to parse the inventory on every line,
-    so it used a colour constant — which is how one session came to be green in
+    so it used a colour constant, which is how one session came to be green in
     the picker and a different colour in its own terminal. One tiny file per
     session, rewritten only when the colour actually changes, costs the prompt
     a single read and ends the second owner.
@@ -4938,7 +4938,7 @@ def _live_session_names(payload_text: str) -> list[str] | None:
 
     ``None`` is the answer that matters. "The list could not be read" and
     "there are no sessions" produce the same empty list, and one of those two
-    means remove every working copy — so the difference has to survive as far
+    means remove every working copy, so the difference has to survive as far
     as the caller, which turns ``None`` into a refusal rather than a sweep.
 
     This lives here rather than in the shell that used to do it because the
@@ -5005,7 +5005,7 @@ def _worktree_command(args: argparse.Namespace, config: dict[str, Any]) -> int:
             print(_worktrees.render_verdict(verdict), end="")
         return 0
     if args.worktree_action == "sweep":
-        # A sweep with no list of what is alive is not a sweep of nothing 
+        # A sweep with no list of what is alive is not a sweep of nothing:
         # it is a sweep of everything. The list is required, and `--none-alive`
         # is how a caller says an empty list is what it means.
         active = list(args.active or [])
@@ -5669,7 +5669,7 @@ def _model_availability_command(args: argparse.Namespace) -> int:
 
     Exit 0 when it is, or when nothing on this machine can say. Exit
     ``MODEL_REFUSED_EXIT`` when this host would answer the request with a
-    different model, or does not offer it at all — with the reason on standard
+    different model, or does not offer it at all, with the reason on standard
     error, because the caller's job is to stop rather than to substitute.
     """
     from sessionkit_inventory import worker_model as _worker_model

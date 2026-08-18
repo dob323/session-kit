@@ -3,7 +3,7 @@ reason about.
 
 The kit already produces this document (`shpool_status --json`); nothing here
 collects state or asks the session manager anything. Two fields the row schema
-is growing — `model` and `origin` — may be absent in a snapshot written by an
+is growing, `model` and `origin`, may be absent in a snapshot written by an
 older release, so both have an answer when they are missing: the model renders
 as an em dash, and a session with no recorded origin is one a person started.
 """

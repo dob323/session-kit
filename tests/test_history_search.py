@@ -118,8 +118,8 @@ class HistorySearchTests(unittest.TestCase):
                 handle.write("\n".join(["needle"] * 10) + "\n")
         shown = self.render("needle")
         self.assertTrue(shown.startswith("Matches: 20\n"), shown)
-        self.assertIn("Recorded 2026-08-11 11:00 — audit missing entry notes", shown)
-        self.assertIn("Recorded 2026-08-12 12:00 — repair search attribution", shown)
+        self.assertIn("Recorded 2026-08-11 11:00, audit missing entry notes", shown)
+        self.assertIn("Recorded 2026-08-12 12:00, repair search attribution", shown)
         self.assertNotIn("Orphaned Record", shown)
         self.assertEqual(16, shown.splitlines().count("needle"))
         self.assertEqual(2, shown.count("… (2 more matches)"))
@@ -137,7 +137,7 @@ class HistorySearchTests(unittest.TestCase):
         with gzip.open(archived, "wt", encoding="utf-8") as handle:
             handle.write("› check this recording\nneedle\n")
         shown = self.render("needle")
-        self.assertIn("Recorded 2026-08-10 09:00 — check this recording", shown)
+        self.assertIn("Recorded 2026-08-10 09:00, check this recording", shown)
         self.assertNotIn("Someone Else's Work", shown)
 
     def test_empty_manifest_identity_cannot_name_an_unrelated_archive(self) -> None:
@@ -197,7 +197,7 @@ class HistorySearchTests(unittest.TestCase):
 
         shown = self.render("needle")
 
-        label = "Recorded 2026-08-12 12:00 — inspect the same request"
+        label = "Recorded 2026-08-12 12:00, inspect the same request"
         self.assertIn(f"{label} (recording 1 of 2) · 1 match", shown)
         self.assertIn(f"{label} (recording 2 of 2) · 1 match", shown)
 

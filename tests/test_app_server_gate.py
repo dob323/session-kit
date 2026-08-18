@@ -24,7 +24,7 @@ WARNING_ANCHOR = (
     "python3 - \"$__sk_state_root\" \"$SHPOOL_SESSION_NAME\" <<'PY' || true\n"
 )
 WEAK_STATE_WARNING = (
-    "[session-kit: Codex App Server disabled — ~/.local/state must be mode 0700]"
+    "[session-kit: Codex App Server disabled: ~/.local/state must be mode 0700]"
 )
 
 

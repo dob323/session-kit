@@ -1,7 +1,7 @@
 """One project identity across the two senses the kit grew separately.
 
-These tests pin the membership rule — a directory belongs to the deepest
-project root above it — and the trust rule that keeps a cloned repository
+These tests pin the membership rule: a directory belongs to the deepest
+project root above it, and the trust rule that keeps a cloned repository
 from choosing what this host launches.
 """
 

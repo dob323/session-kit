@@ -1136,7 +1136,7 @@ PY
           "$id" "$allocated_id" >&2
     fi
   fi
-  # A timed-out reply (124/137) does not prove the session was NOT created 
+  # A timed-out reply (124/137) does not prove the session was NOT created;
   # generation capture below settles it either way.
   if ! sk_capture_session_generation "$id" "$creation_floor_ms"; then
     local quarantine

@@ -46,7 +46,7 @@ def session_is_unavailable(row: Mapping[str, Any]) -> bool:
     """Whether a managed record is quarantined from every board action.
 
     Only a PROVEN missing shell quarantines. An unprovable generation is the
-    opposite case — the kit cannot tell — and a session it cannot judge must
+    opposite case, the kit cannot tell, and a session it cannot judge must
     stay on the board where a person can: two review lanes demonstrated a
     real, actionable human session disappearing from the shell and curses
     lists when this set also matched ``unprovable-generation``. Uncertainty
@@ -443,8 +443,8 @@ def _shell_title(
 
     ``ignored`` is the census's own process tree: its chain of ancestors and
     everything it spawned. A collection verb run inside a managed shell is a
-    descendant of the shell it is titling — the provider-exit menu's reopen is
-    exactly that call — so counting it made an idle terminal read as busy,
+    descendant of the shell it is titling, the provider-exit menu's reopen is
+    exactly that call, so counting it made an idle terminal read as busy,
     the Idle-shell overlay never applied, and provider-exit recovery could
     never pass its gate.
     """

@@ -7,7 +7,7 @@ session closed on purpose came back as recovery work, so the offer that means
 survives being both.
 
 Intent is recorded as a tombstone keyed `provider:uuid` by every deliberate
-close — a clean provider exit, the recovery menu's `c`, `bye`, and `k` from
+close, a clean provider exit, the recovery menu's `c`, `bye`, and `k` from
 the picker. The queue honours it at the one place every consumer passes
 through, so an entry queued before the close disappears from the offers, the
 header count, and the ack together. Tombstones expire on the same clock as the

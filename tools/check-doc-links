@@ -4,7 +4,7 @@
 Both halves of a link are checked: the file it points at, and the heading
 inside that file when the link carries a `#fragment`. The fragment half was
 unchecked for a long time, which meant a renamed heading silently turned
-every link to it into a link that scrolls nowhere — invisible in review
+every link to it into a link that scrolls nowhere, invisible in review
 because the page still loads.
 """
 

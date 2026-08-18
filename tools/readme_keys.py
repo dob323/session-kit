@@ -2,7 +2,7 @@
 
 The picker in the README's screenshot is rendered from live code, so a key
 merged privately and not yet released appears in the picture the moment someone
-regenerates it — advertising a key on the project's front page that the shipped
+regenerates it, advertising a key on the project's front page that the shipped
 release does not have. This refuses to render instead.
 
 The checks used to live inside `tools/render-readme-anatomy`, which drew an

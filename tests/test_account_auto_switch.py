@@ -476,7 +476,7 @@ class AutomaticSwitchPolicyTests(unittest.TestCase):
         """A units change is only visible across the roster, not in one row.
 
         If the feed switched to whole percents, `55` is obviously not a
-        fraction — but `0`, `1` and `2` still parse as 0%, 100% and 200% used,
+        fraction, but `0`, `1` and `2` still parse as 0%, 100% and 200% used,
         so judging the other accounts row by row would move a conversation
         into whatever account happened to be published as `0`.
         """
@@ -721,7 +721,7 @@ class AutomaticSwitchPolicyTests(unittest.TestCase):
         """Finding 8: the binding is a record; the live row is the fact.
 
         A conversation whose process is signed in to `fresh` while the binding
-        still says `spent` was restarted and handed to `fresh` — a move made
+        still says `spent` was restarted and handed to `fresh`, a move made
         on paperwork, against a conversation whose real account was never the
         one found dry.
         """
@@ -858,7 +858,7 @@ class AutomaticSwitchPolicyTests(unittest.TestCase):
         """Finding 2: a half-finished move must not read as no move.
 
         The switch used to commit before the ledger was written, so a failure
-        in between left a conversation that had moved with a zero-hop record —
+        in between left a conversation that had moved with a zero-hop record,
         and the next pass bought it a third account.
         """
         self.standard_estate()
@@ -886,8 +886,8 @@ class AutomaticSwitchPolicyTests(unittest.TestCase):
     def test_two_passes_racing_cannot_both_reserve_the_one_move(self) -> None:
         """The limit is enforced where the reservation is taken.
 
-        Two drivers can be alive at once — the resident watchdog loop and a
-        hand-run pass — and both can read a hop count of zero before either
+        Two drivers can be alive at once, the resident watchdog loop and a
+        hand-run pass, and both can read a hop count of zero before either
         writes. Only one may win; the loser is refused, not granted a second
         paid account.
         """
@@ -1173,7 +1173,7 @@ class DisableIsNeverUndoneTests(unittest.TestCase):
     Preparing a target profile re-verifies it, and re-verification runs a
     provider binary that can take seconds. The registry is shared. If the
     operator switches an account off inside that window, the code that writes
-    the profile back must not write `enabled: True` — doing so silently undid
+    the profile back must not write `enabled: True`, doing so silently undid
     their decision, and whatever used the profile next spent their money on an
     account they had switched off.
     """
@@ -1690,7 +1690,7 @@ class AutomaticSwitchEndToEndTests(unittest.TestCase):
     """The whole move, driven through commit, against a process we own.
 
     Everything before this stopped at `launch-profile`, because going further
-    means the code signals a provider — and the signal is guarded by a check
+    means the code signals a provider, and the signal is guarded by a check
     against real `/proc`, which no fabricated pid can pass. So this starts its
     own harmless process, names it `claude`, and hands the driver that pid.
     The SIGTERM lands on our own sleeper and on nothing else; no real provider,
@@ -2363,7 +2363,7 @@ class WatchdogAccountGuardTests(unittest.TestCase):
         # The control for this is
         # test_a_spent_account_reaches_the_session_that_is_on_it: the same
         # fixture, the same spent account, and one `sp` call. Without that
-        # pair this test would pass on any machine where the pass never ran 
+        # pair this test would pass on any machine where the pass never ran,
         # which is exactly how it passed while the sentinel path was wrong.
         self.seed(spent_weekly=1.0)
         killer = self.fixture.state / "account-switching-off"

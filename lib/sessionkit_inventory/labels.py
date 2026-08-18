@@ -9,9 +9,9 @@ can be asserted directly in tests instead of through a rendered screen.
 
 Two vocabularies live here and they are not the same thing:
 
-* **Screen words** — what a person reads: `question`, `needs you`, `working`, `idle`,
+* **Screen words**, what a person reads: `question`, `needs you`, `working`, `idle`,
   `Ready`, `Open elsewhere`. Changing one changes what the kit says.
-* **Collector words** — what the collectors write into an inventory row:
+* **Collector words**, what the collectors write into an inventory row:
   `needs your reply`, `running`, `attached`. They are evidence, not copy. They
   are named here only so the renderers compare against one spelling, and they
   are never renamed at the source.
@@ -32,7 +32,7 @@ from .common import clean_text
 # --------------------------------------------------------------- placeholders
 
 # A value the kit has not pulled yet. One rule for every column (operator
-# ruling, 2026-08-16): until a section has a valid read, it says `pending` 
+# ruling, 2026-08-16): until a section has a valid read, it says `pending`,
 # never `unknown`, never a dash, never an empty cell.
 MISSING = "pending"
 
@@ -175,7 +175,7 @@ COLLECTOR_STATUSES = (
 
 
 def state_word(text: str, *, terms: Mapping[str, str] | None = None) -> str:
-    """One screen word for one collector word. TOTAL — never the word itself.
+    """One screen word for one collector word. TOTAL, never the word itself.
 
     This used to end `table.get(text, text)`, so any status the table did not
     name printed verbatim: `unknown`, `provider exited`, the vendor's `busy`,
@@ -183,7 +183,7 @@ def state_word(text: str, *, terms: Mapping[str, str] | None = None) -> str:
     a person's screen, which this module's own docstring forbids, and it meant
     the vocabulary was open-ended rather than the four action words named here.
 
-    A word this file does not recognise is not a state — it is the kit failing
+    A word this file does not recognise is not a state; it is the kit failing
     to read one, and it says so.
     """
     table = STATE_WORDS if terms is None else terms
@@ -201,7 +201,7 @@ def session_state(
     reads first: an unfinished launch is named before anything else, a person's
     turn beats every other description, an optional reply is still the model
     working, and a session that has printed nothing for the whole stall window
-    has stopped working whatever the provider calls itself — which leaves the
+    has stopped working whatever the provider calls itself, which leaves the
     person, so it says so.
     """
     if row.get("setup_incomplete"):
@@ -306,7 +306,7 @@ LOCAL_TIME = "local time"
 
 
 def plural(count: int, singular: str, suffix: str = "s") -> str:
-    """`1 day`, `2 days` — the kit never prints `1 days` or `day(s)`."""
+    """`1 day`, `2 days`, the kit never prints `1 days` or `day(s)`."""
     return singular if count == 1 else f"{singular}{suffix}"
 
 
@@ -329,7 +329,7 @@ def relative_time(timestamp_ms: int, now_ms: int) -> str:
 
 
 def precise_local_time(timestamp_ms: int) -> str:
-    """`Aug 12, 2026 at 4:05 PM CDT` — the exact moment, in the reader's zone."""
+    """`Aug 12, 2026 at 4:05 PM CDT`, the exact moment, in the reader's zone."""
     local = datetime.fromtimestamp(timestamp_ms / 1000).astimezone()
     hour = local.hour % 12 or 12
     zone = local.tzname() or LOCAL_TIME
@@ -391,13 +391,13 @@ NO_MATCHES = "No matches."
 
 
 def empty_state(thing: str) -> str:
-    """`Accounts: none.` — the one empty-state form. A count line at zero
+    """`Accounts: none.`, the one empty-state form. A count line at zero
     disappears rather than printing `0`."""
     return f"{thing}: {NONE}."
 
 
 def session_count(total: int, ready: int, elsewhere: int) -> str:
-    """`3 sessions: 2 ready, 1 open elsewhere` — the line above the list."""
+    """`3 sessions: 2 ready, 1 open elsewhere`, the line above the list."""
     return (
         f"{total} {plural(total, SESSION)}: "
         f"{ready} {WHERE_READY}, {elsewhere} {WHERE_OPEN_ELSEWHERE}"
@@ -429,7 +429,7 @@ LAST_ACTIVE_JUST_NOW = f"{LAST_ACTIVE} just now"
 
 
 def last_active(seconds: int | None) -> str:
-    """`last active 3h 9m ago` — the same words on every row, always.
+    """`last active 3h 9m ago`, the same words on every row, always.
 
     One phrase and one shape, so the column lines up down the whole list at
     any width instead of alternating between `3 hr ago` and `opened 3 hr ago`.
@@ -489,7 +489,7 @@ def model_cell(row: Mapping[str, Any]) -> str:
     honoured the collector's recorded reason and said `no reply yet` for a
     brand-new conversation, while the cursor picker never read that field,
     guessed from the provider alone, and called the same healthy session
-    `unreadable` — the kit reporting a broken transcript with nothing wrong.
+    `unreadable`, the kit reporting a broken transcript with nothing wrong.
     One function, so there is one answer.
     """
     display = clean_text(row.get("display_model"), 80)
@@ -516,7 +516,7 @@ def last_active_seconds(row: Mapping[str, Any], now_ms: int) -> int | None:
     Two ways a stamp is refused rather than believed:
 
     * it is in the FUTURE. That used to be clamped to zero, so a box whose
-      clock had skewed forward — or a stamp source ahead of it — reported every
+      clock had skewed forward, or a stamp source ahead of it, reported every
       row as `just now`, which turns a screen full of sessions waiting on a
       person into a screen full of busy ones. Silence read as activity is the
       failure this column exists to prevent.
@@ -616,7 +616,7 @@ NUMBERS_HINT = "Numbers shown here work."
 
 
 def error(fact: str) -> str:
-    """`session-kit: <fact>.` — the one error form, for stderr."""
+    """`session-kit: <fact>.`, the one error form, for stderr."""
     return f"{ERROR_PREFIX} {fact}"
 
 

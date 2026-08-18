@@ -151,8 +151,8 @@ def first_free_color(
     """Keep ``preferred``; if it is taken, the next free colour in palette order.
 
     When every colour in the palette is occupied this returns ``preferred``
-    unchanged and allows the repeat. That is the only honest answer — there is
-    no free colour to give — and it keeps the result a deterministic function of
+    unchanged and allows the repeat. That is the only honest answer: there is
+    no free colour to give, and it keeps the result a deterministic function of
     the identity rather than of arrival order, so a session that has to share
     shares with the same partner every time.
 

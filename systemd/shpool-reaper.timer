@@ -1,5 +1,5 @@
 [Unit]
-Description=Session Kit — hourly check for provider-exited sessions
+Description=Session Kit, hourly check for provider-exited sessions
 
 [Timer]
 OnCalendar=hourly

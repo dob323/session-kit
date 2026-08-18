@@ -568,7 +568,7 @@ def suggest_alias(cwd: str, existing: Sequence[Mapping[str, str]]) -> str:
 def select_rows(rows: Sequence[Mapping[str, str]], answer: str) -> list[dict[str, str]]:
     """Resolve a "1,3-5" / "all" selection against a numbered list.
 
-    The grammar itself lives in ``common.parse_number_selection`` — one
+    The grammar itself lives in ``common.parse_number_selection``, one
     implementation, so no two surfaces can disagree about what a range means.
     """
     try:
@@ -583,8 +583,8 @@ def collapse_rows(
 ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
     """One entry per directory, and the duplicates that were folded into it.
 
-    A directory listed twice — the shape the old add flow forced on anyone who
-    worked in it with both providers — is one project, so the first row keeps
+    A directory listed twice, the shape the old add flow forced on anyone who
+    worked in it with both providers, is one project, so the first row keeps
     its alias and the later rows contribute only their default. Two rows that
     disagree about the provider cancel to no default: a directory worked on
     with both is exactly the case where guessing one is wrong.
@@ -700,7 +700,7 @@ def add_project(
     what the add flow does: which provider opens a directory is answered when
     a session starts, not once and for all when the directory is listed. A
     directory already on the list is refused by name rather than given a
-    second entry — that second entry is what used to be needed to work in one
+    second entry, that second entry is what used to be needed to work in one
     directory with both providers.
     """
     if alias is not None and not ALIAS_RE.fullmatch(alias):

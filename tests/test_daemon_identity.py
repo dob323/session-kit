@@ -501,7 +501,7 @@ class AnotherAccountsDaemonTest(unittest.TestCase):
     its own shpool daemon, and from then on this account could prove nothing.
     Its `/proc/<pid>/fd` belongs to that account, so the socket-holder check
     answered UNKNOWN, the uniqueness rule refused to name any daemon, and
-    every session on the board went unprovable — `sp new` produced
+    every session on the board went unprovable, `sp new` produced
     "Unresolved provider session" and `sp go`/`sp close` refused. The kernel
     had already settled it: a listener under /run/user/<uid> is 0700, so a
     daemon owned by another uid can never be the one answering us.

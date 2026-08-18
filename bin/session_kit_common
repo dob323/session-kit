@@ -1706,7 +1706,7 @@ sk_human_label() {
 #   * a person at a terminal is told what is about to happen, by name, and the
 #     action proceeds;
 #   * automation, which has no one to tell, must name the exact session it is
-#     acting on in SESSION_KIT_CONFIRM_ID. That half is a proven safety net 
+#     acting on in SESSION_KIT_CONFIRM_ID. That half is a proven safety net:
 #     a pipe feeding "y" was never a person reading a label, and it stays.
 #
 # The exact ID travels as an argument and is never printed back.

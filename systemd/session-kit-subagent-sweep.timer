@@ -1,5 +1,5 @@
 [Unit]
-Description=Session Kit — five-minute sweep for finished sub-agent workers
+Description=Session Kit, five-minute sweep for finished sub-agent workers
 
 [Timer]
 # The operator's rule is "close it 15 minutes after it's finished", and idle
@@ -7,7 +7,7 @@ Description=Session Kit — five-minute sweep for finished sub-agent workers
 # promise within about 75 minutes. Five minutes delivers it within about 20.
 # This is its own timer rather than a faster shpool-reaper.timer because that
 # pass also builds a full guard-live inventory and runs the 72-hour terminal
-# auto-close — expensive, destructive, and governed by thresholds that a
+# auto-close, expensive, destructive, and governed by thresholds that a
 # twelve-times-faster cadence buys nothing for.
 OnBootSec=2min
 OnUnitActiveSec=5min

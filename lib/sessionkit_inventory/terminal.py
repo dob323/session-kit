@@ -1,7 +1,7 @@
 """Terminal numbers: the retirement ledger and boot-stable selector assignment.
 
 The registry file primitives live in ``state_io``; this module holds the policy
-built on them — which identity owns a number, how long a dead number stays
+built on them, which identity owns a number, how long a dead number stays
 reserved, and how a live inventory is numbered without disturbing rows.
 """
 

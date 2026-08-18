@@ -161,7 +161,7 @@ class DrillVerdictTests(unittest.TestCase):
         )
         self.assertEqual(0, status)
         self.assertIn("terminalSequence: control sequence-on", text)
-        self.assertIn("sequence-off wrote 0 — marker suppressed", text)
+        self.assertIn("sequence-off wrote 0, marker suppressed", text)
         self.assertNotIn("marker survives", text)
         self.assertIn("suppresses the kit hook title too", text)
 

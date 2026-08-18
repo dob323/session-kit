@@ -321,7 +321,7 @@ class WorktreeLabelTests(ProjectFixture):
     `sp new --worktree` creates a directory that is on no shortcut list and may
     carry no manifest, so path resolution alone would drop its sessions into
     the unplaceable pile. The worktree registry annotates the row with the main
-    repository it was cut from — the same path this module groups by.
+    repository it was cut from, the same path this module groups by.
     """
 
     def worktree_session(self, cwd: str, repo: str, **overrides: object) -> dict:

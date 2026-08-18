@@ -244,7 +244,7 @@ def _recording_label(path: Path, text: RecordingText) -> str:
     if text.prompt:
         prompt = _clean(_safe_line(text.prompt, 80), 80)
         if prompt:
-            label += f" — {prompt}"
+            label += f", {prompt}"
     return label
 
 

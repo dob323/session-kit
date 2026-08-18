@@ -6,7 +6,7 @@ else. And a conversation can move to another model without being retyped: the
 provider restarts on the model asked for and resumes the exact same
 conversation.
 
-The safety is the account switch's, because the risk is the same one — a
+The safety is the account switch's, because the risk is the same one, a
 restart in the middle of a turn loses that turn. A single stable row, a
 conversation that is not mid-computation, no subagents, and a process tree with
 nothing unrecognized in it, or the answer is one refusal line and nothing

@@ -63,7 +63,7 @@ sk_write_bounce_marker() {
 
 # One safe provider bounce: a new-mode Codex booted before its thread title
 # existed, so its status bar shows the conversation ID forever. When the human
-# opens such a session and a title now exists, terminate the exact idle TUI 
+# opens such a session and a title now exists, terminate the exact idle TUI;
 # the session shell relaunches the SAME conversation immediately (marker
 # handshake with the bashrc), so the window opens named and themed. Guards,
 # all fail-open toward "no bounce": untitled-boot marker present (only

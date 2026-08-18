@@ -340,9 +340,9 @@ def attention_rows(list_screen: str) -> list[str]:
 def refuse_disagreeing_screens(list_screen: str, needs_screen: str) -> None:
     """The two screens must count the same sessions as waiting on a person.
 
-    They are built from different evidence — the list prints the one state word
+    They are built from different evidence, the list prints the one state word
     `session_state()` derives, and the needs-you screen counts the rows whose
-    raw `needs_you`/`blocking_question` flags are set — so they can disagree,
+    raw `needs_you`/`blocking_question` flags are set, so they can disagree,
     and a release where they do must not be photographed for the front page.
     The first capture taken for this figure disagreed: an ordinary finished
     Codex turn reports `agent_status: idle` with `needs_you: false`, the list

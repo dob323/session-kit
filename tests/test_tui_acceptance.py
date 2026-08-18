@@ -7,7 +7,7 @@ attributes on every cell, the same way the terminal in front of a person does.
 
 That difference matters. A title too long for its column pushed its own detail
 right; every splitlines-based assertion passed, because the *line* was still
-correct — only the *columns* were wrong. Reconstructing the grid is the check
+correct, only the *columns* were wrong. Reconstructing the grid is the check
 that sees it.
 """
 
@@ -103,7 +103,7 @@ class Emulator:
     """Enough of a terminal to hold what ncurses sends it.
 
     Cursor addressing, erasing, insertion, deletion, scrolling regions, and
-    the attributes in force when each cell was written. Not a terminal — a
+    the attributes in force when each cell was written. Not a terminal, a
     faithful enough model of one to assert against.
     """
 

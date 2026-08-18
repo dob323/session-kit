@@ -234,7 +234,7 @@ Names and colors
   sp color reset <session>           return to the derived color
   sp color reconcile                 give every live session its own color
 
-Claude sessions take red, blue, green, yellow, purple, orange, pink, and cyan —
+Claude sessions take red, blue, green, yellow, purple, orange, pink, and cyan:
 the eight names Claude Code itself accepts. Codex sessions take lime, magenta,
 silver, sand, sky, and sea. The two palettes never overlap, so a Claude session
 and a Codex session cannot look alike.
@@ -281,8 +281,8 @@ reports its health as `ok`. The roster's `serving` flag is a routing toggle
 for scheduled proxy work: it is displayed, and it never decides an interactive
 session, which signs in with that profile's own login and no proxy.
 
-Health comes from the two feeds `sp account configure-feeds` points at — a
-roster of accounts and a rotation advice file — and each carries its own
+Health comes from the two feeds `sp account configure-feeds` points at (a
+roster of accounts and a rotation advice file), and each carries its own
 timestamp. Past SESSION_KIT_ACCOUNT_ADVICE_MAX_AGE_SECONDS (600 by default),
 or with no feed configured at all, nothing is known about any account's
 health. Every enabled account then stays selectable, its row reads `ready
@@ -354,7 +354,7 @@ the exact shpool ID. Every command that takes one accepts both.
 Session numbers are display conveniences. They are stable for the current host
 boot and never change meaning under a repaint, but they describe what is on
 screen, not which conversation you mean. Never automate a move, close, repair,
-or cleanup by number — pass the exact shpool ID.
+or cleanup by number: pass the exact shpool ID.
 
 No Session Kit screen prints a shpool ID or a provider UUID, and no flag reveals
 one. Identifiers live in the 0600 state files, in the JSON modes
@@ -371,7 +371,7 @@ exists: a kill that hit an already-dead process aborts its own bookkeeping, and
 the entry stays in the list with nothing behind it.
 
 Session Kit quarantines those entries. They have no session number, they are
-not drawn in the picker, and every `sp` verb refuses them — there is no shell
+not drawn in the picker, and every `sp` verb refuses them: there is no shell
 to attach to, take over, close, or repair, and a number that resolved to one
 would be a number that cannot act. The picker's More screen counts them so the
 state is never silent.
@@ -438,7 +438,7 @@ demand. Without it, source one copy from your own shell startup file:
 It completes verbs, help topics, flags, provider names, color names, and the
 project aliases in your projects file. It never runs a session command and
 never asks the manager for state, so a Tab press cannot change anything or
-block on a snapshot — which is also why it does not complete session numbers.
+block on a snapshot, which is also why it does not complete session numbers.
 
 Set SESSION_KIT_COMPLETION_DIR to install the copies somewhere else, or to
 "none" to skip them. Uninstall removes only files that still carry the kit's
@@ -472,7 +472,7 @@ refused.
 
 A picker verb answers with 74 when it refuses the action and 75 when the attach
 itself failed after the action was allowed, so the picker can tell the two
-apart. Use the human verbs — `sp go`, `sp close`, `sp name`, `sp recover` —
+apart. Use the human verbs (`sp go`, `sp close`, `sp name`, `sp recover`)
 for anything you type yourself.
 EOF
       ;;

@@ -299,7 +299,7 @@ def label_width(rows: Sequence[Row], width: int) -> int:
     The "a third of the room" floor that used to sit in this ceiling is gone.
     It let the title claim a third of the line whatever the details needed, so
     on a narrow window the row was assembled wider than the terminal and the
-    frame then hard-cut the tail — which is the state and the time, the two
+    frame then hard-cut the tail, which is the state and the time, the two
     facts the row is for. A title that cannot fit beside them is truncated;
     they are not.
     """
@@ -526,7 +526,7 @@ def _closed_row_text(
     if row.age:
         text += f" [{row.age}]"
     if row.state:
-        text += f" — {row.state}"
+        text += f", {row.state}"
     # Measured from the prefix rather than searched for: a provider word can
     # also occur inside a session's own title, and `index()` finds that first.
     provider_start = _cells(prefix)

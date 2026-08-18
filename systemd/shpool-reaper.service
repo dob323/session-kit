@@ -1,5 +1,5 @@
 [Unit]
-Description=Session Kit — close verified provider-exited sessions
+Description=Session Kit, close verified provider-exited sessions
 
 [Service]
 Type=oneshot

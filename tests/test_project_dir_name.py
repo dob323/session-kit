@@ -2,8 +2,8 @@
 
 Every refusal path prints nothing: an old Claude, an unregistered directory,
 an ambiguous registry, a live session, or a name collision all leave the
-launch on today's munged-name behaviour. The one mutating step — renaming the
-legacy directory — happens only with every proof in hand, because Claude
+launch on today's munged-name behaviour. The one mutating step, renaming the
+legacy directory, happens only with every proof in hand, because Claude
 reads auto memory solely from the resolved name and a half-migrated project
 is a session with amnesia.
 """

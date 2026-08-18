@@ -3,14 +3,14 @@
 Most of these fail on the commit before the change and pass after it, and that
 is the point of the file. Not all of them, and the difference is worth naming
 rather than glossing: a handful are REGRESSION GUARDS over behaviour that was
-already right and had to stay right — `b` already worked on the account screen,
+already right and had to stay right, `b` already worked on the account screen,
 switch mode already refused to default, the rename prompt already declined to
 claim `b`, and no third state existed to begin with. Those pass at both commits
 by design. A reviewer counting differentials should not count them, and should
 not read this file as claiming they are.
 
 To reproduce the differential: copy this file AND
-`lib/sessionkit_inventory/session_model.py` into a tree at the older commit —
+`lib/sessionkit_inventory/session_model.py` into a tree at the older commit,
 without the module the whole file fails at import and proves nothing per test.
 
 They are grouped by the ruling they hold, and each one states the defect it
@@ -164,7 +164,7 @@ def cursor_lines(*items: dict, columns: int = 130) -> list[str]:
 
 
 class ModelColumnTests(unittest.TestCase):
-    """The model cell was `—` on all twelve of the operator's live sessions."""
+    """The model cell was `, ` on all twelve of the operator's live sessions."""
 
     def test_the_row_shows_the_model_a_session_is_running(self) -> None:
         for line in picker_lines(

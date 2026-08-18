@@ -841,7 +841,7 @@ finally:
         """A session the kit launches on an account reads that account's
         commands, not ~/.claude's: CLAUDE_CONFIG_DIR replaces the config root
         rather than adding to it. A verb installed only in the home directory
-        is invisible in exactly the sessions it exists for — which is what the
+        is invisible in exactly the sessions it exists for, which is what the
         live drill found, with /kit unknown inside a managed session."""
         (self.home / ".claude").mkdir()
         accounts = self.home / ".local/share/session-kit/accounts"

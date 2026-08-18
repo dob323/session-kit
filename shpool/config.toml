@@ -1,10 +1,10 @@
-# shpool config — ~/.config/shpool/config.toml
+# shpool config, ~/.config/shpool/config.toml
 # Docs: https://github.com/shell-pool/shpool/blob/master/CONFIG.md
-# The daemon hot-reloads this file — no restart, no session loss.
+# The daemon hot-reloads this file, no restart, no session loss.
 
 # "simple": on reattach emit NOTHING from the spool; SIGWINCH makes the live
 # program redraw its own screen. Replaying spooled frames of a cell-diffing
-# TUI (Claude Code, Codex) interleaves cells from different frames — braided
+# TUI (Claude Code, Codex) interleaves cells from different frames, braided
 # corruption no width or line count fixes. Clean reading is `sp history`.
 session_restore_mode = "simple"
 
@@ -17,5 +17,5 @@ vt100_output_spool_width = 200
 # start in $HOME).
 # default_dir = "/home/you/projects/web"
 
-# No name prefix in the prompt — the ▌ marker set in bashrc is the indicator.
+# No name prefix in the prompt, the ▌ marker set in bashrc is the indicator.
 prompt_prefix = ""

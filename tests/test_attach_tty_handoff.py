@@ -35,7 +35,7 @@ Two separate things are guarded here.
 The stub client implements `tty.rs:91` and nothing else, so a failure here is
 the terminal a person would actually get.
 
-WHICH TEST PROVES WHAT — read this before trusting any of them.
+WHICH TEST PROVES WHAT, read this before trusting any of them.
 
 A test that passes at the commit it is named for guards nothing. Every test
 below is tagged with the commit it actually discriminates against, measured by

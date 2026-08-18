@@ -249,7 +249,7 @@ class Application:
 
         `use_default_colors` runs either way. Without it the default pair is
         white-on-black, and ncurses then paints every cell with an explicit
-        colour — the exact opposite of what NO_COLOR asks for.
+        colour, the exact opposite of what NO_COLOR asks for.
         """
 
         try:

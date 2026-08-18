@@ -74,7 +74,7 @@ def _generation_is_quarantined(item: Mapping[str, Any]) -> bool:
     The first is the inert daemon-listed husk with no shell at all. The second
     is any other row whose generation could not be proven: numbering used to
     raise for the WHOLE estate on one of those, which took every session on
-    the machine read-only — no close, no switch, and no launch, because arming
+    the machine read-only, no close, no switch, and no launch, because arming
     a launch needs a clean snapshot. One row is now unactionable and named
     instead, and the other rows keep working.
     """

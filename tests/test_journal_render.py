@@ -227,10 +227,10 @@ class IncrementalTests(unittest.TestCase):
             self.assertEqual(expected_live, live, f"chunk size {size}")
 
     def test_utf8_split_across_chunks(self):
-        stream = "café — naïve ☃\r\n".encode("utf-8")
+        stream = "café, naïve ☃\r\n".encode("utf-8")
         for size in range(1, 9):
             settled, live = render_chunked(stream, size)
-            self.assertEqual(["café — naïve ☃"], settled + live, f"chunk size {size}")
+            self.assertEqual(["café, naïve ☃"], settled + live, f"chunk size {size}")
 
     def test_checkpoint_resume_matches_uninterrupted_feed(self):
         one_shot = JournalRenderer(width=60, height=10)

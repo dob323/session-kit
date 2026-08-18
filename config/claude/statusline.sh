@@ -48,7 +48,7 @@ if [ -n "$session_name" ]; then
     cyan)   tint=$'\033[38;2;64;216;209m' ;;
     *)      tint=$'\033[1m' ;;
   esac
-  printf '%s%s\033[0m — ' "$tint" "$session_name"
+  printf '%s%s\033[0m · ' "$tint" "$session_name"
 fi
 
 # show only the last path component: /srv/example/app -> /app

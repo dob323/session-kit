@@ -3,7 +3,7 @@
 Everything here reaches into a provider's own storage: Claude's name-intent
 file, transcript records and session records; Codex's session index, thread
 store and live app-server sockets. Nothing here decides WHAT a session should
-be called — that is ``names`` — and nothing here reads inventory state.
+be called (that is ``names``), and nothing here reads inventory state.
 
 The two halves depend on each other in both directions (this module reconciles
 pending titles, ``names`` dispatches pushes), so neither imports the other. The
@@ -305,7 +305,7 @@ def _claude_transcripts(home: Path, uuid: str) -> list[Path]:
     A session started on an enrolled account keeps its transcript under that
     account's profile, not under ``~/.claude``. A push that knew only the
     default root therefore wrote nothing for those sessions and reported no
-    error a person would ever see — measured 2026-08-12: six of seven live
+    error a person would ever see, measured 2026-08-12: six of seven live
     sessions had no colour record at all, so every provider window picked its
     own colour while the picker showed the kit's.
     """
@@ -321,8 +321,8 @@ def _claude_transcripts(home: Path, uuid: str) -> list[Path]:
 def _claude_transcripts_by_age(home: Path, uuid: str) -> list[Path]:
     """`_claude_transcripts`, oldest first, unreadable entries dropped.
 
-    One conversation can exist in more than one profile — an account switch
-    copies it — and then "which file describes this session" has to be
+    One conversation can exist in more than one profile, an account switch
+    copies it, and then "which file describes this session" has to be
     answered by evidence, not by which profile name sorts last. Recency is
     the same rule `transcripts._claude_transcript` already uses.
     """
@@ -365,7 +365,7 @@ def _push_claude_title(
         finally:
             if directory >= 0:
                 os.close(directory)
-    # The prompt bar's bottom-right name is a transcript agent-name record 
+    # The prompt bar's bottom-right name is a transcript agent-name record:
     # the exact store /rename persists, hydrated at session start/resume,
     # rendered beside the agent-color. Same append discipline as colors.
     # A profile can hold the transcript without a sessions/ registry (fresh
@@ -455,7 +455,7 @@ def codex_bounce_prepare(
     enough that it must be the final title (a terse prompt can BE the real
     title). The chosen name is mirrored into the session index when its
     latest entry differs, because the relaunched status bar reads only the
-    index. Returns "" when the thread has no real name yet — the caller must
+    index. Returns "" when the thread has no real name yet; the caller must
     then defer the bounce and keep its one-shot marker so a later reopen
     retries after the title exists.
     """
@@ -555,13 +555,13 @@ def claude_bounce_prepare(
     """Decide whether a Claude window can only be named by a restart.
 
     Claude applies a kit name intent through its SessionStart and prompt
-    hooks — a living window renames at the next prompt, and a fresh boot
+    hooks, a living window renames at the next prompt, and a fresh boot
     renames immediately. A session whose name arrived AFTER boot and that
     never saw another prompt (ask, read, close) therefore shows its stale
     title until the provider restarts. Returns (title, clear):
-    title != "" — bounce is warranted; "" with clear=True — the live window
+    title != "", bounce is warranted; "" with clear=True, the live window
     already renamed (a real prompt followed the intent), so the caller
-    should drop its untitled marker; "" with clear=False — defer, a name
+    should drop its untitled marker; "" with clear=False, defer: a name
     may still arrive.
     """
     if home is None:
@@ -646,7 +646,7 @@ def codex_pending_auto_titles(
     """Kit-side auto-titler for Codex threads nobody has named.
 
     Codex seeds threads.title with the raw first prompt and has no title
-    hook, and agents only self-name work they judge substantive — so a plain
+    hook, and agents only self-name work they judge substantive, so a plain
     question thread stays unnamed on every surface. Recent split-schema
     threads whose title is empty or still echoes the first prompt, and which
     have no session-index entry (the deliberate-name evidence), get the same
@@ -658,12 +658,12 @@ def codex_pending_auto_titles(
     Ownership is claimed at the thread's first turn, which is the earliest
     moment a Codex thread has an identity at all: before that turn there is
     no thread id and no first_user_message, so nothing here can see it. From
-    the claim onward the thread is named, and no later pass renames it — and
+    the claim onward the thread is named, and no later pass renames it, and
     a thread a person has renamed is never a candidate in the first place.
 
     Nothing here is capped by count or by age any more. The old shape looked
     at the 200 most recent threads, skipped anything older than seven days,
-    and stopped after twenty names and twenty repairs per pass — so a thread
+    and stopped after twenty names and twenty repairs per pass, so a thread
     that fell past any of those edges was never named at all, while the
     Claude side named everything. The bound is now TIME: this runs on the
     path that builds a human-facing inventory, so a pass spends at most a
@@ -1156,7 +1156,7 @@ def _push_codex_thread_title(
 
     The Codex TUI's thread-title status item and its rename flow read and
     write this column (the session index alone never reaches the status
-    bar). Update-only — a missing row is reported, never created — and every
+    bar). Update-only, a missing row is reported, never created, and every
     failure is fail-open.
     """
     import sqlite3
@@ -1213,7 +1213,7 @@ def _session_kit_state_dir(env: Mapping[str, str], home: Path) -> Path:
 
     Same precedence as the shell helpers: SESSION_KIT_STATE_DIR names the
     kit directory itself; otherwise it lives under XDG_STATE_HOME or the
-    sandbox home. Never falls back to the real home — an explicit
+    sandbox home. Never falls back to the real home, an explicit
     environment IS the caller's sandbox.
     """
     explicit = env.get("SESSION_KIT_STATE_DIR")
@@ -1345,12 +1345,12 @@ def _push_codex_live_rename(
 
     A direct-TUI Codex bar repaints only at process start, but a remote TUI
     attached to a kit app-server repaints its thread-title item from the
-    thread/name/updated broadcast — so a rename through the socket names a
+    thread/name/updated broadcast, so a rename through the socket names a
     LIVE window with no provider restart. Every kit app-server shares one
     thread store, so the rename is offered to each live socket; a server
     not hosting the thread writes the same value the direct push already
     wrote, harmlessly. Entirely fail-open: absent, dead, or refusing
-    sockets never block the store push and never warn — most sessions are
+    sockets never block the store push and never warn, most sessions are
     direct TUIs with no socket at all.
     """
     import base64

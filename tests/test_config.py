@@ -32,7 +32,7 @@ class ShpoolExampleConfigTests(unittest.TestCase):
         """Reattach must never replay spooled TUI frames.
 
         Replaying the vt100 spool interleaves cells from different frames of
-        a cell-diffing TUI (Claude Code, Codex) — the braided corruption seen
+        a cell-diffing TUI (Claude Code, Codex), the braided corruption seen
         live on 2026-08-12. "simple" emits nothing and lets the program
         redraw itself; clean reading lives in `sp history`. The spool bounds
         stay finite so daemon memory is bounded.

@@ -133,7 +133,7 @@ def _yield_to_essential(
     The order is what a person needs off a row when the window is small: whose
     turn it is and when it last moved, then the name, then which model, then
     which account. Returns the two widths and whatever shortfall is still
-    unmet — at which point the row genuinely cannot carry the pair and it comes
+    unmet, at which point the row genuinely cannot carry the pair and it comes
     off every row on the page together.
 
     The floors are readable ones by default, and callers drop them to a single
@@ -158,7 +158,7 @@ def _yield_to_title(
     Order matters and is a judgement about what a person reads first: the model
     gives up its room before the account does, and both stop at the floor where
     a shortened value still reads. They used to give down to a single cell,
-    which rendered the model column as a bare `…` — a column that costs a cell
+    which rendered the model column as a bare `…`, a column that costs a cell
     and says nothing is worse than a narrow one.
     """
     needed = MIN_TITLE_CELLS - title_room
@@ -282,7 +282,7 @@ def _pad(text: str, width: int) -> str:
     `str.ljust` counts characters. Every cell in these rows is truncated by
     display width and was then padded by `ljust`, so a six-character CJK name
     measured twelve cells wide, was accepted as fitting, and then had six more
-    spaces appended — the row over-ran its column by exactly the width the
+    spaces appended, the row over-ran its column by exactly the width the
     wide characters added. One helper, used for every column.
     """
     return text + " " * max(0, width - _display_width(text))
@@ -293,7 +293,7 @@ def _truncate_cells(text: str, limit: int) -> str:
 
     Deliberately does NOT clean: `clean_text` flattens runs of spaces, which
     is right for a value read out of a row and fatal for a line that has
-    already been padded into columns — it collapses the padding and the
+    already been padded into columns, it collapses the padding and the
     columns with it.
     """
     if _display_width(text) <= limit:
@@ -908,7 +908,7 @@ def render_picker_page(
         #
         # This was the review's blocking finding, and it deleted the time from
         # every row at the width the operator actually works at. `label_width`
-        # was sized against the SHORTEST detail form, the state word alone, 
+        # was sized against the SHORTEST detail form, the state word alone,
         # so the title grew until only that fit; the page-wide chooser then
         # found the real details would not fit the room the title had just
         # taken and fell all the way back to state-only, which carries no time.
@@ -1094,7 +1094,7 @@ def render_detail(
 ) -> str:
     """One session in full, for a person.
 
-    `lookup` returns the row itself and is a machine mode — it carries the
+    `lookup` returns the row itself and is a machine mode: it carries the
     shpool id, the conversation UUID, PIDs and start ticks. This is what `sp
     detail` prints instead: everything a person can act on, and no identifier
     they could paste anywhere.

@@ -3,12 +3,12 @@
 The launch gate only ever checked the *shape* of a model identifier. A
 well-formed name that this machine answers with something smaller passed it,
 the flag went on the command line, and the session ran for its whole life on a
-model nobody chose — the exact way a Fable request has been quietly served by
+model nobody chose, the exact way a Fable request has been quietly served by
 a much smaller model on this estate before.
 
 So a second question is asked before anything starts: is this model really
-served here? Two local answers exist — what was served the last time it was
-asked for, and the machine's own model list — and with neither, the answer is
+served here? Two local answers exist (what was served the last time it was
+asked for, and the machine's own model list), and with neither the answer is
 "unknown", said as unknown. Nothing is ever substituted: a refusal names what
 would serve the request and leaves the choice where it belongs.
 """
@@ -220,8 +220,8 @@ class LaunchRefusesASilentDowngradeTests(unittest.TestCase):
         """"Unknown" has to reach the person, or it is not an answer.
 
         With no model list and no observation, nothing on this machine can
-        confirm a model. That is not a refusal — the session starts exactly as
-        asked — but a launch that says nothing is indistinguishable from a
+        confirm a model. That is not a refusal: the session starts exactly as
+        asked, but a launch that says nothing is indistinguishable from a
         launch that was checked. A person asking at a terminal is told; a
         scripted launch is not, because "nobody has confirmed this" repeated
         into every log line is how a real warning stops being read.

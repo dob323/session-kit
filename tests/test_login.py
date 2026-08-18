@@ -2681,8 +2681,8 @@ class LoginPickerTests(unittest.TestCase):
     ) -> None:
         """No static probe proves a program will serve; the handoff does.
 
-        A launcher whose shebang names a missing interpreter — or whose env
-        command is absent — can pass every file check and die a beat after
+        A launcher whose shebang names a missing interpreter, or whose env
+        command is absent, can pass every file check and die a beat after
         exec. Review lanes rv-rn-2 and rv-rn2-* proved the two failure
         shapes: a success line followed by a dead window, and a relaunch
         storm retrying the same corpse every idle beat. The supervised
@@ -2801,7 +2801,7 @@ class LoginPickerTests(unittest.TestCase):
     def test_octal_looking_probation_neither_aborts_nor_serves_a_corpse(self) -> None:
         """ "08" is decimal eight here, not broken octal.
 
-        Bash arithmetic reads a leading zero as octal and aborts on "08" —
+        Bash arithmetic reads a leading zero as octal and aborts on "08",
         review round five drove the picker to die after the reload line with
         no recovery. The value is forced to base ten; the corpse still
         recovers under the eight-second probation it now means."""
@@ -2851,7 +2851,7 @@ class LoginPickerTests(unittest.TestCase):
         """A probation of zero is no probation at all, so it is invalid.
 
         "0" passed the digit check, zeroed the window, and an instant
-        status-0 corpse was announced as served — the picker ended with no
+        status-0 corpse was announced as served, the picker ended with no
         refusal and no recovery (review lane rv-rn6-1). The window exists to
         catch corpses; a value that cannot catch one falls back to the
         default five seconds. "000000" reaches the same rejected-zero branch
@@ -2908,7 +2908,7 @@ class LoginPickerTests(unittest.TestCase):
 
         EPOCHREALTIME is a Bash 5.0 variable and the kit promises Bash 4:
         under nounset the bare expansion aborted the picker right after the
-        reload line — no refusal, no recovery, the list gone (review lane
+        reload line, no refusal, no recovery, the list gone (review lane
         rv-rn6-2, reproduced by unsetting the variable through BASH_ENV on
         the real production path). The guarded expansion now falls back to
         the SECONDS builtin, and an instant status-0 corpse still recovers."""
@@ -2968,8 +2968,8 @@ class LoginPickerTests(unittest.TestCase):
         If a Bash-4 shell treated every handoff as zero elapsed, a person
         who used the new picker for an hour and quit would get the old
         picker relaunched at them and the target falsely marked failed. The
-        SECONDS fallback surrenders one whole second before comparing — the
-        rv-rn4-2 rounding credit cannot return — so the launcher here must
+        SECONDS fallback surrenders one whole second before comparing, the
+        rv-rn4-2 rounding credit cannot return, so the launcher here must
         outlive probation by more than a full second to prove serving."""
         fixture = LoginFixture(inventory(row("alpha", number=1)))
         release_id = "e8f9a0b1c2d3789012345678901234567890abcd"
@@ -3133,7 +3133,7 @@ class LoginPickerTests(unittest.TestCase):
         A launcher that hangs without serving survives probation; when the
         person kills it, the old design propagated 128+N and the window lost
         its list (review lane rv-rn3-2's non-serving hang). A real picker
-        handles its signals — so a signal exit takes the recovery path at
+        handles its signals, so a signal exit takes the recovery path at
         any age."""
         fixture = LoginFixture(inventory(row("alpha", number=1)))
         release_id = "f3a4b5c6d7e8789012345678901234567890abcd"

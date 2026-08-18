@@ -110,7 +110,7 @@ _REAL_HOME = os.environ.get("HOME") or ""
 _INHERITED_STATE_HOME = os.environ.get("XDG_STATE_HOME")
 # A test run launched from inside a kit-managed session inherits the session's
 # own account profile in these. Any suite that starts a real provider CLI in a
-# fixture HOME would then write real transcripts into a real account profile 
+# fixture HOME would then write real transcripts into a real account profile:
 # 952 such stray directories were cleaned out of two profiles on 2026-08-17.
 # Captured here for the same inherited-versus-chosen test the state home uses.
 _INHERITED_PROVIDER_DIRS = {

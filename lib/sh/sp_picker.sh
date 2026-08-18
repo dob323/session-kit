@@ -305,7 +305,7 @@ picker_close() {
       # The provider transcript survives, but `sp recover` validates the same
       # broken Closed ledger and may refuse its whole list. Say that boundary
       # rather than promising an offer the command cannot print.
-      sk_die "the session closed, but it could not be added to Closed sessions — the provider conversation remains on disk, but repair the Closed sessions ledger before relying on \`sp recover\`" || true
+      sk_die "the session closed, but it could not be added to Closed sessions, the provider conversation remains on disk, but repair the Closed sessions ledger before relying on \`sp recover\`" || true
     }
   else
     # A shell close is ledgered too, so `sp recover` lists it (history only).

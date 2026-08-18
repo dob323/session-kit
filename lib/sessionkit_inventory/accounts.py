@@ -1043,7 +1043,7 @@ def _provider_advice(advice: Mapping[str, Any], provider: str) -> Any:
     Advice started out Claude-only: one top-level ``use_now``, with no way to
     say which provider it meant. The roster beside it has always carried both
     providers, so a Codex account could be healthy, serving, and still never
-    recommended — the audit finding this fixes.
+    recommended, the audit finding this fixes.
 
     A feed that covers both says so, either as ``use_now_<provider>`` or under
     ``providers.<provider>.use_now``. The bare top-level key keeps its original

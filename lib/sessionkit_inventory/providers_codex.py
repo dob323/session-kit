@@ -43,7 +43,7 @@ def _final_text_asks_a_question(payload: Mapping) -> bool:
 
     Codex serializes only explicit request_user_input calls as questions, but
     assistants routinely finish a turn with prose like "which hostname should
-    I use?" and then task_complete — the human is being waited on while every
+    I use?" and then task_complete: the human is being waited on while every
     structured signal says idle. Conservative test: the LAST assistant
     message's final non-empty line ends with a question mark.
     """

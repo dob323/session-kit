@@ -6,7 +6,7 @@ own HOME, its own state directory and a fake `shpool` that implements verbs and
 starts nothing, then runs the kit's real `bashrc/shpool.bashrc` inside a pty and
 reads what actually happened.
 
-ISOLATION IS THE POINT, and it is not a mode — it is the only mode. A real
+ISOLATION IS THE POINT, and it is not a mode: it is the only mode. A real
 daemon in a review fixture can answer that fixture's client and make its
 session names look authoritative; mixing those names with the operator
 daemon's process tree can hide or misidentify live sessions. Every path this
@@ -367,7 +367,7 @@ class Sandbox:
         """Write the start record and return the inner script that arms the rest.
 
         The sidecars carry the running shell's own generation, so they can only
-        be written from inside the session shell — exactly as `sp` writes them
+        be written from inside the session shell, exactly as `sp` writes them
         from the launcher it just spawned.
         """
         start = os.path.join(self.start, self.name)
@@ -413,7 +413,7 @@ class Sandbox:
         """One session shell under the stub, with its records already armed.
 
         Waiting stops the moment the provider starts, or the moment the screen
-        says the thing the step was watching for — a step that expects a
+        says the thing the step was watching for. A step that expects a
         refusal should not pay a full timeout to read one.
         """
         environment = self.environment

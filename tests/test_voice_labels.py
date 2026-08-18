@@ -3,7 +3,7 @@
 `lib/sessionkit_inventory/labels.py` is `docs/voice.md` as code. These tests
 hold three lines at once:
 
-* no renderer contains a human label as a literal — the label module is the
+* no renderer contains a human label as a literal, the label module is the
   only place a word lives;
 * what `sp list` and `sp detail` print is exactly what the label module says,
   asserted against the module rather than against a second hardcoded copy, so

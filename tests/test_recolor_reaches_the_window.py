@@ -1,4 +1,4 @@
-"""A color change reaches the window, named session or not — and never at a cost.
+"""A color change reaches the window, named session or not, and never at a cost.
 
 Both provider windows read their color once, when the process starts, so the
 kit's one safe restart is what applies a recolor to a session that is already

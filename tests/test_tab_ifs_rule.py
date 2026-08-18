@@ -2,7 +2,7 @@
 
 The rule, in one line: **`IFS=$'\t' read` on a record with a possibly-empty
 field is the husk bug again.** Tab is IFS whitespace, so a run of tabs
-collapses to one separator and every empty field between them disappears —
+collapses to one separator and every empty field between them disappears,
 the fields after it shift left, and a record armed perfectly is read as
 garbage. The kit lost three launches in one night to exactly that, and the
 fix is the `\034` translation idiom in `bashrc/shpool.bashrc` (translate tabs

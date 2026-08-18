@@ -2209,7 +2209,7 @@ class ClaudeFirstPromptOwnershipTests(unittest.TestCase):
 
 
 class CodexFirstTurnOwnershipTests(unittest.TestCase):
-    """A Codex thread is claimed at its first turn — the first moment it exists."""
+    """A Codex thread is claimed at its first turn, the first moment it exists."""
 
     def _codex_root(self, base: Path, rows: list[tuple]) -> Path:
         import sqlite3

@@ -4643,7 +4643,7 @@ class TerminalNumberRegistryTests(unittest.TestCase):
 
         Numbering raised, the census fell back to cache, and the guard
         snapshot every mutation depends on stopped answering: no close, no
-        switch, no repair, and no launch — because arming a launch needs a
+        switch, no repair, and no launch, because arming a launch needs a
         snapshot that is live, fresh and warning-free. The operator's whole
         machine went read-only over one row, with a message that named no
         session. Each shape below is a row whose generation cannot be proven;
@@ -4726,8 +4726,8 @@ class TerminalNumberRegistryTests(unittest.TestCase):
     def test_an_unprovable_row_still_lets_a_new_launch_arm(self) -> None:
         """The arm's own gate, in the state that used to close it.
 
-        `sk_capture_session_generation` — the step `sp new` runs between
-        creating a session and arming its launch record — refuses to arm
+        `sk_capture_session_generation`, the step `sp new` runs between
+        creating a session and arming its launch record, refuses to arm
         unless the guard snapshot is live, unstale and warning-free, and then
         resolves the new session in it with mutation allowed. Before this fix
         one unprovable row anywhere made that snapshot unavailable, so the
@@ -5206,7 +5206,7 @@ class AutomaticTitleTests(unittest.TestCase):
 
         ``mutate_self_name`` runs ``revalidate`` inside the name-store locks.
         The old revalidate took a fresh full collection there, and collecting
-        can re-acquire config.lock on a second descriptor — a process waiting
+        can re-acquire config.lock on a second descriptor, a process waiting
         on its own flock, which no other process can break; every collector on
         the machine queued behind it. The contract: one snapshot total, taken
         before any lock; revalidation re-reads only the process table.
@@ -7580,7 +7580,7 @@ class WorkerLaunchGateTests(unittest.TestCase):
         # provider-exit recovery is unavailable" for a session whose retained
         # record held `claude --resume <uuid>`. The menu runs the collector
         # from inside the managed shell, so the collector saw its own helper
-        # as the session's work, called the row running, and the overlay 
+        # as the session's work, called the row running, and the overlay,
         # which only annotates idle shells, never attached the recovery.
         fixture = list(inventory_fixture(1, providers=("codex",)))
         active = inventory_core.build_inventory(*fixture, now=1_800_000_000)
@@ -7714,8 +7714,8 @@ class WorkerLaunchGateTests(unittest.TestCase):
     def test_a_foreign_process_still_names_the_shell_as_running(self) -> None:
         # The suppression above is exactly the collector's own process and the
         # processes it started. A workload the terminal itself is running is a
-        # sibling of the collector, not a descendant, and it is still reported
-        #, otherwise the row would lie about a busy terminal.
+        # sibling of the collector, not a descendant, and it is still reported,
+        # otherwise the row would lie about a busy terminal.
         fixture = list(inventory_fixture(1, providers=("codex",)))
         root_pid = 1001
         del fixture[2][2001]

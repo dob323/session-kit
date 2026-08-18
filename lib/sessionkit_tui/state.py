@@ -93,7 +93,7 @@ class Picker:
         """Sessions a person has already looked at.
 
         The session attached in this window is seen by definition. One a
-        person opened from here stays seen until it says something new — that
+        person opened from here stays seen until it says something new; that
         is what makes the attention count trustworthy instead of merely large.
         """
 
@@ -268,7 +268,7 @@ class Picker:
 
         A panel closes, then typed input clears, then a second screen returns
         to the list. With nothing left to step out of, Esc leaves the picker
-        — the way out has to be reachable from the footer that names it.
+        the way out has to be reachable from the footer that names it.
         """
 
         if self.panel is not None:
@@ -290,13 +290,13 @@ class Picker:
         self.leave()
 
     def back_key(self) -> bool:
-        """`b` goes back — on every screen where `b` is a key and not a letter.
+        """`b` goes back, on every screen where `b` is a key and not a letter.
 
         One grammar across the product (operator ruling, 2026-08-15). The two screens that
         refuse it are the session list and the closed list, where letters are
         the filter: taking `b` there would cost a person the ability to search
         for anything beginning with it. Unlike Esc this never leaves the
-        picker — back from the top is still the top.
+        picker, back from the top is still the top.
         """
 
         if self.panel is not None and self.panel.prompt is None:

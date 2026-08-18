@@ -2,7 +2,7 @@
 
 One list. Sessions that need you, then the ones openable here, then the ones
 open in another window; one counted row for machine sessions; then the
-ordinary rows — New session, Projects, Closed sessions, Help. Marking,
+ordinary rows, New session, Projects, Closed sessions, Help. Marking,
 filtering, and the attention rules all live here, where they can be tested
 without a terminal.
 """
@@ -35,7 +35,7 @@ _RANGE = re.compile(r"^(\d+)-(\d+)$")
 
 def is_filter(text: str) -> bool:
     """Digits, commas, and dashes mark. One letter and the whole input is a
-    filter — there is no half-and-half state to explain."""
+    filter; there is no half-and-half state to explain."""
 
     return any(character.isalpha() for character in text)
 

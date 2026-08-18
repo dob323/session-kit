@@ -1333,8 +1333,8 @@ picker_self_upgrade() {
   printf 'Reloading the picker into release %s.\n' "$release_id"
   # Supervised handoff: the new picker runs as this shell's foreground child
   # and owns the terminal. If it serves, this shell is a dormant wrapper that
-  # propagates the eventual exit. If it dies within the probation window 
-  # exec failure, missing env command, startup crash, the window has NOT
+  # propagates the eventual exit. If it dies within the probation window
+  # (exec failure, missing env command, startup crash), the window has NOT
   # been upgraded, this shell says so, marks the target failed, and relaunches
   # the release it was serving seconds ago. Announcing success is the one
   # thing that never happens before the child has outlived probation.

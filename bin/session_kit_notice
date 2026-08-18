@@ -1104,7 +1104,7 @@ def watchdog_record_notices() -> list[dict[str, Any]]:
                 "class": "repair-failed",
                 "key": f"repair:{session}",
                 "evidence": "failed",
-                "line": f"{title} ({provider}) — automatic repair FAILED",
+                "line": f"{title} ({provider}), automatic repair FAILED",
                 "subject": f"Automatic repair failed: {title}",
                 "body": (
                     f"{title} ({provider}) stopped working and the automatic repair "
@@ -1118,7 +1118,7 @@ def watchdog_record_notices() -> list[dict[str, Any]]:
                 # Strength, so an escalation from ordinary silence to the
                 # daemon's own handoff failure is a new thing to say.
                 "evidence": clean(item.get("evidence"), 60) or "silence-only",
-                "line": f"{title} ({provider}) — quiet, nothing changed",
+                "line": f"{title} ({provider}), quiet, nothing changed",
                 "subject": f"Session quiet, nothing changed: {title}",
                 "body": (
                     f"{title} ({provider}) was reported quiet and nothing was changed: "
@@ -1174,7 +1174,7 @@ def stall_notices() -> list[dict[str, str]]:
                 "class": "stall",
                 "key": f"stall:{key}",
                 "evidence": reason or "stalled",
-                "line": f"a stalled session — {told}",
+                "line": f"a stalled session, {told}",
                 "subject": "A session has stalled",
                 "body": (
                     f"A session flagged as stalled: {told}. Nothing was changed. "
@@ -1210,7 +1210,7 @@ def question_notices() -> list[dict[str, str]]:
                 "class": CLASS_QUESTION,
                 "key": f"question:{identifier}",
                 "evidence": "open",
-                "line": f"{who} is waiting on a decision — {header}",
+                "line": f"{who} is waiting on a decision, {header}",
                 "subject": f"A window is waiting on a decision: {header}",
                 "body": f"{who} has an open question. It is in the question inbox.",
                 "at_unix": (

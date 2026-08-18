@@ -3,7 +3,7 @@
 Two owners used to write a session's name and nothing reconciled them: the
 kit's own name, and the title the provider window puts on its bar. A rename
 through `sp name` reached the kit and the provider's store, but the running
-window kept the title it read at start — so the list and the terminal
+window kept the title it read at start, so the list and the terminal
 disagreed until something restarted, and nobody could say which was right.
 
 The other half is the process rule paid for in a real session's death: an

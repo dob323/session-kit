@@ -2,8 +2,8 @@
 
 Before this ledger, a deliberate close left a tombstone that expired in seven
 days and appeared on no screen at all: the recovery feed listed crashes only.
-So the one thing a person is told they can do — close a session and pick the
-conversation up later — was the one thing the kit could not do.
+So the one thing a person is told they can do, close a session and pick the
+conversation up later, was the one thing the kit could not do.
 
 Every deliberate close now appends one durable record, and `sp recover` lists
 those next to the crashes, newest first, until the conversation is restored or

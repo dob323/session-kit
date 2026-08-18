@@ -1,6 +1,6 @@
 """Who asked for a session, stamped at the moment it is created.
 
-A machine starts sessions all day — drills, automations, watchdog restores —
+A machine starts sessions all day (drills, automations, watchdog restores),
 and every one of them lands in the list a person opens to find their own work.
 The picker's default view is the person's own screen (D17), and it can only be
 that if creation says who asked: nothing infers origin later from a directory,

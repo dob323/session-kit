@@ -2,12 +2,12 @@
 
 Three launches started nothing one night. Each one printed its reason to the
 session's own screen and nowhere else, so the only way to learn why was to
-attach to the session before somebody closed it — and by the time anyone
+attach to the session before somebody closed it, and by the time anyone
 asked, all three were closed. Hours went into reconstructing an answer the
 machine had already computed and thrown away.
 
 The shell now records what it decided and which session it decided about, and
-`sp new` records that it created one at all — a verb that makes state and
+`sp new` records that it created one at all, a verb that makes state and
 leaves no trace of having run cannot answer "what made this session".
 """
 

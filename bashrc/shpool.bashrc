@@ -707,7 +707,7 @@ import stat
 import sys
 
 state_root, session_id = sys.argv[1:]
-line = "[session-kit: Codex App Server disabled — ~/.local/state must be mode 0700]"
+line = "[session-kit: Codex App Server disabled: ~/.local/state must be mode 0700]"
 try:
     metadata = os.lstat(state_root)
     private = (
@@ -719,7 +719,7 @@ except OSError:
     private = False
 if private:
     line = (
-        "[session-kit: Codex App Server disabled — "
+        "[session-kit: Codex App Server disabled: "
         "its private state directory is unavailable]"
     )
 print(line, file=sys.stderr)

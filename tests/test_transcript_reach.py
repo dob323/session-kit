@@ -1,12 +1,12 @@
 """Two promises the rebuild dropped: a Codex history, and a doctor that checks.
 
 `sp history` falls back to the conversation's own transcript when a session was
-never recorded — and did it for Claude only, so a Codex session from the same
+never recorded, and did it for Claude only, so a Codex session from the same
 weeks answered "no live history" while its rollout sat on this disk unread.
 
 The doctor's transcript-reachability check went with the supervisor that used
 to own the resolver. It is the only thing that notices when a conversation this
-machine recorded can no longer be read here — the failure that has already
+machine recorded can no longer be read here, the failure that has already
 happened once, silently, under a rotated account profile.
 """
 

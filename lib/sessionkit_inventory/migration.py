@@ -2,8 +2,8 @@
 
 Two migrations live here because they share a shape rather than a subject. Each
 runs once per installation, each rewrites private state that a pinned older
-release may still read, and each is written to be abandonable — plan, publish,
-apply, roll back — rather than applied in place.
+release may still read, and each is written to be abandonable, plan, publish,
+apply, roll back, rather than applied in place.
 
 Keeping them together also keeps them out of ``recovery``. The recovery module
 handles state that changes every time a session appears or disappears; nothing

@@ -1,14 +1,14 @@
 """Every session somebody closed on purpose, kept so it can come back.
 
 A close used to leave a tombstone that expired after seven days, and the
-recovery feed only ever listed CRASHES — so a conversation closed deliberately
+recovery feed only ever listed CRASHES, so a conversation closed deliberately
 was unreachable from every surface the moment it ended, and unrecoverable for
 good a week later. That is the opposite of the promise: closing a session ends
 the terminal, never the conversation.
 
 This is the ledger that makes the promise true. Every deliberate close appends
-one small record — provider, conversation, name, directory, when, and who
-asked for the session — under the durable data directory rather than the state
+one small record, provider, conversation, name, directory, when, and who
+asked for the session, under the durable data directory rather than the state
 directory, because state is what a boot may throw away and this may not be.
 There is no retention window: an entry is two hundred bytes and stays as
 durable evidence after restore. The exact-live projection hides it while the

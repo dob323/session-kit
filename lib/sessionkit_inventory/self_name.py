@@ -62,7 +62,7 @@ _MACHINE_PROMPT_PREFIXES = (
 def derive_prompt_title(prompt: Any, *, stopwords: frozenset[str]) -> str | None:
     """Derive a short display title from a first user prompt.
 
-    Pure heuristic — no model call: first sentence, at most seven words,
+    Pure heuristic, no model call: first sentence, at most seven words,
     trailing function words trimmed, sentence-cased, capped at 64 characters.
     """
     if not isinstance(prompt, str):
@@ -120,8 +120,8 @@ def auto_title_from_hook(
     kit name intent) may already exist.
 
     The name is claimed once, at the conversation's first prompt: a thread
-    whose name is already owned — by a person, or by the pass that ran at
-    that first prompt — is left exactly as it is. The hook fires twice for a
+    whose name is already owned, by a person, or by the pass that ran at
+    that first prompt, is left exactly as it is. The hook fires twice for a
     brand-new session (UserPromptSubmit, then Stop), and that claim is what
     makes the second firing a no-op rather than a second rename.
     """
@@ -364,8 +364,8 @@ def self_name_automatic_title(
     def revalidate() -> None:
         # Runs INSIDE the name-store write locks. A fresh collection here is
         # forbidden: collecting can itself take config.lock through a second
-        # descriptor, and a process cannot pass its own flock on a new handle
-        #, the self-name that jammed every collector on the machine for
+        # descriptor, and a process cannot pass its own flock on a new handle:
+        # the self-name that jammed every collector on the machine for
         # twenty minutes on 2026-08-17 was exactly this call re-collecting
         # under the lock. The caller proof is repeated against a fresh
         # process table (lock-free, and the part that can actually change:

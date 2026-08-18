@@ -3,7 +3,7 @@
 Recovery state is the only private state that has to outlive the event it
 describes. ``recovery-manifest.json`` holds the latest exact generation;
 ``recovery-pending.json`` holds the generations that vanished before anyone
-claimed them. Nothing here decides when to run — the snapshot does that — and
+claimed them. Nothing here decides when to run (the snapshot does that), and
 nothing here reads a clock, a process table, or a configuration file.
 
 Every collaborator arrives as a call-time argument instead of an import. That

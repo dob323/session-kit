@@ -2,7 +2,7 @@
      role="img" aria-label="Session Kit">
   <title>Session Kit</title>
   <!-- The picker's own prompt: a chevron and the block cursor that sits after
-       it. Nothing is invented here — this is the character pair Session Kit
+       it. Nothing is invented here: this is the character pair Session Kit
        draws at the bottom of every screen. The chevron is kept narrow on
        purpose; a wider one reads as a play button once it is small. -->
   <rect x="1" y="1" width="62" height="62" rx="15" fill="#0d1117" stroke="#30363d"

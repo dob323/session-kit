@@ -2,7 +2,7 @@
 
 The roster feed has always carried a ``codex_accounts`` list, but the advice
 beside it was read only when the caller asked about Claude. A Codex account
-could be enabled, healthy, and serving and still never be recommended — the
+could be enabled, healthy, and serving and still never be recommended, the
 audit finding these tests pin down.
 """
 

@@ -2,17 +2,17 @@
 
 Session Kit had two unrelated things called a project:
 
-* a shortcut row in ``projects.tsv`` — an alias, one default provider, and one
+* a shortcut row in ``projects.tsv``, an alias, one default provider, and one
   absolute directory, discovered from what the providers had already run;
-* a supervisor intake — a unit of delegated work whose only sense of place is
+* a supervisor intake, a unit of delegated work whose only sense of place is
   the ``source_cwd`` it arrived from, with no name and no link to any row.
 
 Session rows carried a third, derived notion: a title hint computed from the
 last interesting path component, which never consulted either of the above.
 
 This module makes those one thing. A project is a **canonical absolute root
-directory**. Every other record — a shortcut alias, a manifest, an intake, a
-live session — belongs to the project whose root is the deepest ancestor (or
+directory**. Every other record, a shortcut alias, a manifest, an intake, a
+live session, belongs to the project whose root is the deepest ancestor (or
 equal) of its directory. That single membership rule is what lets the picker
 group sessions, the supervisor place an intake, and ``sp new`` resume a
 context without any of them inventing their own idea of a project.
@@ -26,7 +26,7 @@ this host. So a manifest's launch fields apply only when the project root is
 **host-trusted**, and the trust record is the existing deliberate act of
 adding the project: a non-ignore ``projects.tsv`` row for that exact root, or
 for the main repository of a linked git worktree. An untrusted manifest is
-still parsed, reported, and shown — it just never changes a launch.
+still parsed, reported, and shown, it just never changes a launch.
 """
 
 from __future__ import annotations
@@ -181,7 +181,7 @@ def _shortcut_rows(
 
     Parsing mirrors ``sessionkit_inventory.projects``: three tab fields, a
     known kind, an absolute directory. A row this cannot read is skipped with
-    a warning rather than failing the whole resolution — a project list is a
+    a warning rather than failing the whole resolution, a project list is a
     convenience, and one bad hand-edited line must not blind the picker to
     every other project.
     """
@@ -366,7 +366,7 @@ class Resolver:
 
         The row that matched is carried through. Looking the directory up again
         would answer with the *first* row for it, so on a file that still lists
-        one directory twice — the shape this release folds — asking for the
+        one directory twice, the shape this release folds, asking for the
         second alias returned the first alias's provider and started the wrong
         one.
         """

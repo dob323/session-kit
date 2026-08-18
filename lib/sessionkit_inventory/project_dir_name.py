@@ -4,7 +4,7 @@ Claude Code 2.1.234 added ``CLAUDE_CODE_PROJECT_DIR_NAME``: when
 ``CLAUDE_CONFIG_DIR`` is set, the variable names the per-project directory
 under ``<config>/projects/`` instead of the munged working-directory path.
 This helper decides whether one launch may use it, and prints the name on
-stdout when — and only when — every proof holds:
+stdout when, and only when, every proof holds:
 
 * the installed Claude launcher resolves to a version that knows the
   variable (2.1.234 or newer); an older Claude ignores an exported name
@@ -13,14 +13,14 @@ stdout when — and only when — every proof holds:
 * the launch directory is exactly the registered root of a project shortcut,
   and exactly one shortcut claims that root;
 * the alias satisfies Claude's own validator (``[A-Za-z0-9_-]{1,64}``, not a
-  Windows reserved device name) — Claude falls back *silently* on a bad
+  Windows reserved device name), Claude falls back *silently* on a bad
   value, so the refusal has to happen here where it can be reasoned about;
 * the profile holds no legacy munged directory for this root, or that
   directory was just renamed to the alias. The rename is refused while any
   process still carries this profile with a working directory inside the
   root, because Claude re-resolves the path per write: renaming under a live
   session splits its transcript, and auto memory is only ever read from the
-  resolved name — a half-migrated project is a session with amnesia.
+  resolved name, a half-migrated project is a session with amnesia.
 
 Anything unprovable prints nothing and exits 0: the launch simply keeps
 today's munged-name behaviour. This file is invoked by path from the session
@@ -52,7 +52,7 @@ def claude_supports_project_dir_name(command: str = "claude") -> bool:
 
     The proof is the immutable-release layout the installer creates
     (``.../versions/<major>.<minor>.<patch>``). A launcher that resolves
-    anywhere else proves nothing and the answer is no — never a guess via
+    anywhere else proves nothing and the answer is no, never a guess via
     ``claude --version``, which costs a process start on every launch.
     """
     located = shutil.which(command)
@@ -150,7 +150,7 @@ def profile_live_in_root(profile: Path, root: Path, proc: Path = Path("/proc")) 
     A live session is any process whose environment carries this exact
     ``CLAUDE_CONFIG_DIR`` and whose working directory sits at or under the
     project root. The launching shell and this helper both match that
-    description themselves — their whole ancestor chain is excluded, or the
+    description themselves, their whole ancestor chain is excluded, or the
     migration would wait on the very launch that requested it. Unreadable
     process entries count as live: an unproven quiet is not quiet.
     """
@@ -250,7 +250,7 @@ def resolve_project_dir_name(
         # A raw provider launch takes no part in this lock, so one can start
         # in the gap between the scan above and the rename. Scan again on the
         # far side: if a same-profile process now runs inside the root, its
-        # first write would recreate the munged path beside the moved one 
+        # first write would recreate the munged path beside the moved one,
         # the split-store defect review lane rv-pdn-1 reproduced. Undo the
         # move and refuse; the raw session then finds the world exactly as it
         # was. An undo that fails leaves the both-names state the next launch
@@ -269,7 +269,7 @@ def resolve_project_dir_name(
 def doctor_report(projects_file: Path, accounts_root: Path) -> tuple[str, str]:
     """One ``(status, detail)`` line for ``session-kit doctor``.
 
-    ``warn`` names the states a person has to resolve — a registry root
+    ``warn`` names the states a person has to resolve, a registry root
     claimed twice, a profile holding state under both the munged and the
     short name, or a profile settings file without the auto-continue switch.
     Directories still waiting on their automatic launch-time rename are

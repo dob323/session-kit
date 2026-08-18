@@ -1155,7 +1155,7 @@ report_once() {
 # durable, cheap symptom of that whole class: the snapshot has stopped aging
 # forward AND a kit state lock has waiters. Report the holder by pid so the
 # person (or an agent) can end it. config.lock also serialises atomic config
-# writes (colors, names), so ending the holder can abort that one command 
+# writes (colors, names), so ending the holder can abort that one command;
 # the write itself stays whole either way, and collections retry on their
 # own. The message says exactly that instead of promising universal safety
 # (review lane rv-pdn-2, 2026-08-17).

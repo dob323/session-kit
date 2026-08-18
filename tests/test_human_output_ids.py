@@ -1,7 +1,7 @@
 """The invariant: no human-readable surface ever prints a session identifier.
 
 Identifiers live in 0600 state files, machine-only JSON modes, proofs, and
-command arguments. They are never displayed — not in a row, not in a
+command arguments. They are never displayed, not in a row, not in a
 confirmation, not in an error, not behind a flag.
 
 This is the enforcement mechanism, not a collection of per-surface checks.
@@ -12,7 +12,7 @@ so a new screen cannot join the kit without someone deciding, in writing,
 which side of the line it is on.
 
 Whole identifiers are not the whole test. A truncated identifier is still an
-identifier — the title fallback used to render ``Codex a1b2c3d4`` — so the
+identifier, the title fallback used to render ``Codex a1b2c3d4``, so the
 scan flags any eight-hex-character prefix of a fixture identifier, which is
 why the fixture UUIDs below start with distinctive hex rather than zeros.
 """
@@ -504,7 +504,7 @@ class ShellRendererTests(unittest.TestCase):
     `sp recover`, `sp prune` and `sp color reconcile` each format their screen
     inside a python block in `lib/sh/sp_commands.sh`. Extracting the block and
     running it is the only way to test the code that actually reaches a
-    terminal — a rewritten copy in the test would prove nothing about it.
+    terminal, a rewritten copy in the test would prove nothing about it.
     """
 
     SOURCE = REPO / "lib" / "sh" / "sp_commands.sh"
@@ -537,8 +537,8 @@ class ShellRendererTests(unittest.TestCase):
     def test_the_recovery_list_names_conversations_not_identifiers(self) -> None:
         """The closed list is a screen, so it is driven as one.
 
-        `sp recover` now merges two sources — the conversations somebody closed
-        on purpose and the ones a crash took — and the merge itself carries
+        `sp recover` now merges two sources, the conversations somebody closed
+        on purpose and the ones a crash took, and the merge itself carries
         identifiers so a restore can use them. What must never carry one is the
         list a person reads, so the whole command is run and its output judged.
         """

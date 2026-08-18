@@ -3,7 +3,7 @@
 The snapshot comes from `shpool_status --json`, exactly the document the rest
 of the kit reads. Actions go to `sp`, with a proof file naming the exact
 session, exactly as the picker has always called them. Nothing here decides
-what should happen — it carries out what `state` already decided.
+what should happen; it carries out what `state` already decided.
 """
 
 from __future__ import annotations

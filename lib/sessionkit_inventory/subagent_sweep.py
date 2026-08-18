@@ -867,7 +867,7 @@ _ATTRIBUTION_SLACK_NS = 3600 * 1_000_000_000
 def _worker_started_wallclock_ns(proc: Path, start_ticks: object) -> int | None:
     """The worker's start as wallclock nanoseconds, from boot time + ticks.
 
-    Unreadable pieces return None — the caller must treat that as refusal
+    Unreadable pieces return None; the caller must treat that as refusal
     territory, never as permission to dismiss a candidate transcript."""
     if not isinstance(start_ticks, int) or isinstance(start_ticks, bool):
         return None

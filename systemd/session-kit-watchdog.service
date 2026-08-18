@@ -1,5 +1,5 @@
 [Unit]
-Description=Session Kit — restore sessions whose terminal dies
+Description=Session Kit, restore sessions whose terminal dies
 # The watchdog reads the daemon's log and inventory; it must not start before
 # the daemon exists, but it must not fail if the daemon is restarted either.
 Wants=shpool.service

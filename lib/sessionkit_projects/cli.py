@@ -61,7 +61,7 @@ def _resolver(
 
 
 def _target(resolver: identity.Resolver, target: str | None) -> identity.Project | None:
-    """An alias, a directory, or — with neither — the current directory."""
+    """An alias, a directory, or, with neither, the current directory."""
     if not target:
         return resolver.resolve(os.getcwd())
     project = resolver.resolve_alias(target)
@@ -90,7 +90,7 @@ def _read_snapshot(path: str | None) -> tuple[list[dict[str, Any]], list[str]]:
         except (OSError, ValueError) as error:
             return [], [f"the session snapshot is unreadable: {error}"]
     else:
-        import subprocess  # noqa: PLC0415 — only the live path pays for this
+        import subprocess  # noqa: PLC0415, only the live path pays for this
 
         tool = Path(__file__).resolve().parents[1] / "session_inventory.py"
         try:

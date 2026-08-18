@@ -682,8 +682,8 @@ def _owned_by_this_account(process: Mapping[str, Any]) -> bool:
     2026-08-17).
 
     The uid comes from the census row, which read it from ``/proc/<pid>``
-    while it was there. A row without one — an old snapshot, a hand-built
-    table — is a candidate as before: an unproven guess about a process is
+    while it was there. A row without one, an old snapshot, a hand-built
+    table, is a candidate as before: an unproven guess about a process is
     not evidence against it.
     """
     uid = process.get("uid")

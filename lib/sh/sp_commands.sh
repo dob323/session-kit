@@ -118,7 +118,7 @@ sk_record_close() {
     # did not land. The provider transcript survives, but the fused recovery
     # command also validates the broken Closed ledger and may refuse its whole
     # list. Name that boundary instead of promising an offer it cannot print.
-    sk_die "the session closed, but it could not be added to Closed sessions — the provider conversation remains on disk, but repair the Closed sessions ledger before relying on \`sp recover\`" || true
+    sk_die "the session closed, but it could not be added to Closed sessions, the provider conversation remains on disk, but repair the Closed sessions ledger before relying on \`sp recover\`" || true
     return 0
   fi
   python3 "$INVENTORY_CORE" closed-sessions record shell --session "$id" \
@@ -1582,7 +1582,7 @@ show_recovery() {
     line=${line//$'\t'/$'\034'}
     IFS=$'\034' read -r number selector source provider uuid cwd restorable event_age title reason <<<"$line"
     local note="" label="—"
-    [[ $source != lost ]] || note=" — lost with its session"
+    [[ $source != lost ]] || note=", lost with its session"
     # The number a session has everywhere else, not a position in this list.
     # A conversation whose number was retired goes by the name beside it, or
     # by the time of its own event when two rows answer to one name -- and the

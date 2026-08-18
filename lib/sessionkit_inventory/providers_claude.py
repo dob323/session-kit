@@ -185,7 +185,7 @@ def read_claude_transcript_signals(
     """Return Claude's persisted per-conversation title and color evidence.
 
     The TUI stores its conversation auto-title as an ``ai-title`` transcript
-    record and its session color as an ``agent-color`` record — neither lives
+    record and its session color as an ``agent-color`` record, neither lives
     in the session record, so the derived window label and the visible
     conversation state can disagree. Reads are bounded to the transcript's
     head and tail; the last record of each kind wins. Any problem returns
@@ -193,7 +193,7 @@ def read_claude_transcript_signals(
 
     Every profile is searched, not just the default one. A session launched
     on an enrolled account runs with CLAUDE_CONFIG_DIR set, so its transcript
-    lives under that profile and the default root does not have it — this read
+    lives under that profile and the default root does not have it, this read
     returned "no title, no color" for those sessions and every caller treated
     that as "the provider never set one". The write side already searches all
     roots (`names_push._claude_transcripts`, fixed for the same reason); this

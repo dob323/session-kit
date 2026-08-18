@@ -1,7 +1,7 @@
 """What every choice on the screen actually runs.
 
-The screen never touches a session itself. It names an `sp` command — the same
-proof-bound commands the picker has always used — and hands it to the runner.
+The screen never touches a session itself. It names an `sp` command, the same
+proof-bound commands the picker has always used, and hands it to the runner.
 Planning is separated from running so the exact command line each choice
 produces is testable without starting anything.
 """
@@ -48,7 +48,7 @@ def _selector(session: Session) -> str:
     """Numbers are what a person sees; the proof is what names the session.
 
     Where a verb takes no proof, the number is the only selector the screen is
-    allowed to pass on — an ID would have to be printed to be typed, and no
+    allowed to pass on: an ID would have to be printed to be typed, and no
     screen prints one.
     """
 
@@ -113,7 +113,7 @@ def change_model(session: Session, model: str) -> Plan:
     """`sp change-model` is the verb this screen calls.
 
     A release without it refuses in its own words, and those are the words the
-    screen shows — inventing a friendlier line would hide which release is
+    screen shows, inventing a friendlier line would hide which release is
     installed.
     """
 

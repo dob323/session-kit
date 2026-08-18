@@ -100,7 +100,7 @@ HELP_NOTES = (
 
 
 def plural(count: int, singular: str, many: str | None = None) -> str:
-    """`1 session`, `3 sessions` — the count and its noun, never apart."""
+    """`1 session`, `3 sessions`, the count and its noun, never apart."""
 
     word = singular if count == 1 else (many or singular + "s")
     return f"{count} {word}"

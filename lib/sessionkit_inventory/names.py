@@ -6,7 +6,7 @@ title and colour propagation with their retry and reconcile bookkeeping, and the
 Claude native hydration pass.
 
 Provider-native writing lives in ``names_push``. The two halves need each other
-in both directions, so neither imports the other — the facade injects across the
+in both directions, so neither imports the other, the facade injects across the
 seam, which keeps the package graph acyclic.
 """
 
@@ -121,7 +121,7 @@ def last_kit_title(document: Mapping[str, Any], key: str) -> str:
 
     The recorded push is the exact answer. Documents written before that
     record existed fall back to the retained automatic title, which is the
-    value the kit would have pushed — that fallback is what lets a session
+    value the kit would have pushed; that fallback is what lets a session
     renamed natively before this release still be recognised.
     """
     pushed = _valid_pushed_titles(document.get("pushed_titles")).get(key)
@@ -464,8 +464,8 @@ def adopt_native_rename(
     dropped rather than left behind to be restored by a later pass.
 
     This is also the migration. A session renamed natively before any of this
-    existed carries the same evidence — a native title that is not the
-    retained automatic one — so the first reconciliation after the release
+    existed carries the same evidence, a native title that is not the
+    retained automatic one, so the first reconciliation after the release
     settles it without anyone re-typing anything.
 
     Returns the adopted title, or "" when there was no native rename to adopt.
@@ -921,8 +921,8 @@ def propagate_provider_title(
 
     Assignment semantics are last-writer-wins: the push happens once at
     assignment time and later provider-side renames stand until the next
-    assignment. Every failure is fail-open — naming never breaks because a
-    provider surface is unavailable — but each skipped surface is reported.
+    assignment. Every failure is fail-open, naming never breaks because a
+    provider surface is unavailable, but each skipped surface is reported.
     """
     exact_uuid = valid_uuid(uuid)
     clean_title = clean_text(title, 100)

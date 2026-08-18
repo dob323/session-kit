@@ -408,7 +408,7 @@ class PresenceTests(unittest.TestCase):
 
         A session keeps printing for as long as its turn takes, so a window they
         walked away from mid-turn looked more present than one they were reading
-        — and the notice was delivered into that unattended conversation and
+        and the notice was delivered into that unattended conversation and
         latched as said. Output age is no longer consulted at all.
         """
         answer = self.verdict(snapshot(attached=[attached_session(age=1)]))
@@ -954,7 +954,7 @@ class SweepTests(unittest.TestCase):
         and writes a fresh record for the same session and the same evidence.
         This file used to collapse those to one key and call the second one
         already-said, so a real second failure produced a watchdog record and
-        NO notice — information loss of exactly the kind the branch exists to
+        NO notice, information loss of exactly the kind the branch exists to
         prevent. A record written after the last thing said about a session is
         the watchdog telling us the last incident was over.
         """
@@ -1772,7 +1772,7 @@ class TerminalRouteTests(unittest.TestCase):
 
         `send()` returns delivered=False for `sent-no-receipt` and names the
         target's own transcript as the receipt of record. Calling that landed
-        — which this did — reported a message they never saw AND latched it, so
+        which this did, reported a message they never saw AND latched it, so
         for a swept record it stayed suppressed while the record lived.
         """
         self.fake.records_transcript = False
@@ -1866,7 +1866,7 @@ echo '{{"routed": true, "route": "away"}}'
         """`notify()` is not a route to them and this branch does not touch it.
 
         Its notifier is an alert board with a 7-day retention, and granting it
-        push would mean claiming an emergency policy id — an alerting decision
+        push would mean claiming an emergency policy id, an alerting decision
         that belongs to the operator, not to this branch. The router is a
         SEPARATE road; `notify()` stays byte-identical to what it was.
         """
@@ -1904,7 +1904,7 @@ exit 0
 
         The suppression test read `"routed": 0` followed by `"held": 0`, and
         the router sorts its keys, so the quiet case could never match: every
-        pass of a 60-second watchdog wrote a line saying nothing had happened —
+        pass of a 60-second watchdog wrote a line saying nothing had happened,
         1,440 a day. The branch's own test used a stub whose JSON omitted
         `held`, so it never exercised the branch it was guarding.
         """

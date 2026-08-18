@@ -87,8 +87,8 @@ def _face(path: Path, family: str, extra: str = "") -> str:
 def font_faces() -> str:
     """Embed the fonts so a figure never depends on a network font host.
 
-    A missing font is not fatal — the browser falls back and the figure still
-    lays out — but it does change every pixel, which the approved-digest gate
+    A missing font is not fatal, the browser falls back and the figure still
+    lays out, but it does change every pixel, which the approved-digest gate
     then rejects with a message about digests rather than about fonts. Say
     which font is missing while that is still the useful thing to know.
     """

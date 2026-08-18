@@ -1,7 +1,7 @@
 """A clean provider exit closes the session; a crash reopens it once.
 
 Contract (operator rule, 2026-08-11, replacing the stay-alive rule of the same
-day): `/exit` — the provider ending with status 0 — is the operator saying
+day): `/exit`, the provider ending with status 0, is the operator saying
 "done here". The managed shell ends with it, which ends the shpool session,
 frees its terminal number into the ordinary quarantine, and lands the person
 back at the picker. Nothing is left behind to reopen, and `/kit` is the verb
@@ -10,9 +10,9 @@ for the other intention: leave the conversation running and walk away.
 A CRASH heals itself (D14). The conversation is reopened once, with one line
 saying so; a second crash within a minute of that reopen stops there and hands
 the window back to the picker with the session still open. No question is
-asked on either path — no screen in the kit asks one.
+asked on either path, no screen in the kit asks one.
 
-Every deliberate close — the clean exit and `bye` — records intent, so the
+Every deliberate close, the clean exit and `bye`, records intent, so the
 crash queue can tell "somebody closed this" from "this was lost".
 tests/test_close_intent.py owns that queue's side of the contract.
 """

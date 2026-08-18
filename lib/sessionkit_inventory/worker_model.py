@@ -2,12 +2,12 @@
 
 Extracted verbatim from the retired ``sessionkit_supervisor.intake`` module
 (2026-08-12 one-door rebuild): the ``validate-worker-model`` verb sits on the
-live launch path — ``bashrc/shpool.bashrc`` and ``sp new`` both call it before
-starting a provider — so the gate survives the supervisor's deletion.
+live launch path, ``bashrc/shpool.bashrc`` and ``sp new`` both call it before
+starting a provider, so the gate survives the supervisor's deletion.
 
 That gate only ever checked the *shape* of an identifier. A model can be
 perfectly well-formed, accepted by the provider's command line, and quietly
-served by something smaller — which is how a session runs for an hour on a
+served by something smaller, which is how a session runs for an hour on a
 model nobody chose. So there is a second question here, asked before a session
 starts and never answered by guessing:
 
@@ -21,7 +21,7 @@ Two local sources answer it, in this order:
 * **The machine's own model list** (``models.tsv``), which is the operator
   saying what this host offers.
 
-With neither, the answer is ``unknown`` — said as unknown, never as verified.
+With neither, the answer is ``unknown``, said as unknown, never as verified.
 Nothing in this module ever substitutes a model: it refuses, names what would
 serve the request instead, and leaves the choice to the person.
 """
@@ -135,7 +135,7 @@ def record_served(
     """Record the model a request was really answered with.
 
     This is the one call anything reading a live session's actual model needs
-    to make. The newest observation for a pair replaces the older one — a model
+    to make. The newest observation for a pair replaces the older one, a model
     that has come back is as important as one that went away.
     """
     provider = str(provider)

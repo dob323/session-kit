@@ -3,8 +3,8 @@
 Three ways the attention count used to disagree with reality, all proven on a
 pseudo-terminal before they were fixed:
 
-  * a search filter — including the preview drawn while the line was still
-    being typed — emptied the count, and the Needs-you screen answered
+  * a search filter, including the preview drawn while the line was still
+    being typed, emptied the count, and the Needs-you screen answered
     "Nothing needs you." while a session waited;
   * the home summary line de-duplicated a session against its own stall flag
     and the Needs-you screen did not, so the two screens printed different

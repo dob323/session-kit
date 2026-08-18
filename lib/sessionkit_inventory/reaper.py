@@ -254,7 +254,7 @@ def _safe_candidate(
 
     A BACKSTOP since 2026-08-15: the managed shell closes itself the moment
     its provider is gone for good, so a row that reaches the full window
-    means the shell could not — an older release still running, or a close
+    means the shell could not, an older release still running, or a close
     that failed. bin/shpool_reaper's header lists the cases.
 
     Two husk classes sit deliberately outside this predicate. Without
@@ -331,7 +331,7 @@ def _phantom_candidate(
     """A daemon-listed session whose shell process no longer exists at all.
 
     The daemon keeps advertising it (an ESRCH during a kill aborts removal on
-    stock shpool), the kit quarantines it, and no picker action can touch it —
+    stock shpool), the kit quarantines it, and no picker action can touch it,
     it lies in the list until a daemon restart. There is nothing to preserve:
     no shell, no provider, no identity. Nominated on the first complete pass:
     exact absence is already the proof, and waiting cannot make it safer.
@@ -521,8 +521,8 @@ def sweep_stale_app_server_dirs(
     window forever. A directory is removed only when all three proofs hold:
     the daemon no longer lists its session, its socket refuses a connection,
     and nothing has touched the directory or its files for the stale window.
-    Anything unexpected — a foreign owner, a symlink, an unreadable entry, a
-    socket that answers — leaves the directory in place. Returns the removed
+    Anything unexpected, a foreign owner, a symlink, an unreadable entry, a
+    socket that answers, leaves the directory in place. Returns the removed
     session IDs.
     """
     live = set(live_session_ids)

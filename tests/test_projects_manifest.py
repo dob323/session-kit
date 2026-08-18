@@ -3,7 +3,7 @@
 The manifest decides what a launch does, so these tests care about two things
 above all: that a malformed or hostile file is refused by name rather than
 half-applied, and that the hand-written subset parser reads a manifest to the
-same values ``tomllib`` does — because a manifest that means one thing on
+same values ``tomllib`` does, because a manifest that means one thing on
 Python 3.13 and another on 3.10 is worse than no manifest at all.
 """
 

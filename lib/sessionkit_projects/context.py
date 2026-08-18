@@ -1,7 +1,7 @@
 """What is going on in a project, gathered from every record that mentions it.
 
-Entering a project should answer the question a person actually has — "where
-did I leave this?" — and the answer is keyed on the project root: a session
+Entering a project should answer the question a person actually has, "where
+did I leave this?", and the answer is keyed on the project root: a session
 belongs to a project when its working directory is inside that root. The one
 membership rule lives in :mod:`lib.sessionkit_projects.identity`, so the
 picker and ``sp new`` agree about what is in a project.
@@ -149,7 +149,7 @@ def group_sessions_by_project(
     ``assignments`` comes from :meth:`Resolver.assign`, so one pass over the
     shortcut table and the manifests serves the whole list. Sessions whose
     directory belongs to no project are kept together under ``ungrouped``
-    rather than dropped — a session the picker cannot place must still be
+    rather than dropped, a session the picker cannot place must still be
     reachable.
 
     ``projects`` is the host's project list, used to place a worktree session

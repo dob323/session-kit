@@ -5,7 +5,7 @@ colour in its own terminal. Three owners, not one.
 
   1. The colour push wrote only into ``~/.claude/projects``. A session started
      on an enrolled account keeps its transcript under that account's profile,
-     so the push found nothing and said so to nobody — six of seven live
+     so the push found nothing and said so to nobody, six of seven live
      sessions had no colour record at all, and every provider window therefore
      picked its own colour while the picker showed the kit's.
   2. The in-session prompt bar was a colour constant. It could agree with the

@@ -8,9 +8,9 @@ leave usable state behind. If the collection is incomplete it serves the last
 known good cache instead, marked stale and carrying the reason.
 
 Nothing here reads a process table, a rollout, or a provider database. Every
-step arrives as a call-time argument — the collector, the boot identity, the
+step arrives as a call-time argument, the collector, the boot identity, the
 state reader and publisher, the terminal helpers, the recovery transaction, the
-lifecycle passes — so this file can be read as the sequence itself, and so a
+lifecycle passes, so this file can be read as the sequence itself, and so a
 facade patch on any single step still reaches the refresh under test.
 
 The two modes are not symmetrical and the asymmetry is the point. ``write_state``

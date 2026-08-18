@@ -129,7 +129,7 @@ class ProjectsMenuTests(unittest.TestCase):
             fixture.close()
 
     def test_a_directory_already_listed_is_refused_by_the_name_it_has(self) -> None:
-        """One directory, one entry — and the refusal says which entry.
+        """One directory, one entry, and the refusal says which entry.
 
         Adding it again under a second short name is exactly how a directory
         ended up listed twice, once per provider.

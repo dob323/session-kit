@@ -271,7 +271,7 @@ def _valid_pushed_titles(raw: Any) -> dict[str, str]:
 
     This is the discriminator for a provider-native human rename. Session Kit
     pushes its own titles into Claude's transcript records and Codex's thread
-    table, so "the native store disagrees with us" means nothing on its own —
+    table, so "the native store disagrees with us" means nothing on its own,
     half the time the kit put that value there. A native title that differs
     from the last value the kit itself pushed is somebody typing /rename.
     """
@@ -356,7 +356,7 @@ def _valid_name_ownership(raw: Any) -> dict[str, dict[str, str]]:
     """Validate the durable record of who named each session.
 
     ``human`` is an override: a person renamed the session through `sp name`
-    or the picker, and no automatic pass may ever rename it again — not after
+    or the picker, and no automatic pass may ever rename it again, not after
     a `sp name reset`, not after a restart. ``automatic`` is the one-shot
     claim taken at a thread's first prompt, so no second automatic pass
     re-titles work a first pass already named.

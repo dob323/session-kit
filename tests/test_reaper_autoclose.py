@@ -1048,8 +1048,8 @@ print(pathlib.Path(source).read_text(),end="")
         """An unreadable list is never "nothing is alive", on any path out.
 
         A payload this malformed makes the pass refuse during auto-close
-        planning, before the sweep is reached — so the property under test is
-        not which message appears, it is that **no copy is removed**. The sweep
+        planning, before the sweep is reached, so the property under test is
+        not which message appears; it is that **no copy is removed**. The sweep
         arriving at its own version of this question is proved at the verb, in
         `tests.test_worktree_isolation.TheSweepIsToldWhatIsAliveTests`, where a
         payload can be handed straight to the thing that acts on it: that is

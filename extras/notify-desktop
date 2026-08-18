@@ -6,7 +6,7 @@
 #
 #   --type=<alert type>  --severity=<warning>  --title=<subject>  --body=<text>
 #
-# This is the smallest useful implementation of that contract — a desktop
+# This is the smallest useful implementation of that contract, a desktop
 # popup through notify-send on Linux or osascript on macOS. Copy it, point the
 # variable at your copy, and change the last few lines to reach a phone, a
 # chat room, or an alert hub instead.

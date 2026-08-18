@@ -294,12 +294,12 @@ def report(results: list, root: Path) -> int:
     by_mode = {item["mode"]: item for item in results}
     missing = {"title-on", "title-off", "sequence-on", "sequence-off"} - set(by_mode)
     if missing:
-        print(f"VERDICT: inconclusive — runs missing: {', '.join(sorted(missing))}")
+        print(f"VERDICT: inconclusive, runs missing: {', '.join(sorted(missing))}")
         return 2
     for mode in ("title-on", "sequence-on"):
         if not by_mode[mode]["marker_present"]:
             print(
-                f"VERDICT: inconclusive — the control run {mode} wrote no kit "
+                f"VERDICT: inconclusive, the control run {mode} wrote no kit "
                 "title, so the switch-set runs prove nothing"
             )
             return 2
@@ -312,7 +312,7 @@ def report(results: list, root: Path) -> int:
             f"{mechanism}: control {control} wrote "
             f"{len(by_mode[control]['titles_written'])} title(s) including the "
             f"marker; with the switch set, {switched} wrote "
-            f"{len(by_mode[switched]['titles_written'])} — "
+            f"{len(by_mode[switched]['titles_written'])}, "
             + ("marker survives" if survives else "marker suppressed")
         )
     both_suppressed = not by_mode["title-off"]["marker_present"] and not (

@@ -1338,7 +1338,7 @@ class TheRegistrylessWorkerOutputBinding(SweepHarness):
         Review lanes rv-c10b-1/2 killed a live worker whose just-born
         transcript held only setup records: the complete-scan rule dismissed
         it and a quiet decoy became the whole copy set. Age is the exact
-        discriminator — a transcript cannot predate its worker — so a
+        discriminator, a transcript cannot predate its worker, so a
         setup-only file as recent as the worker refuses the whole answer,
         and an unreadable worker start refuses too."""
         transcript = standalone_transcript(self.proc, CURRENT_SESSION)

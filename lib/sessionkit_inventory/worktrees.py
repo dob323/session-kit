@@ -11,10 +11,10 @@ Five rules the code enforces rather than documents:
 
 * Nothing outside the kit's own worktree root is ever removed. Teardown reads
   a registry record, checks the recorded path is inside that root, and refuses
-  anything else — a hand-made worktree elsewhere is the operator's, not ours.
+  anything else, a hand-made worktree elsewhere is the operator's, not ours.
 * Nothing is written into a checkout the machine *runs*. `shared_checkout`
   answers that from the path, armed by default, and it gates creation and
-  removal alike — a removal runs `git worktree remove` inside the repository,
+  removal alike, a removal runs `git worktree remove` inside the repository,
   which is a write.
 * Only this module's own registrations are ever unregistered. `git worktree
   prune` is repository-wide and takes the index, reflog and rebase state of any
@@ -27,7 +27,7 @@ Five rules the code enforces rather than documents:
   one being asked, and the narrow answer is indistinguishable from "empty".
 * Unmerged is refused, measured against the copy's **actual HEAD** rather than
   the branch the registry recorded. Commits are never destroyed either way:
-  teardown removes the worktree, never the branch — but a commit made on a
+  teardown removes the worktree, never the branch, but a commit made on a
   detached HEAD is on no branch, so that promise only holds if the check looks
   at where the copy really is.
 * A check that could not run has not passed. Every git question here is asked
@@ -192,7 +192,7 @@ def shared_checkout(repo: Path | str, environ: Mapping[str, str] | None = None) 
     """Why this repository must never be copied or written into, or ``""``.
 
     Some checkouts *are* the running thing. Editing a copy of one is not
-    isolation, it is working somewhere the change never takes effect — and on a
+    isolation; it is working somewhere the change never takes effect, and on a
     checkout that serves a live site, a delegated agent that thinks it is
     editing the site would be editing nothing. Nothing in this module writes
     into a repository this refuses: no branch, no worktree, no prune, and no
@@ -200,10 +200,10 @@ def shared_checkout(repo: Path | str, environ: Mapping[str, str] | None = None) 
 
     Four answers, in the order they are asked:
 
-    * the host says this one *is* copyable — `SESSION_KIT_COPYABLE_REPOS`, the
+    * the host says this one *is* copyable, `SESSION_KIT_COPYABLE_REPOS`, the
       one way to overrule everything below, because a rule with no exit is a
       rule somebody works around;
-    * the host names it as shared — `SESSION_KIT_SHARED_REPOS`;
+    * the host names it as shared, `SESSION_KIT_SHARED_REPOS`;
     * it is under a system root (:data:`SYSTEM_ROOTS`), which is a path fact
       and needs nobody to have configured anything;
     * the repository says so itself with a `.session-kit-shared` file.
@@ -256,7 +256,7 @@ def auto_copy_refusal(
     itself. A checkout of a few hundred files costs milliseconds; one of forty
     thousand costs gigabytes of disk and seconds of wall clock inside `sp new`,
     per session, and nobody chose that at the moment it happens. So a large
-    checkout is not copied automatically — the session runs in it and says so,
+    checkout is not copied automatically, the session runs in it and says so,
     naming the two ways to decide otherwise. An explicit `--worktree BRANCH` is
     a decision and is never refused for size.
     """
@@ -336,7 +336,7 @@ def repository_root(
 ) -> Path | None:
     """The main working tree the directory belongs to, or None when it is not one.
 
-    None is a real answer here — the launcher asks this question exactly so it
+    None is a real answer here, the launcher asks this question exactly so it
     can say in the receipt that a project has no repository to isolate in,
     instead of failing a launch or pretending isolation happened.
 
@@ -379,7 +379,7 @@ def forget_registration(runner: Runner, repo: Path, tree_path: Path) -> str:
 
     Never `git worktree prune`. That verb is repository-wide: it deletes
     ``.git/worktrees/<name>`` for *every* worktree of the repository whose
-    directory it cannot reach at that moment — one on a volume that is not
+    directory it cannot reach at that moment, one on a volume that is not
     mounted, one on a share that is briefly down, one somebody renamed and
     means to move back. That directory is where a worktree keeps its index, so
     its staged-but-uncommitted content, its HEAD, its reflog and its
@@ -545,7 +545,7 @@ def expire_tombstones(root: Path, *, now: int, ttl_ms: int = TOMBSTONE_TTL_MS) -
     registry is read through a hard cap that truncates in silence, so a file
     that never expires eventually pushes a *live* copy out of every listing and
     out of the sweep. Only records marked released are touched, and only ones
-    whose removal stamp is readable — an unreadable record is left where it is.
+    whose removal stamp is readable, an unreadable record is left where it is.
     """
     registry = root / "registry"
     if not registry.is_dir():
@@ -604,7 +604,7 @@ def labels(
 
     ``path`` is in the value as well as the key so a consumer holding one
     annotation can name the working copy itself, not only the repository it
-    belongs to — the project view places a session by `repo` and then has a
+    belongs to: the project view places a session by `repo` and then has a
     real directory to show for it.
     """
     return {
@@ -632,7 +632,7 @@ def preflight(
 
     The delegate path asks this before it reserves or dispatches anything. Once
     a worker row is marked dispatching, a refusal from inside the launcher
-    reads as an uncertain dispatch and costs somebody a manual reconcile — so
+    reads as an uncertain dispatch and costs somebody a manual reconcile, so
     the answer has to be available while refusing is still free.
     """
     wanted = valid_branch(branch)
@@ -842,7 +842,7 @@ def head_of(*, path: Path | str, runner: Runner = subprocess.run) -> dict[str, A
     record.
 
     Each question is asked without ``check``, because a failure here is an
-    answer the caller has to act on rather than an exception to unwind on — but
+    answer the caller has to act on rather than an exception to unwind on, but
     it is the answer *"nobody knows"*, and it comes back in ``unreadable`` so
     that no caller can mistake an empty string for "there is nothing there".
     Every guarantee in this module rests on one of these three values; a git
@@ -907,7 +907,7 @@ def stashes_for(
 
     * **the entry's first parent is the commit this copy is standing on.** The
       only definitive answer, and the only one that works for a stash pushed
-      from a detached HEAD — git records those as ``On (no branch): …``, which
+      from a detached HEAD, git records those as ``On (no branch): …``, which
       names nothing at all.
     * **the subject names one of this copy's branches**, compared with case
       folded on both sides. Git writes the branch as spelled, so a copy on
@@ -982,7 +982,7 @@ def inspect_work(
     thing that permits a removal.
 
     Two kinds of reason go in that list and both keep the copy. ``refusals``
-    that name work — a file, a commit, a stash — and ``unreadable`` ones that
+    that name work, a file, a commit, a stash, and ``unreadable`` ones that
     name a question git could not answer. The second kind matters as much as
     the first: every check here is "prove the work is safe", so a check that
     could not run has not passed, and reading its empty result as "there is
@@ -1159,7 +1159,7 @@ def teardown(
     Refuses a dirty or unmerged worktree unless ``force`` is set, and never
     touches the branch itself: the commits outlive the directory either way.
     A working copy somebody is still standing in is refused whatever ``force``
-    says — that is not a decision about unsaved work, it is pulling the floor
+    says. That is not a decision about unsaved work; it is pulling the floor
     out from under a live session.
     """
     record = lookup(state_dir, path=path, repo=repo, branch=branch, environ=environ)
@@ -1301,7 +1301,7 @@ MANY = "many"
 def _ancestor_pids(proc: Path = Path("/proc")) -> set[int]:
     """This process and everything that started it.
 
-    A session closing from the inside — `bye`, or a provider that exited —
+    A session closing from the inside (`bye`, or a provider that exited)
     runs this code *in* the working copy being released, so its own shell
     would otherwise count as somebody still working in it.
     """
@@ -1339,7 +1339,7 @@ def busy_scan(
     directory shows up here whether or not any record says it owns it.
 
     The process table is not always readable. ``hidepid``, a restricted
-    container, a `/proc` that is not mounted — each of those produces an empty
+    container, a `/proc` that is not mounted, each of those produces an empty
     list that is indistinguishable from "nobody is working in it", and that
     list is the *only* thing standing between a live session and having the
     floor pulled out from under it. So the scan reports what it could not read:
@@ -1556,7 +1556,7 @@ def release_idle(
 
     A close that lands while the worker is still writing keeps the directory
     on purpose. Without this sweep that decision would be permanent, so the
-    same check runs again later — but only ever against a list of what is
+    same check runs again later, but only ever against a list of what is
     alive that the caller actually supplies.
 
     Two rules make this safe to schedule:

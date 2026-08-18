@@ -1,8 +1,8 @@
 """One list of what can come back, behind both surfaces that show it.
 
 The operator closed a session and could not get it back. `sp recover` listed
-it; the picker's Closed-sessions screen — the screen whose only job is
-bringing sessions back — did not list it at all. The two read different
+it; the picker's Closed-sessions screen, the screen whose only job is
+bringing sessions back, did not list it at all. The two read different
 stores: measured live on 2026-08-15 they shared three conversations out of
 fifty-one, and thirty-four of the picker's seventy-seven entries were
 conversations that were open at that moment, offered for restore.
@@ -256,7 +256,7 @@ class RecoveryProjectionTests(unittest.TestCase):
         """Never invent a name; never throw one away either.
 
         Manifests and pending records keep no provenance at all, so a title
-        with none is measured against the labels the kit itself generates —
+        with none is measured against the labels the kit itself generates,
         and against nothing else. Every one of these was found on the real
         machine being shown as though somebody had chosen it.
         """
@@ -386,7 +386,7 @@ class RecoveryProjectionTests(unittest.TestCase):
         """It is a conversation with a transcript, held for them to look at.
 
         Every non-actionable pending row was told it was a plain shell with
-        nothing to reopen — on the list, again when they typed its number, and
+        nothing to reopen, on the list, again when they typed its number, and
         again from `sp restore`.
         """
         rows = self.rows(
@@ -415,7 +415,7 @@ class RecoveryProjectionTests(unittest.TestCase):
         """The ledger knows which session it was; the list has to say so.
 
         A record with no conversation is kept only by its own identity, and
-        the closed loop was not passing the one the ledger holds — so a shell
+        the closed loop was not passing the one the ledger holds, so a shell
         closed while the inventory cache was unreadable was on no screen at
         all.
         """
@@ -1117,7 +1117,7 @@ raise SystemExit(completed.returncode)
 
     def cli_rows(self, screen: str) -> list[dict]:
         rows: list[dict] = []
-        note = " — lost with its session"
+        note = ", lost with its session"
         for line in screen.splitlines():
             if not line.strip() or line.startswith("Bring one back"):
                 continue
@@ -1145,7 +1145,7 @@ raise SystemExit(completed.returncode)
         """Ruling 1, as they meet it: two renderers, one state, one list.
 
         The test this replaces called the same core command twice and asserted
-        the results matched, so it could not see the two screens disagree —
+        the results matched, so it could not see the two screens disagree,
         which is what they were doing about every age on the list and about
         how to act on a row with no number.
         """
@@ -1270,7 +1270,7 @@ raise SystemExit(completed.returncode)
 
         The screen printed a dash where the selector belongs while the parser
         quietly accepted a short id it never showed, and `sp recover` printed
-        that short id — a conversation identifier — as the way in. Both
+        that short id, a conversation identifier, as the way in. Both
         surfaces now offer the same row the same way: by its name.
         """
         entries = self.picker_entries()
@@ -1469,8 +1469,8 @@ raise SystemExit(completed.returncode)
     def test_every_made_up_name_reads_unnamed_on_both_screens(self) -> None:
         """Ruling 4, on the labels the real machine was actually showing.
 
-        None of these records carries provenance — manifests and pending
-        records never have any — so each was shown as though somebody had
+        None of these records carries provenance, manifests and pending
+        records never have any, so each was shown as though somebody had
         chosen it.
         """
         placeholders = (

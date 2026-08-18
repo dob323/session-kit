@@ -102,7 +102,7 @@ CODEX_KNOWN_TOKENS = {
 
 
 def _is_release_date(token: str) -> bool:
-    """`20250929` in `claude-sonnet-4-5-20250929` — a build stamp, not a name."""
+    """`20250929` in `claude-sonnet-4-5-20250929`, a build stamp, not a name."""
     return len(token) == 8 and token.isdigit()
 
 
@@ -110,7 +110,7 @@ def _claude_name(model_id: str) -> str:
     """`claude-sonnet-4-5-20250929` becomes `Sonnet 4.5`.
 
     Every token must be accounted for. This used to skip whatever it did not
-    recognise, so `claude-opus-experimental-5` rendered as `Opus 5` — a
+    recognise, so `claude-opus-experimental-5` rendered as `Opus 5`, a
     different model's name, indistinguishable on screen from the real one.
     A name is only produced when the identifier is fully understood; anything
     else keeps its raw identifier, which is ugly and true.
@@ -254,7 +254,7 @@ def _read_aligned(
 
     A block that begins mid-record would be parsed as garbage, so a start the
     caller cannot vouch for drops its first partial line. ``aligned`` says the
-    caller already knows this offset is a line boundary — a resumed read starts
+    caller already knows this offset is a line boundary, a resumed read starts
     exactly where the last one stopped, and dropping a line there would skip a
     whole record the provider had just appended.
 
@@ -322,7 +322,7 @@ def prune_cache(
 
     Everything else under the state directory has a reaper; this did not, and
     it writes one small file per conversation the kit has ever read a model for
-    — including a `missed_at` marker for every session whose transcript could
+    including a `missed_at` marker for every session whose transcript could
     not be found. Small each, unbounded together, over the life of an install.
 
     A record is kept while its conversation is live, and for a week after it
@@ -462,7 +462,7 @@ def current_model(
     is. That matters more than it looks: finding a Codex rollout means walking
     a sessions tree of several hundred files, and finding a Claude transcript
     means globbing every profile root, so doing it per session per refresh is
-    the expensive part of this — not the reading.
+    the expensive part of this, not the reading.
 
     ``cache_dir`` is what makes the reading cheap: with one, a conversation is
     scanned backward once and afterwards only the bytes the provider has

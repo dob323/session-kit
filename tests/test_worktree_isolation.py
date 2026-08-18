@@ -7,7 +7,7 @@ directory on the machine for good.
 
 So: a machine session in a git repository is given a worktree without asking,
 and the close gives it back. Everything below is about what that must never
-do — remove unsaved work, remove unmerged commits, remove a directory somebody
+do, remove unsaved work, remove unmerged commits, remove a directory somebody
 is still standing in, remove the operator's own checkout, or remove any of the
 copies that were already on this machine before the kit started managing them.
 """
@@ -313,7 +313,7 @@ class WorkIsMoreThanGitStatusTests(unittest.TestCase):
     Every case below was clean to `git status --porcelain` and every one of
     them is somebody's work. The first two destroy it permanently: a commit
     that exists on no branch dies with the worktree's reflog, and a file the
-    repository ignores — a report, a log, a screenshot, a `.env` — is exactly
+    repository ignores, a report, a log, a screenshot, a `.env`, is exactly
     what an agent produces all day.
     """
 
@@ -556,7 +556,7 @@ class WorkIsMoreThanGitStatusTests(unittest.TestCase):
 
         A reference that does not exist makes `merge-base` exit 128, so the
         comparison produces an error rather than an answer. That error used to
-        read as an ordinary refusal, which `--force` covers — and the forced
+        read as an ordinary refusal, which `--force` covers, and the forced
         removal takes the copy's reflog, the only thing that reaches the
         commit.
         """
@@ -616,7 +616,7 @@ class AQuestionGitCouldNotAnswerKeepsTheCopyTests(unittest.TestCase):
 
     Every guard in the module asks git to *prove* the work is safe. Each of
     those questions was asked without `check`, and each empty answer was then
-    read as "there is nothing there" — so one failed `git rev-parse` switched
+    read as "there is nothing there", so one failed `git rev-parse` switched
     off the identity check, the half-finished-operation check and the
     unmerged-commit check together, and the copy was removed in silence.
 
@@ -718,7 +718,7 @@ class AQuestionGitCouldNotAnswerKeepsTheCopyTests(unittest.TestCase):
         """One session, two copies, one unreadable record.
 
         Concluding "this session holds exactly one copy" from a listing that
-        silently dropped the other is how the other becomes permanent — the
+        silently dropped the other is how the other becomes permanent, the
         exact failure the many-copies branch exists to prevent.
         """
         second = worktrees.materialize(
@@ -743,8 +743,8 @@ class AQuestionGitCouldNotAnswerKeepsTheCopyTests(unittest.TestCase):
 class OnlyOurOwnRegistrationIsEverForgottenTests(unittest.TestCase):
     """`git worktree prune` is repository-wide, and that is somebody else's work.
 
-    A worktree's `.git/worktrees/<name>` directory holds its index — its
-    staged-but-uncommitted content — its HEAD, its reflog and its rebase state.
+    A worktree's `.git/worktrees/<name>` directory holds its index, its
+    staged-but-uncommitted content, its HEAD, its reflog and its rebase state.
     `git worktree prune` deletes that directory for *every* worktree of the
     repository whose own directory it cannot reach at that moment: one on a
     volume that is not mounted, one on a share that is briefly down, one
@@ -847,7 +847,7 @@ class ACheckoutThatIsTheRunningThingIsNeverCopiedTests(unittest.TestCase):
     """Some directories are served live. A copy of one is not isolation.
 
     Editing a copy of a checkout whose files are being served is work that
-    never takes effect — and the repository would collect a branch per
+    never takes effect, and the repository would collect a branch per
     delegated session besides. A repository says so for itself with a marker
     file, or the host names it; either way nothing is written into it and
     nothing is ever removed outside the kit's own root.
@@ -905,8 +905,8 @@ class ACheckoutThatIsTheRunningThingIsNeverCopiedTests(unittest.TestCase):
         """The one answer that needs nobody to have configured anything.
 
         The marker file and `SESSION_KIT_SHARED_REPOS` are both opt-in, so on a
-        host where nobody set either — which is every host until somebody does
-        — a checkout that *is* the running site was copyable. Where a
+        host where nobody set either, which is every host until somebody does
+        a checkout that *is* the running site was copyable. Where a
         repository lives is a fact about it, and `/srv`, `/var`, `/opt` and
         `/usr` are where a machine keeps software it runs.
         """
@@ -1012,7 +1012,7 @@ class AReleasedCopyStillLeadsBackToItsRepositoryTests(unittest.TestCase):
     """A delegated session that closes cleanly must stay restorable.
 
     Its recorded directory is the copy, and a clean close is exactly the case
-    where the copy is collected — so the most ordinary delegated session was
+    where the copy is collected, so the most ordinary delegated session was
     also the one whose conversation could never be reopened: restore refuses a
     directory that does not exist, and no screen offers another one. The
     release leaves a tombstone naming the repository, and the restore reopens
@@ -1252,7 +1252,7 @@ class DelegatedSessionsAreIsolatedByDefaultTests(unittest.TestCase):
         `copy-check` answers in exit codes: 0 with a reason means do not copy
         this one, 1 means copying it is fine. Every other exit is the check
         itself failing, and reading "non-zero" as "go ahead" put a delegated
-        session in a copy of a checkout that might be the running site — where
+        session in a copy of a checkout that might be the running site, where
         its edits take effect nowhere and the verification reads the old page.
         """
         started = run(

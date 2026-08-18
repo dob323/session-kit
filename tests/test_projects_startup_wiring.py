@@ -1,8 +1,8 @@
 """A startup command a person can review and approve.
 
 `sp new` reads a project's launch plan and refuses to run a startup command
-nobody approved. The verbs that review and approve one existed — in
-lib/sessionkit_projects/cli.py — but `session-kit projects` dispatched only to
+nobody approved. The verbs that review and approve one existed, in
+lib/sessionkit_projects/cli.py, but `session-kit projects` dispatched only to
 the project-list tool, so no command a person could type reached them. An
 unapproved command could therefore never become approved, and the notice `sp
 new` printed pointed at nothing.
@@ -112,7 +112,7 @@ class ProjectPlanFieldsTests(unittest.TestCase):
     run of them reads as ONE separator, so the empty account field vanished and
     every field after it shifted left. The model landed in the account
     variable and `sp new <project>` refused itself with "--account is available
-    only for Claude or Codex with an enrolled alias" — a flag nobody typed.
+    only for Claude or Codex with an enrolled alias", a flag nobody typed.
     """
 
     def setUp(self) -> None:

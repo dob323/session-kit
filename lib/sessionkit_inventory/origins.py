@@ -2,7 +2,7 @@
 
 The picker's default view is the person's own screen. Everything an
 automation, a drill, or a headless restore creates belongs behind one counted
-row — it is work nobody chose to look at, and a list that mixes the two makes
+row; it is work nobody chose to look at, and a list that mixes the two makes
 a person's own sessions harder to find every time a machine starts one.
 
 Origin is stamped at CREATION, by the verb that creates the session, because

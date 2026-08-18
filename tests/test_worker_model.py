@@ -1,6 +1,6 @@
 """The launch gate's own rules, pinned.
 
-``validate_requested_model`` sits on the LIVE launch path — the login shell
+``validate_requested_model`` sits on the LIVE launch path, the login shell
 (bashrc/shpool.bashrc) and ``sp new`` both call the ``validate-worker-model``
 verb before starting a provider. It moved into ``sessionkit_inventory`` in the
 one-door rebuild (2026-08-12); these tests pin its rules so a future edit

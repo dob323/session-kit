@@ -3,9 +3,9 @@
 Both stores keep small documents the operator alone may read or change, and
 both are read back by code that acts on them: a worktree record decides which
 directory `sp` is allowed to remove, and a receipt decides whether a worker is
-allowed to keep spending. A record that exists but cannot be trusted — a
+allowed to keep spending. A record that exists but cannot be trusted, a
 symlink, another owner's file, a group-readable one, one larger than its
-subsystem ever writes — is an error here, never a silent absence. Answering
+subsystem ever writes, is an error here, never a silent absence. Answering
 "no such record" for a damaged file is how a live worktree gets orphaned or a
 breached cap gets forgotten.
 
@@ -116,8 +116,8 @@ def private_names(
     """Sorted record names in one private directory, bounded and symlink-free.
 
     ``strict`` refuses a directory holding more records than the bound instead
-    of returning the first ``limit`` of them. A caller that sums the records —
-    spend against a cap — has to refuse, because a truncated list reads as a
+    of returning the first ``limit`` of them. A caller that sums the records
+    (spend against a cap) has to refuse, because a truncated list reads as a
     smaller total and a cap that under-counts is not a cap.
     """
     try:
