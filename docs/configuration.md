@@ -114,6 +114,28 @@ feed, not just its own row. A single value cannot reveal a units change — if
 percents replaced fractions, `55` is obviously wrong but `0`, `1` and `2` still
 parse — so one impossible number means none of that feed's numbers are judged.
 
+### Before you turn automatic switching on
+
+Read this first, because the consequence lands on your account rather than on
+this tool.
+
+Holding several subscriptions and doing your own work on each one is ordinary
+use. Nothing here shares an account between people, resells access, or puts a
+subscription token into a harness of its own: every session launches the
+provider's own binary against its own configuration directory, and the kit
+never reads, copies, prints, or logs a token. That is the side of the line
+providers have drawn.
+
+Moving a conversation to another account *because the first account hit its
+limit* is a different shape. However many subscriptions you paid for, an
+automated move triggered by exhaustion is the pattern that limit-evasion
+enforcement is built to find, and enforcement acts on accounts. This is a
+judgement about your own risk, and it is why the mechanism ships off, why the
+installer never enables it, and why nothing turns it on for you.
+
+If you want the information without the action, leave the watchdog in `report`
+mode and read what it would have done. That costs nothing and carries no risk.
+
 `sp account-auto-switch <session>` prints the decision for one session and
 changes nothing; `--apply` is what actually moves it. Judging is the default
 because this verb moves a live conversation between paid subscriptions and is

@@ -8,6 +8,10 @@
 
 Session Kit is a local picker for Claude Code and Codex. Type `kit` and every session you are running is in one list, each with a stable number, a name, and a state word that says whether it is waiting on you or still working. The sessions run on the host, so closing the terminal or dropping SSH does not end them.
 
+One limit, stated up front rather than in a table further down: Claude Code reports a blocking prompt the moment it opens one, so `question` is exact. Codex does not expose that yet, so a Codex session reads `needs you` when its turn ends rather than the instant it asks you something.
+
+**What is on the screen is not what gets trusted.** The number, the name, the directory, the timestamps — all of that is display. Identity is the provider's conversation UUID together with the exact process generation, and every action that changes anything re-proves that against the live system in the moment before it runs, then refuses outright on evidence that is missing, stale, partial or contradictory. This is the part worth caring about: a picker one second out of date still cannot act on the wrong session, because the picker was never the evidence.
+
 **Every session names itself.** It takes a short title from its own first piece of work, keeps a number that does not move, and gets a colour of its own. All three follow the session *into* its own window — the tab title carries the name and number, and the session is tinted its colour in Claude Code and Codex themselves. So the window you are typing in tells you which session it is, and the picker and the session never disagree about it. Colours are kept distinct from the other live sessions: eight for Claude Code, six for Codex, chosen so no Claude session can ever share a colour with a Codex one.
 
 **Every session can use a different subscription.** Enrol several accounts for the same provider and hand each session whichever one you want — three Claude Code subscriptions running in three sessions side by side on one machine, at the same time. The account belongs to the session, not to the machine or to the terminal you launched from, which is the usual arrangement elsewhere.
@@ -19,10 +23,10 @@ Session Kit is a local picker for Claude Code and Codex. Type `kit` and every se
 <p align="center">
   <a href="#install">Install</a> ·
   <a href="#the-picker">The picker</a> ·
+  <a href="#safety-model">Safety model</a> ·
   <a href="#accounts-and-subscriptions">Accounts</a> ·
   <a href="#delegated-work">Delegated work</a> ·
   <a href="#how-it-works">How it works</a> ·
-  <a href="#safety-model">Safety model</a> ·
   <a href="#documentation">Documentation</a>
 </p>
 
@@ -46,7 +50,6 @@ Session Kit is a local picker for Claude Code and Codex. Type `kit` and every se
 | **Guarded actions** | Every mutation rechecks exact live identity immediately before it runs, and refuses on any doubt. |
 | **Recoverable conversations** | Closing a Claude Code or Codex session records the exact conversation for restore. |
 | **Isolated working copies** | A delegated session gets its own git worktree on its own branch, and hands it back when it closes — kept instead, with the reason named, whenever giving it back could lose work. |
-| **Quota carry-over** | A conversation whose weekly quota runs out is carried to another enrolled account once, and you are told afterwards. |
 | **Local only** | No hosted account, no analytics, no update beacon, no telemetry. |
 
 ## Is this for you?
@@ -56,11 +59,19 @@ It fits best if you run several AI coding sessions at once, work on a remote hos
 Here is what it does **not** do:
 
 - **No diff review.** It will not show you what a session changed. That stays in git and your editor.
-- **No cost or spend accounting.** It can read the provider's own quota percentages and act when one runs out, but it does not price or count tokens.
+- **No cost or spend accounting.** It can read the provider's own quota percentages and tell you when one runs out, but it does not price or count tokens.
 - **Not a multiplexer.** It runs on [shpool](https://github.com/shell-pool/shpool) and does not replace tmux, or try to.
 - **Not a security boundary.** It protects you from acting on the wrong session, not from a hostile process running as you.
 
 If what you actually need is reviewing the diff each agent produced, a different tool will serve you better.
+
+### Why not tmux, or one of the other session managers?
+
+**tmux** is already on your machine and keeps processes alive, which is most of the way there. What it does not do is tell you which of eleven panes is waiting on an answer, and it has no notion of which conversation a pane holds — so nothing stops you acting on the pane next to the one you meant. If you are running two sessions, tmux is enough and this is overkill.
+
+**The other AI session managers** solve the listing problem, and several are pleasant. The difference is what they do with the list: they act on it. Here the list is treated as a cache that can be a second out of date, and identity is re-proved against the live system before anything is changed. That distinction only matters when you have enough sessions that the list *can* be wrong — which is also the point where you start needing this.
+
+**What it costs you:** this runs on shpool rather than tmux, so there is one more thing to install before you see anything. That was a deliberate trade — shpool gives a clean session per shell without fighting multiplexer semantics, which is what makes a session's identity provable at all. It is a real cost, and it is paid before you get to the payoff.
 
 ## Install
 
@@ -103,7 +114,7 @@ session-kit doctor
 
 ### Requirements
 
-- shpool `0.11.0`
+- shpool `0.11.0` — the stock build. The optional patches in [`shpool-patch/`](shpool-patch/) are **not** needed to install or to start using this; that decision can wait until something makes you want them
 - Claude Code, Codex, or both
 - one trusted Unix account, with per-user service access
 
@@ -171,6 +182,26 @@ A session that is open elsewhere defaults to **Move it here** after a fresh iden
 
 Press `?` for the full key reference — filtering, ranges, grouping, forking, renaming, and `g` to jump to the next session that needs you are all there. See [Picker navigation](docs/picker-navigation.md) for the cursor-driven picker, mouse behavior, action panels, machine sessions, and closed-session restore.
 
+## Safety model
+
+Session Kit deliberately separates **what you see** from **what it trusts**.
+
+<p align="center">
+  <img src="docs/assets/readme/safety-model.png" alt="Four steps: a frozen snapshot, binding an action proof to the exact provider UUID and generation, rechecking live identity immediately before acting, then acting or refusing" width="100%">
+</p>
+
+1. **Provider UUID plus exact process generation is identity.**
+2. Session number, title, directory, timestamps, and terminal output are display context.
+3. Every mutation rechecks live identity immediately before it runs.
+4. Missing, stale, partial, duplicated, or conflicting evidence fails closed.
+5. A refusal changes nothing.
+
+Before a proof-bound action, Session Kit can bind and recheck the session manager, terminal generation, managed shell, provider process and ancestry, exact provider conversation UUID, and frozen snapshot generation. The proof is owner-only and short-lived.
+
+This protects against stale or ambiguous picker state selecting a different session than the one you intended. It does **not** isolate mutually hostile processes running with your own Unix-user privileges.
+
+Read [Security and local data](docs/security-and-data.md) and [Architecture](docs/architecture.md) for the complete trust model.
+
 ## Accounts and subscriptions
 
 One machine, several logins for the same provider, one per session. Enrol each account once and it becomes a choice at launch:
@@ -184,9 +215,15 @@ Each enrolled account keeps its own provider configuration directory, so a sessi
 
 This is the part most session tools do not do. A terminal multiplexer inherits whichever login the shell that started it happened to have, so every window shares one subscription. Here the account is a property of the session.
 
-Provider authentication stays in provider-owned storage throughout. Session Kit does not ask for, copy, print, or log provider tokens.
+Provider authentication stays in provider-owned storage throughout. Each session launches the provider's own binary against its own configuration directory. Session Kit does not ask for, copy, print, or log provider tokens, and it does not put a subscription token into any harness of its own.
 
-When a conversation's weekly quota runs out, it can be carried to another enrolled account once, and you are told after the fact rather than asked in the middle of your work. Read [Configure Session Kit](docs/configuration.md) for enrolment, verification, and the carry-over rules.
+### Carrying a conversation to another account
+
+There is a mechanism that can move one idle conversation to another enrolled account when its weekly quota runs out. **It is off, and it stays off until you turn it on.** The watchdog runs in `report` mode by default and only says what it would do; automatic changes require setting `SESSION_KIT_WATCHDOG_MODE=repair` deliberately.
+
+Leave it off unless you have a reason. Owning several subscriptions and using each for your own work is ordinary use. Moving work between accounts *because a limit was reached* is a different shape, and it is the shape providers look for when they enforce against limit evasion — the consequence lands on your account, not on this tool. `sp account-auto-switch <session>` shows you what would happen without doing it.
+
+Read [Configure Session Kit](docs/configuration.md) for enrolment, verification, and the carry-over rules in full.
 
 ## Delegated work
 
@@ -215,26 +252,6 @@ Install Session Kit where the work actually runs.
 - A host reboot ends them. Recoverable Claude Code and Codex conversations remain available through **Closed sessions**.
 
 There is no Session Kit server to deploy.
-
-## Safety model
-
-Session Kit deliberately separates **what you see** from **what it trusts**.
-
-<p align="center">
-  <img src="docs/assets/readme/safety-model.png" alt="Four steps: a frozen snapshot, binding an action proof to the exact provider UUID and generation, rechecking live identity immediately before acting, then acting or refusing" width="100%">
-</p>
-
-1. **Provider UUID plus exact process generation is identity.**
-2. Session number, title, directory, timestamps, and terminal output are display context.
-3. Every mutation rechecks live identity immediately before it runs.
-4. Missing, stale, partial, duplicated, or conflicting evidence fails closed.
-5. A refusal changes nothing.
-
-Before a proof-bound action, Session Kit can bind and recheck the session manager, terminal generation, managed shell, provider process and ancestry, exact provider conversation UUID, and frozen snapshot generation. The proof is owner-only and short-lived.
-
-This protects against stale or ambiguous picker state selecting a different session than the one you intended. It does **not** isolate mutually hostile processes running with your own Unix-user privileges.
-
-Read [Security and local data](docs/security-and-data.md) and [Architecture](docs/architecture.md) for the complete trust model.
 
 ## Claude Code and Codex
 
