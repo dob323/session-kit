@@ -67,7 +67,6 @@ The key-driven home screen keeps the common actions visible:
 | `m` | Open More. |
 | `a` | Show everything that needs you. |
 | `h <number>` | Read settled history without opening the session. |
-| `p <number>` | Pin that session's project; its sessions hold the top of the list, marked `*`. |
 | `?` | Show picker help. |
 | `b` or `q` | Leave the home screen for an ordinary shell. |
 
