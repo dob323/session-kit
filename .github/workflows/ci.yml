@@ -7,12 +7,13 @@ on:
   pull_request:
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  # Superseding a branch run saves runner time. Superseding a run on the
-  # default branch does something else: the cancelled run is the one the
-  # README badge reads, and GitHub draws a cancelled run as "failing". Two
-  # pushes ten minutes apart therefore showed the project as broken when
-  # nothing had failed. Default-branch runs always finish and report.
+  # Branch runs share one group and supersede each other, which saves runner
+  # time on a busy branch. Default-branch runs get a group of their own per
+  # run, so they neither cancel nor queue behind anything: the badge reads
+  # the newest default-branch run, GitHub draws both cancelled AND queued-
+  # then-superseded runs as failing, and several pushes an hour apart left
+  # the project looking broken while every job that ran had passed.
+  group: ci-${{ github.workflow }}-${{ github.ref }}-${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && github.run_id || 'branch' }}
   cancel-in-progress: ${{ github.ref != format('refs/heads/{0}', github.event.repository.default_branch) }}
 
 permissions:
