@@ -141,7 +141,13 @@ class CodexTitlerTests(unittest.TestCase):
                 for number in range(1, 261)
             ]
             codex = self.store(home, threads)
-            result = self.run_pass(codex, home)
+            # A stopped clock, because this test is about the backlog and not
+            # about the two-second budget: with the real clock, a loaded CI
+            # runner spent the budget partway through and named 169 of 260.
+            # The budget has its own tests, which pin the clock the same way.
+            result = self.run_pass(
+                codex, home, budget_seconds=1.0, monotonic=lambda: 0.0
+            )
             self.assertEqual(260, len(result))
             self.assertIn(uuid_for(260), self.indexed(codex))
 
