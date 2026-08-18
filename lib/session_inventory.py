@@ -4613,6 +4613,43 @@ def _color_command(args: argparse.Namespace, config: dict[str, Any]) -> int:
     return 0
 
 
+def _self_name_command(config: dict[str, Any], title: str) -> int:
+    """`sp self-name`, with an exit status that means what it says.
+
+    This used to `return 0` whatever came back. A root agent is told to name
+    itself on its first substantive turn and to report `name failed` if that
+    does not work, so it needs an answer it can act on; instead a self-name
+    that never took looked exactly like one that did. Observed live on
+    2026-08-17: the call met the collector jam, was killed while waiting, and
+    the session ran for three hours unnamed with nothing to show for it.
+
+    Two things are checked, both cheap and both read-back rather than trust:
+    the written document has to actually carry this title for this session,
+    and the name has to be showing rather than queued behind a retry. Either
+    way the JSON still prints, so a caller that wants the detail keeps it.
+    """
+    result = self_name_automatic_title(config, title)
+    _json_print(result)
+    caller = result.get("caller") or {}
+    key = f"{caller.get('provider')}:{caller.get('uuid')}"
+    stored = (result.get("aliases") or {}).get(key)
+    if stored != result.get("title"):
+        print(
+            f"session-kit: the self-name did not take for {key}; "
+            "nothing was written. Retry.",
+            file=sys.stderr,
+        )
+        return 1
+    if result.get("automatic_name_state") != "ready":
+        print(
+            "session-kit: the name is recorded but not showing yet; a retry is "
+            "queued. Treat this as not yet named.",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
 def _automatic_title_command(args: argparse.Namespace, config: dict[str, Any]) -> int:
     if args.automatic_title_action == "list":
         document = _private_alias_document(config_path(), allow_missing=True)
@@ -4630,8 +4667,7 @@ def _automatic_title_command(args: argparse.Namespace, config: dict[str, Any]) -
         )
         return 0
     if args.automatic_title_action == "self-name":
-        _json_print(self_name_automatic_title(config, args.title))
-        return 0
+        return _self_name_command(config, args.title)
     if args.automatic_title_action == "from-hook":
         _json_print(auto_title_from_hook(sys.stdin.read()))
         return 0

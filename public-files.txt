@@ -111,6 +111,7 @@ tests/test_picker_rows_grammar.py
 tests/test_picker_stderr_survives.py
 tests/test_picker_ux.py
 tests/test_readme_anatomy.py
+tests/test_self_name_exit_status.py
 tests/test_projects.py
 tests/test_projects_context.py
 tests/test_projects_identity.py

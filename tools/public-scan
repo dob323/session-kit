@@ -94,11 +94,22 @@ APPROVED_BINARY_SHA256 = {
         # all. The picker render is pasted unscaled-in-aspect and verified
         # pixel-identical to tools/render-readme-picker output before approval.
         "2819ce4a9fc8a8d6ecace378d9f7dbbc24dfb3d3074118f6a836cf3d174f95b6",
+        # 2026-08-17, third cut: an annotated picker rather than an explainer.
+        # The capture is pasted at native size and is byte-identical to the
+        # render; every label sits outside it and its leader stops short of the
+        # border, so the crop of this figure and the picker render compare
+        # equal pixel for pixel. Includes the prompt line the renderer used to
+        # trim, and the ↵ and ❯ glyphs now that the host has a font with them.
+        "e637186dfc12ad5e631074fdc4b6edb6fc096d90d5abad151287dc16db58dfc6",
     ),
     # The bare picker render, identical to the docs/assets/session-kit-picker
     # blob above because both come from the same deterministic tool.
     "docs/assets/readme/picker-home.png": (
         "5cb56b210644526e5cc54534248a922ae2e2dca36c0ef717c211caa9f5a83ca8",
+        # 2026-08-17 re-render: keeps the prompt line, and the ↵ and ❯ glyphs
+        # resolve now that the render host has a font carrying them. Both used
+        # to reach the README as missing-glyph boxes.
+        "f41b7567f281bf4d0548769442673c4e2908ba762ae7edd92f5b840a895d9c95",
     ),
     # GitHub social preview: 1280x640, uploaded through repository settings,
     # versioned here so the share artwork travels with the rest.
