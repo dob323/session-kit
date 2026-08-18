@@ -82,7 +82,15 @@ jobs:
           python-version: "3.13"
       - name: Install supported Bash
         run: |
-          brew install bash
+          # A runner image can arrive with a third-party tap Homebrew refuses
+          # to trust, and `brew install` then exits nonzero over a tap this
+          # job never asked for. Untrusted taps are removed first so the
+          # install speaks only about Bash.
+          for tap in $(brew tap 2>/dev/null); do
+            case "$tap" in homebrew/*) continue ;; esac
+            brew untap "$tap" 2>/dev/null || true
+          done
+          brew install bash || brew list bash
           modern_bash="$(brew --prefix bash)/bin/bash"
           test -x "$modern_bash"
           printf 'SESSION_KIT_TEST_BASH=%s\n' "$modern_bash" >> "$GITHUB_ENV"
