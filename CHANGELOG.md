@@ -6,6 +6,18 @@ All notable changes to Session Kit are documented here.
 
 ### Fixed
 
+- Both pickers now agree with their own list about which sessions are waiting.
+  The 2026-08-15 ruling that a finished provider turn is `needs you` however
+  the vendor spells it lives in `labels.STATE_WORDS`, and the list column reads
+  it through `labels.session_state`. Neither the Needs-you screen, `g`, nor the
+  cursor picker's count did: they tested the raw `needs_you` and
+  `blocking_question` flags, which the ruling never touched. A Codex turn
+  ending in `task_complete` reports `agent_status: idle` with
+  `needs_you: false`, so its row printed `needs you` while the screen left it
+  out and `g` skipped past it. On a live estate of nine sessions the list
+  showed seven waiting and the screen said one. Both surfaces now ask
+  `labels.session_state`. The new test is a superset of the flags it replaces,
+  so no row that was listed before stops being listed.
 - The documented install command could not run. `gh release download` without a
   tag requires `--pattern` or `--archive`, so the version-free form printed a
   flag error instead of downloading anything. The README and `docs/install.md`

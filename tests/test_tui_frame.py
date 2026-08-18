@@ -187,7 +187,7 @@ class AttentionLineTests(unittest.TestCase):
         screen, drawn = frame_of(
             row("Alpha", number=1, needs_you=True),
             row("Beta", number=2, needs_you=True),
-            row("Gamma", number=3),
+            row("Gamma", number=3, agent_status="working"),
         )
         # joined(), not text(): the line was drawn in the tail, and asserting
         # its ABSENCE on text() passed at the parent commit as well -- a test

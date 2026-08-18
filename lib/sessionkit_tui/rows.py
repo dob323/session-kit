@@ -88,12 +88,26 @@ def is_seen(session: Session, seen: Iterable[str]) -> bool:
     return session.key in set(seen)
 
 
-def needs_you(session: Session, seen: Iterable[str]) -> bool:
-    """A session a person is looking at is seen, never counted as waiting."""
+# The words that mean a person is being waited on. `idle` is one of them: it
+# is a needs-you session whose transcript has stopped moving, not a state of
+# its own.
+ATTENTION_STATES = frozenset({labels.QUESTION, labels.WAITING_ON_YOU, labels.IDLE})
 
-    return bool(
-        session.needs_you or session.raw.get("blocking_question") is True
-    ) and not is_seen(session, seen)
+
+def needs_you(session: Session, seen: Iterable[str]) -> bool:
+    """A session a person is looking at is seen, never counted as waiting.
+
+    Asked of the state word this row displays, not of the raw `needs_you` and
+    `blocking_question` flags underneath it. Those answer a narrower question:
+    a provider turn that ended normally reports `agent_status: idle` with
+    `needs_you: false`, so the row read `needs you` on screen while this
+    predicate said no, and the count beside it disagreed with the rows it was
+    counting.
+    """
+
+    if is_seen(session, seen):
+        return False
+    return session.state_word() in ATTENTION_STATES
 
 
 def _natural_key(session: Session) -> tuple:

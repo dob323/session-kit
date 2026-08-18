@@ -29,6 +29,14 @@ def waiting(shpool_id: str, *, number: int, provider: str = "codex") -> dict:
     return row(shpool_id, number=number, provider=provider, needs_you=True)
 
 
+def working(shpool_id: str, *, number: int, provider: str = "codex") -> dict:
+    """A turn the model is driving, which is nobody's turn to answer."""
+
+    item = row(shpool_id, number=number, provider=provider, needs_you=False)
+    item["agent_status"] = "working"
+    return item
+
+
 def quarantined(shpool_id: str, *, provider: str = "claude") -> dict:
     """A real, designed state: the shell generation could not be proven."""
     item = row(shpool_id, number=99, provider=provider, needs_you=True)
@@ -324,6 +332,76 @@ class ActionReceiptTests(unittest.TestCase):
                     if entry.get("args", [""])[0] == "picker-history"
                 ],
             )
+        finally:
+            fixture.close()
+
+
+
+
+class TheScreenAgreesWithTheListTests(unittest.TestCase):
+    """One definition of a waiting session, on both surfaces.
+
+    The 2026-08-15 ruling is that a finished provider turn is `needs you`
+    however the vendor spells it, and it lives in labels.STATE_WORDS: a Claude
+    session parked at its prompt raises the vendor's own notification and a
+    Codex session parked at exactly the same prompt writes `task_complete`, so
+    both map to the one word. The list reads that word through
+    labels.session_state. This screen used to read the raw `needs_you` and
+    `blocking_question` flags instead, which the ruling never touched, so a
+    normal finished Codex turn printed `needs you` on the list and was absent
+    here -- six of nine sessions on one live estate.
+    """
+
+    def finished_turn(self, shpool_id: str, *, number: int) -> dict:
+        """A provider turn that ended normally: the shape the collector writes.
+
+        `agent_status: idle` with `needs_you: false` is what collector.py
+        produces for a Codex rollout ending in `task_complete`, and it is the
+        ordinary resting state of a session waiting on a person.
+        """
+
+        item = row(shpool_id, number=number, provider="codex", needs_you=False)
+        item["agent_status"] = "idle"
+        return item
+
+    def test_a_finished_turn_is_on_the_screen_that_names_who_is_waiting(
+        self,
+    ) -> None:
+        fixture = LoginFixture(inventory(self.finished_turn("alpha", number=4)))
+        try:
+            code, output = run_pty(fixture, b"a\nq\nq\n", columns=120)
+            self.assertEqual(0, code)
+            self.assertIn("needs you: 1", output)
+            self.assertNotIn("Nothing needs you.", output)
+        finally:
+            fixture.close()
+
+    def test_both_surfaces_count_the_same_sessions(self) -> None:
+        """The list's own state words are the count this screen must match."""
+
+        fixture = LoginFixture(
+            inventory(
+                self.finished_turn("alpha", number=4),
+                self.finished_turn("bravo", number=5),
+                row("charlie", number=6, provider="claude", needs_you=True),
+                working("delta", number=7),
+            )
+        )
+        try:
+            code, output = run_pty(fixture, b"a\nq\nq\n", columns=120)
+            self.assertEqual(0, code)
+            self.assertIn("needs you: 3", output)
+        finally:
+            fixture.close()
+
+    def test_a_working_session_is_not_called_waiting(self) -> None:
+        """The superset must not have swallowed the whole estate."""
+
+        fixture = LoginFixture(inventory(working("delta", number=7)))
+        try:
+            code, output = run_pty(fixture, b"a\nq\nq\n", columns=120)
+            self.assertEqual(0, code)
+            self.assertIn("Nothing needs you.", output)
         finally:
             fixture.close()
 

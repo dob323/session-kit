@@ -265,7 +265,10 @@ class EnterTests(unittest.TestCase):
         self.assertEqual("2 sessions marked", screen.panel.title)
 
     def test_the_counted_machine_row_opens_in_place(self) -> None:
-        screen = picker(row("Mine", number=1), row("Drill", number=2, origin="machine"))
+        screen = picker(
+            row("Mine", number=1),
+            row("Drill", number=2, origin="machine", agent_status="working"),
+        )
         screen.move(1)
         self.assertEqual("1 machine session", screen.current_row().label)
         self.assertIsNone(screen.enter())

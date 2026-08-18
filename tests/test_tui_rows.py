@@ -109,8 +109,8 @@ class MachineRowTests(unittest.TestCase):
     def test_machine_sessions_stay_behind_one_counted_row(self) -> None:
         sessions = inventory(
             row("Mine", number=1),
-            row("Drill", number=2, origin="machine"),
-            row("Worker", number=3, origin="machine"),
+            row("Drill", number=2, origin="machine", agent_status="working"),
+            row("Worker", number=3, origin="machine", agent_status="working"),
         ).sessions
         drawn = rowmod.build_rows(sessions)
         labels = [item.label for item in drawn]
@@ -121,7 +121,7 @@ class MachineRowTests(unittest.TestCase):
     def test_the_counted_row_expands_in_place(self) -> None:
         sessions = inventory(
             row("Mine", number=1),
-            row("Drill", number=2, origin="machine"),
+            row("Drill", number=2, origin="machine", agent_status="working"),
         ).sessions
         drawn = rowmod.build_rows(sessions, machine_expanded=True)
         labels = [item.label for item in drawn]
@@ -132,7 +132,7 @@ class MachineRowTests(unittest.TestCase):
     def test_the_counted_row_says_how_many_of_them_need_you(self) -> None:
         sessions = inventory(
             row("Drill", number=1, origin="machine", needs_you=True),
-            row("Worker", number=2, origin="machine"),
+            row("Worker", number=2, origin="machine", agent_status="working"),
         ).sessions
         drawn = rowmod.build_rows(sessions)
         self.assertIn("2 machine sessions · 1 needs you", [item.label for item in drawn])

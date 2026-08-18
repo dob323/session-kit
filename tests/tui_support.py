@@ -43,6 +43,9 @@ def row(
     quiet_seconds: int | None = None,
     subagents: int = 0,
     age_seconds: int = 300,
+    # A provider turn that has finished. This is a WAITING session: `idle`
+    # maps to `needs you`, so a fixture row that is meant to want nothing
+    # from a person has to say `agent_status="working"` for itself.
     agent_status: str = "idle",
     display_color: str | None = None,
 ) -> dict:

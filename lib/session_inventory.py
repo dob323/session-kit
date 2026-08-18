@@ -6328,11 +6328,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "render":
             print(render_inventory(inventory, rows_only=args.rows))
         elif args.command == "waiting-count":
+            # The state word each row displays, not the raw flags under it: a
+            # provider turn that ended normally reports `agent_status: idle`
+            # with `needs_you: false`, and `idle` is a needs-you session that
+            # has gone quiet. Counting the flags made this disagree with the
+            # picker it is supposed to summarise.
+            stall = _render.stall_threshold_seconds()
             print(
                 sum(
                     1
                     for item in inventory["sessions"]
-                    if item.get("blocking_question") or item.get("needs_you")
+                    if _labels.session_state(item, stall_seconds=stall)
+                    in {_labels.QUESTION, _labels.WAITING_ON_YOU, _labels.IDLE}
                 )
             )
         elif args.command == "lookup":

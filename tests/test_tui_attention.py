@@ -121,7 +121,7 @@ class DrillableTests(unittest.TestCase):
 
     def test_a_machine_session_that_needs_you_is_counted_where_it_is_shown(self) -> None:
         screen = picker(
-            row("Mine", number=1),
+            row("Mine", number=1, agent_status="working"),
             row("Drill", number=2, origin="machine", needs_you=True),
         )
         self.assertEqual(0, attention_of(screen))

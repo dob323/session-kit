@@ -37,6 +37,8 @@ import re
 import sys
 import unicodedata
 
+from sessionkit_inventory.common import stall_threshold_seconds
+from sessionkit_inventory.labels import IDLE, QUESTION, WAITING_ON_YOU, session_state
 from sessionkit_inventory.model import (
     canonical_session_order_key,
     classify_top_level_sessions,
@@ -152,6 +154,45 @@ def group_label(row):
         else "Open elsewhere"
     )
 
+# The one state word a row displays is the authority for whether it is waiting,
+# because that word is what the person read on the list. It is derived HERE the
+# same way the list derives it -- labels.session_state, the function
+# render.py already calls for the state column -- rather than read from a
+# precomputed field, so the two surfaces cannot answer differently and neither
+# depends on a publisher having filled one in.
+#
+# This used to test the raw `needs_you`/`blocking_question` flags, which is a
+# different question. The 2026-08-15 ruling that a finished provider turn is
+# `needs you` however the vendor spells it lives in labels.STATE_WORDS and
+# never reached this screen: a Codex turn ending in `task_complete` reports
+# `agent_status: idle` with `needs_you: false`, so the list said `needs you`
+# for it while this screen left it out and `g` skipped past it.
+#
+# The test is a superset of the flags it replaced -- blocking_question yields
+# `question`, and needs_you yields `needs you` or `idle` -- so no row that was
+# listed before can stop being listed now.
+ATTENTION_STATES = {QUESTION, WAITING_ON_YOU, IDLE}
+_stall_seconds = stall_threshold_seconds()
+
+
+def waiting_state(row):
+    """The word the list shows for this row."""
+
+    return session_state(row, stall_seconds=_stall_seconds)
+
+
+def is_waiting(row):
+    """Whether this row is waiting on a person at all.
+
+    One predicate for both the membership test and the waited-for age, because
+    a row on this screen with no age is the same defect twice: an unfinished
+    launch says `pending`, which is not one of the words above, and gating the
+    age separately silently dropped how long it had been pending.
+    """
+
+    return waiting_state(row) in ATTENTION_STATES or bool(row.get("setup_incomplete"))
+
+
 rows = []
 human_rows, expandable_machine_rows, orphan_subagents = classify_top_level_sessions(
     data.get("sessions", [])
@@ -188,7 +229,7 @@ for original in visible_sources:
     # the only number on either was its creation date. The moment a waiting
     # session went quiet IS the moment it started waiting, which is the last
     # output it produced.
-    if row.get("needs_you"):
+    if is_waiting(row):
         waiting_since = row.get("recent_output_at_unix_ms")
         if (
             isinstance(waiting_since, int)
@@ -234,9 +275,7 @@ for original in sorted(
         if isinstance(item, dict)
         and not session_is_unavailable(item)
         and (
-            item.get("blocking_question")
-            or item.get("needs_you")
-            or item.get("setup_incomplete")
+            is_waiting(item)
         )
     ),
     key=default_order,
@@ -258,13 +297,11 @@ for original in sorted(
             "state": (
                 "pending"
                 if original.get("setup_incomplete")
-                else "question"
-                if original.get("blocking_question")
-                else "needs you"
+                else waiting_state(original)
             ),
             "waiting_since_unix_ms": (
                 original.get("recent_output_at_unix_ms")
-                if original.get("needs_you")
+                if is_waiting(original)
                 else None
             ),
         }
@@ -341,14 +378,7 @@ projected["_picker"] = {
         matches(item) for item in expandable_machine_rows
     ),
     "machine_expanded": machine_expanded,
-    "machine_needs_you": sum(
-        bool(
-            item.get("blocking_question")
-            or item.get("needs_you")
-            or item.get("setup_incomplete")
-        )
-        for item in machine_rows
-    ),
+    "machine_needs_you": sum(bool(is_waiting(item)) for item in machine_rows),
 }
 with open(destination, "w", encoding="utf-8") as handle:
     json.dump(projected, handle, sort_keys=True, separators=(",", ":"))
