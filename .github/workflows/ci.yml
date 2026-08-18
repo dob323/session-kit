@@ -8,7 +8,12 @@ on:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Superseding a branch run saves runner time. Superseding a run on the
+  # default branch does something else: the cancelled run is the one the
+  # README badge reads, and GitHub draws a cancelled run as "failing". Two
+  # pushes ten minutes apart therefore showed the project as broken when
+  # nothing had failed. Default-branch runs always finish and report.
+  cancel-in-progress: ${{ github.ref != format('refs/heads/{0}', github.event.repository.default_branch) }}
 
 permissions:
   contents: read
