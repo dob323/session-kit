@@ -222,7 +222,8 @@ jobs:
           python -m py_compile tools/build-public-tree \
             tools/build-release-artifact tools/check-doc-links \
             tools/check-embedded-scripts tools/public-scan \
-            tools/render-readme-picker deploy/session-kit-release
+            tools/render-readme-anatomy tools/render-readme-picker \
+            deploy/session-kit-release
       - name: Check types
         env:
           MYPY_CACHE_DIR: ${{ runner.temp }}/mypy-cache

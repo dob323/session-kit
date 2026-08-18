@@ -1,0 +1,348 @@
+#!/usr/bin/env python3
+"""Render the README's "Reading the picker" figure around the real picker.
+
+The terminal in this picture is not a drawing of the picker: it is the same
+SVG `render-readme-picker` builds by driving the real picker through the login
+fixture, nested here at its native aspect. Nothing is ever drawn on top of it,
+so a callout can never obscure or strike through the interface it explains.
+
+Text is laid out with explicit line breaks, the way the hand-authored diagrams
+under docs/assets/readme are, so the tool needs no font-measuring library.
+"""
+
+from __future__ import annotations
+
+import argparse
+import html
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO))
+
+from importlib.machinery import SourceFileLoader  # noqa: E402
+
+
+def picker_module():
+    """Loaded on demand: importing it drags in the whole login fixture."""
+
+    return SourceFileLoader(
+        "session_kit_render_readme_picker", str(REPO / "tools" / "render-readme-picker")
+    ).load_module()
+
+
+DEFAULT_OUTPUT = REPO / "docs" / "assets" / "readme" / "picker-anatomy.png"
+
+WIDTH, HEIGHT = 1600, 1200
+MARGIN, GAP = 44, 20
+CAPTURE_X, CAPTURE_Y, CAPTURE_W = MARGIN, 126, 1512
+
+BG, PANEL, BORDER = "#0d1117", "#161b22", "#30363d"
+FG, DIM, HEAD = "#e6edf3", "#8b949e", "#bb9af7"
+GREEN, CYAN, ORANGE, YELLOW, PURPLE = (
+    "#9ece6a",
+    "#2ac3de",
+    "#e0af68",
+    "#d8b44a",
+    "#bb9af7",
+)
+SANS = "Noto Sans,Helvetica,Arial,sans-serif"
+MONO = "Red Hat Mono,DejaVu Sans Mono,monospace"
+
+# The row every column label points at. It is the one row in the demo capture
+# with every field populated, subagent count included.
+STRIP = "61  Improve Session Picker  | CDX | work | GPT-5-Codex | working | 2 subagents | 10m"
+FIELDS = (
+    ("61", "number"),
+    ("Improve Session Picker", "title"),
+    ("CDX", "provider"),
+    ("work", "account"),
+    ("GPT-5-Codex", "model"),
+    ("working", "state"),
+    ("2 subagents", "subagents"),
+    ("10m", "last activity"),
+)
+# Meanings are quoted from the README's state table; keep them identical.
+STATES = (
+    (
+        "53",
+        "question",
+        ORANGE,
+        "Claude has a blocking prompt open now. Codex does not claim this state yet.",
+    ),
+    (
+        "57",
+        "needs you",
+        ORANGE,
+        "The provider finished its turn and is waiting for you.",
+    ),
+    ("60", "working", DIM, "The provider is driving the current turn."),
+    (
+        "59",
+        "idle",
+        DIM,
+        "A needs-you transcript has not moved for the configured idle window.",
+    ),
+)
+KEYS = (
+    (
+        "Enter",
+        "or a session number",
+        "Open the first visible session or the numbered session.",
+    ),
+    ("k <numbers>", "", "Close one or more visible sessions. Lists and ranges work."),
+    ("n", "", "Start a new session."),
+    ("m", "", "Open More."),
+    ("a", "", "Show everything that needs you."),
+    ("h <number>", "", "Read settled history without opening the session."),
+    ("?", "", "Show picker help."),
+    ("b or q", "", "Leave the home screen for an ordinary shell."),
+)
+
+
+def documented_keys() -> set[str]:
+    """The single-character keys the README's key table currently promises."""
+
+    table = (REPO / "README.md").read_text(encoding="utf-8")
+    keys = set()
+    for row in re.findall(r"^\|.*\|\s*$", table, re.MULTILINE):
+        # A row may name more than one key, as "`b` or `q`" does.
+        for span in re.findall(r"`([^`]+)`", row):
+            head = span.split()[0]
+            if len(head) == 1 and (head.isalpha() or head == "?"):
+                keys.add(head)
+    if not keys:
+        raise RuntimeError("the README key table named no keys")
+    return keys
+
+
+def offered_keys(frame: str) -> set[str]:
+    """The single-character keys the rendered footer actually offers."""
+
+    footer = next(
+        (line for line in frame.splitlines() if "kill" in line and "leave" in line), ""
+    )
+    if not footer:
+        raise RuntimeError("the capture had no command bar to check")
+    # The frame carries its colour escapes; they sit flush against the keys.
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", footer)
+    return {token for token in re.findall(r"(?<!\S)([a-z?])(?!\S)", plain)}
+
+
+def refuse_undocumented_keys(frame: str) -> None:
+    """A key the picker offers but the README does not document must not ship.
+
+    The picker is rendered from live code, so a feature merged privately and
+    not yet released will appear in this figure the moment someone regenerates
+    it — putting a key on the project's front page that the shipped release
+    does not have. Fail closed instead.
+    """
+
+    extra = sorted(offered_keys(frame) - documented_keys())
+    if extra:
+        raise SystemExit(
+            "the picker offers keys the README does not document: "
+            + ", ".join(extra)
+            + "\nEither document them in the README key table, or render this "
+            "figure from a tree where the feature is not present. Shipping it "
+            "would advertise a key the released version does not have."
+        )
+
+
+def text(x, y, body, *, font=SANS, size=15, fill=DIM, weight=400, anchor=None):
+    at = f' text-anchor="{anchor}"' if anchor else ""
+    return (
+        f'<text x="{x:.1f}" y="{y:.1f}" font-family="{font}" font-size="{size}" '
+        f'font-weight="{weight}" fill="{fill}"{at} xml:space="preserve">'
+        f"{html.escape(body)}</text>"
+    )
+
+
+def panel(x, y, w, h, title, out):
+    out.append(
+        f'<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="12" '
+        f'fill="{PANEL}" stroke="{BORDER}"/>'
+    )
+    out.append(text(x + 24, y + 40, title, size=22, weight=700, fill=HEAD))
+    return x + 24, y + 78
+
+
+def nested_picker() -> tuple[str, float]:
+    """The real picker SVG, as a group scaled to the figure's capture width."""
+
+    picker = picker_module()
+    frame = picker.capture_picker()
+    refuse_undocumented_keys(frame)
+    document = picker.svg_document(frame)
+    head = re.search(r"<svg[^>]*>", document)
+    if head is None:
+        raise RuntimeError("the picker renderer did not produce an svg element")
+    native = re.search(r'width="(\d+)"\s+height="(\d+)"', head.group(0))
+    if native is None:
+        raise RuntimeError("the picker svg did not name its own size")
+    native_w, native_h = int(native.group(1)), int(native.group(2))
+    scale = CAPTURE_W / native_w
+    body = document[head.end() :].rsplit("</svg>", 1)[0]
+    # Percentage sizes resolve against the whole outer canvas once this is a
+    # group, so the card background would flood the figure. Pin them.
+    pinned = re.sub(r'width="100%"', f'width="{native_w}"', body)
+    pinned = re.sub(r'height="100%"', f'height="{native_h}"', pinned)
+    if "100%" in pinned:
+        raise RuntimeError("a percentage size survived nesting: " + pinned[:200])
+    body = pinned
+    group = (
+        f'<g transform="translate({CAPTURE_X},{CAPTURE_Y}) scale({scale:.6f})">'
+        f"{body}</g>"
+    )
+    return group, native_h * scale
+
+
+def build() -> str:
+    out: list[str] = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{WIDTH}" '
+        f'height="{HEIGHT}" viewBox="0 0 {WIDTH} {HEIGHT}">',
+        f'<rect width="{WIDTH}" height="{HEIGHT}" fill="{BG}"/>',
+        text(MARGIN, 72, "Reading the picker", size=42, weight=700, fill=FG),
+        text(MARGIN + 2, 108, "A quick guide to Session Kit's home screen.", size=20),
+    ]
+
+    capture, capture_h = nested_picker()
+    out.append(capture)
+
+    pw = (WIDTH - 2 * MARGIN - GAP) // 2
+    left, right = MARGIN, MARGIN + pw + GAP
+    top1 = CAPTURE_Y + capture_h + 24
+    h1 = 200
+    top2 = top1 + h1 + GAP
+    h2 = HEIGHT - top2 - 30
+
+    # -- read one row left to right
+    px, py = panel(left, top1, pw, h1, "Read one row left to right", out)
+    cell = 14 * 0.6  # Red Hat Mono advances 0.6em, as the picker renderer assumes
+    out.append(
+        f'<text x="{px}" y="{py}" font-family="{MONO}" font-size="14" '
+        f'font-weight="500" fill="{FG}" textLength="{len(STRIP) * cell:.2f}" '
+        f'lengthAdjust="spacingAndGlyphs" xml:space="preserve">'
+        f"{html.escape(STRIP)}</text>"
+    )
+    cursor = 0
+    for value, label in FIELDS:
+        index = STRIP.index(value, cursor)
+        cursor = index + len(value)
+        centre = px + (index + len(value) / 2) * cell
+        out.append(
+            f'<line x1="{centre:.1f}" y1="{py + 8}" x2="{centre:.1f}" '
+            f'y2="{py + 16}" stroke="{BORDER}"/>'
+        )
+        out.append(text(centre, py + 30, label, size=11, anchor="middle"))
+    legend_y = py + 66
+    for code, name, colour in (
+        ("CLD", "= Claude Code", YELLOW),
+        ("CDX", "= Codex", CYAN),
+    ):
+        out.append(
+            text(px, legend_y, code, font=MONO, size=14, weight=700, fill=colour)
+        )
+        out.append(text(px + 46, legend_y, name, size=14))
+        legend_y += 22
+
+    # -- what the state words mean
+    px, py = panel(right, top1, pw, h1, "What the state words mean", out)
+    for number, word, colour, meaning in STATES:
+        out.append(text(px, py, number, font=MONO, size=14, weight=700, fill=GREEN))
+        out.append(text(px + 34, py, word, font=MONO, size=14, weight=700, fill=colour))
+        out.append(text(px + 132, py, meaning, size=14))
+        py += 28
+
+    # -- ready and open elsewhere
+    px, py = panel(left, top2, pw, h2, "Ready and Open elsewhere", out)
+    out.append(text(px, py, "Ready", size=15, weight=700, fill=GREEN))
+    out.append(text(px + 52, py, "= available to open in this window.", size=15))
+    py += 30
+    out.append(text(px, py, "Open elsewhere", size=15, weight=700, fill=PURPLE))
+    out.append(
+        text(px + 126, py, "= already attached to another window; choosing", size=15)
+    )
+    for line in (
+        'one defaults to "Move it here" after a fresh identity check, the other',
+        "window returns to its picker, and the conversation is not duplicated.",
+    ):
+        py += 22
+        out.append(text(px, py, line, size=15))
+    py += 32
+    for line in (
+        "Ready sessions come first. Within a group, attention state determines",
+        "the first part of the order, followed by provider and activity.",
+    ):
+        out.append(text(px, py, line, size=15))
+        py += 22
+    py += 12
+    out.append(
+        text(
+            px,
+            py,
+            "7 sessions · 5 ready · 2 open elsewhere",
+            font=MONO,
+            size=13,
+            weight=700,
+            fill=FG,
+        )
+    )
+    py += 24
+    out.append(
+        text(
+            px,
+            py,
+            "= total, how many you can open here, and how many are attached elsewhere.",
+            size=15,
+        )
+    )
+
+    # -- which key do I press next?
+    px, py = panel(right, top2, pw, h2, "Which key do I press next?", out)
+    out.append(
+        text(
+            px,
+            py,
+            'The command bar reads "open 53" because 53 is the top visible session.',
+            size=15,
+        )
+    )
+    py += 22
+    out.append(text(px, py, "Enter takes it.", size=15))
+    py += 34
+    for key, extra, meaning in KEYS:
+        out.append(text(px, py, key, font=MONO, size=14, weight=700, fill=GREEN))
+        if extra:
+            out.append(text(px + 8 + len(key) * 14 * 0.6, py, extra, size=13))
+        out.append(text(px + 200, py, meaning, size=14))
+        py += 23
+
+    out.append("</svg>")
+    return "\n".join(out) + "\n"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("output", nargs="?", type=Path, default=DEFAULT_OUTPUT)
+    args = parser.parse_args()
+    converter = shutil.which("rsvg-convert")
+    if converter is None:
+        parser.error("rsvg-convert is required to produce the PNG")
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="session-kit-anatomy-") as raw:
+        svg = Path(raw) / "anatomy.svg"
+        svg.write_text(build(), encoding="utf-8")
+        subprocess.run(
+            [converter, "--format=png", "--output", args.output, svg], check=True
+        )
+    print(args.output)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
