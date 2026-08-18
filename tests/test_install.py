@@ -147,10 +147,23 @@ class InstallerTests(unittest.TestCase):
             )
 
     def tearDown(self) -> None:
-        for path in self.temp.rglob("*"):
-            if path.is_dir() and not path.is_symlink():
-                path.chmod(path.stat().st_mode | 0o700)
-        shutil.rmtree(self.temp)
+        # The tree is walked to restore search permission on directories the
+        # installer deliberately locked, then removed. A test's own git
+        # subprocess can still be pruning objects underneath that walk, and
+        # rglob raises when a directory disappears mid-scan — a cleanup that
+        # failed the run over work it was about to delete anyway. Both the
+        # walk and each chmod tolerate a vanished entry.
+        try:
+            paths = list(self.temp.rglob("*"))
+        except OSError:
+            paths = []
+        for path in paths:
+            try:
+                if path.is_dir() and not path.is_symlink():
+                    path.chmod(path.stat().st_mode | 0o700)
+            except OSError:
+                continue
+        shutil.rmtree(self.temp, ignore_errors=True)
 
     def run_installer(
         self, *args: str, check: bool = True
