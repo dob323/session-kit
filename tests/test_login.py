@@ -2644,9 +2644,17 @@ class LoginPickerTests(unittest.TestCase):
                     "SESSION_KIT_ROOT": os.fspath(install_root),
                     "SESSION_KIT_PICKER_REFRESH_SECONDS": "0",
                 },
-                deferred=("Codex alpha", b"q\n"),
+                # Type only once the warning is on screen. Typing on the
+                # deferred beat put the keystroke into the same read that the
+                # upgrade check was interrupting to print that warning: the
+                # `q` was swallowed and the trailing newline arrived alone,
+                # so the picker opened the top session instead of leaving
+                # (macOS arm64, where the beat and the check coincide). A
+                # person types after they read the line; so does this test.
+                deferred=("Codex alpha", b""),
                 deferred_action=activate,
-                deferred_delay_seconds=2,
+                deferred_delay_seconds=0,
+                followup=(warning, b"q\n", 30),
             )
             self.assertEqual(0, code)
             self.assertEqual(1, output.count(warning))
