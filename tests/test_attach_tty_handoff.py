@@ -111,6 +111,7 @@ can suffer while holding the terminal raw:
             guard did not run leaves behind.
 """
 import os
+import select
 import signal
 import sys
 import termios
@@ -147,10 +148,18 @@ if MODE in DEATHS:
     time.sleep(5)
 if MODE == "forget":
     os._exit(0)
-if saved is not None:
-    termios.tcsetattr(0, termios.TCSADRAIN, saved)
+# Say it before letting go, and wait to be heard. The harness counts this
+# client as holding the terminal until CLIENT-DOWN reaches it, so restoring
+# first left a window in which a sample saw cooked mode under a client the
+# harness still thought was live -- a failure about nothing, and a scheduler
+# hiccup on a loaded runner was enough to open it. The harness writes a byte
+# back when it has read the line; the timeout is only so a harness that never
+# answers (the master is closed under this client in one test) cannot wedge it.
 sys.stdout.write("CLIENT-DOWN\\r\\n")
 sys.stdout.flush()
+select.select([0], [], [], 2.0)
+if saved is not None:
+    termios.tcsetattr(0, termios.TCSADRAIN, saved)
 '''
 
 
@@ -260,6 +269,7 @@ class Handoff:
         fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 100, 0, 0))
         started = time.time()
         client_up = False
+        answered = False
         buffer = bytearray()
         while time.time() - started < self.seconds + 12:
             ready, _, _ = select.select([master], [], [], 0.01)
@@ -274,6 +284,17 @@ class Handoff:
             text = buffer.decode("utf-8", "replace")
             if "CLIENT-UP" in text:
                 client_up = True
+            if "CLIENT-DOWN" in text and not answered:
+                # The client is waiting to hear that its farewell landed
+                # before it puts the terminal back. This loop has already
+                # stopped counting it as the holder -- `alive` below reads
+                # the same text -- so the restore can no longer be seen as
+                # the terminal being taken from a live client.
+                answered = True
+                try:
+                    os.write(master, b"\r")
+                except OSError:
+                    pass
             try:
                 lflag = termios.tcgetattr(master)[3]
             except termios.error:

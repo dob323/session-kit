@@ -295,17 +295,35 @@ class AttentionLatencyTests(unittest.TestCase):
         def event_during_the_snapshot() -> None:
             # The subscriber is a stub `sleep`; the picker reads its stream
             # from the file, so writing a line there IS an event arriving.
-            # Wait for the subscription, then write INTO the collection that
-            # the subscription's own resync started -- that is the race.
-            deadline = time.monotonic() + 6
+            # It has to land INSIDE the collection the subscription's own
+            # resync started -- that is the race being measured.
+            #
+            # The stream file appearing is not that moment. One subscription
+            # creates the file and starts the resync, so a write fired on the
+            # file alone can land a breath BEFORE the collection begins, and a
+            # collection that starts after an event is already the answer to
+            # it: nothing is deferred, no trailing collection is earned, and
+            # this test fails having measured nothing. That is the 2026-08-18
+            # ubuntu-22.04/3.12 failure, with the window already at 12 s.
+            #
+            # The stub status appends its arguments the instant it is called
+            # and only then sleeps LOGIN_SLOW_SECONDS, so a second `--json`
+            # in the log means the resync is running and has seconds left to
+            # run. Wait for that, and the write is inside it by construction.
+            deadline = time.monotonic() + 8
+            stream = None
             while time.monotonic() < deadline:
-                for path in sorted(self.fixture.state.iterdir()):
-                    if path.name.startswith("login-events.json."):
-                        with path.open("a", encoding="utf-8") as handle:
-                            handle.write('{"type":"session.created"}\n')
-                        events.write_text(path.name, encoding="utf-8")
-                        return
-                time.sleep(0.1)
+                if stream is None:
+                    for path in sorted(self.fixture.state.iterdir()):
+                        if path.name.startswith("login-events.json."):
+                            stream = path
+                            break
+                if stream is not None and collections(self.fixture) >= 2:
+                    with stream.open("a", encoding="utf-8") as handle:
+                        handle.write('{"type":"session.created"}\n')
+                    events.write_text(stream.name, encoding="utf-8")
+                    return
+                time.sleep(0.05)
 
         run_picker_with(
             self.fixture,
