@@ -108,6 +108,10 @@ APPROVED_BINARY_SHA256 = {
         # chrome, no traffic lights, terminal padding only. The framed version
         # looked like a product shot of a terminal rather than the terminal.
         "c3e0f3c7a3feeab6a3deb59accb3f32bea2666abecf683a94fb47d7c06d66882",
+        # 2026-08-17 final: a terminal window with the picker in it — frame,
+        # neutral ~ title, and a cursor on the prompt so the command line
+        # reads as one. Matches what the picker looks like on screen.
+        "3f437edeb57aa016fbd465f3b146b4e9ec53482174e065e352cbf2d1d1f747d8",
     ),
     # The bare picker render, identical to the docs/assets/session-kit-picker
     # blob above because both come from the same deterministic tool.
@@ -121,6 +125,10 @@ APPROVED_BINARY_SHA256 = {
         # chrome, no traffic lights, terminal padding only. The framed version
         # looked like a product shot of a terminal rather than the terminal.
         "c3e0f3c7a3feeab6a3deb59accb3f32bea2666abecf683a94fb47d7c06d66882",
+        # 2026-08-17 final: a terminal window with the picker in it — frame,
+        # neutral ~ title, and a cursor on the prompt so the command line
+        # reads as one. Matches what the picker looks like on screen.
+        "3f437edeb57aa016fbd465f3b146b4e9ec53482174e065e352cbf2d1d1f747d8",
     ),
     # GitHub social preview: 1280x640, uploaded through repository settings,
     # versioned here so the share artwork travels with the rest.
