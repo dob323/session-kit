@@ -164,7 +164,10 @@ class CodexTitlerTests(unittest.TestCase):
                 (uuid_for(900), "", "name this session properly please", now - 5)
             )
             codex = self.store(home, threads)
-            self.run_pass(codex, home)
+            # A stopped clock: the promise under test is that the newest thread
+            # is reached first among two hundred and forty, not that one machine
+            # fits all of them inside two seconds. The budget has its own tests.
+            self.run_pass(codex, home, budget_seconds=1.0, monotonic=lambda: 0.0)
             self.assertIn(uuid_for(900), self.indexed(codex))
 
     def test_a_pass_stops_at_its_budget_and_the_next_one_continues(self) -> None:
@@ -522,9 +525,16 @@ class CodexTitlerTests(unittest.TestCase):
                 pushed_writes.append((provider, uuid, title))
                 document["pushed_titles"][f"{provider}:{uuid}"] = title
 
+            # A stopped clock: the assertion below names all forty tail
+            # threads exactly, so the pass has to finish its scan. Against the
+            # real budget a slow runner truncates that list and the test reads
+            # as a starved tail when nothing starved it. The budget has its own
+            # tests, which pin the clock this way.
             result = self.run_pass(
                 codex,
                 home,
+                budget_seconds=1.0,
+                monotonic=lambda: 0.0,
                 load_config=lambda: document,
                 human_named=human_named,
                 name_owner=name_owner,
@@ -560,6 +570,8 @@ class CodexTitlerTests(unittest.TestCase):
             second = self.run_pass(
                 codex,
                 home,
+                budget_seconds=1.0,
+                monotonic=lambda: 0.0,
                 load_config=lambda: document,
                 human_named=human_named,
                 name_owner=name_owner,
@@ -685,8 +697,15 @@ class CodexTitlerTests(unittest.TestCase):
                     raise sqlite3.OperationalError("injected page-two failure")
                 return real_connect(*args, **kwargs)
 
+            # A stopped clock, or page two is never reached: the injected
+            # failure fires on the third connect, and a runner that spends the
+            # two-second budget inside page one never gets there -- so nothing
+            # fails, no record is written, and the test dies reading a file that
+            # was never created (2026-08-18, ubuntu-24.04/3.10). What is under
+            # test is that a mid-scan failure keeps its record, not how much of
+            # a two-hundred-thread store one machine covers per second.
             with mock.patch("sqlite3.connect", side_effect=fail_page_two):
-                self.run_pass(codex, home)
+                self.run_pass(codex, home, budget_seconds=1.0, monotonic=lambda: 0.0)
             record = json.loads(
                 (
                     home / ".local" / "state" / "session-kit"
