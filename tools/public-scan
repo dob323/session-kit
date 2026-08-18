@@ -275,7 +275,11 @@ class BaselineError(Exception):
 
 
 def load_baseline(path: Path) -> frozenset[str]:
-    """Read the reviewed history blobs the private-marker rule may skip.
+    """Read the reviewed history objects the private-marker rule may skip.
+
+    An entry is a blob id or a commit id; both are 40 hex digits and both are
+    a digest of the thing they exempt, so neither can be stretched to cover
+    anything but the bytes that were reviewed.
 
     Every failure mode here is fatal on purpose. A baseline that silently
     parses to nothing would turn the history scan back into a pass with no
@@ -286,7 +290,7 @@ def load_baseline(path: Path) -> frozenset[str]:
         payload = path.read_text(encoding="utf-8")
     except OSError as exc:
         raise BaselineError(f"baseline is unreadable: {exc}") from exc
-    blobs: set[str] = set()
+    objects: set[str] = set()
     for number, line in enumerate(payload.splitlines(), 1):
         entry = line.split("#", 1)[0].strip()
         if not entry:
@@ -294,13 +298,15 @@ def load_baseline(path: Path) -> frozenset[str]:
         match = BASELINE_ENTRY.fullmatch(entry)
         if match is None:
             raise BaselineError(f"malformed baseline line {number}: {line!r}")
-        blob = match.group(1)
-        if blob in blobs:
-            raise BaselineError(f"duplicate baseline blob on line {number}: {blob}")
-        blobs.add(blob)
-    if not blobs:
-        raise BaselineError("baseline lists no blobs")
-    return frozenset(blobs)
+        object_id = match.group(1)
+        if object_id in objects:
+            raise BaselineError(
+                f"duplicate baseline object on line {number}: {object_id}"
+            )
+        objects.add(object_id)
+    if not objects:
+        raise BaselineError("baseline lists no objects")
+    return frozenset(objects)
 
 
 def git(root: Path, *args: str, text: bool = True) -> subprocess.CompletedProcess:
@@ -361,6 +367,69 @@ def scan_history(
                 applied.add(object_id)
             found = [item for item in found if not item.endswith(MARKER_FAILURE)]
         failures.extend(found)
+    failures.extend(
+        scan_commit_messages(
+            root,
+            patterns,
+            private_markers=private_markers,
+            baseline=baseline,
+            applied=applied,
+        )
+    )
+    return failures
+
+
+def scan_commit_messages(
+    root: Path,
+    patterns: dict[str, re.Pattern[str]],
+    *,
+    private_markers: bool,
+    baseline: frozenset[str] = frozenset(),
+    applied: set[str] | None = None,
+) -> list[str]:
+    """A commit message is published text, and it was not being read.
+
+    The object walk above opens blobs and nothing else, so every rule this
+    scanner enforces stopped at the file boundary. A name, a token, or a
+    private path written into a commit message shipped with nothing here
+    objecting, even where the same word in a tracked file would have failed.
+
+    A message cannot be corrected without rewriting history, and rewriting a
+    published history breaks every provenance chain that points into it. So
+    this is a gate on what is about to be published rather than a cleanup of
+    what already was: reviewed messages that predate the gate are baselined by
+    commit id, exactly as reviewed blobs are.
+    """
+    # Record and field separators, not NUL: scan_text treats a NUL byte as
+    # proof of a binary file and would refuse every message it was handed.
+    try:
+        raw = git(root, "log", "--format=%H%x1f%B%x1e", "--all").stdout
+    except subprocess.CalledProcessError as exc:
+        detail = exc.stderr.strip() or "not a Git repository"
+        return [f"Git history unavailable: {detail}"]
+
+    failures: list[str] = []
+    for record in raw.split("\x1e"):
+        record = record.strip("\n")
+        if not record:
+            continue
+        commit, _, message = record.partition("\x1f")
+        found = scan_text(
+            f"commit {commit[:12]} message",
+            message.encode("utf-8"),
+            patterns,
+            private_markers=private_markers,
+        )
+        if commit in baseline:
+            # Same bargain the blob baseline strikes: exempt from the
+            # private-marker rule and from nothing else. A credential or key
+            # in a listed message still fails, and the exemption is keyed to
+            # the commit id, which no later message can inherit.
+            excused = [item for item in found if item.endswith(MARKER_FAILURE)]
+            if excused and applied is not None:
+                applied.add(commit)
+            found = [item for item in found if not item.endswith(MARKER_FAILURE)]
+        failures.extend(found)
     return failures
 
 
@@ -370,7 +439,7 @@ def main() -> int:
     parser.add_argument(
         "--git-history",
         action="store_true",
-        help="scan every blob reachable from local Git refs",
+        help="scan every blob and commit message reachable from local Git refs",
     )
     parser.add_argument(
         "--private-markers",
@@ -381,8 +450,9 @@ def main() -> int:
         "--baseline",
         type=Path,
         help=(
-            "file listing reviewed history blobs that predate a private marker; "
-            "exempts those exact blobs from the private-marker rule only"
+            "file listing reviewed blobs and commit messages that predate a "
+            "private marker; exempts those exact objects from the "
+            "private-marker rule only"
         ),
     )
     args = parser.parse_args()
@@ -425,7 +495,7 @@ def main() -> int:
         # Say what the baseline actually did here, not how long the list is.
         # A gap between the two is how a stale entry becomes visible.
         scope += (
-            f", {len(applied)} of {len(baseline)} baselined history blob(s) excused"
+            f", {len(applied)} of {len(baseline)} baselined history object(s) excused"
         )
     print(f"public scan passed ({scope})")
     return 0

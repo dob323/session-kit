@@ -1,20 +1,22 @@
-# Reviewed history blobs that predate the private-marker rule.
+# Reviewed history objects that predate the private-marker rule.
 #
 # What this is
-#   tools/public-scan --git-history --private-markers rejects any blob holding
-#   a repository-private word. The rule was added after those words had already
-#   been published, so it also condemns commits that shipped before it existed.
-#   The published history cannot be rewritten: the repository is public, clones
-#   and forks already carry these objects, and rewriting would break every
-#   reference to them while removing nothing from anyone's copy. Each blob below
-#   was read, classified, and accepted as history that stays.
+#   tools/public-scan --git-history --private-markers rejects any blob or
+#   commit message holding a repository-private word. The rule was added after
+#   those words had already been published, so it also condemns commits that
+#   shipped before it existed. The published history cannot be rewritten: the
+#   repository is public, clones and forks already carry these objects, release
+#   provenance is anchored to these exact commit ids, and rewriting would break
+#   every reference to them while removing nothing from anyone's copy. Each
+#   object below was read, classified, and accepted as history that stays.
 #
 # What it is not
-#   A blob listed here is exempt from the private-marker rule and from nothing
-#   else. Credential and key patterns still fail for every blob, listed or not.
-#   The exemption is keyed to the exact object id, and an object id is a digest
-#   of the content, so it cannot be stretched to cover anything but the reviewed
-#   bytes. Editing a listed file produces a different object that fails again.
+#   An object listed here is exempt from the private-marker rule and from
+#   nothing else. Credential and key patterns still fail for every object,
+#   listed or not. The exemption is keyed to the exact object id, and an object
+#   id is a digest of the thing it names, so it cannot be stretched to cover
+#   anything but what was reviewed. Editing a listed file, or writing a new
+#   message, produces a different id that fails again.
 #
 # What was reviewed (2026-08-11)
 #   33 blobs  a maintainer's personal name, written before shipped files were
@@ -22,16 +24,25 @@
 #             cleaned; these are the pre-cleanup copies.
 #    4 blobs  a private word appearing only inside a longer underscore-joined
 #             identifier, which the rule tests part by part.
-#   No blob in this list holds a credential, key, token, or host secret.
+#
+# What was reviewed (2026-08-18)
+#    1 commit  a maintainer's personal name in the message body, describing who
+#             an upgrade was certified against. Messages were not scanned until
+#             now, so this one predates its gate exactly as the blobs above do.
+#             Six release tags name this commit and their provenance files bind
+#             it by id, so a rewrite would invalidate all six.
+#   Nothing in this list holds a credential, key, token, or host secret.
 #
 # The rule for changing this file
-#   Additive only, and only after review. Append an entry when a blob already
+#   Additive only, and only after review. Append an entry when something already
 #   published is confirmed to hold nothing worse than the classes above, and say
-#   so in the commit. Never add a blob to make a new failure go away: a failure
-#   on an unpublished blob means the working tree still has to be fixed. Removing
-#   an entry is safe at any time and only ever makes the scan stricter.
+#   so in the commit. Never add an entry to make a new failure go away: a failure
+#   on an unpublished blob means the working tree still has to be fixed, and a
+#   failure on an unpushed commit means the message has to be rewritten before it
+#   leaves this machine. Removing an entry is safe at any time and only ever
+#   makes the scan stricter.
 #
-# Format: <40-character blob object id>  <path the blob was found at>
+# Format: <40-character blob or commit id>  <where it was found>
 
 05f1bd57302b0860397688195407f8b0b11fad9d  bashrc/shpool.bashrc
 51a70d2e38050dd8681844d9562beb848368cd6c  bashrc/shpool.bashrc
@@ -70,3 +81,6 @@ ae57de10c78b00429926cded071942a4b5765cdc  tests/test_inventory.py
 85a068d5f516125b31fb9c3e3b627e27787c879c  tests/test_provider_title_push.py
 ba79a2d4ee38274299ba8d7255787661dd2f9287  tests/test_provider_title_push.py
 ef52617b1295576a54da447ffa570f3bb9db01fa  tests/test_provider_title_push.py
+
+# Commit messages
+8c90b75dd20d9522d1b312b4baf222079c3c3832  message of v0.2.0..v0.4.2

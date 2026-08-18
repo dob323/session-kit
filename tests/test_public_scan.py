@@ -269,7 +269,7 @@ class PublicScanTests(unittest.TestCase):
         )
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("1 of 1 baselined history blob(s) excused", result.stdout)
+        self.assertIn("1 of 1 baselined history object(s) excused", result.stdout)
 
     def test_baseline_never_excuses_a_secret(self) -> None:
         marker = "restricted" + "fixture"
@@ -318,7 +318,7 @@ class PublicScanTests(unittest.TestCase):
         blob = "a" * 40
         cases = {
             "missing": (None, "baseline is unreadable"),
-            "empty": ("# nothing but a comment\n", "baseline lists no blobs"),
+            "empty": ("# nothing but a comment\n", "baseline lists no objects"),
             "malformed": ("not-a-blob-id  somewhere.txt\n", "malformed baseline line"),
             "short": (f"{blob[:39]}  somewhere.txt\n", "malformed baseline line"),
             "uppercase": (
@@ -327,7 +327,7 @@ class PublicScanTests(unittest.TestCase):
             ),
             "duplicate": (
                 f"{blob}  one.txt\n{blob}  two.txt\n",
-                "duplicate baseline blob",
+                "duplicate baseline object",
             ),
         }
         for name, (body, reason) in cases.items():
@@ -347,6 +347,78 @@ class PublicScanTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(reason, result.stderr)
 
+    def test_history_reads_commit_messages(self) -> None:
+        """A message is published text, so the rules that guard files apply."""
+        marker = "restricted" + "fixture"
+        self.init_git()
+        (self.root / "ordinary.txt").write_text("nothing notable\n", encoding="utf-8")
+        self.commit(f"mention {marker} in the subject")
+
+        tree_only = self.run_scan("--private-markers")
+        history = self.run_scan("--git-history", "--private-markers")
+
+        # The tracked file is clean, so only the message can be the difference.
+        self.assertEqual(tree_only.returncode, 0, tree_only.stdout + tree_only.stderr)
+        self.assertNotEqual(history.returncode, 0)
+        self.assertIn("message: private marker", history.stdout)
+        self.assertNotIn(marker, history.stdout)
+
+    def test_history_reads_a_secret_in_a_commit_message(self) -> None:
+        secret = "ghp_" + ("c" * 20)
+        self.init_git()
+        (self.root / "ordinary.txt").write_text("nothing notable\n", encoding="utf-8")
+        self.commit(f"paste {secret} where nobody looked")
+
+        result = self.run_scan("--git-history")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("GitHub token", result.stdout)
+        # Naming the secret in the refusal would publish it a second time.
+        self.assertNotIn(secret, result.stdout)
+
+    def test_baseline_excuses_a_reviewed_commit_message(self) -> None:
+        """Published messages cannot be edited, so review is the only remedy."""
+        marker = "restricted" + "fixture"
+        self.init_git()
+        (self.root / "ordinary.txt").write_text("nothing notable\n", encoding="utf-8")
+        self.commit(f"mention {marker} in the subject")
+        reviewed = subprocess.run(
+            ["git", "-C", str(self.root), "rev-parse", "HEAD"],
+            check=True,
+            stdout=subprocess.PIPE,
+            text=True,
+        ).stdout.strip()
+        baseline = self.write_baseline(f"{reviewed}  reviewed message\n")
+
+        result = self.run_scan(
+            "--git-history", "--private-markers", "--baseline", str(baseline)
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("1 of 1 baselined history object(s) excused", result.stdout)
+
+    def test_baseline_never_excuses_a_secret_in_a_commit_message(self) -> None:
+        marker = "restricted" + "fixture"
+        secret = "ghp_" + ("d" * 20)
+        self.init_git()
+        (self.root / "ordinary.txt").write_text("nothing notable\n", encoding="utf-8")
+        self.commit(f"mention {marker} and paste {secret}")
+        reviewed = subprocess.run(
+            ["git", "-C", str(self.root), "rev-parse", "HEAD"],
+            check=True,
+            stdout=subprocess.PIPE,
+            text=True,
+        ).stdout.strip()
+        baseline = self.write_baseline(f"{reviewed}  reviewed message\n")
+
+        result = self.run_scan(
+            "--git-history", "--private-markers", "--baseline", str(baseline)
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("GitHub token", result.stdout)
+        self.assertNotIn(secret, result.stdout)
+
     def test_shipped_baseline_is_parsable_and_additive_only(self) -> None:
         """The committed baseline must survive the parser it is written for."""
         shipped = REPO / "tools" / "public-scan-history-baseline"
@@ -360,7 +432,7 @@ class PublicScanTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         # None of the shipped blobs exist in this fixture's history, and the
         # summary has to say so rather than claim the whole list was used.
-        self.assertIn("0 of 37 baselined history blob(s) excused", result.stdout)
+        self.assertIn("0 of 38 baselined history object(s) excused", result.stdout)
         entries = [
             line.split("#", 1)[0].strip()
             for line in shipped.read_text(encoding="utf-8").splitlines()
