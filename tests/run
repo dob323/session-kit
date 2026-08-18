@@ -9,8 +9,20 @@ export PYTHONDONTWRITEBYTECODE=1
 # to 12 and starved interactive use on 2026-08-17. Lowest scheduling priority
 # and idle IO for this process and everything it starts; harmless where the
 # tools are missing.
-renice -n 15 -p $$ >/dev/null 2>&1 || true
-ionice -c 3 -p $$ >/dev/null 2>&1 || true
+#
+# NOT on a CI runner. There the suite is the only thing running and there is
+# nobody to yield to, so lowering its own priority only starves the pty tests:
+# the picker under test loses its scheduling slice mid-read and a fixture
+# waiting on a repaint gives up on a picker that was behaving correctly. That
+# is measured, not supposed — under one identical load,
+# test_help_and_more_remain_modal_across_refresh_intervals passed 3 of 4 runs
+# at normal priority and 0 of 4 reniced, and the ubuntu-24.04/3.10 cell went
+# from five straight green runs to failing every run from the commit that
+# added these two lines (42d5946) onward.
+if [[ ${GITHUB_ACTIONS:-} != true ]]; then
+  renice -n 15 -p $$ >/dev/null 2>&1 || true
+  ionice -c 3 -p $$ >/dev/null 2>&1 || true
+fi
 
 # The suite must not inherit the operator's window, and must not inherit a
 # kill switch their shell happened to export either. tests/__init__.py pins
