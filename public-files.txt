@@ -101,7 +101,6 @@ tests/test_attention_truth.py
 tests/test_picker_attention_truth.py
 tests/test_picker_events.py
 tests/test_pinned_formats.py
-tests/test_pins.py
 tests/test_probe_side_effects.py
 tests/test_picker_exit_grammar.py
 tests/test_picker_input_safety.py
@@ -111,7 +110,6 @@ tests/test_model_availability.py
 tests/test_picker_rows_grammar.py
 tests/test_picker_stderr_survives.py
 tests/test_picker_ux.py
-tests/test_project_dir_name.py
 tests/test_readme_anatomy.py
 tests/test_projects.py
 tests/test_projects_context.py
