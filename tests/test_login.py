@@ -2492,8 +2492,20 @@ class LoginPickerTests(unittest.TestCase):
                             "SESSION_KIT_PICKER_REFRESH_SECONDS": "2",
                             "SESSION_KIT_NO_COLOR": None,
                         },
-                        deferred=(marker, b"\nq\n"),
+                        # Back out of the modal, then leave from the list --
+                        # two beats, not one burst. Written together as
+                        # "\nq\n", both keys sat in the read that closed the
+                        # modal: the picker took the newline as "back" and
+                        # the "q\n" behind it went nowhere, so the list was
+                        # left sitting at its prompt until the fixture killed
+                        # it (2026-08-18, ubuntu-24.04/3.10). "Codex bravo"
+                        # is the marker because it is the one line that
+                        # cannot already be on screen -- the modal is proven
+                        # below never to have shown it, so seeing it means
+                        # the list is back and has taken the refresh.
+                        deferred=(marker, b"\n"),
                         deferred_delay_seconds=3,
+                        followup=("Codex bravo", b"q\n", 30),
                     )
                     self.assertEqual(0, code)
                     modal_start = output.index(marker)
