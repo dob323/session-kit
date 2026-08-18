@@ -1073,7 +1073,14 @@ class SecondaryPageTests(TerminalCaseMixin, unittest.TestCase):
         self.assert_green(session, footer, "↵")
         self.assertIn("esc back", session.screen.line(footer))
         session.type(ENTER)
-        session.expect(lambda screen: screen.find("Restore") >= 0, what="closed actions")
+        # Wait for the whole page, not its first word: a loaded runner can
+        # capture a frame where Restore has flushed and History has not.
+        session.expect(
+            lambda screen: screen.find("Restore") >= 0
+            and screen.find("History") >= 0
+            and screen.find("[CDX] login time unknown") >= 0,
+            what="closed actions",
+        )
         self.assertGreaterEqual(session.screen.find("History"), 0)
         subtitle = session.screen.find("[CDX] login time unknown")
         provider = session.screen.line(subtitle).index("CDX")

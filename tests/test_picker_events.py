@@ -310,7 +310,12 @@ class AttentionLatencyTests(unittest.TestCase):
         run_picker_with(
             self.fixture,
             case=self,
-            seconds=7.0,
+            # Three 2 s collections have to finish inside this window; 7 s
+            # left one second of slack and a loaded CI runner spent it, ending
+            # the run with the trailing collection still in flight. The poll
+            # is 300 s and the refresh 30 s away, so the extra headroom cannot
+            # add a collection of its own.
+            seconds=12.0,
             extra={
                 "SESSION_KIT_PICKER_REFRESH_SECONDS": "30",
                 "SESSION_KIT_PICKER_EVENT_POLL_SECONDS": "300",
