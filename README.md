@@ -6,7 +6,11 @@
 
 **Many AI coding sessions. One place to see which one needs you.**
 
-Session Kit is a local picker for Claude Code, Codex, and shell sessions. Type `kit` and every session you are running is in one list, with a stable number, a name, and a state word that says whether it is waiting on you or still working. The sessions run on the host, so closing the terminal or dropping SSH does not end them.
+Session Kit is a local picker for Claude Code and Codex. Type `kit` and every session you are running is in one list, each with a stable number, a name, and a state word that says whether it is waiting on you or still working. The sessions run on the host, so closing the terminal or dropping SSH does not end them.
+
+**Every session names itself.** It takes a short title from its own first piece of work, keeps a number that does not move, and gets a colour of its own. All three follow the session *into* its own window — the tab title carries the name and number, and the session is tinted its colour in Claude Code and Codex themselves. So the window you are typing in tells you which session it is, and the picker and the session never disagree about it. Colours are kept distinct from the other live sessions: eight for Claude Code, six for Codex, chosen so no Claude session can ever share a colour with a Codex one.
+
+**Every session can use a different subscription.** Enrol several accounts for the same provider and hand each session whichever one you want — three Claude Code subscriptions running in three sessions side by side on one machine, at the same time. The account belongs to the session, not to the machine or to the terminal you launched from, which is the usual arrangement elsewhere.
 
 <p align="center">
   <img src="docs/assets/readme/picker.png" alt="The Session Kit picker: seven sessions grouped into Ready and Open elsewhere, each row showing number, name, provider, account, model, state, and last activity" width="100%">
@@ -27,16 +31,18 @@ Session Kit is a local picker for Claude Code, Codex, and shell sessions. Type `
 
 | Capability | What it means |
 |---|---|
-| **One list** | Managed Claude Code, Codex, and shell sessions in a single keyboard-first picker. |
+| **One list** | Every managed Claude Code and Codex session in a single keyboard-first picker. |
+| **Named without asking** | A session titles itself from its own first work. Rename it yourself and your name wins from then on. |
+| **A colour per session** | Each session gets a colour the others do not have, in the picker and inside the session's own window. |
+| **A subscription per session** | Enrol several accounts for one provider and give each session its own. Sessions do not share a single login. |
 | **States that mean something** | `question`, `needs you`, `working`, and `idle` have exact definitions and sort consistently. |
 | **Stable session numbers** | Open, inspect, close, and find sessions without copying internal shpool IDs. |
 | **Survives disconnects** | The session stays on the host when a terminal window closes or SSH drops. |
 | **Guarded actions** | Every mutation rechecks exact live identity immediately before it runs, and refuses on any doubt. |
 | **Recoverable conversations** | Closing a Claude Code or Codex session records the exact conversation for restore. |
 | **Isolated working copies** | A delegated session gets its own git worktree on its own branch, and hands it back when it closes — kept instead, with the reason named, whenever giving it back could lose work. |
-| **Account-aware** | Provider accounts are enrolled and shown per session. A conversation whose weekly quota runs out is carried to another enrolled account once, and you are told afterwards. |
+| **Quota carry-over** | A conversation whose weekly quota runs out is carried to another enrolled account once, and you are told afterwards. |
 | **Local only** | No hosted account, no analytics, no update beacon, no telemetry. |
-| **Provider-aware display** | Names, account aliases, models, terminal titles, and per-session colors stay visible without becoming identity evidence. |
 
 ## Is this for you?
 
