@@ -515,6 +515,14 @@ def run_pty(
                 time.sleep(deferred_delay_seconds)
             if deferred_check is not None:
                 deferred_check()
+            # The keystrokes below get their own wait, the way the followup and
+            # signal stages already do. The overall deadline runs from process
+            # start, so waiting for the picker to paint (up to 20s) and any
+            # deliberate delay were charged against the time this typed input
+            # then had to finish in: on a slow runner the quit was typed with
+            # seconds left and the test killed a picker that was doing exactly
+            # what it should.
+            deadline = max(deadline, time.monotonic() + 20)
             os.write(descriptor, payload)
         if followup is not None:
             # A second scripted beat for flows that hand the terminal to a
