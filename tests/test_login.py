@@ -401,6 +401,57 @@ raise SystemExit(int(os.environ.get("LOGIN_SP_EXIT","0")))
         )
 
 
+# The picker names the window it is serving: a session's own title while that
+# session is open, and "session kit" while the menu is. That trail is the one
+# reliable record of what the picker DID, and it is the fact a timeout is
+# almost always about.
+_OSC_TITLE = re.compile(rb"\x1b\][02];([^\x07\x1b]*)(?:\x07|\x1b\\)")
+_IDLE_TITLE = "session kit"
+
+
+def _pty_diagnosis(raw: bytes, typed: list[bytes]) -> str:
+    """Say what the picker did with what was typed, in one line.
+
+    A timed-out picker used to report several kilobytes of escape bytes and
+    nothing else, so every occurrence had to be decoded by hand before it could
+    be argued about -- and each of these timeouts so far has turned out to be
+    the same shape, spelled out in an OSC title nobody was reading: a keystroke
+    went missing, the bare newline behind it answered the prompt, and `Enter
+    opens the top session` did exactly what it promises. Reading that out of
+    the dump cost far more than acting on it, so the harness reads it here.
+
+    The raw dump still follows. This only puts the answer in front of it.
+    """
+    notes: list[str] = []
+    if typed:
+        notes.append("typed " + ", ".join(repr(item) for item in typed))
+    titles = [
+        match.group(1).decode("utf-8", errors="replace")
+        for match in _OSC_TITLE.finditer(raw)
+    ]
+    if titles:
+        notes.append("window titles in order: " + " -> ".join(repr(t) for t in titles))
+        opened = [title for title in titles if title and title != _IDLE_TITLE]
+        if opened:
+            notes.append(
+                f"the picker OPENED {opened[0]!r} -- a prompt was answered by "
+                "Enter, not by what was typed"
+            )
+    # Whether the keys were echoed AFTER the last prompt, not whether they
+    # appear at all: every one of these screens carries the footer, and the
+    # footer says "leave q or b", so a plain search for a `q` always finds one.
+    #
+    # The bare glyph, with no trailing space: a coloured prompt puts a reset
+    # sequence between the two, and matching "glyph space" then finds none of
+    # the prompts on any screen the kit drew in colour.
+    prompt = "❯".encode()
+    keys = b"".join(typed).replace(b"\n", b"").replace(b"\r", b"")
+    if keys and prompt in raw and keys not in raw.rsplit(prompt, 1)[-1]:
+        notes.append(f"nothing echoed {keys!r} after the last prompt was drawn")
+    notes.append(f"{raw.count(prompt)} prompt(s) drawn")
+    return "; ".join(notes)
+
+
 def run_pty(
     fixture: LoginFixture,
     input_bytes: bytes = b"",
@@ -480,9 +531,13 @@ def run_pty(
         os.close(ready_writer)
 
     output = bytearray()
+    # Every keystroke this harness sends, in order, so a timeout can say what
+    # the picker was given as well as what it did with it.
+    typed: list[bytes] = []
     deadline = time.monotonic() + 30
     try:
         if input_bytes:
+            typed.append(input_bytes)
             os.write(descriptor, input_bytes)
         if deferred is not None:
             # Type only once the picker has painted something on its own,
@@ -523,6 +578,7 @@ def run_pty(
             # seconds left and the test killed a picker that was doing exactly
             # what it should.
             deadline = max(deadline, time.monotonic() + 20)
+            typed.append(payload)
             os.write(descriptor, payload)
         if followup is not None:
             # A second scripted beat for flows that hand the terminal to a
@@ -556,6 +612,7 @@ def run_pty(
                     f"deferred stage; output={output.decode(errors='replace')!r}"
                 )
             deadline = max(deadline, time.monotonic() + 20)
+            typed.append(followup_payload)
             os.write(descriptor, followup_payload)
         if send_signal is not None:
             # Which prompt the signal is aimed at. A modal has to be on screen
@@ -609,6 +666,7 @@ def run_pty(
                             f"picker never printed {post_signal_marker!r} after the "
                             f"signal; output={output.decode(errors='replace')!r}"
                         )
+                typed.append(post_signal_bytes)
                 os.write(descriptor, post_signal_bytes)
         status = None
         while time.monotonic() < deadline:
@@ -630,7 +688,8 @@ def run_pty(
             os.kill(pid, signal.SIGKILL)
             _, status = os.waitpid(pid, 0)
             raise AssertionError(
-                f"picker PTY timed out; output={output.decode(errors='replace')!r}"
+                f"picker PTY timed out; {_pty_diagnosis(bytes(output), typed)}"
+                f"\noutput={output.decode(errors='replace')!r}"
             )
         while True:
             ready, _, _ = select.select([descriptor], [], [], 0)
