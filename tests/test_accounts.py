@@ -121,21 +121,24 @@ class AccountProfileTests(unittest.TestCase):
             ("claude", "source", "source@example.com"),
             ("claude", "target", "target@example.com"),
         )
-        transcript = self.profile_root / "claude" / "source" / "projects" / "repo" / f"{CLAUDE_UUID}.jsonl"
+        transcript = (
+            self.profile_root
+            / "claude"
+            / "source"
+            / "projects"
+            / "repo"
+            / f"{CLAUDE_UUID}.jsonl"
+        )
         transcript.parent.mkdir(parents=True)
         transcript.write_text("{}\n", encoding="utf-8")
         transcript.chmod(0o600)
 
-        found = accounts.source_profile_for_thread(
-            self.config, "claude", CLAUDE_UUID
-        )
+        found = accounts.source_profile_for_thread(self.config, "claude", CLAUDE_UUID)
 
         self.assertEqual("source", found["alias"])
         self.assertEqual(
             "legacy-first-switch",
-            accounts.binding_for(self.config, "claude", CLAUDE_UUID)[
-                "binding_source"
-            ],
+            accounts.binding_for(self.config, "claude", CLAUDE_UUID)["binding_source"],
         )
 
     def test_registry_rejects_escaped_profile_and_cross_provider_binding(self) -> None:
@@ -223,12 +226,20 @@ class AccountProfileTests(unittest.TestCase):
             codex = accounts.account_choices(self.config, "codex")
 
         self.assertEqual("backup", claude["recommendation"])
-        self.assertEqual("most weekly allowance remains", claude["recommendation_reason"])
-        self.assertTrue(next(row for row in claude["choices"] if row["alias"] == "backup")["eligible"])
+        self.assertEqual(
+            "most weekly allowance remains", claude["recommendation_reason"]
+        )
+        self.assertTrue(
+            next(row for row in claude["choices"] if row["alias"] == "backup")[
+                "eligible"
+            ]
+        )
         self.assertIsNone(codex["recommendation"])
         self.assertFalse(any(row["recommended"] for row in codex["choices"]))
 
-    def test_configured_feeds_are_private_and_used_without_environment_overrides(self) -> None:
+    def test_configured_feeds_are_private_and_used_without_environment_overrides(
+        self,
+    ) -> None:
         self.seed_profiles(("claude", "primary", "primary@invalid.example"))
         now = int(accounts.time.time())
         self.write_feed(
@@ -385,10 +396,10 @@ class AccountProfileTests(unittest.TestCase):
 
         stored = json.loads(state_path.read_text(encoding="utf-8"))
         self.assertTrue(stored["hasCompletedOnboarding"])
-        self.assertEqual("primary@invalid.example", stored["oauthAccount"]["emailAddress"])
-        self.assertTrue(
-            stored["projects"]["/srv/trusted"]["hasTrustDialogAccepted"]
+        self.assertEqual(
+            "primary@invalid.example", stored["oauthAccount"]["emailAddress"]
         )
+        self.assertTrue(stored["projects"]["/srv/trusted"]["hasTrustDialogAccepted"])
         self.assertNotIn("/srv/untrusted", stored["projects"])
         self.assertEqual(0o600, state_path.stat().st_mode & 0o777)
 
@@ -606,7 +617,7 @@ class AccountProfileTests(unittest.TestCase):
                 scratch = state_path.parent / (state_path.name + ".tmp.9999.abc")
                 scratch.write_text(json.dumps(current), encoding="utf-8")
                 scratch.chmod(0o600)
-                os.replace(scratch, state_path)   # exactly how Claude saves it
+                os.replace(scratch, state_path)  # exactly how Claude saves it
             return result
 
         with mock.patch.object(
@@ -623,7 +634,7 @@ class AccountProfileTests(unittest.TestCase):
         self.assertEqual(3, reads["of_the_profile"])
         stored = json.loads(state_path.read_text(encoding="utf-8"))
         self.assertEqual("2.1.233", stored["lastReleaseNotesSeen"])  # never lost
-        self.assertIs(True, stored["hasSeenAutoDefaultNudge"])       # ours retried in
+        self.assertIs(True, stored["hasSeenAutoDefaultNudge"])  # ours retried in
         self.assertTrue(stored["hasCompletedOnboarding"])
         self.assertEqual(0o600, state_path.stat().st_mode & 0o777)
 
@@ -692,16 +703,12 @@ class AccountProfileTests(unittest.TestCase):
             ("claude", "source", "source@example.com"),
             ("claude", "target", "target@example.com"),
         )
-        accounts.bind(
-            self.config, "claude", CLAUDE_UUID, "source", source="fixture"
-        )
+        accounts.bind(self.config, "claude", CLAUDE_UUID, "source", source="fixture")
         accounts.kill_switch_path(self.config).touch(mode=0o600)
 
         with mock.patch.object(accounts.subprocess, "run") as provider:
             with self.assertRaisesRegex(CollectionError, "disabled"):
-                accounts.enroll(
-                    self.config, "claude", "newone", "newone@example.com"
-                )
+                accounts.enroll(self.config, "claude", "newone", "newone@example.com")
             with self.assertRaisesRegex(CollectionError, "disabled"):
                 accounts.launch_profile(self.config, "claude", "source")
             with self.assertRaisesRegex(CollectionError, "disabled"):
@@ -762,13 +769,22 @@ class AccountSwitchTransactionTests(unittest.TestCase):
         if provider == "claude":
             artifact = source / "projects" / "-srv-test" / f"{uuid}.jsonl"
         else:
-            artifact = source / "sessions" / "2026" / "08" / "10" / f"rollout-test-{uuid}.jsonl"
+            artifact = (
+                source
+                / "sessions"
+                / "2026"
+                / "08"
+                / "10"
+                / f"rollout-test-{uuid}.jsonl"
+            )
         artifact.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         artifact.write_text("source history\n", encoding="utf-8")
         artifact.chmod(0o600)
         return source, target
 
-    def test_prepare_apply_and_commit_move_exact_claude_history_and_binding(self) -> None:
+    def test_prepare_apply_and_commit_move_exact_claude_history_and_binding(
+        self,
+    ) -> None:
         source, target = self.seed_switch("claude", CLAUDE_UUID)
         transcript = Path("projects") / "-srv-test" / f"{CLAUDE_UUID}.jsonl"
 
@@ -813,11 +829,7 @@ class AccountSwitchTransactionTests(unittest.TestCase):
     def test_rollback_restores_newest_codex_history_and_original_binding(self) -> None:
         source, target = self.seed_switch("codex", CODEX_UUID)
         rollout = (
-            Path("sessions")
-            / "2026"
-            / "08"
-            / "10"
-            / f"rollout-test-{CODEX_UUID}.jsonl"
+            Path("sessions") / "2026" / "08" / "10" / f"rollout-test-{CODEX_UUID}.jsonl"
         )
         prepared = accounts.prepare_switch(
             self.config,
@@ -850,18 +862,12 @@ class AccountSwitchTransactionTests(unittest.TestCase):
         )
         self.assertEqual(
             "account-switch-rollback",
-            accounts.binding_for(self.config, "codex", CODEX_UUID)[
-                "binding_source"
-            ],
+            accounts.binding_for(self.config, "codex", CODEX_UUID)["binding_source"],
         )
         self.assertEqual(
             "rolled_back",
             accounts.transaction(self.config, prepared["txid"])["status"],
         )
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class RulesSyncTests(unittest.TestCase):
@@ -921,7 +927,9 @@ class RulesSyncTests(unittest.TestCase):
         result = accounts.sync_rules(self.config)
         self.assertFalse(result["ok"])
         self.assertEqual(result["targets"], [])
-        self.assertEqual(self.claude_rulebook().read_text(encoding="utf-8"), "claude text\n")
+        self.assertEqual(
+            self.claude_rulebook().read_text(encoding="utf-8"), "claude text\n"
+        )
 
     def test_first_sync_keeps_the_existing_rulebook_text(self) -> None:
         self.rules.write_text("# Shared\n\nbe careful\n", encoding="utf-8")
@@ -1007,3 +1015,7 @@ class RulesSyncTests(unittest.TestCase):
         self.write_default_rulebooks("tail\n", "tail\n")
         with self.assertRaises(CollectionError):
             accounts.sync_rules(self.config)
+
+
+if __name__ == "__main__":
+    unittest.main()
