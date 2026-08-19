@@ -424,9 +424,9 @@ def _footer_line(width: int, footer: str = voice.FOOTER) -> Line:
         ("more m", "m"),
         ("help ?", "?"),
         ("b back", "b"),
-        ("esc leave", "esc"),
+        ("esc quit", "esc"),
         ("esc back", "esc"),
-        ("ctrl-d leave", "ctrl-d"),
+        ("ctrl-d quit", "ctrl-d"),
     )
     spans.extend(_key_spans(text, markers))
     return Line(text, tuple(spans))

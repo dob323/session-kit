@@ -493,7 +493,7 @@ resume. Picker semantics never depend on colour alone.
 
 ## When a provider exits
 
-A clean exit closes the session. `/exit` inside Claude or Codex, the provider
+A clean exit closes the session. `/exit` inside Claude, the provider
 ending with status 0, ends the shell with it, returns the session number to
 the ordinary quarantine, and lands you at the picker. The conversation is in
 Closed sessions, and one Restore brings it back. There is no opt-in marker: one

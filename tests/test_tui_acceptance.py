@@ -968,7 +968,7 @@ class InputTests(TerminalCaseMixin, unittest.TestCase):
     def test_the_footer_names_the_way_out(self) -> None:
         session = self.open()
         index = session.screen.find("open #")
-        self.assertIn("esc leave", session.screen.line(index))
+        self.assertIn("esc quit", session.screen.line(index))
 
 
 class SecondaryPageTests(TerminalCaseMixin, unittest.TestCase):
@@ -1010,7 +1010,7 @@ class SecondaryPageTests(TerminalCaseMixin, unittest.TestCase):
         footer = session.screen.find("↵ back")
         self.assertGreaterEqual(footer, 0)
         self.assert_green(session, footer, "↵")
-        self.assertIn("ctrl-d leave", session.screen.line(footer))
+        self.assertIn("ctrl-d quit", session.screen.line(footer))
 
     def test_project_chooser_mirrors_the_numbered_old_project_step(self) -> None:
         session = self.one(projects=(("main", "/srv/project"),))

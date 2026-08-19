@@ -85,8 +85,7 @@ def account_root(config: Mapping[str, Any]) -> Path:
         root = Path(override)
     else:
         data_home = Path(
-            os.environ.get("XDG_DATA_HOME")
-            or (Path.home() / ".local" / "share")
+            os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share")
         )
         root = data_home / "session-kit" / "accounts"
     if not root.is_absolute():
@@ -127,9 +126,14 @@ def _feed_paths(config: Mapping[str, Any]) -> tuple[Path, Path]:
     if raw is None:
         root = Path(str(config["state_dir"]))
         return root / "account-roster.json", root / "account-advice.json"
-    if not isinstance(raw, Mapping) or raw.get("schema_version") != ACCOUNT_SCHEMA_VERSION:
+    if (
+        not isinstance(raw, Mapping)
+        or raw.get("schema_version") != ACCOUNT_SCHEMA_VERSION
+    ):
         raise CollectionError("account feed configuration is invalid")
-    paths = tuple(Path(str(raw.get(key) or "")) for key in ("roster_path", "advice_path"))
+    paths = tuple(
+        Path(str(raw.get(key) or "")) for key in ("roster_path", "advice_path")
+    )
     if any(not path.is_absolute() for path in paths):
         raise CollectionError("account feed configuration is invalid")
     return paths[0], paths[1]
@@ -172,7 +176,11 @@ def _validate_registry(raw: Any, config: Mapping[str, Any]) -> dict[str, Any]:
     if raw.get("schema_version") != ACCOUNT_SCHEMA_VERSION:
         raise CollectionError("account registry schema is unsupported")
     generation = raw.get("generation")
-    if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
+    if (
+        not isinstance(generation, int)
+        or isinstance(generation, bool)
+        or generation < 0
+    ):
         raise CollectionError("account registry generation is invalid")
     profiles_raw = raw.get("profiles")
     bindings_raw = raw.get("bindings")
@@ -241,7 +249,9 @@ def _validate_registry(raw: Any, config: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def load_registry(config: Mapping[str, Any], *, allow_missing: bool = True) -> dict[str, Any]:
+def load_registry(
+    config: Mapping[str, Any], *, allow_missing: bool = True
+) -> dict[str, Any]:
     path = registry_path(config)
     raw = read_private_json(
         path,
@@ -316,7 +326,9 @@ def _atomic_private_json(path: Path, value: Any, *, expect: Any = _NO_GUARD) -> 
             os.unlink(temporary)
 
 
-def write_registry(config: Mapping[str, Any], registry: Mapping[str, Any]) -> dict[str, Any]:
+def write_registry(
+    config: Mapping[str, Any], registry: Mapping[str, Any]
+) -> dict[str, Any]:
     checked = _validate_registry(registry, config)
     _atomic_private_json(registry_path(config), checked)
     return checked
@@ -334,7 +346,9 @@ def profile(config: Mapping[str, Any], provider: str, alias: str) -> dict[str, A
     return dict(value)
 
 
-def list_profiles(config: Mapping[str, Any], provider: str | None = None) -> list[dict[str, Any]]:
+def list_profiles(
+    config: Mapping[str, Any], provider: str | None = None
+) -> list[dict[str, Any]]:
     if provider is not None and provider not in PROVIDERS:
         raise CollectionError("account provider is invalid")
     registry = load_registry(config)
@@ -346,7 +360,9 @@ def list_profiles(config: Mapping[str, Any], provider: str | None = None) -> lis
     return sorted(result, key=lambda item: (item["provider"], item["alias"]))
 
 
-def binding_for(config: Mapping[str, Any], provider: str, uuid: str) -> dict[str, Any] | None:
+def binding_for(
+    config: Mapping[str, Any], provider: str, uuid: str
+) -> dict[str, Any] | None:
     exact = valid_uuid(uuid)
     if provider not in PROVIDERS or not exact:
         return None
@@ -434,7 +450,11 @@ def _run_codex_account_read(profile_dir: Path) -> dict[str, Any]:
                 "method": "initialize",
                 "id": 0,
                 "params": {
-                    "clientInfo": {"name": "session-kit", "title": "Session Kit", "version": "1"},
+                    "clientInfo": {
+                        "name": "session-kit",
+                        "title": "Session Kit",
+                        "version": "1",
+                    },
                     "capabilities": {},
                 },
             },
@@ -555,7 +575,11 @@ def probe_identity(provider: str, profile_dir: Path) -> dict[str, Any]:
 
 def _copy_regular(source: Path, destination: Path, *, mode: int = 0o600) -> None:
     info = source.lstat()
-    if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_uid != os.geteuid():
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or info.st_uid != os.geteuid()
+    ):
         raise CollectionError("profile configuration source is unsafe")
     destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(destination.parent, 0o700)
@@ -604,7 +628,9 @@ def sync_profile_configuration(provider: str, profile_dir: Path) -> None:
             try:
                 parsed = json.loads(settings.read_text(encoding="utf-8"))
             except (OSError, ValueError) as exc:
-                raise CollectionError("Claude settings could not be safely copied") from exc
+                raise CollectionError(
+                    "Claude settings could not be safely copied"
+                ) from exc
             if not isinstance(parsed, dict):
                 raise CollectionError("Claude settings could not be safely copied")
             value = parsed
@@ -680,7 +706,9 @@ def _load_owned_claude_state(path: Path) -> Mapping[str, Any] | None:
         elif info.st_uid != os.geteuid():
             reason = "it is owned by another user"
         elif info.st_size > MAX_CLAUDE_STATE_BYTES:
-            reason = f"it is {info.st_size} bytes, past the {MAX_CLAUDE_STATE_BYTES} cap"
+            reason = (
+                f"it is {info.st_size} bytes, past the {MAX_CLAUDE_STATE_BYTES} cap"
+            )
         else:
             reason = ""
         if reason:
@@ -783,9 +811,7 @@ def _complete_claude_profile_onboarding(profile_dir: Path) -> None:
 
     default_state = _load_owned_claude_state(Path.home() / ".claude.json")
     default_projects = (
-        default_state.get("projects", {})
-        if isinstance(default_state, Mapping)
-        else {}
+        default_state.get("projects", {}) if isinstance(default_state, Mapping) else {}
     )
     projects = value.get("projects")
     if projects is not None and not isinstance(projects, dict):
@@ -861,7 +887,7 @@ def _complete_claude_profile_onboarding(profile_dir: Path) -> None:
             merged["hasCompletedOnboarding"] = True
             latest_projects = merged.get("projects")
             if latest_projects is not None and not isinstance(latest_projects, dict):
-                latest_projects = None          # not ours to reshape
+                latest_projects = None  # not ours to reshape
             elif latest_projects is None:
                 latest_projects = {}
                 merged["projects"] = latest_projects
@@ -926,7 +952,9 @@ def _register_profile(
     identity = probe_identity(provider, profile_dir)
     email = clean_text(expected_email, 254).casefold()
     if identity["email"] != email:
-        raise CollectionError("provider-reported account does not match the selected email")
+        raise CollectionError(
+            "provider-reported account does not match the selected email"
+        )
     if provider == "claude" and not legacy:
         _complete_claude_profile_onboarding(profile_dir)
     with _registry_lock(config):
@@ -965,9 +993,15 @@ def _register_profile(
                     "settings were left unchanged" % alias
                 )
         for other_key, other in registry["profiles"].items():
-            if other_key != key and other["provider"] == provider and other["email"] == email:
+            if (
+                other_key != key
+                and other["provider"] == provider
+                and other["email"] == email
+            ):
                 raise CollectionError("that provider account is already enrolled")
-        _safe_profile_path(provider, alias, os.fspath(profile_dir), config=config, legacy=legacy)
+        _safe_profile_path(
+            provider, alias, os.fspath(profile_dir), config=config, legacy=legacy
+        )
         registry["profiles"][key] = {
             "provider": provider,
             "alias": alias,
@@ -1020,7 +1054,9 @@ def enroll(
     )
 
 
-def verify_profile(config: Mapping[str, Any], provider: str, alias: str) -> dict[str, Any]:
+def verify_profile(
+    config: Mapping[str, Any], provider: str, alias: str
+) -> dict[str, Any]:
     """Re-prove an already-enrolled profile. Never enables anything."""
     current = profile(config, provider, alias)
     return _register_profile(
@@ -1120,9 +1156,7 @@ def account_choices(config: Mapping[str, Any], provider: str) -> dict[str, Any]:
             recommended_email = clean_text(use_now.get("account"), 254).casefold()
             # Feeds have shipped the explanation under both spellings. Taking
             # either beats showing a recommendation with no stated reason.
-            advice_reason = clean_text(
-                use_now.get("why") or use_now.get("reason"), 240
-            )
+            advice_reason = clean_text(use_now.get("why") or use_now.get("reason"), 240)
     roster_state = (
         "fresh" if roster_fresh else ("stale" if roster is not None else "absent")
     )
@@ -1213,7 +1247,9 @@ def _require_eligible_profile(
         )
 
 
-def resume_profile(config: Mapping[str, Any], provider: str, alias: str) -> dict[str, Any]:
+def resume_profile(
+    config: Mapping[str, Any], provider: str, alias: str
+) -> dict[str, Any]:
     item = verify_profile(config, provider, alias)
     if provider == "claude":
         # Every profile the kit can launch, not only the ones it creates from
@@ -1235,7 +1271,9 @@ def resume_profile(config: Mapping[str, Any], provider: str, alias: str) -> dict
     }
 
 
-def launch_profile(config: Mapping[str, Any], provider: str, alias: str) -> dict[str, Any]:
+def launch_profile(
+    config: Mapping[str, Any], provider: str, alias: str
+) -> dict[str, Any]:
     if kill_switch_path(config).exists():
         raise CollectionError("account enrollment and switching are disabled")
     item = resume_profile(config, provider, alias)
@@ -1254,8 +1292,13 @@ def _transaction_path(config: Mapping[str, Any], txid: str) -> Path:
 
 
 def _load_transaction(config: Mapping[str, Any], txid: str) -> dict[str, Any]:
-    raw = read_private_json(_transaction_path(config, txid), max_bytes=MAX_TRANSACTION_BYTES)
-    if not isinstance(raw, Mapping) or raw.get("schema_version") != ACCOUNT_SCHEMA_VERSION:
+    raw = read_private_json(
+        _transaction_path(config, txid), max_bytes=MAX_TRANSACTION_BYTES
+    )
+    if (
+        not isinstance(raw, Mapping)
+        or raw.get("schema_version") != ACCOUNT_SCHEMA_VERSION
+    ):
         raise CollectionError("account switch transaction is invalid")
     if raw.get("txid") != txid or raw.get("provider") not in PROVIDERS:
         raise CollectionError("account switch transaction identity is invalid")
@@ -1382,7 +1425,9 @@ def apply_switch(config: Mapping[str, Any], txid: str) -> dict[str, Any]:
             backup = backup_root / relative
             target = target_root / relative
             if target.exists():
-                raise CollectionError("target profile already contains this exact conversation")
+                raise CollectionError(
+                    "target profile already contains this exact conversation"
+                )
             copied_targets.append(target)
             _copy_artifact(source, backup)
             _copy_artifact(source, target)
@@ -1525,9 +1570,7 @@ def rules_targets(config: Mapping[str, Any]) -> list[dict[str, str]]:
         if resolved in seen or not path.is_file():
             return
         seen.add(resolved)
-        found.append(
-            {"provider": provider, "label": label, "path": os.fspath(path)}
-        )
+        found.append({"provider": provider, "label": label, "path": os.fspath(path)})
 
     for provider in sorted(PROVIDERS):
         offer(
@@ -1592,13 +1635,30 @@ def sync_rules(config: Mapping[str, Any], *, check: bool = False) -> dict[str, A
         }
     if source.stat().st_size > MAX_RULES_BYTES:
         raise CollectionError("the canonical rules file is implausibly large")
-    body = source.read_text(encoding="utf-8")
+    try:
+        body = source.read_text(encoding="utf-8")
+    except UnicodeDecodeError as error:
+        raise CollectionError(
+            f"the canonical rules file is not UTF-8 text: {source}"
+        ) from error
     block = render_rules_block(body)
     results = []
     drifted = 0
     for target in rules_targets(config):
         path = Path(target["path"])
-        original = path.read_text(encoding="utf-8")
+        # A symlinked rulebook belongs to whatever manages the link target,
+        # dotfiles usually. Rewriting through the link would edit that other
+        # system's file, and the backup copy refuses symlinks anyway -- so the
+        # skip happens here, by name, instead of five targets in as an abort
+        # that leaves the run half applied.
+        if path.is_symlink():
+            results.append({**target, "state": "skipped", "reason": "symlink"})
+            continue
+        try:
+            original = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            results.append({**target, "state": "skipped", "reason": "not UTF-8 text"})
+            continue
         if RULES_BLOCK_RE.search(original):
             updated = RULES_BLOCK_RE.sub(lambda _: block, original, count=1)
         else:

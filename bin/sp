@@ -260,10 +260,10 @@ Accounts
   sp account enroll <claude|codex> <alias> <email>
                                      create a separate provider profile
   sp account verify <claude|codex> <alias>
+                                     confirm a profile is signed in
   sp account sync-rules [--check]    write the shared rules file into every
                                      provider and profile rulebook, leaving each
                                      one's own text alone; --check only reports
-                                     confirm a profile is signed in
   sp account configure-feeds <roster-json> <advice-json>
                                      point account advice at local feeds
   sp new <claude|codex> [project-alias] --account <alias>

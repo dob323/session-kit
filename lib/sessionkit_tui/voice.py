@@ -26,18 +26,18 @@ from __future__ import annotations
 # this surface because it is named nowhere else.
 FOOTER = (
     "↵ open · open # · kill k # · new n · more m · "
-    "help ? · history h # · esc leave"
+    "help ? · history h # · esc quit"
 )
 
 # The parts of the footer that name a key. Coloured so the eye finds them
 # without the footer growing brackets or a glossary.
 FOOTER_KEYS = ("↵", "#", "k #", "h #", "n", "m", "?", "esc")
 
-BACK_FOOTER = "↵ choose · b back · esc back · ctrl-d leave"
-HELP_FOOTER = "↵ back · b back · esc back · ctrl-d leave"
-CLOSED_FOOTER = "↵ actions · esc back · ctrl-d leave"
+BACK_FOOTER = "↵ choose · b back · esc back · ctrl-d quit"
+HELP_FOOTER = "↵ back · b back · esc back · ctrl-d quit"
+CLOSED_FOOTER = "↵ actions · esc back · ctrl-d quit"
 # The rename prompt is the one panel where `b` is a name, not a key.
-NAME_PROMPT_FOOTER = "↵ save · esc back · ctrl-d leave"
+NAME_PROMPT_FOOTER = "↵ save · esc back · ctrl-d quit"
 
 # The one cancel wording. Nothing else means "nothing happened".
 NOTHING_CHANGED = "Nothing changed."

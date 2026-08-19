@@ -59,7 +59,7 @@ class FooterTests(unittest.TestCase):
         # and `more` is a door, so `more m` outranks `history h #` here too.
         self.assertEqual(
             "↵ open · open # · kill k # · new n · more m · "
-            "help ? · history h # · esc leave",
+            "help ? · history h # · esc quit",
             voice.FOOTER,
         )
 
@@ -74,7 +74,7 @@ class FooterTests(unittest.TestCase):
             "new n",
             "more m",
             "help ?",
-            "esc leave",
+            "esc quit",
         ):
             self.assertIn(phrase, footer.text)
         key_positions = (
@@ -84,7 +84,7 @@ class FooterTests(unittest.TestCase):
             ("n", footer.text.index("new n") + len("new ")),
             ("m", footer.text.index("more m") + len("more ")),
             ("?", footer.text.index("help ?") + len("help ")),
-            ("esc", footer.text.index("esc leave")),
+            ("esc", footer.text.index("esc quit")),
         )
         for token, start in key_positions:
             self.assertTrue(
@@ -474,7 +474,7 @@ class PanelPaintTests(unittest.TestCase):
         rows = [line.text for line in drawn.lines if " | " in line.text]
         self.assertEqual(1, len({line.index("|") for line in rows}), rows)
         self.assertEqual(
-            "  ↵ choose · b back · esc back · ctrl-d leave", drawn.lines[-1].text
+            "  ↵ choose · b back · esc back · ctrl-d quit", drawn.lines[-1].text
         )
         self.assertTrue(any(span.style == "title:red" for span in drawn.lines[0].spans))
 
@@ -506,7 +506,7 @@ class HelpTests(unittest.TestCase):
         self.assertEqual(len(voice.HELP_ROWS), len(rows))
         self.assertTrue(all(any(span.style == "key" for span in line.spans) for line in rows))
         self.assertTrue(all(line.text[15] == " " for line in rows))
-        self.assertIn("  ↵ back · b back · esc back · ctrl-d leave", drawn.text())
+        self.assertIn("  ↵ back · b back · esc back · ctrl-d quit", drawn.text())
 
 
 class ClosedPagePaintTests(unittest.TestCase):
@@ -520,7 +520,7 @@ class ClosedPagePaintTests(unittest.TestCase):
         line = next(line for line in drawn.lines if "Old Alpha" in line.text)
         self.assertIn("[CDX] Old Alpha [login time unknown]", line.text)
         self.assertTrue(any(span.style == "provider:codex" for span in line.spans))
-        self.assertEqual("  ↵ actions · esc back · ctrl-d leave", drawn.lines[-1].text)
+        self.assertEqual("  ↵ actions · esc back · ctrl-d quit", drawn.lines[-1].text)
 
 
 class ScrollTests(unittest.TestCase):

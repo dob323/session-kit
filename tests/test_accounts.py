@@ -955,6 +955,33 @@ class RulesSyncTests(unittest.TestCase):
         self.assertIn("tail note", claude)
         self.assertEqual(claude.count(accounts.RULES_END), 1)
 
+    def test_a_symlinked_rulebook_is_skipped_by_name_not_aborted_on(self) -> None:
+        self.rules.write_text("a rule\n", encoding="utf-8")
+        self.write_default_rulebooks("claude tail\n", "codex tail\n")
+        elsewhere = self.root / "dotfiles-CLAUDE.md"
+        elsewhere.write_text("managed elsewhere\n", encoding="utf-8")
+        self.claude_rulebook().unlink()
+        self.claude_rulebook().symlink_to(elsewhere)
+        result = accounts.sync_rules(self.config)
+        self.assertTrue(result["ok"])
+        states = {t["path"]: t["state"] for t in result["targets"]}
+        self.assertEqual(states[str(self.claude_rulebook())], "skipped")
+        # The link and its target are both untouched, and the other rulebook
+        # was still written -- one refused target does not end the run.
+        self.assertEqual(elsewhere.read_text(encoding="utf-8"), "managed elsewhere\n")
+        self.assertIn("a rule", self.codex_rulebook().read_text(encoding="utf-8"))
+
+    def test_a_rulebook_that_is_not_text_is_skipped_not_a_traceback(self) -> None:
+        self.rules.write_text("a rule\n", encoding="utf-8")
+        self.write_default_rulebooks("claude tail\n", "codex tail\n")
+        self.claude_rulebook().write_bytes(b"\xff\xfe\x00 not text")
+        result = accounts.sync_rules(self.config)
+        self.assertTrue(result["ok"])
+        states = {t["path"]: t["state"] for t in result["targets"]}
+        self.assertEqual(states[str(self.claude_rulebook())], "skipped")
+        self.assertEqual(self.claude_rulebook().read_bytes(), b"\xff\xfe\x00 not text")
+        self.assertIn("a rule", self.codex_rulebook().read_text(encoding="utf-8"))
+
     def test_check_reports_drift_without_writing(self) -> None:
         self.rules.write_text("first rule\n", encoding="utf-8")
         self.write_default_rulebooks("tail\n", "tail\n")
