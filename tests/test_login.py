@@ -3952,5 +3952,55 @@ class LoginPickerTests(unittest.TestCase):
             fixture.close()
 
 
+class TerminalReadDisciplineTests(unittest.TestCase):
+    """No read may CONSUME from the terminal while a timer runs on it.
+
+    Bash's timed read abandons input it has already pulled out of the kernel
+    when the timeout fires mid-read: the queue no longer has the byte and the
+    variable never receives it.  Under a loaded scheduler that window
+    stretches to whole time slices, and one keypress in a few hundred died on
+    the one-second beat exactly that way (measured 2026-08-19: a lone Enter
+    into `read -r -t 1` aimed at the timer edge was lost 7 times in 200, and
+    the q of a q-then-Enter into a timed single-character read was eaten 1
+    time in 300 -- the two shapes CI kept failing with).  The picker now
+    waits on its tick fifo and asks readiness with a zero timeout, which
+    consumes nothing; only untimed reads take bytes.  Every timed read in the
+    picker's shell must therefore poll (-t 0), read a non-terminal
+    descriptor (-u), or carry one of the two audited waivers: the legacy
+    branch used only when no tick fifo could be opened, and the interrupt
+    path whose whole job is throwing queued input away.
+    """
+
+    WAIVERS = ("# tick-fallback", "# discard-by-design")
+
+    def test_no_consuming_terminal_read_carries_a_timer(self) -> None:
+        offenders: list[str] = []
+        sources = sorted((REPO / "lib" / "sh").glob("shpool_login*.sh"))
+        sources.append(REPO / "bin" / "shpool_login")
+        for path in sources:
+            for number, line in enumerate(
+                path.read_text(encoding="utf-8").splitlines(), start=1
+            ):
+                if line.lstrip().startswith("#"):
+                    continue
+                if any(waiver in line for waiver in self.WAIVERS):
+                    continue
+                if not re.search(r"\bread\b", line):
+                    continue
+                timer = re.search(r"-t\s+(\S+)", line)
+                if timer is None:
+                    continue
+                if timer.group(1).strip("\"'") == "0":
+                    continue
+                if re.search(r"-u\s", line):
+                    continue
+                offenders.append(f"{path.name}:{number}: {line.strip()}")
+        self.assertEqual(
+            [],
+            offenders,
+            "timed reads that can consume (and so abandon) a keypress",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

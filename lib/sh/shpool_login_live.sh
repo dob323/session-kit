@@ -51,6 +51,56 @@ PICKER_ESCAPE_TAIL=""
 # a character at a time stays instant.
 PICKER_PASTE_LIMIT=8192
 
+# A timed read from the terminal can eat the byte it was handed: bash pulls
+# the byte out of the kernel, the timer fires before the builtin finishes, and
+# the jump out of the read abandons what was already consumed -- the kernel no
+# longer has it and the variable never gets it. On a loaded machine the gap
+# between those two moments stretches to whole scheduler slices, and about one
+# keypress in three hundred dies on the timer edge (measured 2026-08-19:
+# `read -n 1 -t 1` on a raw pty under one contended CPU lost the q of a q-Enter
+# exactly the way CI keeps losing it). So no read that CONSUMES from the
+# terminal may carry a timeout. Waiting happens against this fifo -- a
+# descriptor that never has data, so its timeouts have nothing to abandon --
+# and readiness is asked with `read -t 0`, which consumes nothing.
+PICKER_TICK_FD=""
+PICKER_TICK_FAILED=0
+
+picker_tick_open() {
+  [[ -z $PICKER_TICK_FD ]] || return 0
+  (( ! PICKER_TICK_FAILED )) || return 1
+  local fifo=${SK_STATE_DIR:-${TMPDIR:-/tmp}}/.picker-tick.$$
+  command rm -f -- "$fifo"
+  if ! mkfifo -m 600 -- "$fifo" 2>/dev/null; then
+    PICKER_TICK_FAILED=1
+    return 1
+  fi
+  # Opened read-write, so this shell is its own writer and the open cannot
+  # block; unlinked at once, so the descriptor is the only trace it leaves.
+  if ! exec {PICKER_TICK_FD}<>"$fifo"; then
+    PICKER_TICK_FD=""
+    PICKER_TICK_FAILED=1
+    command rm -f -- "$fifo"
+    return 1
+  fi
+  command rm -f -- "$fifo"
+}
+
+# Sleep without touching the terminal. Nothing ever writes the tick fifo, so
+# the timeout is the whole point, and a trapped signal still ends the wait
+# early -- which is how Ctrl-C keeps its sub-second response.
+picker_tick() {
+  local __sk_tick_junk=""
+  IFS= read -r -t "${1:-0.05}" -u "$PICKER_TICK_FD" __sk_tick_junk 2>/dev/null
+  return 0
+}
+
+# True when the terminal has input ready to hand over whole -- a complete line
+# in canonical mode, any byte in character mode -- asked without consuming:
+# a zero timeout never reads.
+picker_input_ready() {
+  IFS= read -r -t 0
+}
+
 picker_paste_arm() {
   (( PICKER_SCREEN )) || return 0
   [[ -t 0 ]] || return 0
@@ -79,13 +129,32 @@ picker_paste_clean() {
 # Read the rest of a paste straight from the terminal, up to its closing
 # marker. Bounded twice: a terminal that never closes the block must not hold
 # the prompt, and an enormous paste must not be assembled forever.
+# One raw byte of a paste block: -N so a newline is data, the wait spent on
+# ticks (forty of them, the old two-second bound), the take untimed -- the
+# same separation as every other consuming read here.
+picker_paste_next() {
+  local __sk_paste_var=$1 __sk_paste_ticks=0
+  if [[ -z $PICKER_TICK_FD ]]; then
+    # shellcheck disable=SC2229
+    IFS= read -r -s -N 1 -t 2 "$__sk_paste_var" 2>/dev/null  # tick-fallback
+    return
+  fi
+  while ! picker_input_ready; do
+    __sk_paste_ticks=$(( __sk_paste_ticks + 1 ))
+    (( __sk_paste_ticks <= 40 )) || return 1
+    picker_tick
+  done
+  # shellcheck disable=SC2229
+  IFS= read -r -s -N 1 "$__sk_paste_var" 2>/dev/null
+}
+
 picker_paste_drain() {
   local character=""
   PICKER_PASTE_RAW=""
   while (( ${#PICKER_PASTE_RAW} < PICKER_PASTE_LIMIT )); do
     # -N takes the byte as it is, so a newline inside the block is data here
     # rather than the end of a read.
-    IFS= read -r -s -N 1 -t 2 character 2>/dev/null || break
+    picker_paste_next character || break
     if [[ $character == $'\033' ]]; then
       picker_swallow_escape
       [[ $PICKER_ESCAPE_TAIL != '[201~' ]] || break
@@ -127,7 +196,7 @@ picker_discard_pending_input() {
   [[ -t 0 ]] || return 0
   while (( __sk_reads < PICKER_PASTE_LIMIT )); do
     __sk_reads=$(( __sk_reads + 1 ))
-    IFS= read -r -s -N 1 -t 0.01 __sk_junk 2>/dev/null || break
+    IFS= read -r -s -N 1 -t 0.01 __sk_junk 2>/dev/null || break  # discard-by-design
   done
   return 0
 }
@@ -676,24 +745,55 @@ picker_read_raw() {
   # half-typed line, so nothing typed is lost across the poll.
   picker_paste_arm
   printf '%s' "$__sk_raw_prompt"
+  picker_tick_open || true
+  local __sk_raw_ticks=0
   while true; do
-    # The status MUST be captured in the else. After a bare `if` whose
-    # condition failed, $? is the status of the `if` itself -- zero -- and
-    # every one-second poll would read as closed input and walk out of the
-    # prompt on its own. The console learned this the same way.
-    # shellcheck disable=SC2229
-    if IFS= read -r -t 1 "$__sk_raw_var"; then
-      # A pasted block is one answer to this prompt, never a queue of them:
-      # the rest of the block is read here and folded into the same line, so
-      # no later prompt is answered by a line nobody typed.
-      if picker_paste_in_line "${!__sk_raw_var}"; then
-        picker_paste_absorb "${!__sk_raw_var}"
-        # shellcheck disable=SC2229
-        printf -v "$__sk_raw_var" '%s' "$PICKER_PASTE_TEXT"
+    # Waiting and consuming are separated on purpose: only an UNTIMED read may
+    # take bytes off the terminal, and it runs solely after `read -t 0` says a
+    # whole answer is already queued -- so it returns at once and no timer can
+    # fire while it holds a half-taken keypress.
+    if picker_input_ready; then
+      # shellcheck disable=SC2229
+      if IFS= read -r "$__sk_raw_var"; then
+        # A pasted block is one answer to this prompt, never a queue of them:
+        # the rest of the block is read here and folded into the same line, so
+        # no later prompt is answered by a line nobody typed.
+        if picker_paste_in_line "${!__sk_raw_var}"; then
+          picker_paste_absorb "${!__sk_raw_var}"
+          # shellcheck disable=SC2229
+          printf -v "$__sk_raw_var" '%s' "$PICKER_PASTE_TEXT"
+        fi
+        return 0
       fi
-      return 0
+      # Readable but nothing deliverable is closed input, not a timeout.
+      __sk_raw_status=1
+    elif [[ -n $PICKER_TICK_FD ]]; then
+      picker_tick
+      __sk_raw_ticks=$(( __sk_raw_ticks + 1 ))
+      if (( __sk_raw_ticks < 20 && PICKER_INTERRUPTED == 0 )); then
+        continue
+      fi
+      # Twenty ticks are this loop's old one-second beat.
+      __sk_raw_ticks=0
+      __sk_raw_status=142
     else
-      __sk_raw_status=$?
+      # No fifo could be opened, so this is the old timed read -- and with it
+      # the timer race everything above exists to remove.
+      # The status MUST be captured in the else. After a bare `if` whose
+      # condition failed, $? is the status of the `if` itself -- zero -- and
+      # every one-second poll would read as closed input and walk out of the
+      # prompt on its own. The console learned this the same way.
+      # shellcheck disable=SC2229
+      if IFS= read -r -t 1 "$__sk_raw_var"; then  # tick-fallback
+        if picker_paste_in_line "${!__sk_raw_var}"; then
+          picker_paste_absorb "${!__sk_raw_var}"
+          # shellcheck disable=SC2229
+          printf -v "$__sk_raw_var" '%s' "$PICKER_PASTE_TEXT"
+        fi
+        return 0
+      else
+        __sk_raw_status=$?
+      fi
     fi
     if (( PICKER_INTERRUPTED )); then
       PICKER_INTERRUPTED=0
@@ -716,14 +816,32 @@ picker_read_raw() {
 # into a name. Arrows, Home, Delete and Page Up all arrive as ESC [ … final
 # byte, and every prompt in this picker takes a number, a key, a word or a
 # path -- none of which can contain one. Read the whole sequence and drop it.
+# One byte of an escape sequence, waited for off-terminal and taken untimed.
+# The 50ms budget is the old one: past it the sequence is over, or was never a
+# sequence at all.
+picker_escape_next() {
+  local __sk_esc_var=$1
+  if [[ -z $PICKER_TICK_FD ]]; then
+    # shellcheck disable=SC2229
+    IFS= read -r -s -n 1 -t 0.05 "$__sk_esc_var" 2>/dev/null  # tick-fallback
+    return
+  fi
+  if ! picker_input_ready; then
+    picker_tick 0.05
+    picker_input_ready || return 1
+  fi
+  # shellcheck disable=SC2229
+  IFS= read -r -s -n 1 "$__sk_esc_var" 2>/dev/null
+}
+
 picker_swallow_escape() {
   local extra="" code
   PICKER_ESCAPE_TAIL=""
   # A lone ESC is a key of its own; only [ and O introduce a sequence.
-  IFS= read -r -s -n 1 -t 0.05 extra 2>/dev/null || return 0
+  picker_escape_next extra || return 0
   [[ $extra == '[' || $extra == O ]] || return 0
   PICKER_ESCAPE_TAIL=$extra
-  while IFS= read -r -s -n 1 -t 0.05 extra 2>/dev/null; do
+  while picker_escape_next extra; do
     [[ -n $extra ]] || continue
     PICKER_ESCAPE_TAIL+=$extra
     # Parameter and intermediate bytes (32 through 63) continue the sequence;
@@ -864,6 +982,7 @@ picker_read_live() {
   local __sk_live_var=$1 __sk_live_prompt=$2
   local seconds buffer="" character="" read_status=0 collect_status
   local filter_pending=0 read_timeout=1 elapsed_tenths=0 paste_seen=0
+  local live_ticks=0 tick_limit=20
   PICKER_QUERY_BASE=$QUERY
   PICKER_FILTER_ACTIVE=0
   # The page on the screen is the page this answer is about. A live repaint
@@ -892,16 +1011,43 @@ picker_read_live() {
   # so a repaint can reproduce them.
   # The indirection is deliberate: the caller passes the DESTINATION variable
   # name, which the character loop below fills with `printf -v`.
-  # shellcheck disable=SC2229
-  if IFS= read -r -t 1 "$__sk_live_var"; then
-    # A paste whose first newline arrived inside the canonical second: the
-    # marker is on this line and the rest of the block is still queued. Take
-    # the terminal and read the whole block as data instead of returning a
-    # command the person never typed.
-    picker_paste_in_line "${!__sk_live_var}" || return 0
-    paste_seen=1
+  # The second itself is spent on ticks, and the take is untimed, for the
+  # reason at the tick fifo's definition: a timed read that is handed a line
+  # as its timer fires abandons it.
+  picker_tick_open || true
+  if [[ -n $PICKER_TICK_FD ]]; then
+    read_status=142
+    live_ticks=0
+    while (( live_ticks < 20 )); do
+      if picker_input_ready; then
+        read_status=0
+        break
+      fi
+      picker_tick
+      live_ticks=$(( live_ticks + 1 ))
+      (( PICKER_INTERRUPTED == 0 && PICKER_RESIZED == 0 )) || break
+    done
+    if (( read_status == 0 )); then
+      # shellcheck disable=SC2229
+      if IFS= read -r "$__sk_live_var"; then
+        # A paste whose first newline arrived inside the canonical second: the
+        # marker is on this line and the rest of the block is still queued.
+        # Take the terminal and read the whole block as data instead of
+        # returning a command the person never typed.
+        picker_paste_in_line "${!__sk_live_var}" || return 0
+        paste_seen=1
+      else
+        read_status=1
+      fi
+    fi
   else
-    read_status=$?
+    # shellcheck disable=SC2229
+    if IFS= read -r -t 1 "$__sk_live_var"; then  # tick-fallback
+      picker_paste_in_line "${!__sk_live_var}" || return 0
+      paste_seen=1
+    else
+      read_status=$?
+    fi
   fi
   # The interrupt is answered BEFORE the status is classified. A read that a
   # trapped signal ended returns OVER 128 -- the same range as an ordinary
@@ -960,10 +1106,17 @@ picker_read_live() {
     picker_redraw_home "$__sk_live_prompt" "$buffer"
   fi
   # Characters typed during the canonical second are already visible. Drain
-  # them into our buffer without echoing them a second time.
+  # them into our buffer without echoing them a second time. Ready-check
+  # before every take, one 10ms grace tick for a burst still in flight, and
+  # the takes untimed: the drain must not carry the timer race the reads
+  # above just gave up.
   while true; do
     character=""
-    if ! IFS= read -r -s -n 1 -t 0.01 character; then
+    if ! picker_input_ready; then
+      [[ -z $PICKER_TICK_FD ]] || picker_tick 0.01
+      picker_input_ready || break
+    fi
+    if ! IFS= read -r -s -n 1 character; then
       break
     fi
     if [[ -z $character || $character == $'\r' ]]; then
@@ -996,8 +1149,34 @@ picker_read_live() {
     # the original one-second cadence, so the live refresh below is unchanged.
     read_timeout=1
     (( filter_pending == 0 )) || read_timeout=0.25
-    # shellcheck disable=SC2229
-    if IFS= read -r -s -n 1 -t "$read_timeout" character; then
+    # The same wait/take separation as the canonical read above: the beat is
+    # ticks, the take is untimed and runs only against input already queued.
+    if [[ -n $PICKER_TICK_FD ]]; then
+      tick_limit=20
+      [[ $read_timeout == 1 ]] || tick_limit=5
+      live_ticks=0
+      read_status=142
+      while (( live_ticks < tick_limit )); do
+        if picker_input_ready; then
+          read_status=0
+          break
+        fi
+        picker_tick
+        live_ticks=$(( live_ticks + 1 ))
+        (( PICKER_INTERRUPTED == 0 && PICKER_RESIZED == 0 )) || break
+      done
+      if (( read_status == 0 )) && ! IFS= read -r -s -n 1 character; then
+        read_status=1
+      fi
+    else
+      # shellcheck disable=SC2229
+      if IFS= read -r -s -n 1 -t "$read_timeout" character; then  # tick-fallback
+        read_status=0
+      else
+        read_status=$?
+      fi
+    fi
+    if (( read_status == 0 )); then
       # `read -n 1` returns an empty value for the newline delimiter.
       if [[ -z $character || $character == $'\r' ]]; then
         printf -v "$__sk_live_var" '%s' "$buffer"
@@ -1048,8 +1227,6 @@ picker_read_live() {
           ;;
       esac
       continue
-    else
-      read_status=$?
     fi
     # Same order as the read above and as picker_read_raw: the interrupt is
     # answered first, and the line it interrupted is gone -- what is on screen
