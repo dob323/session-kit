@@ -109,12 +109,19 @@ picker_input_ready() {
 # three -- which starved the event-collection cadence the beat drives.
 picker_wait_input() {
   local __sk_wait_end=0 __sk_wait_ticks=0 __sk_wait_limit=0
+  # Readiness is asked again AFTER every tick and answered before the signal
+  # flags: keys and a Ctrl-C landing inside the same tick must come out in
+  # the order the person produced them. The old blocking read had this
+  # property for free -- it returned each queued byte ahead of noticing any
+  # flag -- and the interrupt test types a line and interrupts it in the
+  # same breath, expecting the line echoed and THEN thrown away.
   if [[ -n ${EPOCHREALTIME:-} ]]; then
     __sk_wait_end=$(( ${EPOCHREALTIME/./} + $1 ))
     while true; do
       picker_input_ready && return 0
       (( ${EPOCHREALTIME/./} < __sk_wait_end )) || return 142
       picker_tick
+      picker_input_ready && return 0
       (( PICKER_INTERRUPTED == 0 && PICKER_RESIZED == 0 )) || return 142
     done
   fi
@@ -126,6 +133,7 @@ picker_wait_input() {
     (( __sk_wait_ticks < __sk_wait_limit )) || return 142
     picker_tick
     __sk_wait_ticks=$(( __sk_wait_ticks + 1 ))
+    picker_input_ready && return 0
     (( PICKER_INTERRUPTED == 0 && PICKER_RESIZED == 0 )) || return 142
   done
 }
