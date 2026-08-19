@@ -291,9 +291,11 @@ class StateLock:
                 return descriptor
             try:
                 legacy_descriptor = self._open_and_lock(legacy)
-            except CollectionError:
+            except (CollectionError, PermissionError):
                 # Another new process may have replaced the legacy inode while
-                # this process waited on it. The exact fence is the only safe
+                # this process waited on it -- or fenced it between this
+                # process's fence check and its O_RDWR open, which the 0400
+                # fence answers with EACCES. The exact fence is the only safe
                 # reason to retry through the new lock generation.
                 if self._legacy_lock_is_fenced(legacy):
                     continue

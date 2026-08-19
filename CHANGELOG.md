@@ -17,6 +17,13 @@ All notable changes to Session Kit are documented here.
   than counted in ticks, so load cannot stretch it, and keys queued ahead of a
   Ctrl-C are answered in the order they were typed. A source-scan test fails
   any future timed read of the terminal.
+- Losing the publishing-lock fence race no longer crashes. Retiring the
+  legacy `inventory.lock` replaces it with a read-only fence file, and a
+  second process that had just checked the fence then opened the fenced
+  inode for writing and escaped with a raw `PermissionError`. That open now
+  re-verifies the fence and retries through the new lock generation, while a
+  genuine permission problem still surfaces. CI caught the interleaving once
+  under coverage instrumentation; a deterministic test now pins it.
 - `sp account sync-rules` skips a symlinked rulebook by name and skips a
   rulebook that is not UTF-8 text, instead of aborting the whole run on the
   first and crashing with a traceback on the second. The skipped file and the

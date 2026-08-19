@@ -20,7 +20,9 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "lib"))
 
 from sessionkit_inventory.state_io import (  # noqa: E402
+    _LEGACY_LOCK_FENCE,
     CollectionError,
+    StateLock,
     _read_state_json,
     atomic_write_json,
     atomic_write_private_json,
@@ -147,6 +149,58 @@ class AtomicStateWriteTests(unittest.TestCase):
 
     def test_atomic_private_json_refuses_an_interposed_published_path(self) -> None:
         self._assert_interposed_publication_is_refused(atomic_write_private_json)
+
+
+class PublishingLockFenceRaceTests(unittest.TestCase):
+    """A process that loses the fence race retries instead of crashing.
+
+    The legacy `inventory.lock` is retired by replacing it with a mode-0400
+    fence file. A second process that checked the fence just before the
+    replacement then opens the fenced inode with O_RDWR and receives EACCES.
+    CI caught that interleaving once under coverage instrumentation
+    (2026-08-19): `acknowledge_pending` escaped with a raw PermissionError.
+    The open must re-verify the fence and continue through the new lock
+    generation, and a genuine permission problem must still surface.
+    """
+
+    def setUp(self) -> None:
+        self._raw = tempfile.TemporaryDirectory(prefix=".state-io-")
+        self.addCleanup(self._raw.cleanup)
+        self.root = Path(self._raw.name) / "state"
+        self.root.mkdir(mode=0o700)
+        self.versioned = self.root / "inventory-v2.lock"
+
+    def _fence(self) -> Path:
+        legacy = self.root / "inventory.lock"
+        legacy.write_bytes(_LEGACY_LOCK_FENCE)
+        legacy.chmod(0o400)
+        return legacy
+
+    def test_losing_the_fence_race_retries_through_the_new_generation(self) -> None:
+        self._fence()
+        real = StateLock._legacy_lock_is_fenced
+        calls = {"n": 0}
+
+        def stale_then_real(lock: StateLock, path: Path) -> bool:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return False  # the check that raced the fence publisher
+            return real(lock, path)
+
+        with mock.patch.object(StateLock, "_legacy_lock_is_fenced", stale_then_real):
+            with StateLock(self.root, self.versioned):
+                pass  # acquiring is the assertion: no PermissionError escapes
+
+    def test_a_genuine_permission_problem_still_surfaces(self) -> None:
+        legacy = self.root / "inventory.lock"
+        legacy.write_bytes(b"not the fence\n")
+        legacy.chmod(0o000)
+        with mock.patch.object(
+            StateLock, "_legacy_lock_is_fenced", lambda lock, path: False
+        ):
+            with self.assertRaises(PermissionError):
+                with StateLock(self.root, self.versioned):
+                    pass
 
 
 if __name__ == "__main__":
