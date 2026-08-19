@@ -24,27 +24,9 @@ import unittest
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, os.fspath(REPO / "lib"))
 
-from tests.support import THEME_COLORS  # noqa: E402
-from tests.sweep_sandboxes import PREFIXES as SANDBOX_PREFIXES  # noqa: E402
+from tests.support import THEME_COLORS, source_tree_ignore  # noqa: E402
 from sessionkit_inventory.common import CollectionError  # noqa: E402
 from sessionkit_inventory.state_io import StateLock  # noqa: E402
-
-
-# What a copy of this repository's source must leave behind. The build caches
-# are obvious; the sandbox prefixes are not. The fixtures build their sandboxes
-# inside the checkout on purpose, to keep AF_UNIX paths short, and they come and
-# go in seconds -- so copying the tree while a sibling test removed one made
-# copytree list an entry and then fail to open it, a real error about a file
-# that was never part of the source. Serial runs never saw it; one sharded run
-# found it immediately.
-SOURCE_COPY_IGNORES = (
-    ".git",
-    ".mypy_cache",
-    ".ruff_cache",
-    "__pycache__",
-    "*.pyc",
-    *(f"{prefix}*" for prefix in SANDBOX_PREFIXES),
-)
 
 RELEASE_A = "1" * 40
 RELEASE_B = "2" * 40
@@ -388,7 +370,7 @@ class InstallerTests(unittest.TestCase):
         shutil.copytree(
             REPO,
             source,
-            ignore=shutil.ignore_patterns(*SOURCE_COPY_IGNORES),
+            ignore=source_tree_ignore(),
         )
         subprocess.run(["git", "init", "-q", source], check=True)
         subprocess.run(["git", "-C", source, "add", "."], check=True)
@@ -692,7 +674,7 @@ finally:
         shutil.copytree(
             REPO,
             source,
-            ignore=shutil.ignore_patterns(*SOURCE_COPY_IGNORES),
+            ignore=source_tree_ignore(),
         )
         subprocess.run(["git", "init", "-q", source], check=True)
         for relative in (
@@ -3266,7 +3248,7 @@ finally:
         shutil.copytree(
             REPO,
             source,
-            ignore=shutil.ignore_patterns(*SOURCE_COPY_IGNORES),
+            ignore=source_tree_ignore(),
         )
         shutil.rmtree(source / "config/codex-themes")
         subprocess.run(["git", "init", "-q", source], check=True)

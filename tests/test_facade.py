@@ -13,6 +13,13 @@ from unittest import mock
 
 from tests.support import REPO
 
+# Two tests below import sessionkit_inventory directly. They passed only
+# because some earlier module in the same process had already put lib on the
+# shared sys.path -- run this module on its own and both raise
+# ModuleNotFoundError. Ordering is not a dependency a test may have, and the
+# first sharded run, which gives every module its own process, said so. The
+# insert is the same one the modules that import lib already make.
+sys.path.insert(0, os.fspath(REPO / "lib"))
 
 CORE = REPO / "lib" / "session_inventory.py"
 REQUIRED_SYMBOLS = {

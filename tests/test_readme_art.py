@@ -172,6 +172,16 @@ class LayoutRefusalTests(unittest.TestCase):
         self.art = readme_art_lib
         if self.art.chromium_path() is None:
             self.skipTest("no chromium available for layout checks")
+        # A browser on the box does not mean a driver in this interpreter, and
+        # rendering needs both. Checking only for chromium turned a missing
+        # package into two errors on any environment that has one without the
+        # other -- a virtualenv built from requirements-dev.txt on a machine
+        # where chromium is installed system-wide is exactly that, and it read
+        # as a real failure until the traceback was opened.
+        try:
+            import playwright.sync_api  # noqa: F401
+        except ImportError:
+            self.skipTest("no playwright driver available for layout checks")
 
     def test_text_outside_its_box_stops_the_render(self) -> None:
         import tempfile

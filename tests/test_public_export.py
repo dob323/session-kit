@@ -7,7 +7,7 @@ import subprocess
 import tempfile
 import unittest
 
-from tests.support import REPO
+from tests.support import REPO, source_tree_ignore
 
 
 class PublicExportTests(unittest.TestCase):
@@ -21,18 +21,7 @@ class PublicExportTests(unittest.TestCase):
 
     def make_source(self, root: Path) -> tuple[Path, str]:
         source = root / "source"
-        shutil.copytree(
-            REPO,
-            source,
-            ignore=shutil.ignore_patterns(
-                ".git",
-                ".claude",
-                ".mypy_cache",
-                ".ruff_cache",
-                "__pycache__",
-                "*.pyc",
-            ),
-        )
+        shutil.copytree(REPO, source, ignore=source_tree_ignore())
         subprocess.run(["git", "init", "-q", source], check=True)
         subprocess.run(
             ["git", "-C", source, "config", "user.name", "Session Kit Tests"],

@@ -25,6 +25,50 @@ from tests.sandbox_guard import (  # noqa: F401
 
 
 REPO = Path(__file__).resolve().parents[1]
+
+# The only dotted entries at the repository root that ARE the source. Anything
+# else dotted up there is a fixture's sandbox or a build cache.
+SOURCE_ROOT_DOTTED = frozenset({".github", ".gitignore", ".shellcheckrc"})
+
+
+def source_tree_ignore(root: Path = REPO):
+    """What a copy of this checkout must leave behind.
+
+    Three tests copy the source tree, and all three used to name what to skip:
+    `.git`, the caches, `__pycache__`. None of them skipped the fixtures'
+    sandboxes, which are built inside the checkout on purpose to keep AF_UNIX
+    paths short and which come and go in seconds. Copy the tree while a sibling
+    test removes one and copytree lists an entry, then fails to open it, and the
+    run dies over a file that was never part of the source.
+
+    c9d85e9 fixed that in one of the three by listing sweep_sandboxes.PREFIXES.
+    That list holds six prefixes; the suite builds a hundred and eighty-three
+    inside the checkout, so the fix covered neither of the two sandboxes that
+    have actually broken a run. Prefixes were never the right shape here.
+
+    .gitignore settled this for Git already -- `/.*/` with `!/.github/`, under
+    the note "Ignore the whole class rather than chase prefixes" -- so this
+    applies that same rule at the root: every dotted entry goes except the ones
+    that really are source. Nothing about deeper directories changes, where a
+    dotted name is ordinary content.
+    """
+    root = Path(root).resolve()
+
+    def ignore(directory: str, names: list[str]) -> set[str]:
+        dropped = {
+            name for name in names if name == "__pycache__" or name.endswith(".pyc")
+        }
+        if Path(directory).resolve() == root:
+            dropped |= {
+                name
+                for name in names
+                if name.startswith(".") and name not in SOURCE_ROOT_DOTTED
+            }
+        return dropped
+
+    return ignore
+
+
 RELEASE_TOOL = REPO / "deploy" / "session-kit-release"
 HELPERS = (
     "sp",

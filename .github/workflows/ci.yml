@@ -230,6 +230,7 @@ jobs:
             tests/test_projects_manifest.py \
             tests/test_public_export.py tests/test_public_scan.py \
             tests/test_release_artifact.py tests/support.py \
+            tests/shard.py \
             tests/test_readme_art.py tests/test_readme_keys.py \
             tools/readme_art_lib.py tools/readme_keys.py
           ruff format --check tools/build-public-tree tools/build-release-artifact \
@@ -273,6 +274,15 @@ jobs:
             tools/public-scan . --git-history
           fi
       - name: Build and test exact public export
+        env:
+          # One process per module, four at a time. This suite is bounded by
+          # wall clock rather than by processors -- most of its expensive
+          # modules sit in a pty waiting for a picker to repaint -- so four
+          # workers finish the same 2,728 tests in a quarter of the time on
+          # this runner's four cores just as they do on thirty-two. Measured
+          # 2026-08-18: 1,588 s serial, 395 s here, floor 393 s because
+          # test_watchdog alone takes that long.
+          SESSION_KIT_TEST_WORKERS: "4"
         run: |
           tools/build-public-tree \
             --commit "$GITHUB_SHA" \
@@ -301,8 +311,12 @@ jobs:
         env:
           COVERAGE_FILE: ${{ runner.temp }}/coverage
         run: |
-          coverage run --branch --source=lib \
-            -m unittest discover -s tests -t .
+          # Every worker gets its own data file (--parallel-mode inside the
+          # driver), and `combine` merges them into COVERAGE_FILE before the
+          # threshold is applied -- so the number below is the whole suite's,
+          # exactly as it was when one process walked every module.
+          python tests/shard.py --workers 4 --coverage
+          coverage combine
           coverage report --skip-empty --fail-under=70
 
   shpool-patch:

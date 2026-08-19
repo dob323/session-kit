@@ -60,6 +60,7 @@ tests/latency/shim/stty
 tests/latency/shim/tput
 tests/run
 tests/sandbox_guard.py
+tests/shard.py
 tests/support.py
 tests/sweep_sandboxes.py
 tests/test_account_advice_providers.py
