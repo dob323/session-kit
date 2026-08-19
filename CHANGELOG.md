@@ -6,6 +6,22 @@ All notable changes to Session Kit are documented here.
 
 ### Fixed
 
+- A pressed key could vanish when the machine was busy. Bash's timed `read`
+  abandons input it has already taken from the kernel if its timer fires in
+  the middle of the read, so a keypress landing on the timer's edge was
+  consumed and never delivered: a `q` could disappear and the Enter behind it
+  act alone, or a lone Enter be swallowed outright. No read that consumes the
+  terminal carries a timer any more. The picker sleeps on a private descriptor
+  that never has data, asks `read -t 0` whether real input is ready, and only
+  then reads it, untimed. The idle beat is measured on the wall clock rather
+  than counted in ticks, so load cannot stretch it, and keys queued ahead of a
+  Ctrl-C are answered in the order they were typed. A source-scan test fails
+  any future timed read of the terminal.
+- `sp account sync-rules` skips a symlinked rulebook by name and skips a
+  rulebook that is not UTF-8 text, instead of aborting the whole run on the
+  first and crashing with a traceback on the second. The skipped file and the
+  reason appear in the report.
+- The `sp` help table had lost the line naming what `sp account verify` does.
 - Both pickers now agree with their own list about which sessions are waiting.
   The 2026-08-15 ruling that a finished provider turn is `needs you` however
   the vendor spells it lives in `labels.STATE_WORDS`, and the list column reads
@@ -44,8 +60,23 @@ All notable changes to Session Kit are documented here.
   `Kill confirmation`. `docs/voice.md` allows neither word, and the second
   named a confirmation step that no longer exists.
 
+### Changed
+
+- Two keys, named for what they do: inside a session, Ctrl-Q leaves it
+  running and Ctrl-D closes it; in the picker, Esc and Ctrl-D quit. Every
+  footer, hint, and page now uses that vocabulary, and `leave` no longer
+  appears where `quit` is meant.
+
 ### Added
 
+- `sp account sync-rules [--check]`: one shared rulebook, written by hand in
+  one place, is rendered into every enrolled profile's rulebook between
+  markers. `--check` reports drift without writing. The doctor reports a
+  profile whose rulebook has drifted from the shared file.
+- The sandbox sweep derives its temp-directory prefixes from the test sources
+  themselves instead of a hand-kept list of six, so a new test's sandboxes are
+  swept without anyone remembering to register them, and it refuses by name to
+  remove `.git`, `.github`, `.gitignore`, and `.shellcheckrc`.
 - `CODE_OF_CONDUCT.md`, the Contributor Covenant 2.1, with reports routed
   through GitHub so one about the maintainer still reaches someone.
 - The README's pictures are generated from the running picker rather than
