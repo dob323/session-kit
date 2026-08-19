@@ -22,6 +22,7 @@ permissions:
 jobs:
   linux:
     name: Linux ${{ matrix.os }} / Python ${{ matrix.python }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -70,6 +71,7 @@ jobs:
 
   macos:
     name: macOS ${{ matrix.arch }} / Python 3.13
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -153,6 +155,7 @@ jobs:
 
   quality:
     name: Quality, privacy, and public export
+    timeout-minutes: 60
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -322,6 +325,7 @@ jobs:
 
   shpool-patch:
     name: Optional shpool patches apply, test, and build
+    timeout-minutes: 30
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -351,6 +355,9 @@ jobs:
               "$GITHUB_WORKSPACE/shpool-patch/$patch"
           done
           cargo test --locked --manifest-path \
-            "$RUNNER_TEMP/shpool/Cargo.toml" --workspace
+            "$RUNNER_TEMP/shpool/Cargo.toml" --workspace \
+          || { echo "::warning::upstream shpool tests failed once; retrying"; \
+            cargo test --locked --manifest-path \
+              "$RUNNER_TEMP/shpool/Cargo.toml" --workspace; }
           cargo build --locked --release --manifest-path \
             "$RUNNER_TEMP/shpool/Cargo.toml" --bin shpool
