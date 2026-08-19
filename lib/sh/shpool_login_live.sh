@@ -101,6 +101,35 @@ picker_input_ready() {
   IFS= read -r -t 0
 }
 
+# Wait up to $1 MICROSECONDS for terminal input. 0 the moment input is ready;
+# 142 when the budget ran out or a trap flagged interrupt or resize, so
+# callers answer signals as fast as the timed read they replaced. The budget
+# is measured on the wall clock, not in ticks: under load every tick pays a
+# scheduling tax, and twenty of them stretched the one-second beat to two or
+# three -- which starved the event-collection cadence the beat drives.
+picker_wait_input() {
+  local __sk_wait_end=0 __sk_wait_ticks=0 __sk_wait_limit=0
+  if [[ -n ${EPOCHREALTIME:-} ]]; then
+    __sk_wait_end=$(( ${EPOCHREALTIME/./} + $1 ))
+    while true; do
+      picker_input_ready && return 0
+      (( ${EPOCHREALTIME/./} < __sk_wait_end )) || return 142
+      picker_tick
+      (( PICKER_INTERRUPTED == 0 && PICKER_RESIZED == 0 )) || return 142
+    done
+  fi
+  # No sub-second clock in this bash: count ticks and accept the stretch.
+  __sk_wait_limit=$(( $1 / 50000 ))
+  (( __sk_wait_limit > 0 )) || __sk_wait_limit=1
+  while true; do
+    picker_input_ready && return 0
+    (( __sk_wait_ticks < __sk_wait_limit )) || return 142
+    picker_tick
+    __sk_wait_ticks=$(( __sk_wait_ticks + 1 ))
+    (( PICKER_INTERRUPTED == 0 && PICKER_RESIZED == 0 )) || return 142
+  done
+}
+
 picker_paste_arm() {
   (( PICKER_SCREEN )) || return 0
   [[ -t 0 ]] || return 0
@@ -746,7 +775,6 @@ picker_read_raw() {
   picker_paste_arm
   printf '%s' "$__sk_raw_prompt"
   picker_tick_open || true
-  local __sk_raw_ticks=0
   while true; do
     # Waiting and consuming are separated on purpose: only an UNTIMED read may
     # take bytes off the terminal, and it runs solely after `read -t 0` says a
@@ -768,14 +796,13 @@ picker_read_raw() {
       # Readable but nothing deliverable is closed input, not a timeout.
       __sk_raw_status=1
     elif [[ -n $PICKER_TICK_FD ]]; then
-      picker_tick
-      __sk_raw_ticks=$(( __sk_raw_ticks + 1 ))
-      if (( __sk_raw_ticks < 20 && PICKER_INTERRUPTED == 0 )); then
+      # One wall-clock second, same beat as the timed read this replaces.
+      # Input arriving mid-wait loops straight back to the take above.
+      __sk_raw_status=0
+      picker_wait_input 1000000 || __sk_raw_status=$?
+      if (( __sk_raw_status == 0 )); then
         continue
       fi
-      # Twenty ticks are this loop's old one-second beat.
-      __sk_raw_ticks=0
-      __sk_raw_status=142
     else
       # No fifo could be opened, so this is the old timed read -- and with it
       # the timer race everything above exists to remove.
@@ -982,7 +1009,7 @@ picker_read_live() {
   local __sk_live_var=$1 __sk_live_prompt=$2
   local seconds buffer="" character="" read_status=0 collect_status
   local filter_pending=0 read_timeout=1 elapsed_tenths=0 paste_seen=0
-  local live_ticks=0 tick_limit=20
+  local wait_micros=1000000
   PICKER_QUERY_BASE=$QUERY
   PICKER_FILTER_ACTIVE=0
   # The page on the screen is the page this answer is about. A live repaint
@@ -1016,17 +1043,8 @@ picker_read_live() {
   # as its timer fires abandons it.
   picker_tick_open || true
   if [[ -n $PICKER_TICK_FD ]]; then
-    read_status=142
-    live_ticks=0
-    while (( live_ticks < 20 )); do
-      if picker_input_ready; then
-        read_status=0
-        break
-      fi
-      picker_tick
-      live_ticks=$(( live_ticks + 1 ))
-      (( PICKER_INTERRUPTED == 0 && PICKER_RESIZED == 0 )) || break
-    done
+    read_status=0
+    picker_wait_input 1000000 || read_status=$?
     if (( read_status == 0 )); then
       # shellcheck disable=SC2229
       if IFS= read -r "$__sk_live_var"; then
@@ -1149,22 +1167,13 @@ picker_read_live() {
     # the original one-second cadence, so the live refresh below is unchanged.
     read_timeout=1
     (( filter_pending == 0 )) || read_timeout=0.25
-    # The same wait/take separation as the canonical read above: the beat is
-    # ticks, the take is untimed and runs only against input already queued.
+    # The same wait/take separation as the canonical read above: the wait is
+    # off-terminal, the take is untimed and runs only against queued input.
     if [[ -n $PICKER_TICK_FD ]]; then
-      tick_limit=20
-      [[ $read_timeout == 1 ]] || tick_limit=5
-      live_ticks=0
-      read_status=142
-      while (( live_ticks < tick_limit )); do
-        if picker_input_ready; then
-          read_status=0
-          break
-        fi
-        picker_tick
-        live_ticks=$(( live_ticks + 1 ))
-        (( PICKER_INTERRUPTED == 0 && PICKER_RESIZED == 0 )) || break
-      done
+      wait_micros=1000000
+      [[ $read_timeout == 1 ]] || wait_micros=250000
+      read_status=0
+      picker_wait_input "$wait_micros" || read_status=$?
       if (( read_status == 0 )) && ! IFS= read -r -s -n 1 character; then
         read_status=1
       fi
