@@ -107,13 +107,19 @@ class FakeAppServer:
             if first & 0x0F != 1:
                 continue
             message = json.loads(payload)
+            # Record before replying: the client treats the reply as receipt
+            # and the test asserts as soon as the push returns, so a rename
+            # appended after sendall loses that race on a loaded machine
+            # (one matrix job caught it, 2026-08-19).
+            renamed = message.get("method") == "thread/name/set"
+            if renamed:
+                self.renames.append(message.get("params") or {})
             if message.get("id") is not None:
                 reply = json.dumps(
                     {"id": message["id"], "result": {}}, separators=(",", ":")
                 ).encode()
                 link.sendall(bytes([0x81, len(reply)]) + reply)
-            if message.get("method") == "thread/name/set":
-                self.renames.append(message.get("params") or {})
+            if renamed:
                 return
 
 
