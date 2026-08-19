@@ -38,6 +38,7 @@ local conversation data separate.
 sp account list
 sp account enroll <claude|codex> <alias> <email>
 sp account verify <claude|codex> <alias>
+sp account sync-rules [--check]
 sp account configure-feeds <absolute-roster-json> <absolute-advice-json>
 ```
 
@@ -54,6 +55,48 @@ bound alias, email, and provider-supplied plan. The account-choice screen shows
 current roster health, usage, and any provider-qualified recommendation.
 Provider data that is missing or cannot be verified is shown as unknown rather
 than inferred.
+
+### One rulebook across every profile
+
+Each provider reads its own instruction file — `CLAUDE.md` for Claude Code,
+`AGENTS.md` for Codex — and each profile keeps a private copy inside its own
+config root. Nothing reconciles those copies on its own, so a working rule added
+to one of them applies only there, and profiles enrolled at different times start
+from different text.
+
+`sp account sync-rules` fixes that. It reads one file you own and writes it into
+every provider default home and every enrolled profile, between these markers:
+
+```text
+<!-- BEGIN UNIVERSAL RULES ... -->
+<!-- END UNIVERSAL RULES -->
+```
+
+Only the region between the markers is replaced. Anything outside it is that
+provider's or that profile's own text and is left exactly as it was, so a
+rulebook can hold provider-specific notes alongside the shared rules. A rulebook
+that has never carried the block keeps all of its existing text: the block is
+added above it rather than replacing it. Each rewritten file gets a `.bak-sync`
+copy beside it.
+
+The shared file lives at `$XDG_CONFIG_HOME/agent-rules/universal-rules.md`
+(`~/.config/agent-rules/universal-rules.md` by default), or wherever
+`SESSION_KIT_RULES_FILE` points. It stays outside the kit and outside any
+repository: it holds your own working rules, which are yours and not
+distributable. With no such file present, nothing is written and every rulebook
+stands on its own.
+
+`--check` reports which rulebooks no longer match and exits non-zero without
+changing anything, which is what `session-kit doctor` runs as its `rules-parity`
+check.
+
+Memory is a separate store with the same shape: each profile has its own
+`projects/<project>/memory` directory, so memories written under one account are
+not visible under another. If you want one shared store, point each profile's
+memory directory at a common location with a symbolic link — the providers read
+and write through it normally. Keep the shared `MEMORY.md` index under 25,000
+characters; that is a hard limit in Claude Code, and a larger index is refused
+rather than truncated.
 
 The default Claude and Codex homes remain usable as legacy profiles, but Session
 Kit does not invent an email identity for them. Enroll and verify a named profile

@@ -368,7 +368,8 @@ doctor_command() {
     "${project_dir_detail:-project directory naming could not be checked}"
   local audit_output audit_ok=1 audit_name
   local -a audit_names=(
-    claude-version codex-version codex-themes naming-instructions naming-hook
+    claude-version codex-version codex-themes naming-instructions rules-parity
+    naming-hook
     statusline claude-integration-ledger claude-statusline-backups
     tab-title codex-titles attention-hook internal-formats
     kill-switches subagent-sweep acceptance shpool-binary
@@ -677,6 +678,60 @@ if instruction_errors:
     emit("warn", "naming-instructions", "self-name instruction missing for: " + ", ".join(instruction_errors))
 else:
     emit("ok", "naming-instructions", "Codex and Claude self-name instructions are present")
+
+# One rulebook per provider per profile drifts apart silently: each copy lives
+# in its own config root, so an instruction added in one place is simply absent
+# everywhere else. The rendered block carries a short digest of the rules file it
+# came from, which is all this needs to compare - no registry, no imports.
+rules_file = os.environ.get("SESSION_KIT_RULES_FILE", "").strip()
+if rules_file:
+    rules_path = Path(rules_file).expanduser()
+else:
+    config_home = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    rules_base = Path(config_home).expanduser() if config_home else home / ".config"
+    rules_path = rules_base / "agent-rules" / "universal-rules.md"
+rules_body = bounded_text(rules_path)
+if rules_body is None:
+    emit(
+        "ok",
+        "rules-parity",
+        "no shared rules file is configured; each rulebook stands on its own",
+    )
+else:
+    want = hashlib.sha256(rules_body.encode("utf-8")).hexdigest()[:12]
+    data_home = Path(os.environ.get("XDG_DATA_HOME") or (home / ".local/share"))
+    profiles_root = data_home / "session-kit" / "accounts"
+    rulebooks = [
+        ("codex:default", codex_home / "AGENTS.md"),
+        ("claude:default", home / ".claude" / "CLAUDE.md"),
+    ]
+    for provider, filename in (("claude", "CLAUDE.md"), ("codex", "AGENTS.md")):
+        provider_root = profiles_root / provider
+        if not provider_root.is_dir():
+            continue
+        for profile in sorted(provider_root.iterdir()):
+            if profile.is_dir():
+                rulebooks.append((f"{provider}:{profile.name}", profile / filename))
+    stale = []
+    for label, path in rulebooks:
+        text = bounded_text(path)
+        if text is None:
+            continue
+        marker = re.search(r"<!-- BEGIN UNIVERSAL RULES.*?-->", text, re.DOTALL)
+        if marker is None or f"sha256:{want}" not in marker.group(0):
+            stale.append(label)
+    if stale:
+        emit(
+            "warn",
+            "rules-parity",
+            "rulebook(s) out of date, run `sp account sync-rules`: " + ", ".join(stale),
+        )
+    else:
+        emit(
+            "ok",
+            "rules-parity",
+            f"all {len(rulebooks)} rulebooks carry the current rules",
+        )
 
 hook_errors = []
 statusline_errors = []

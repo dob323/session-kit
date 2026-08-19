@@ -136,6 +136,7 @@ Accounts
   sp account adopt-default <claude|codex> <alias> <email>
   sp account enroll <claude|codex> <alias> <email>
   sp account verify <claude|codex> <alias>
+  sp account sync-rules [--check]    give every profile the same rulebook
   sp account configure-feeds <roster-json> <advice-json>
 
 History and recovery
@@ -259,6 +260,9 @@ Accounts
   sp account enroll <claude|codex> <alias> <email>
                                      create a separate provider profile
   sp account verify <claude|codex> <alias>
+  sp account sync-rules [--check]    write the shared rules file into every
+                                     provider and profile rulebook, leaving each
+                                     one's own text alone; --check only reports
                                      confirm a profile is signed in
   sp account configure-feeds <roster-json> <advice-json>
                                      point account advice at local feeds

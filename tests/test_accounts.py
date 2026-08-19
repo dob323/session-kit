@@ -862,3 +862,148 @@ class AccountSwitchTransactionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RulesSyncTests(unittest.TestCase):
+    """One rules file has to reach every provider home and every profile.
+
+    The interesting cases are not "did it copy": they are whether a rulebook's
+    own text survives the write, whether adopting the sync destroys what a
+    provider already relied on, and whether drift is actually reported.
+    """
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory(prefix="session-kit-rules.")
+        self.root = Path(self.temporary.name)
+        self.home = self.root / "home"
+        self.state = self.root / "state"
+        self.data = self.root / "data"
+        self.config_home = self.root / "config"
+        for path in (self.home, self.state, self.data, self.config_home):
+            path.mkdir(mode=0o700, parents=True)
+        (self.home / ".claude").mkdir(mode=0o700)
+        (self.home / ".codex").mkdir(mode=0o700)
+        self.registry = self.state / "accounts.json"
+        self.profile_root = self.data / "session-kit" / "accounts"
+        self.rules = self.config_home / "agent-rules" / "universal-rules.md"
+        self.rules.parent.mkdir(mode=0o700, parents=True)
+        self.config = {"state_dir": str(self.state)}
+        self.environment = mock.patch.dict(
+            os.environ,
+            {
+                "HOME": str(self.home),
+                "XDG_DATA_HOME": str(self.data),
+                "XDG_CONFIG_HOME": str(self.config_home),
+                "SESSION_KIT_ACCOUNT_REGISTRY": str(self.registry),
+                "SESSION_KIT_ACCOUNT_ROOT": str(self.profile_root),
+            },
+            clear=False,
+        )
+        self.environment.start()
+        os.environ.pop("SESSION_KIT_RULES_FILE", None)
+
+    def tearDown(self) -> None:
+        self.environment.stop()
+        self.temporary.cleanup()
+
+    def claude_rulebook(self) -> Path:
+        return self.home / ".claude" / "CLAUDE.md"
+
+    def codex_rulebook(self) -> Path:
+        return self.home / ".codex" / "AGENTS.md"
+
+    def write_default_rulebooks(self, claude: str, codex: str) -> None:
+        self.claude_rulebook().write_text(claude, encoding="utf-8")
+        self.codex_rulebook().write_text(codex, encoding="utf-8")
+
+    def test_missing_rules_file_changes_nothing(self) -> None:
+        self.write_default_rulebooks("claude text\n", "codex text\n")
+        result = accounts.sync_rules(self.config)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["targets"], [])
+        self.assertEqual(self.claude_rulebook().read_text(encoding="utf-8"), "claude text\n")
+
+    def test_first_sync_keeps_the_existing_rulebook_text(self) -> None:
+        self.rules.write_text("# Shared\n\nbe careful\n", encoding="utf-8")
+        self.write_default_rulebooks("provider only note\n", "codex only note\n")
+        result = accounts.sync_rules(self.config)
+        self.assertTrue(result["ok"])
+        claude = self.claude_rulebook().read_text(encoding="utf-8")
+        self.assertIn("be careful", claude)
+        self.assertIn("provider only note", claude)
+        codex = self.codex_rulebook().read_text(encoding="utf-8")
+        self.assertIn("be careful", codex)
+        self.assertIn("codex only note", codex)
+
+    def test_resync_replaces_only_the_block(self) -> None:
+        self.rules.write_text("first rule\n", encoding="utf-8")
+        self.write_default_rulebooks("tail note\n", "codex tail\n")
+        accounts.sync_rules(self.config)
+        self.rules.write_text("second rule\n", encoding="utf-8")
+        accounts.sync_rules(self.config)
+        claude = self.claude_rulebook().read_text(encoding="utf-8")
+        self.assertIn("second rule", claude)
+        self.assertNotIn("first rule", claude)
+        self.assertIn("tail note", claude)
+        self.assertEqual(claude.count(accounts.RULES_END), 1)
+
+    def test_check_reports_drift_without_writing(self) -> None:
+        self.rules.write_text("first rule\n", encoding="utf-8")
+        self.write_default_rulebooks("tail\n", "tail\n")
+        accounts.sync_rules(self.config)
+        self.rules.write_text("second rule\n", encoding="utf-8")
+        before = self.claude_rulebook().read_text(encoding="utf-8")
+        result = accounts.sync_rules(self.config, check=True)
+        self.assertEqual(result["drifted"], 2)
+        self.assertEqual(self.claude_rulebook().read_text(encoding="utf-8"), before)
+
+    def test_check_is_clean_right_after_a_sync(self) -> None:
+        self.rules.write_text("a rule\n", encoding="utf-8")
+        self.write_default_rulebooks("tail\n", "tail\n")
+        accounts.sync_rules(self.config)
+        result = accounts.sync_rules(self.config, check=True)
+        self.assertEqual(result["drifted"], 0)
+        self.assertTrue(all(item["state"] == "current" for item in result["targets"]))
+
+    def test_enrolled_profiles_are_included(self) -> None:
+        self.rules.write_text("a rule\n", encoding="utf-8")
+        self.write_default_rulebooks("tail\n", "tail\n")
+        profile = self.profile_root / "claude" / "work"
+        profile.mkdir(mode=0o700, parents=True)
+        (profile / "CLAUDE.md").write_text("profile tail\n", encoding="utf-8")
+        with mock.patch.object(
+            accounts,
+            "list_profiles",
+            return_value=[
+                {
+                    "provider": "claude",
+                    "alias": "work",
+                    "profile_dir": str(profile),
+                }
+            ],
+        ):
+            result = accounts.sync_rules(self.config)
+        labels = {item["label"] for item in result["targets"]}
+        self.assertIn("claude:work", labels)
+        text = (profile / "CLAUDE.md").read_text(encoding="utf-8")
+        self.assertIn("a rule", text)
+        self.assertIn("profile tail", text)
+
+    def test_rules_file_can_be_pointed_elsewhere(self) -> None:
+        elsewhere = self.root / "elsewhere.md"
+        elsewhere.write_text("relocated rule\n", encoding="utf-8")
+        os.environ["SESSION_KIT_RULES_FILE"] = str(elsewhere)
+        try:
+            self.write_default_rulebooks("tail\n", "tail\n")
+            accounts.sync_rules(self.config)
+        finally:
+            os.environ.pop("SESSION_KIT_RULES_FILE", None)
+        self.assertIn(
+            "relocated rule", self.claude_rulebook().read_text(encoding="utf-8")
+        )
+
+    def test_an_implausibly_large_rules_file_is_refused(self) -> None:
+        self.rules.write_text("x" * (accounts.MAX_RULES_BYTES + 1), encoding="utf-8")
+        self.write_default_rulebooks("tail\n", "tail\n")
+        with self.assertRaises(CollectionError):
+            accounts.sync_rules(self.config)

@@ -4708,6 +4708,30 @@ def _automatic_title_command(args: argparse.Namespace, config: dict[str, Any]) -
     return 0
 
 
+def _render_rules_sync(result: dict[str, Any]) -> str:
+    """Say which rulebooks carry the current rules, in plain words."""
+    if not result.get("ok"):
+        return (
+            "No rules file to sync from. Put one at "
+            f"{result.get('source', '')} (or set SESSION_KIT_RULES_FILE) and run "
+            "this again."
+        )
+    targets = result.get("targets", [])
+    if not targets:
+        return "No rulebooks were found to sync."
+    lines = []
+    for item in targets:
+        lines.append(f"  {item['state']:8} {item['label']:20} {item['path']}")
+    drifted = result.get("drifted", 0)
+    if drifted:
+        lines.append("")
+        lines.append(
+            f"{drifted} rulebook(s) no longer match the rules file. "
+            "Run `sp account sync-rules` to bring them back."
+        )
+    return "\n".join(lines)
+
+
 def _render_account_list(profiles: list[dict[str, Any]]) -> str:
     """`sp account list` for a person.
 
@@ -4798,6 +4822,16 @@ def _account_command(args: argparse.Namespace, config: dict[str, Any]) -> int:
         )
     elif action == "enroll":
         _json_print(_accounts.enroll(config, args.provider, args.alias, args.email))
+    elif action == "sync-rules":
+        result = _accounts.sync_rules(config, check=args.rules_check)
+        if getattr(args, "account_json", False):
+            _json_print(result)
+        else:
+            print(_render_rules_sync(result))
+        if not result.get("ok"):
+            return 1
+        if args.rules_check and result.get("drifted"):
+            return 1
     elif action == "verify":
         _json_print(_accounts.verify_profile(config, args.provider, args.alias))
     elif action == "binding":
@@ -5245,6 +5279,13 @@ def _parser() -> argparse.ArgumentParser:
         account_mutation.add_argument("provider", choices=sorted(_accounts.PROVIDERS))
         account_mutation.add_argument("alias")
         account_mutation.add_argument("email")
+    account_sync_rules = account_subparsers.add_parser("sync-rules")
+    account_sync_rules.add_argument(
+        "--check", dest="rules_check", action="store_true"
+    )
+    account_sync_rules.add_argument(
+        "--json", dest="account_json", action="store_true"
+    )
     account_verify = account_subparsers.add_parser("verify")
     account_verify.add_argument("provider", choices=sorted(_accounts.PROVIDERS))
     account_verify.add_argument("alias")

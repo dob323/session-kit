@@ -44,6 +44,18 @@ MAX_TRANSACTION_BYTES = 256 * 1024
 MAX_FEED_CONFIG_BYTES = 16 * 1024
 MAX_ARTIFACT_BYTES = 512 * 1024 * 1024
 PROVIDERS = frozenset({"claude", "codex"})
+# One rulebook, every profile. Each provider reads its own instruction file, and
+# each enrolled profile keeps a private copy of it, so an instruction added in
+# one place used to reach only that one place. The canonical file is rendered
+# into every rulebook between these markers; anything outside them is that
+# provider's or that profile's own text and is preserved untouched.
+RULES_BEGIN = "<!-- BEGIN UNIVERSAL RULES"
+RULES_END = "<!-- END UNIVERSAL RULES -->"
+RULES_BLOCK_RE = re.compile(
+    re.escape(RULES_BEGIN) + r".*?" + re.escape(RULES_END), re.DOTALL
+)
+RULES_FILENAME = {"claude": "CLAUDE.md", "codex": "AGENTS.md"}
+MAX_RULES_BYTES = 512 * 1024
 
 
 def _now_ms() -> int:
@@ -1481,3 +1493,130 @@ def rollback_switch(config: Mapping[str, Any], txid: str) -> dict[str, Any]:
 
 def transaction(config: Mapping[str, Any], txid: str) -> dict[str, Any]:
     return _load_transaction(config, txid)
+
+
+def canonical_rules_path() -> Path:
+    """Where the one rulebook lives.
+
+    Owner-private by design: it holds the operator's own working rules and is
+    never part of a repository, so the kit only ever reads it from a
+    configurable location outside its own tree.
+    """
+    override = os.environ.get("SESSION_KIT_RULES_FILE", "").strip()
+    if override:
+        return Path(override).expanduser()
+    config_home = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    base = Path(config_home).expanduser() if config_home else Path.home() / ".config"
+    return base / "agent-rules" / "universal-rules.md"
+
+
+def rules_targets(config: Mapping[str, Any]) -> list[dict[str, str]]:
+    """Every rulebook that should carry the canonical block.
+
+    Both provider default homes are included even when no profile is enrolled:
+    an unenrolled machine still has one rulebook per provider, and leaving it
+    out would let the default home drift away from the profiles.
+    """
+    found: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    def offer(provider: str, path: Path, label: str) -> None:
+        resolved = os.path.realpath(path)
+        if resolved in seen or not path.is_file():
+            return
+        seen.add(resolved)
+        found.append(
+            {"provider": provider, "label": label, "path": os.fspath(path)}
+        )
+
+    for provider in sorted(PROVIDERS):
+        offer(
+            provider,
+            _default_profile_dir(provider) / RULES_FILENAME[provider],
+            f"{provider}:default",
+        )
+    for item in list_profiles(config):
+        provider = str(item.get("provider", ""))
+        if provider not in RULES_FILENAME:
+            continue
+        profile_dir = str(item.get("profile_dir", ""))
+        if not profile_dir:
+            continue
+        offer(
+            provider,
+            Path(profile_dir) / RULES_FILENAME[provider],
+            f"{provider}:{item.get('alias', '')}",
+        )
+    return found
+
+
+def render_rules_block(body: str) -> str:
+    """Wrap the canonical text in a marked, fingerprinted block."""
+    digest = hashlib.sha256(body.encode("utf-8")).hexdigest()[:12]
+    head = (
+        f"{RULES_BEGIN} · generated · sha256:{digest} · DO NOT EDIT HERE — edit "
+        f"the canonical rules file and run `sp account sync-rules` -->"
+    )
+    return f"{head}\n\n{body.strip()}\n\n{RULES_END}"
+
+
+def _write_rulebook(path: Path, text: str) -> None:
+    temporary = path.with_name(path.name + ".sync-tmp")
+    try:
+        with open(temporary, "w", encoding="utf-8") as writer:
+            writer.write(text)
+            writer.flush()
+            os.fsync(writer.fileno())
+        os.replace(temporary, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            temporary.unlink()
+
+
+def sync_rules(config: Mapping[str, Any], *, check: bool = False) -> dict[str, Any]:
+    """Render the canonical rulebook into every provider and profile copy.
+
+    `check` reports drift and changes nothing, which is what the doctor and any
+    pre-push gate should call. A rulebook that has never carried the block keeps
+    all of its existing text: the block is added above it rather than replacing
+    it, so nothing a provider already relies on is lost by adopting the sync.
+    """
+    source = canonical_rules_path()
+    if not source.is_file():
+        return {
+            "ok": False,
+            "reason": "no canonical rules file",
+            "source": os.fspath(source),
+            "targets": [],
+            "drifted": 0,
+        }
+    if source.stat().st_size > MAX_RULES_BYTES:
+        raise CollectionError("the canonical rules file is implausibly large")
+    body = source.read_text(encoding="utf-8")
+    block = render_rules_block(body)
+    results = []
+    drifted = 0
+    for target in rules_targets(config):
+        path = Path(target["path"])
+        original = path.read_text(encoding="utf-8")
+        if RULES_BLOCK_RE.search(original):
+            updated = RULES_BLOCK_RE.sub(lambda _: block, original, count=1)
+        else:
+            updated = f"{block}\n\n{original.lstrip()}"
+        if updated == original:
+            state = "current"
+        elif check:
+            state = "drifted"
+            drifted += 1
+        else:
+            backup = path.with_name(path.name + ".bak-sync")
+            _copy_regular(path, backup)
+            _write_rulebook(path, updated)
+            state = "updated"
+        results.append({**target, "state": state})
+    return {
+        "ok": True,
+        "source": os.fspath(source),
+        "targets": results,
+        "drifted": drifted,
+    }
