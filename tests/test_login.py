@@ -439,7 +439,7 @@ def _pty_diagnosis(raw: bytes, typed: list[bytes]) -> str:
             )
     # Whether the keys were echoed AFTER the last prompt, not whether they
     # appear at all: every one of these screens carries the footer, and the
-    # footer says "leave q or b", so a plain search for a `q` always finds one.
+    # footer says "quit q or b", so a plain search for a `q` always finds one.
     #
     # The bare glyph, with no trailing space: a coloured prompt puts a reset
     # sequence between the two, and matching "glyph space" then finds none of
@@ -789,7 +789,7 @@ class LoginPickerTests(unittest.TestCase):
             self.assertTrue(
                 footers[-1].startswith("  ↵ open 7 · # · kill k #"), footers[-1]
             )
-            self.assertIn("leave q or b", footers[-1])
+            self.assertIn("quit q or b", footers[-1])
             self.assertNotIn("back ↵ or b", output)
         finally:
             fixture.close()

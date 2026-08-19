@@ -1003,7 +1003,7 @@ class SecondaryPageTests(TerminalCaseMixin, unittest.TestCase):
     def test_help_is_the_old_picker_key_table_with_a_coloured_way_back(self) -> None:
         session = self.one()
         self.move_to(session, 4, "Picker help")
-        for heading in ("Sessions", "Needs you", "The list", "Leaving"):
+        for heading in ("Sessions", "Needs you", "The list", "Quitting"):
             self.assertGreaterEqual(session.screen.find(heading), 0, session.screen.text())
         rows = [session.screen.line(session.screen.find(key)) for key in ("Enter         Open", "number        Mark")]
         self.assertEqual(1, len({line.index("Open") if "Open" in line else line.index("Mark") for line in rows}))

@@ -76,7 +76,7 @@ class ScreenSeparationTests(unittest.TestCase):
         "     60  Document Release     | CLD | personal | Opus 5 | working   | 9m\n"
         "\n"
         "  ↵ open 53 · # · kill k # · new n · more m · needs you a · help ? · "
-        "history h # · leave q or b\n"
+        "history h # · quit q or b\n"
         "  ❯ "
     )
     NEEDS = (

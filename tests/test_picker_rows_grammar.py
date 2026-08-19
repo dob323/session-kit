@@ -888,8 +888,8 @@ class OneGrammarTests(unittest.TestCase):
         source = (REPO / "lib/sh/shpool_login_render.sh").read_text(encoding="utf-8")
         # Enter opens the top row here, so the door out is named for the keys
         # that take it -- q and b -- and not for Enter.
-        self.assertIn("leave q or b", source)
-        self.assertIn("leave $(picker_green q) or $(picker_green b)", source)
+        self.assertIn("quit q or b", source)
+        self.assertIn("quit $(picker_green q) or $(picker_green b)", source)
         self.assertNotIn("back %s or %s", source)
 
     def test_b_goes_back_from_the_account_screen(self) -> None:

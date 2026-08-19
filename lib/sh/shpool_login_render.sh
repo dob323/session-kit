@@ -317,14 +317,14 @@ render_main() {
   # keeps that promise.
   local -a plain=(
     "$enter_plain" "#" "kill k #" "new n" "more m"
-    "needs you a" "help ?" "history h #" "leave q or b"
+    "needs you a" "help ?" "history h #" "quit q or b"
   )
   local -a colored=(
     "$enter_colored" "$(picker_green '#')" "kill $(picker_green 'k #')"
     "new $(picker_green n)" "more $(picker_green m)"
     "needs you $(picker_green a)" "help $(picker_green '?')"
     "history $(picker_green 'h #')"
-    "leave $(picker_green q) or $(picker_green b)"
+    "quit $(picker_green q) or $(picker_green b)"
   )
   local line="  ${colored[0]}" used=$(( 2 + ${#plain[0]} )) index
   for (( index = 1; index < ${#plain[@]}; index++ )); do
@@ -672,9 +672,9 @@ The list	o	Show sessions outside the kit (read-only)
 The list	u	Restore a closed conversation; opening this screen changes nothing
 Going back	b	Back, on every screen inside the picker
 Going back	Enter	Takes the most likely choice on every screen: here the top session (a new session when the list is empty), Claude Code on New session, the recommended account or project where one is named; where nothing is choosable it goes back, and the screen's own footer says which
-Leaving	b	Back from the top is out: leave the picker for a regular shell
-Leaving	q / quit / exit	The same, by name
-Leaving	Ctrl-C	Cancel the prompt you are in; on this screen, redraw it
+Quitting	b	Back from the top is out: quit the picker for a regular shell
+Quitting	q / quit / exit	The same, by name
+Quitting	Ctrl-C	Cancel the prompt you are in; on this screen, redraw it
 ROWS
 }
 
@@ -693,7 +693,7 @@ show_help() {
   done < <(picker_help_rows)
   echo
   echo "  A key takes its number with or without the space: k5 and k 5 are the same."
-  echo "  Inside a session: bye closes it, and disconnecting SSH leaves it running."
+  echo "  Inside a session: Ctrl-Q leaves it running, Ctrl-D or bye closes it."
   echo "  History is an action on every row."
   echo "  Grouping and compact rows last for this window; SESSION_KIT_PICKER_GROUP and"
   echo "  SESSION_KIT_PICKER_COMPACT set how it starts."

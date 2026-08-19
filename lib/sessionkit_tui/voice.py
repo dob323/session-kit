@@ -82,19 +82,19 @@ HELP_ROWS = (
     ("Sessions", "name", "Choose Rename from a session's actions"),
     ("Needs you", "a", "Filter the list as you type"),
     ("The list", "text", "Type to filter names, providers, and projects"),
-    ("The list", "Esc", "Clear typed text, go back, then leave"),
+    ("The list", "Esc", "Clear typed text, go back, then quit"),
     ("The list", "mouse", "Wheel to scroll; click to highlight or open"),
     ("The list", "?", "Choose Help from the list"),
     ("Going back", "Enter", "Takes the choice under the cursor on any screen"),
     ("Going back", "b", "Back, on every screen that is not filtering by name"),
-    ("Leaving", "Esc", "Leave when there is nothing to clear or go back from"),
-    ("Leaving", "q", "Leave from the main list"),
-    ("Leaving", "Ctrl-D", "Leave from anywhere"),
+    ("Quitting", "Esc", "Quit when there is nothing to clear or go back from"),
+    ("Quitting", "q", "Quit from the main list"),
+    ("Quitting", "Ctrl-D", "Quit the picker from anywhere"),
 )
 
 HELP_NOTES = (
     "Nothing on this screen asks you to confirm. An action runs, then says what it did.",
-    "Inside a session: bye closes it, and disconnecting SSH leaves it running.",
+    "Inside a session: Ctrl-Q leaves it running, Ctrl-D or bye closes it.",
     "History is an action on every session row.",
 )
 

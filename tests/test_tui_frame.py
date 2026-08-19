@@ -496,7 +496,7 @@ class HelpTests(unittest.TestCase):
         drawn = screen.frame(width=200, height=40)
         text = drawn.joined()
         self.assertEqual("  Picker help", drawn.lines[0].text)
-        for section in ("Sessions", "Needs you", "The list", "Leaving"):
+        for section in ("Sessions", "Needs you", "The list", "Quitting"):
             self.assertIn(f"  {section}", text)
         rows = [
             line

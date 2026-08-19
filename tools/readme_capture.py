@@ -209,7 +209,7 @@ def list_frame(frames: list[str]) -> str:
     for part in frames:
         candidate = part.rsplit(REPAINT, 1)[-1]
         readable = plain(candidate)
-        if "sessions" in readable and "kill" in readable and "leave" in readable:
+        if "sessions" in readable and "kill" in readable and "quit" in readable:
             complete.append(candidate)
     if not complete:
         raise RuntimeError("the real picker produced no complete list screen")

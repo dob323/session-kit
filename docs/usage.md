@@ -13,13 +13,13 @@ New session, Projects, Closed sessions, and Help follow the session rows.
 
 ```text
 Enter           open the top or highlighted row; on an empty list, start new
-b               go back; from the home screen, leave for an ordinary shell
+b               go back; from the home screen, quit to an ordinary shell
 digits          mark sessions: 5 · 1,4 · 7-9
 letters         filter the list as you type
-q               leave from the home screen when no filter text is typed
-Esc             clear text, step back, then leave when nothing else remains
+q               quit from the home screen when no filter text is typed
+Esc             clear text, step back, then quit when nothing else remains
 Ctrl-C          abandon the line being typed
-Ctrl-D          leave from anywhere
+Ctrl-D          quit the picker from anywhere
 ↑ / ↓           move the highlight on the cursor-driven screen
 mouse           scroll, highlight, and open on the cursor-driven screen
 ```
@@ -72,7 +72,7 @@ p               projects: add, review, hide, or restore new-session directories
 o               show sessions outside the kit, read-only
 u               restore a closed conversation
 ?               show this table from the picker itself
-b / q           leave the home screen for a regular shell
+b / q           quit the home screen for a regular shell
 quit / exit     the same, by name
 ```
 
@@ -518,17 +518,34 @@ the reasons is that a provider is still running in that terminal.
 
 Nothing asks you to choose.
 
-To leave a conversation RUNNING and walk away, press **Ctrl-q**. It detaches,
-the provider keeps working, and the session's number brings you back to the
-same live conversation later, the same outcome as closing the terminal window
-without typing anything, but without having to close a window to get it.
-Ctrl-q works in every session, whichever provider is running, because the
-session manager handles it before the provider ever sees the key.
+Two keys end your time in a session, and the difference between them is the
+whole point.
 
-Session Kit puts that binding in the shpool config it writes for a fresh
-setup. It is not shpool's own default, stock shpool detaches on the two-key
-chord **Ctrl-Space Ctrl-q**, so if you already had a shpool config before
-installing Session Kit, yours was left alone and Ctrl-q may do nothing there.
+**Ctrl-Q leaves.** The work keeps running and you land back at the picker. The
+session's number brings you back to the same live conversation later. It is the
+same outcome as closing the terminal window without typing anything, without
+having to close a window to get it. Ctrl-Q works in every session, whichever
+provider is running, because the session manager handles it before the provider
+ever sees the key — including in a window where the provider has stopped
+answering the keyboard at all.
+
+**Ctrl-D closes.** The provider exits, the session ends, its number returns to
+the ordinary quarantine, and the conversation lands in Closed sessions where one
+Restore brings it back. Codex and a shell session close on a single press.
+Claude Code answers the first press with `Press Ctrl-D again to exit`. That
+confirmation belongs to Claude's exit action rather than to the key, so the kit
+cannot configure it away, and binding the same action to a different key keeps
+the identical prompt.
+
+In Claude each key has a typed twin: `/kit` does what Ctrl-Q does, and `/exit`
+does what Ctrl-D does, closing on the first press with nothing to confirm. Codex
+has neither, so in Codex it is the keys.
+
+Session Kit puts the Ctrl-Q binding in the shpool config it writes for a fresh
+setup; shpool's own name for the action is `detach`. It is not shpool's default,
+stock shpool detaches on the two-key chord **Ctrl-Space Ctrl-q**, so if you
+already had a shpool config before installing Session Kit, yours was left alone
+and Ctrl-Q may do nothing there.
 Add this to `~/.config/shpool/config.toml`. shpool compiles keybindings once
 per attachment, so it needs no daemon restart, but it reaches only windows you
 open or REOPEN after the edit. A window you are already sitting in keeps the
@@ -540,10 +557,6 @@ and do nothing in the one next to it:
 binding = "Ctrl-q"
 action = "detach"
 ```
-
-**In Claude only**, `/kit` does the same thing from inside the conversation.
-There is no Codex equivalent, and the two are not symmetric: Ctrl-q is the one
-way that works everywhere, and it is the one to learn.
 
 Why there is no `/kit` in Codex: in codex-cli 0.145.0 the slash namespace is
 built-in commands only. Its app-server protocol has no channel for a custom
@@ -568,12 +581,12 @@ in `$SHPOOL_SESSION_NAME`. A provider that is not installed on the machine gets
 nothing, an existing `kit.md` that is not a plain file is left alone, and the
 account profile a session happens to be using is never written to.
 
-Only a typed `/kit` ever detaches. Claude Code treats a file in `commands/` as
+Only a typed `/kit` ever leaves a session. Claude Code treats a file in `commands/` as
 a skill it may invoke on its own when the conversation looks relevant, so the
 verb carries `disable-model-invocation: true`: the description is not placed in
 the model's context at all, and nothing but the typed command can fire it.
 Without that, typing the bare word `kit` as an ordinary message was enough to
-detach a terminal mid-turn.
+empty a terminal mid-turn.
 
 Do not use a generic latest-conversation command to come back. If exact
 identity cannot be proved, reopen is disabled rather than guessed.
