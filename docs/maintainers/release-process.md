@@ -6,7 +6,7 @@ and release assets.
 
 ## Version and support policy
 
-The release documented by this tree is `v0.4.2` and remains beta software.
+The release documented by this tree is `v0.4.3` and remains beta software.
 Follow Semantic Versioning and never move or reuse a tag.
 
 Before `1.0.0`, put every incompatible command, configuration, or private-state

@@ -2,7 +2,7 @@
 
 All notable changes to Session Kit are documented here.
 
-## [Unreleased]
+## [0.4.3] - 2026-08-19
 
 ### Fixed
 
@@ -343,6 +343,7 @@ All notable changes to Session Kit are documented here.
   attach.
 - Added patch `0006`, which coalesces bursts of client resize events.
 
+[0.4.3]: https://github.com/dob323/session-kit/releases/tag/v0.4.3
 [0.4.2]: https://github.com/dob323/session-kit/releases/tag/v0.4.2
 [0.4.1]: https://github.com/dob323/session-kit/releases/tag/v0.4.1
 [0.4.0]: https://github.com/dob323/session-kit/releases/tag/v0.4.0

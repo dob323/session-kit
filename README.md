@@ -30,7 +30,7 @@ One limit, stated up front rather than in a table further down: Claude Code repo
   <a href="#documentation">Documentation</a>
 </p>
 
-> **Public beta, `v0.4.2`.** Linux with systemd, or macOS 14 and newer.
+> **Public beta, `v0.4.3`.** Linux with systemd, or macOS 14 and newer.
 >
 > **Settled:** the picker, session identity and the guards around every action, install, update and rollback, and the Claude Code and Codex integrations. Around 2,700 tests run on both platforms for every change.
 >

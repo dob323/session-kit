@@ -1,6 +1,6 @@
 # Install Session Kit
 
-Session Kit `v0.4.2` is a public beta for Linux with systemd and macOS 14 or
+Session Kit `v0.4.3` is a public beta for Linux with systemd and macOS 14 or
 newer. Install the accepted release artifact under a single-user account where
 provider conversations are recoverable.
 
