@@ -28,6 +28,17 @@ def _executable(path: Path) -> None:
 
 class Fixture:
     def __init__(self) -> None:
+        # The module under test honors SESSION_KIT_PROJECT_DIR_NAME=off as a
+        # kill switch. A shell that exports it -- flipped once for debugging
+        # and forgotten -- turns every rename in this module into a refusal
+        # and fails four tests for a reason that is not a defect (that is
+        # exactly how it was first reported, as a suspected regression, on
+        # 2026-08-19). Every test therefore starts from the variable unset;
+        # the kill-switch test sets it back deliberately through its own
+        # patch.
+        self._environment = mock.patch.dict(os.environ, {}, clear=False)
+        self._environment.start()
+        os.environ.pop("SESSION_KIT_PROJECT_DIR_NAME", None)
         self.temp = tempfile.TemporaryDirectory(prefix=".projects-dirname-")
         self.base = Path(self.temp.name)
         self.root = self.base / "repo"
@@ -53,6 +64,7 @@ class Fixture:
 
     def close(self) -> None:
         self.temp.cleanup()
+        self._environment.stop()
 
     def resolve(self) -> str | None:
         return project_dir_name.resolve_project_dir_name(
