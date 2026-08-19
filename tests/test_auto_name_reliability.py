@@ -220,7 +220,22 @@ class CodexTitlerTests(unittest.TestCase):
             with mock.patch.object(
                 names_push(), "_push_codex_thread_title", side_effect=slow_store
             ):
-                self.run_pass(codex, home, budget_seconds=0.01)
+                # And a stopped clock, because widening that gap left the other
+                # half of the same fault in place. The ten milliseconds are the
+                # budget for the WHOLE pass, and the connect, the schema probe,
+                # the first page and the index read all spend it before the row
+                # loop is reached; a pass already over budget there breaks
+                # before calling the store at all, and `received` is empty.
+                # That is the IndexError this test died on twice on busy
+                # runners (2026-08-18, ubuntu-24.04/3.11 and 22.04/3.12), and
+                # pinning one CPU against three spinners reproduces it in 2 of
+                # 10 runs. A pinned clock hands the store the same ten
+                # milliseconds every time, so the deadline is measured instead
+                # of the machine. The elapsed check below still runs on the
+                # real clock, which is what makes an ignored deadline visible.
+                self.run_pass(
+                    codex, home, budget_seconds=0.01, monotonic=lambda: 0.0
+                )
             elapsed = time.monotonic() - started
             self.assertIsNotNone(received[0])
             self.assertLessEqual(received[0], 0.01)
@@ -245,6 +260,13 @@ class CodexTitlerTests(unittest.TestCase):
                 codex,
                 home,
                 budget_seconds=0.01,
+                # The same pinned clock as the store-deadline test above, for
+                # the same reason: ten milliseconds is the budget for the whole
+                # pass, so a runner that spends it on the fixture never reaches
+                # the row, never calls this rename, and dies on an empty
+                # `received` rather than on the deadline. This one has not
+                # failed in CI yet; it is the identical shape and would.
+                monotonic=lambda: 0.0,
                 environ={"HOME": os.fspath(home)},
                 push_live_rename=slow_live,
             )
