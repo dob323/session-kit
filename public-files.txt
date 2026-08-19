@@ -139,6 +139,7 @@ tests/test_release_artifact.py
 tests/test_release_gc.py
 tests/test_restore_identity.py
 tests/test_sandbox_guard.py
+tests/test_sandbox_sweep.py
 tests/test_session_colors.py
 tests/test_snapshot_contract.py
 tests/test_state_column.py

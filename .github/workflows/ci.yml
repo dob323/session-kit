@@ -230,6 +230,7 @@ jobs:
             tests/test_projects_manifest.py \
             tests/test_public_export.py tests/test_public_scan.py \
             tests/test_release_artifact.py tests/support.py \
+            tests/test_sandbox_sweep.py \
             tests/shard.py \
             tests/test_readme_art.py tests/test_readme_keys.py \
             tools/readme_art_lib.py tools/readme_keys.py

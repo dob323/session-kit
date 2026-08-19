@@ -41,10 +41,15 @@ def source_tree_ignore(root: Path = REPO):
     test removes one and copytree lists an entry, then fails to open it, and the
     run dies over a file that was never part of the source.
 
-    c9d85e9 fixed that in one of the three by listing sweep_sandboxes.PREFIXES.
-    That list holds six prefixes; the suite builds a hundred and eighty-three
-    inside the checkout, so the fix covered neither of the two sandboxes that
-    have actually broken a run. Prefixes were never the right shape here.
+    c9d85e9 fixed that in one of the three by borrowing the sweep's list of
+    sandbox prefixes. Six were named against the two hundred and more the suite
+    hands tempfile, so the fix covered neither of the two sandboxes that have
+    actually broken a run. Prefixes were never the right shape here.
+
+    tests/sweep_sandboxes.py no longer carries a list -- it reads the prefixes
+    out of the test sources -- and this rule still does not borrow from it. A
+    copy rule and a delete rule disagree about `.git`: the copy must drop it,
+    the sweep must protect it. Two answers, two constants, no shared edit.
 
     .gitignore settled this for Git already -- `/.*/` with `!/.github/`, under
     the note "Ignore the whole class rather than chase prefixes" -- so this
