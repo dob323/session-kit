@@ -4,11 +4,11 @@
 [![Latest release](https://img.shields.io/github/v/release/dob323/session-kit)](https://github.com/dob323/session-kit/releases)
 [![License](https://img.shields.io/github/license/dob323/session-kit)](LICENSE)
 
-**Many AI coding sessions. One place to see which one needs you.**
+**Close the terminal windows, not the AI coding sessions. One number takes you back in.**
 
-Session Kit is a terminal home screen for Claude Code and Codex. Type `kit` and every session you are running is on one screen, each with a stable number, a name, and a word that says whether it is waiting on you or still working. Type its number to go straight back in.
+Every Claude Code and Codex session in one menu: named, numbered, colour-coded. Open, close, and jump to whichever needs you.
 
-The sessions run on the host, so closing the terminal or dropping SSH does not end them.
+The sessions keep running on the host whether or not you are watching them.
 
 <p align="center">
   <img src="docs/assets/readme/picker.png" alt="The Session Kit picker: seven sessions grouped into Ready and Open elsewhere, each row showing number, name, provider, account, model, state, and last activity" width="100%">
