@@ -960,12 +960,26 @@ class PulseIntervalTests(unittest.TestCase):
         return pulse, interval, state
 
     def argv(self) -> str:
-        deadline = time.monotonic() + 5
+        # The watcher is a separate process, so its argv file appears after the
+        # probe returns. Waiting five seconds was enough on an idle machine and
+        # not on a loaded CI runner, and the old timeout returned an empty
+        # string, so the caller's assertion blamed the interval value for a
+        # watcher that had simply not started yet (2026-08-20). Wait longer,
+        # require the write to be complete, and say what actually went wrong.
+        budget = 30
+        deadline = time.monotonic() + budget
         while time.monotonic() < deadline:
-            if self.argv_file.exists():
-                return self.argv_file.read_text(encoding="utf-8")
+            try:
+                recorded = self.argv_file.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                recorded = ""
+            if recorded.strip():
+                return recorded
             time.sleep(0.05)
-        return ""
+        raise AssertionError(
+            f"the watcher wrote no argv to {self.argv_file} within {budget}s; "
+            "it never started, so nothing here is a statement about its arguments"
+        )
 
     def test_a_value_argparse_cannot_read_falls_back_to_the_default(self) -> None:
         marker = self.base / "pwn"
