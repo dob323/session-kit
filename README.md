@@ -6,18 +6,16 @@
 
 **Many AI coding sessions. One place to see which one needs you.**
 
-Session Kit is a local picker for Claude Code and Codex. Type `kit` and every session you are running is in one list, each with a stable number, a name, and a state word that says whether it is waiting on you or still working. The sessions run on the host, so closing the terminal or dropping SSH does not end them.
+Session Kit is a terminal home screen for Claude Code and Codex. Type `kit` and every session you are running is on one screen, each with a stable number, a name, and a word that says whether it is waiting on you or still working. Type its number to go straight back in.
 
-One limit, stated up front rather than in a table further down: Claude Code reports a blocking prompt the moment it opens one, so `question` is exact. Codex does not expose that yet, so a Codex session reads `needs you` when its turn ends rather than the instant it asks you something.
-
-**What is on the screen is not what gets trusted.** The number, the name, the directory, the timestamps: all of that is display. Identity is the provider's conversation UUID together with the exact process generation, and every action that changes anything re-proves that against the live system in the moment before it runs, then refuses outright on evidence that is missing, stale, partial or contradictory. This is the part worth caring about: a picker one second out of date still cannot act on the wrong session, because the picker was never the evidence.
-
-**Every session names itself.** It takes a short title from its own first piece of work, keeps a number that does not move, and gets a colour of its own. All three follow the session *into* its own window. The tab title carries the name and number, and the session is tinted its colour in Claude Code and Codex themselves. So the window you are typing in tells you which session it is, and the picker and the session never disagree about it. Colours are kept distinct from the other live sessions: eight for Claude Code, six for Codex, chosen so no Claude session can ever share a colour with a Codex one.
-
-**Every session can use a different subscription.** Enrol several accounts for the same provider and hand each session whichever one you want: three Claude Code subscriptions running in three sessions side by side on one machine, at the same time. The account belongs to the session, not to the machine or to the terminal you launched from, which is the usual arrangement elsewhere.
+The sessions run on the host, so closing the terminal or dropping SSH does not end them.
 
 <p align="center">
   <img src="docs/assets/readme/picker.png" alt="The Session Kit picker: seven sessions grouped into Ready and Open elsewhere, each row showing number, name, provider, account, model, state, and last activity" width="100%">
+</p>
+
+<p align="center">
+  <code>kit</code> → see what needs you → type its number → back in the session.
 </p>
 
 <p align="center">
@@ -30,54 +28,55 @@ One limit, stated up front rather than in a table further down: Claude Code repo
   <a href="#documentation">Documentation</a>
 </p>
 
-> **Public beta, `v0.4.3`.** Linux with systemd, or macOS 14 and newer.
->
-> **Settled:** the picker, session identity and the guards around every action, install, update and rollback, and the Claude Code and Codex integrations. Around 2,700 tests run on both platforms for every change.
->
-> **Not settled:** the beta moves quickly, thirteen releases in its first three weeks, so expect to update. Codex does not report a blocking prompt yet.
->
-> **What is promised:** this is a tool its author uses daily and publishes; it is not a supported product. Replies are best-effort, security fixes go into the current release with no dated windows and no back-ports, and nothing here is a security boundary against another process already running as your Unix user. Start on a single trusted Unix account where provider conversations can be recovered.
+> **Public beta, `v0.4.3`.** Linux with systemd, or macOS 14 and newer. I use Session Kit daily, and the beta moves quickly, so expect to update. Full detail in [Beta and support](#beta-and-support).
 
-## What you get
+## Why I built it
 
-| Capability | What it means |
-|---|---|
-| **One list** | Every managed Claude Code and Codex session in a single keyboard-first picker. |
-| **Named without asking** | A session titles itself from its own first work. Rename it yourself and your name wins from then on. |
-| **A colour per session** | Each session gets a colour the others do not have, in the picker and inside the session's own window. |
-| **A subscription per session** | Enrol several accounts for one provider and give each session its own. Sessions do not share a single login. |
-| **States that mean something** | `question`, `needs you`, `working`, and `idle` have exact definitions and sort consistently. |
-| **Stable session numbers** | Open, inspect, close, and find sessions without copying internal shpool IDs. |
-| **Survives disconnects** | The session stays on the host when a terminal window closes or SSH drops. |
-| **Guarded actions** | Every mutation rechecks exact live identity immediately before it runs, and refuses on any doubt. |
-| **Recoverable conversations** | Closing a Claude Code or Codex session records the exact conversation for restore. |
-| **Isolated working copies** | A delegated session gets its own git worktree on its own branch, and hands it back when it closes. It is kept instead, with the reason named, whenever giving it back could lose work. |
-| **Local only** | No hosted account, no analytics, no update beacon, no telemetry. |
+I run several Claude Code and Codex sessions at the same time. Keeping them alive turned out to be the easy part. Remembering which one was doing what, which one had finished, and which one had been sitting there waiting on me the whole time was not. I kept opening window after window just to find the session that had asked me something.
+
+Session Kit is the small home screen I wanted for that. I use it every day, on a local machine and over SSH to the host where the work actually runs.
+
+It is a passion project. There is no company behind it, no paid tier, and nothing to buy. It is MIT licensed, it collects nothing, and it talks to no server of mine. I published it because it fixed a problem I hit every single day, and if you hit the same one, it will probably fix yours.
+
+## What it does
+
+- **See every session in one list.** Claude Code and Codex together, on one screen.
+- **Know what needs you.** `question`, `needs you`, `working`, and `idle` make the next session to check obvious.
+- **Jump back in by number.** Every session keeps a stable number that does not move.
+- **Survive terminal and SSH disconnects.** The session keeps running on the host.
+- **Know which window is which.** Sessions name and colour themselves, and the name, number, and colour follow the session into its own window.
+- **Use a different account per session.** The subscription belongs to the session, not to the terminal that launched it.
+- **Get a closed conversation back.** Closing a session records the exact conversation for restore.
+- **Keep delegated work apart.** A machine-origin session gets its own git worktree on its own branch, and hands it back when it closes.
+- **Stay local.** No hosted account, no analytics, no telemetry, no update beacon.
 
 ## Is this for you?
 
-It fits best if you run several AI coding sessions at once, work on a remote host over SSH, and want to know at a glance which session is blocked on you rather than opening each one to find out.
+If you regularly have enough sessions open that you lose track of which one needs you, this was built for exactly that, and you will feel it on the first run.
 
-Here is what it does **not** do:
+If you usually keep one or two sessions going, you probably do not need it yet.
 
-- **No diff review.** It will not show you what a session changed. That stays in git and your editor.
-- **No cost or spend accounting.** It can read the provider's own quota percentages and tell you when one runs out, but it does not price or count tokens.
-- **Not a multiplexer.** It runs on [shpool](https://github.com/shell-pool/shpool) and does not replace tmux, or try to.
-- **Not a security boundary.** It protects you from acting on the wrong session, not from a hostile process running as you.
+It works the same on a local workstation or on a remote host over SSH.
 
-If what you actually need is reviewing the diff each agent produced, a different tool will serve you better.
+## Simple on purpose
 
-### Why not tmux, or one of the other session managers?
+The interface is deliberately small: open `kit`, see what needs you, press a number.
 
-**tmux** is already on your machine and keeps processes alive, which is most of the way there. What it does not do is tell you which of eleven panes is waiting on an answer, and it has no notion of which conversation a pane holds, so nothing stops you acting on the pane next to the one you meant. If you are running two sessions, tmux is enough and this is overkill.
+More is going on underneath. Before Session Kit changes a live session, it re-proves that the session is still the exact provider conversation and the exact process it expects. If it cannot prove that, it refuses instead of guessing.
 
-**The other AI session managers** solve the listing problem, and several are pleasant. The difference is what they do with the list: they act on it. Here the list is treated as a cache that can be a second out of date, and identity is re-proved against the live system before anything is changed. That distinction only matters when you have enough sessions that the list *can* be wrong, which is also the point where you start needing this.
-
-**What it costs you:** this runs on shpool rather than tmux, so there is one more thing to install before you see anything. That was a deliberate trade: shpool gives a clean session per shell without fighting multiplexer semantics, which is what makes a session's identity provable at all. It is a real cost, and it is paid before you get to the payoff.
+The picker is a view of your sessions. It is never trusted as evidence of which live session an action should affect. That distinction is the whole design, and [Safety model](#safety-model) has it in full.
 
 ## Install
 
 Session Kit installs per user, on the Linux or macOS machine where the work runs.
+
+### Installing with an AI assistant
+
+The shortest path, if Claude Code, Codex, or another terminal agent is already open: give it this.
+
+> Install Session Kit from `https://github.com/dob323/session-kit`. Use the latest release artifact, not a clone of `main`. Download the release archive with its `.sha256` and `.provenance.json` files, verify the checksum, extract it, and run `./install.sh --check` first. Fix only the remedies that preflight explicitly names. Then run `./install.sh`, `session-kit doctor`, `session-kit services enable`, and `session-kit doctor` again. Never bypass a refused step. Show me the final doctor output and finish by telling me to type `kit`.
+
+### Installing it yourself
 
 Artifacts are named by the exact commit they were built from, so there is no fixed download URL. This asks the release API which files belong to the current release, checks what arrived, and only then unpacks it. It needs nothing but Python 3 and `tar`, both of which the install needs anyway.
 
@@ -125,12 +124,6 @@ session-kit doctor
 
 Prefer the GitHub CLI, installing without a network path to the API, or checking the provenance file by hand? [Install Session Kit](docs/install.md) has every route, plus supported shpool paths, provider setup, project import, and activation.
 
-### Installing with an AI assistant
-
-If Claude Code, Codex, or another terminal agent is doing the installation, give it this:
-
-> Install Session Kit from `https://github.com/dob323/session-kit`. Use the latest release artifact, not a clone of `main`. Download the release archive with its `.sha256` and `.provenance.json` files, verify the checksum, extract it, and run `./install.sh --check` first. Fix only the remedies that preflight explicitly names. Then run `./install.sh`, `session-kit doctor`, `session-kit services enable`, and `session-kit doctor` again. Never bypass a refused step. Show me the final doctor output and finish by telling me to type `kit`.
-
 ## First run
 
 ```bash
@@ -160,6 +153,8 @@ The state words are deliberately small and literal:
 | `idle` | A needs-you transcript has not moved for the configured idle window. |
 | `pending` | A launch that has not finished, or a value Session Kit cannot currently read. It is not a fifth state. |
 
+One limit worth stating plainly: Claude Code reports a blocking prompt the moment it opens one, so `question` is exact. Codex does not expose that yet, so a Codex session reads `needs you` when its turn ends rather than the instant it asks you something.
+
 Pressing `a` narrows the list to just those sessions, with how long each has
 waited.
 
@@ -182,6 +177,8 @@ The home screen keeps the common actions one key away:
 
 A session that is open elsewhere defaults to **Move it here** after a fresh identity check. The earlier window returns to its picker, and the provider conversation is not duplicated.
 
+Every session also names and colours itself. It takes a short title from its own first piece of work, keeps a number that does not move, and gets a colour no other live session has. All three follow the session into its own window: the tab title carries the name and number, and the session is tinted its colour inside Claude Code and Codex themselves. So the window you are typing in tells you which session it is, and the picker and the session never disagree.
+
 Press `?` for the full key reference: filtering, ranges, grouping, forking, renaming, and `g` to jump to the next session that needs you are all there. See [Picker navigation](docs/picker-navigation.md) for the cursor-driven picker, mouse behavior, action panels, machine sessions, and closed-session restore.
 
 ## Safety model
@@ -200,9 +197,26 @@ Session Kit deliberately separates **what you see** from **what it trusts**.
 
 Before a proof-bound action, Session Kit can bind and recheck the session manager, terminal generation, managed shell, provider process and ancestry, exact provider conversation UUID, and frozen snapshot generation. The proof is owner-only and short-lived.
 
-This protects against stale or ambiguous picker state selecting a different session than the one you intended. It does **not** isolate mutually hostile processes running with your own Unix-user privileges.
+This is the part worth caring about: a picker one second out of date still cannot act on the wrong session, because the picker was never the evidence.
+
+It protects against stale or ambiguous picker state selecting a different session than the one you intended. It does **not** isolate mutually hostile processes running with your own Unix-user privileges.
 
 Read [Security and local data](docs/security-and-data.md) and [Architecture](docs/architecture.md) for the complete trust model.
+
+## What it does not do
+
+- **No diff review.** It will not show you what a session changed. That stays in git and your editor.
+- **No cost or spend accounting.** It can read the provider's own quota percentages and tell you when one runs out, but it does not price or count tokens.
+- **Not a multiplexer.** It runs on [shpool](https://github.com/shell-pool/shpool) and does not replace tmux, or try to.
+- **Not a security boundary.** It protects you from acting on the wrong session, not from a hostile process running as you.
+
+### Why not tmux?
+
+tmux keeps processes alive, which is most of the way there, and it is already on your machine. What it cannot tell you is which of eleven panes is waiting on an answer. It has no notion of which conversation a pane holds, so nothing stops you acting on the pane next to the one you meant.
+
+Session Kit knows both. Every session carries the identity of its provider conversation, and that identity is re-proved against the live system before anything is changed.
+
+It runs on [shpool](https://github.com/shell-pool/shpool) rather than tmux, so there is one more thing to install first. That was the trade: shpool gives a clean session per shell without fighting multiplexer semantics, and that is what makes a session's identity provable at all.
 
 ## Accounts and subscriptions
 
@@ -289,6 +303,14 @@ sp help                 # every command, with exit codes and selectors
 `doctor` is the first thing to run when anything looks wrong. Updates install an immutable local release and move `current` atomically; rollback selects a verified release already on the machine. Read [Update and roll back](docs/update-and-rollback.md) before changing releases, [Configure Session Kit](docs/configuration.md) for colour, terminal titles and every setting, and [Troubleshooting](docs/troubleshooting.md) when `doctor` names something you have not met.
 
 Session Kit runs on [shpool](https://github.com/shell-pool/shpool) and neither vendors nor replaces it. The repository carries optional shpool patches with their scope and checks; `doctor` records the shpool binary validated at installation and reports when it later changes. Read [`shpool-patch/`](shpool-patch/) before choosing a patched binary.
+
+## Beta and support
+
+**Settled:** the picker, session identity and the guards around every action, install, update and rollback, and the Claude Code and Codex integrations. Around 2,700 tests run in CI, with native Linux and macOS coverage.
+
+**Not settled:** the beta moves quickly, thirteen releases in its first three weeks, so expect to update. Codex does not report a blocking prompt yet.
+
+**What is promised:** this is a tool its author uses daily and publishes; it is not a supported product. Replies are best-effort, security fixes go into the current release with no dated windows and no back-ports, and nothing here is a security boundary against another process already running as your Unix user. Start on a single trusted Unix account where provider conversations can be recovered.
 
 ## Documentation
 
